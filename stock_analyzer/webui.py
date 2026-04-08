@@ -11,6 +11,7 @@ import os
 from datetime import datetime
 
 import httpx
+import yfinance as yf
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -51,8 +52,136 @@ st.markdown("""
     .score-positive { color: #26a69a; }
     .score-negative { color: #ef5350; }
     div[data-testid="stSidebar"] { background-color: #1a1d23; }
+    .index-card {
+        background: #1a1d23;
+        border-radius: 8px;
+        padding: 12px 14px;
+        border-left: 3px solid #444;
+        margin-bottom: 4px;
+    }
+    .index-card .idx-name {
+        color: #999;
+        font-size: 11px;
+        margin-bottom: 2px;
+        letter-spacing: 0.5px;
+    }
+    .index-card .idx-price {
+        color: #e0e0e0;
+        font-size: 18px;
+        font-weight: 700;
+        margin-bottom: 1px;
+    }
+    .index-card .idx-change-up {
+        color: #26a69a;
+        font-size: 13px;
+        font-weight: 600;
+    }
+    .index-card .idx-change-down {
+        color: #ef5350;
+        font-size: 13px;
+        font-weight: 600;
+    }
+    .index-card .idx-change-flat {
+        color: #888;
+        font-size: 13px;
+        font-weight: 600;
+    }
+    .idx-section-title {
+        color: #888;
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 1px;
+        margin-bottom: 6px;
+        padding-bottom: 4px;
+        border-bottom: 1px solid #2a2d33;
+    }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  시장 지수 데이터 수집
+# ═══════════════════════════════════════════════════════════════
+
+# 지수 정의: (yfinance 티커, 표시명, 소수점 자릿수)
+MARKET_INDICES = {
+    "us_market": {
+        "title": "US MARKET",
+        "items": [
+            ("^GSPC", "S&P 500", 2),
+            ("^IXIC", "NASDAQ", 2),
+            ("^DJI", "DOW", 2),
+        ],
+    },
+    "kr_market": {
+        "title": "KR MARKET",
+        "items": [
+            ("^KS11", "KOSPI", 2),
+            ("^KQ11", "KOSDAQ", 2),
+            ("USDKRW=X", "USD/KRW", 2),
+        ],
+    },
+    "commodities": {
+        "title": "COMMODITIES",
+        "items": [
+            ("GC=F", "Gold", 2),
+            ("SI=F", "Silver", 2),
+            ("HG=F", "Copper", 3),
+            ("NG=F", "Nat Gas", 2),
+        ],
+    },
+}
+
+
+@st.cache_data(ttl=300)  # 5분 캐시
+def fetch_market_indices() -> dict:
+    """주요 시장 지수 현재가 및 등락률 수집"""
+    results = {}
+    all_tickers = []
+    for group in MARKET_INDICES.values():
+        for sym, name, decimals in group["items"]:
+            all_tickers.append(sym)
+
+    try:
+        data = yf.download(
+            all_tickers,
+            period="5d",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+    except Exception:
+        return results
+
+    for group_key, group in MARKET_INDICES.items():
+        for sym, name, decimals in group["items"]:
+            try:
+                if len(all_tickers) == 1:
+                    close_series = data['Close']
+                else:
+                    close_series = data['Close'][sym]
+
+                close_series = close_series.dropna()
+                if len(close_series) < 2:
+                    continue
+
+                price = float(close_series.iloc[-1])
+                prev = float(close_series.iloc[-2])
+                change = price - prev
+                change_pct = (change / prev) * 100
+
+                results[sym] = {
+                    "name": name,
+                    "price": price,
+                    "change": change,
+                    "change_pct": change_pct,
+                    "decimals": decimals,
+                    "group": group_key,
+                }
+            except Exception:
+                continue
+
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -151,8 +280,79 @@ with st.sidebar:
 #  대시보드 페이지
 # ═══════════════════════════════════════════════════════════════
 
+def _render_index_card(info: dict) -> str:
+    """단일 지수 카드 HTML 생성"""
+    price = info["price"]
+    decimals = info["decimals"]
+    change = info["change"]
+    change_pct = info["change_pct"]
+
+    # 가격 포맷
+    price_str = f"{price:,.{decimals}f}"
+
+    # 등락 포맷
+    if change_pct > 0:
+        arrow = "▲"
+        css_class = "idx-change-up"
+    elif change_pct < 0:
+        arrow = "▼"
+        css_class = "idx-change-down"
+    else:
+        arrow = "−"
+        css_class = "idx-change-flat"
+
+    change_str = f"{arrow} {abs(change):,.{decimals}f} ({abs(change_pct):.2f}%)"
+
+    # 카드 좌측 보더 색상
+    if change_pct > 0:
+        border_color = "#26a69a"
+    elif change_pct < 0:
+        border_color = "#ef5350"
+    else:
+        border_color = "#444"
+
+    return f"""
+    <div class="index-card" style="border-left-color: {border_color};">
+        <div class="idx-name">{info['name']}</div>
+        <div class="idx-price">{price_str}</div>
+        <div class="{css_class}">{change_str}</div>
+    </div>
+    """
+
+
+def render_market_indices():
+    """대시보드 상단에 시장 지수 표시"""
+    indices = fetch_market_indices()
+    if not indices:
+        return
+
+    # 3개 그룹을 3개 컬럼으로 배치
+    cols = st.columns(3)
+
+    for col_idx, (group_key, group) in enumerate(MARKET_INDICES.items()):
+        with cols[col_idx]:
+            st.markdown(f'<div class="idx-section-title">{group["title"]}</div>', unsafe_allow_html=True)
+            for sym, name, decimals in group["items"]:
+                info = indices.get(sym)
+                if info:
+                    st.markdown(_render_index_card(info), unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+                    <div class="index-card">
+                        <div class="idx-name">{name}</div>
+                        <div class="idx-price" style="color: #555;">-</div>
+                        <div class="idx-change-flat">데이터 없음</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+    st.divider()
+
+
 def render_dashboard():
     st.header("📊 에이전트 대시보드")
+
+    # 시장 지수 표시
+    render_market_indices()
 
     data = api_get("/results")
     if not data or not data.get("results"):
