@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.stockagent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/hsptest/stock_auto/chart_agent_service/venv/bin/python</string>
+        <string>/Users/hsptest/stock_auto/chart_agent_service/service.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/hsptest/stock_auto/chart_agent_service</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/hsptest/stock_auto/chart_agent_service/output/service.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/hsptest/stock_auto/chart_agent_service/output/service_error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/hsptest/stock_auto/chart_agent_service/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

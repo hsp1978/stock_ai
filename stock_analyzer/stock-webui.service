@@ -1,0 +1,15 @@
+[Unit]
+Description=Stock Analysis WebUI (Streamlit)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/stock_auto/stock_analyzer
+ExecStart=/home/ubuntu/stock_auto/venv/bin/streamlit run webui.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+Restart=always
+RestartSec=5
+Environment=PATH=/home/ubuntu/stock_auto/venv/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

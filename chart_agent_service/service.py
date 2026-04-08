@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""
+차트 분석 에이전트 서비스 (Mac Studio 전용)
+- FastAPI: REST API 제공
+- APScheduler: 30분 주기 자동 분석
+- 텔레그램: 기준치 도달 시 즉시 알림
+
+실행:
+    python service.py
+    # 또는
+    uvicorn service:app --host 0.0.0.0 --port 8100
+"""
+import json
+import os
+import time
+from datetime import datetime
+from typing import Optional
+
+import httpx
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from apscheduler.schedulers.background import BackgroundScheduler
+
+from config import (
+    API_HOST, API_PORT, SCAN_INTERVAL_MINUTES,
+    WATCHLIST, OLLAMA_MODEL,
+    BUY_THRESHOLD, SELL_THRESHOLD, MIN_CONFIDENCE,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, OUTPUT_DIR,
+)
+from data_collector import fetch_ohlcv, calculate_indicators
+from analysis_tools import ChartAnalysisAgent, generate_agent_chart
+
+
+# ═══════════════════════════════════════════════════════════════
+#  전역 상태 저장소
+# ═══════════════════════════════════════════════════════════════
+
+# 최신 분석 결과 캐시 {ticker: {result, timestamp, alert_sent}}
+latest_results: dict = {}
+
+# 분석 히스토리 (최근 100건)
+scan_history: list = []
+
+
+# ═══════════════════════════════════════════════════════════════
+#  텔레그램 알림
+# ═══════════════════════════════════════════════════════════════
+
+def send_telegram(text: str, parse_mode: str = "HTML") -> bool:
+    """텔레그램 메시지 전송"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[텔레그램] 미설정. 알림 건너뜀.")
+        return False
+    try:
+        resp = httpx.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": parse_mode,
+            },
+            timeout=10,
+        )
+        return resp.status_code == 200
+    except Exception as e:
+        print(f"[텔레그램 오류] {e}")
+        return False
+
+
+def send_telegram_image(image_path: str, caption: str = "") -> bool:
+    """텔레그램 이미지 전송"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    if not os.path.exists(image_path):
+        return False
+    try:
+        with open(image_path, 'rb') as f:
+            resp = httpx.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"},
+                files={"photo": f},
+                timeout=30,
+            )
+        return resp.status_code == 200
+    except Exception as e:
+        print(f"[텔레그램 이미지 오류] {e}")
+        return False
+
+
+def format_alert_message(ticker: str, result: dict) -> str:
+    """알림 메시지 포매팅"""
+    signal = result.get("final_signal", "?")
+    score = result.get("composite_score", 0)
+    confidence = result.get("confidence", 0)
+    dist = result.get("signal_distribution", {})
+
+    emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(signal, "⚪")
+
+    msg = (
+        f"{emoji} <b>{ticker} 에이전트 알림</b>\n\n"
+        f"<b>신호:</b> {signal}\n"
+        f"<b>점수:</b> {score:+.2f} / 10\n"
+        f"<b>신뢰도:</b> {confidence} / 10\n"
+        f"<b>분포:</b> 매수 {dist.get('buy', 0)} | 매도 {dist.get('sell', 0)} | 중립 {dist.get('neutral', 0)}\n\n"
+    )
+
+    # 상위 3개 tool 결과
+    summaries = result.get("tool_summaries", [])
+    sorted_tools = sorted(summaries, key=lambda x: abs(x.get("score", 0)), reverse=True)[:3]
+    msg += "<b>주요 근거:</b>\n"
+    for s in sorted_tools:
+        t_emoji = "📈" if s["score"] > 0 else ("📉" if s["score"] < 0 else "➖")
+        msg += f"  {t_emoji} {s['name']}: {s['signal']} ({s['score']:+.1f})\n"
+
+    # LLM 판단 요약 (앞 300자)
+    llm = result.get("llm_conclusion", "")
+    if llm and not llm.startswith("[오류]"):
+        # 첫 줄만 추출 (종합 판단 부분)
+        first_section = llm.split("\n\n")[0][:300]
+        msg += f"\n<b>LLM 판단:</b>\n{first_section}"
+
+    msg += f"\n\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    return msg
+
+
+# ═══════════════════════════════════════════════════════════════
+#  분석 실행 엔진
+# ═══════════════════════════════════════════════════════════════
+
+def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
+    """단일 종목 에이전트 분석"""
+    try:
+        print(f"  [{ticker}] 데이터 수집...")
+        df = fetch_ohlcv(ticker)
+        df = calculate_indicators(df)
+
+        print(f"  [{ticker}] 12개 기법 분석...")
+        agent = ChartAnalysisAgent(ticker, df)
+        result = agent.run(mode=ai_mode)
+
+        # 차트 생성
+        chart_path = None
+        try:
+            chart_path = generate_agent_chart(ticker, df, result)
+            result["chart_path"] = chart_path
+        except Exception as e:
+            print(f"  [{ticker}] 차트 생성 실패: {e}")
+
+        # JSON 저장
+        json_path = os.path.join(OUTPUT_DIR, f"{ticker}_agent_{datetime.now().strftime('%Y%m%d_%H%M')}.json")
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(result, f, indent=2, ensure_ascii=False, default=str)
+
+        result["json_path"] = json_path
+        result["analyzed_at"] = datetime.now().isoformat()
+
+        print(f"  [{ticker}] 완료: {result.get('final_signal')} (점수: {result.get('composite_score')})")
+        return result
+
+    except Exception as e:
+        print(f"  [{ticker}] 분석 실패: {e}")
+        return None
+
+
+def check_alert_condition(ticker: str, result: dict) -> Optional[dict]:
+    """기준치 체크. 알림 대상이면 dict 반환, 아니면 None"""
+    score = result.get("composite_score", 0)
+    confidence = result.get("confidence", 0)
+    signal = result.get("final_signal", "HOLD")
+
+    # 1) 임계값 체크 (상향 조정: 기본 5.0 / -5.0)
+    should_alert = False
+    if confidence >= MIN_CONFIDENCE:
+        if score >= BUY_THRESHOLD and signal == "BUY":
+            should_alert = True
+        elif score <= SELL_THRESHOLD and signal == "SELL":
+            should_alert = True
+
+    if not should_alert:
+        reason = []
+        if confidence < MIN_CONFIDENCE:
+            reason.append(f"신뢰도 부족({confidence}<{MIN_CONFIDENCE})")
+        if SELL_THRESHOLD < score < BUY_THRESHOLD:
+            reason.append(f"점수 범위 밖({SELL_THRESHOLD}<{score}<{BUY_THRESHOLD})")
+        print(f"  [{ticker}] 알림 조건 미충족: {', '.join(reason)}")
+        return None
+
+    # 2) 중복 알림 억제 (동일 종목 + 동일 신호 → 1시간 내 1회만)
+    COOLDOWN_SECONDS = 1 * 3600  # 1시간
+    prev = latest_results.get(ticker, {})
+    prev_signal = prev.get("result", {}).get("final_signal")
+    prev_time = prev.get("alert_sent_at")
+
+    if prev_signal == signal and prev_time:
+        elapsed = (datetime.now() - datetime.fromisoformat(prev_time)).total_seconds()
+        if elapsed < COOLDOWN_SECONDS:
+            print(f"  [{ticker}] 중복 알림 억제 ({signal}, {elapsed/3600:.1f}시간 전 발송)")
+            return None
+
+    print(f"  [{ticker}] ⚡ 기준치 도달! {signal} (점수: {score}, 신뢰도: {confidence})")
+    return {
+        "ticker": ticker,
+        "signal": signal,
+        "score": score,
+        "confidence": confidence,
+        "result": result,
+    }
+
+
+def send_summary_alert(alerts: list):
+    """스캔 완료 후 기준치 도달 종목을 요약 1건으로 텔레그램 전송"""
+    if not alerts:
+        return
+
+    buy_alerts = [a for a in alerts if a["signal"] == "BUY"]
+    sell_alerts = [a for a in alerts if a["signal"] == "SELL"]
+
+    msg = f"📊 <b>에이전트 스캔 알림</b> ({datetime.now().strftime('%Y-%m-%d %H:%M')})\n"
+    msg += f"기준치 도달: {len(alerts)}개 종목\n\n"
+
+    if buy_alerts:
+        msg += "🟢 <b>매수 신호</b>\n"
+        for a in sorted(buy_alerts, key=lambda x: x["score"], reverse=True):
+            top_tools = sorted(
+                a["result"].get("tool_summaries", []),
+                key=lambda x: x.get("score", 0), reverse=True
+            )[:2]
+            tools_str = ", ".join(f"{t['name']}({t['score']:+.0f})" for t in top_tools)
+            msg += f"  <b>{a['ticker']}</b>: {a['score']:+.1f}점 (신뢰도 {a['confidence']}) [{tools_str}]\n"
+        msg += "\n"
+
+    if sell_alerts:
+        msg += "🔴 <b>매도 신호</b>\n"
+        for a in sorted(sell_alerts, key=lambda x: x["score"]):
+            top_tools = sorted(
+                a["result"].get("tool_summaries", []),
+                key=lambda x: x.get("score", 0)
+            )[:2]
+            tools_str = ", ".join(f"{t['name']}({t['score']:+.0f})" for t in top_tools)
+            msg += f"  <b>{a['ticker']}</b>: {a['score']:+.1f}점 (신뢰도 {a['confidence']}) [{tools_str}]\n"
+
+    send_telegram(msg)
+
+    # 알림 발송 시간 기록 (중복 억제용)
+    for a in alerts:
+        ticker = a["ticker"]
+        latest_results[ticker] = {
+            **latest_results.get(ticker, {}),
+            "alert_sent_at": datetime.now().isoformat(),
+        }
+
+
+def run_scheduled_scan():
+    """스케줄된 전체 종목 스캔"""
+    tickers = [t.strip().upper() for t in WATCHLIST.split(",") if t.strip()]
+
+    # watchlist.txt 파일이 있으면 병합
+    wl_file = os.path.join(os.path.dirname(__file__), "watchlist.txt")
+    if os.path.exists(wl_file):
+        with open(wl_file, 'r') as f:
+            file_tickers = [
+                line.strip().upper()
+                for line in f
+                if line.strip() and not line.strip().startswith('#')
+            ]
+        # 중복 제거
+        seen = set(tickers)
+        for t in file_tickers:
+            if t not in seen:
+                tickers.append(t)
+                seen.add(t)
+
+    print(f"\n{'='*60}")
+    print(f"  스캔 시작: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"  종목: {len(tickers)}개 - {', '.join(tickers)}")
+    print(f"  임계값: 매수≥{BUY_THRESHOLD}, 매도≤{SELL_THRESHOLD}, 신뢰도≥{MIN_CONFIDENCE}")
+    print(f"{'='*60}\n")
+
+    scan_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "tickers": tickers,
+        "results": {},
+        "alerts": [],
+    }
+
+    pending_alerts = []  # 알림 대상 수집
+
+    for ticker in tickers:
+        result = analyze_ticker(ticker)
+        if result:
+            latest_results[ticker] = {
+                "result": result,
+                "timestamp": datetime.now().isoformat(),
+                "alert_sent_at": latest_results.get(ticker, {}).get("alert_sent_at"),
+            }
+            scan_entry["results"][ticker] = {
+                "signal": result.get("final_signal"),
+                "score": result.get("composite_score"),
+                "confidence": result.get("confidence"),
+            }
+
+            # 개별 전송하지 않고 수집만
+            alert = check_alert_condition(ticker, result)
+            if alert:
+                pending_alerts.append(alert)
+                scan_entry["alerts"].append(ticker)
+
+        time.sleep(3)  # API 부하 방지
+
+    # 스캔 완료 후 기준치 도달 종목을 요약 1건으로 전송
+    if pending_alerts:
+        print(f"\n  📨 알림 대상: {len(pending_alerts)}개 종목")
+        send_summary_alert(pending_alerts)
+    else:
+        print(f"\n  알림 대상 없음")
+
+    # 히스토리 저장 (최근 100건)
+    scan_history.append(scan_entry)
+    if len(scan_history) > 100:
+        scan_history.pop(0)
+
+    print(f"\n  스캔 완료: {datetime.now().strftime('%H:%M')}")
+    print(f"{'='*60}\n")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  FastAPI 앱
+# ═══════════════════════════════════════════════════════════════
+
+app = FastAPI(
+    title="Chart Analysis Agent",
+    description="12개 기법 차트 분석 에이전트 API (Mac Studio)",
+    version="1.0.0",
+)
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "chart-analysis-agent",
+        "status": "running",
+        "model": OLLAMA_MODEL,
+        "watchlist": WATCHLIST,
+        "scan_interval": f"{SCAN_INTERVAL_MINUTES}분",
+        "thresholds": {
+            "buy": BUY_THRESHOLD,
+            "sell": SELL_THRESHOLD,
+            "min_confidence": MIN_CONFIDENCE,
+        },
+        "last_scan": scan_history[-1]["timestamp"] if scan_history else None,
+        "cached_tickers": list(latest_results.keys()),
+    }
+
+
+@app.get("/results")
+def get_all_results():
+    """전체 최신 결과 조회"""
+    summary = {}
+    for ticker, data in latest_results.items():
+        r = data.get("result", {})
+        summary[ticker] = {
+            "signal": r.get("final_signal"),
+            "score": r.get("composite_score"),
+            "confidence": r.get("confidence"),
+            "signal_distribution": r.get("signal_distribution"),
+            "analyzed_at": data.get("timestamp"),
+            "alert_sent_at": data.get("alert_sent_at"),
+        }
+    return {"count": len(summary), "results": summary}
+
+
+@app.get("/results/{ticker}")
+def get_ticker_result(ticker: str):
+    """특정 종목 상세 결과"""
+    ticker = ticker.upper()
+    if ticker not in latest_results:
+        raise HTTPException(404, f"{ticker}: 분석 결과 없음. /scan/{ticker} 로 분석 실행 가능.")
+    data = latest_results[ticker]
+    return {
+        "ticker": ticker,
+        "timestamp": data.get("timestamp"),
+        "alert_sent_at": data.get("alert_sent_at"),
+        **data.get("result", {}),
+    }
+
+
+@app.post("/scan/{ticker}")
+def scan_ticker(ticker: str, ai_mode: str = "ollama"):
+    """단일 종목 즉시 분석"""
+    ticker = ticker.upper()
+    result = analyze_ticker(ticker, ai_mode)
+    if not result:
+        raise HTTPException(500, f"{ticker}: 분석 실패")
+
+    latest_results[ticker] = {
+        "result": result,
+        "timestamp": datetime.now().isoformat(),
+        "alert_sent_at": latest_results.get(ticker, {}).get("alert_sent_at"),
+    }
+    alert = check_alert_condition(ticker, result)
+    if alert:
+        send_summary_alert([alert])
+    return result
+
+
+@app.post("/scan")
+def scan_all(ai_mode: str = "ollama"):
+    """전체 watchlist 즉시 스캔"""
+    run_scheduled_scan()
+    return {"status": "completed", "results": get_all_results()}
+
+
+@app.get("/history")
+def get_history(limit: int = 10):
+    """스캔 히스토리 조회"""
+    return {"count": len(scan_history), "history": scan_history[-limit:]}
+
+
+@app.get("/chart/{ticker}")
+def get_chart(ticker: str):
+    """최신 차트 이미지 반환"""
+    ticker = ticker.upper()
+    data = latest_results.get(ticker, {})
+    chart_path = data.get("result", {}).get("chart_path")
+    if chart_path and os.path.exists(chart_path):
+        return FileResponse(chart_path, media_type="image/png")
+    raise HTTPException(404, f"{ticker}: 차트 없음")
+
+
+@app.get("/health")
+def health():
+    """헬스 체크"""
+    ollama_ok = False
+    try:
+        resp = httpx.get(f"http://localhost:11434/api/tags", timeout=3)
+        ollama_ok = resp.status_code == 200
+    except Exception:
+        pass
+
+    return {
+        "status": "healthy",
+        "ollama": "connected" if ollama_ok else "disconnected",
+        "cached_results": len(latest_results),
+        "scan_count": len(scan_history),
+        "uptime_scans": len(scan_history),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  메인 실행
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    print(f"\n{'='*60}")
+    print(f"  차트 분석 에이전트 서비스 시작")
+    print(f"  API: http://{API_HOST}:{API_PORT}")
+    print(f"  모델: {OLLAMA_MODEL}")
+    print(f"  스캔 주기: {SCAN_INTERVAL_MINUTES}분")
+    print(f"  종목: {WATCHLIST}")
+    print(f"  매수 임계: ≥{BUY_THRESHOLD}, 매도 임계: ≤{SELL_THRESHOLD}")
+    print(f"{'='*60}\n")
+
+    # 스케줄러 시작
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(
+        run_scheduled_scan,
+        'interval',
+        minutes=SCAN_INTERVAL_MINUTES,
+        id='watchlist_scan',
+        next_run_time=datetime.now(),  # 시작 즉시 1회 실행
+    )
+    scheduler.start()
+    print(f"[스케줄러] {SCAN_INTERVAL_MINUTES}분 간격 스캔 등록 완료\n")
+
+    # FastAPI 서버 시작
+    uvicorn.run(app, host=API_HOST, port=API_PORT, log_level="info")
+
+
+if __name__ == "__main__":
+    main()
