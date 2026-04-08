@@ -7,7 +7,10 @@ import pandas as pd
 import numpy as np
 from config.settings import (
     SMA_PERIODS, EMA_PERIODS, RSI_PERIOD, BOLLINGER_PERIOD, BOLLINGER_STD,
-    ADX_PERIOD, ATR_PERIOD, MACD_FAST, MACD_SLOW, MACD_SIGNAL
+    ADX_PERIOD, ATR_PERIOD, MACD_FAST, MACD_SLOW, MACD_SIGNAL,
+    STOCHASTIC_K, STOCHASTIC_D, STOCHASTIC_SMOOTH,
+    ICHIMOKU_TENKAN, ICHIMOKU_KIJUN, ICHIMOKU_SENKOU_B,
+    WILLIAMS_R_PERIOD, CMF_PERIOD,
 )
 
 
@@ -23,6 +26,7 @@ class TechnicalIndicators:
         self._add_momentum_indicators()
         self._add_volatility_indicators()
         self._add_volume_indicators()
+        self._add_extra_indicators()
         return self.df
 
     # ── 기본 계산 함수 ───────────────────────────────────────
@@ -119,6 +123,77 @@ class TechnicalIndicators:
         self.df['OBV'] = (self.df['Volume'] * direction).fillna(0).cumsum()
 
         self.df['Volume_SMA_20'] = self._sma(self.df['Volume'], 20)
+
+    # ── 추가 지표 (Stochastic, Ichimoku, Williams %R, CMF) ──
+
+    def _add_extra_indicators(self):
+        """확장 기술 지표 계산"""
+        self._calculate_stochastic()
+        self._calculate_ichimoku()
+        self._calculate_williams_r()
+        self._calculate_cmf()
+
+    def _calculate_stochastic(self):
+        """Stochastic Oscillator (%K, %D)"""
+        high, low, close = self.df['High'], self.df['Low'], self.df['Close']
+        lowest_low = low.rolling(window=STOCHASTIC_K, min_periods=STOCHASTIC_K).min()
+        highest_high = high.rolling(window=STOCHASTIC_K, min_periods=STOCHASTIC_K).max()
+        denom = highest_high - lowest_low
+        denom = denom.replace(0, np.nan)
+
+        fast_k = 100 * (close - lowest_low) / denom
+        # Slow %K = Fast %K를 STOCHASTIC_SMOOTH 기간으로 평활
+        slow_k = fast_k.rolling(window=STOCHASTIC_SMOOTH, min_periods=1).mean()
+        slow_d = slow_k.rolling(window=STOCHASTIC_D, min_periods=1).mean()
+
+        self.df['STOCH_K'] = slow_k
+        self.df['STOCH_D'] = slow_d
+
+    def _calculate_ichimoku(self):
+        """Ichimoku Cloud (일목균형표)"""
+        high, low, close = self.df['High'], self.df['Low'], self.df['Close']
+
+        # 전환선 (Tenkan-sen): (최고+최저)/2 over tenkan 기간
+        tenkan_high = high.rolling(window=ICHIMOKU_TENKAN, min_periods=ICHIMOKU_TENKAN).max()
+        tenkan_low = low.rolling(window=ICHIMOKU_TENKAN, min_periods=ICHIMOKU_TENKAN).min()
+        self.df['ICHI_TENKAN'] = (tenkan_high + tenkan_low) / 2
+
+        # 기준선 (Kijun-sen)
+        kijun_high = high.rolling(window=ICHIMOKU_KIJUN, min_periods=ICHIMOKU_KIJUN).max()
+        kijun_low = low.rolling(window=ICHIMOKU_KIJUN, min_periods=ICHIMOKU_KIJUN).min()
+        self.df['ICHI_KIJUN'] = (kijun_high + kijun_low) / 2
+
+        # 선행스팬 A (Senkou Span A): (전환선+기준선)/2 를 kijun 기간 앞으로 이동
+        self.df['ICHI_SENKOU_A'] = ((self.df['ICHI_TENKAN'] + self.df['ICHI_KIJUN']) / 2).shift(ICHIMOKU_KIJUN)
+
+        # 선행스팬 B (Senkou Span B): (최고+최저)/2 over senkou_b 기간을 kijun 앞으로 이동
+        senkou_high = high.rolling(window=ICHIMOKU_SENKOU_B, min_periods=ICHIMOKU_SENKOU_B).max()
+        senkou_low = low.rolling(window=ICHIMOKU_SENKOU_B, min_periods=ICHIMOKU_SENKOU_B).min()
+        self.df['ICHI_SENKOU_B'] = ((senkou_high + senkou_low) / 2).shift(ICHIMOKU_KIJUN)
+
+        # 후행스팬 (Chikou Span): 종가를 kijun 기간 뒤로 이동
+        self.df['ICHI_CHIKOU'] = close.shift(-ICHIMOKU_KIJUN)
+
+    def _calculate_williams_r(self):
+        """Williams %R"""
+        high, low, close = self.df['High'], self.df['Low'], self.df['Close']
+        highest_high = high.rolling(window=WILLIAMS_R_PERIOD, min_periods=WILLIAMS_R_PERIOD).max()
+        lowest_low = low.rolling(window=WILLIAMS_R_PERIOD, min_periods=WILLIAMS_R_PERIOD).min()
+        denom = highest_high - lowest_low
+        denom = denom.replace(0, np.nan)
+        self.df['WILLIAMS_R'] = -100 * (highest_high - close) / denom
+
+    def _calculate_cmf(self):
+        """Chaikin Money Flow (CMF)"""
+        high, low, close, volume = self.df['High'], self.df['Low'], self.df['Close'], self.df['Volume']
+        denom = high - low
+        denom = denom.replace(0, np.nan)
+        mf_multiplier = ((close - low) - (high - close)) / denom
+        mf_volume = mf_multiplier * volume
+
+        vol_sum = volume.rolling(window=CMF_PERIOD, min_periods=CMF_PERIOD).sum()
+        vol_sum = vol_sum.replace(0, np.nan)
+        self.df['CMF'] = mf_volume.rolling(window=CMF_PERIOD, min_periods=CMF_PERIOD).sum() / vol_sum
 
     # ── 현재 상태 요약 ───────────────────────────────────────
 

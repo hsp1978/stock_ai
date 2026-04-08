@@ -824,6 +824,323 @@ class AnalysisTools:
         })
         return result
 
+    # ── 확장 분석 4개 ─────────────────────────────────────────
+
+    def stochastic_analysis(self) -> dict:
+        """[확장1] Stochastic Oscillator 분석 - K/D 크로스, 과매수/과매도"""
+        result = {"tool": "stochastic_analysis", "name": "스토캐스틱 분석"}
+
+        if 'STOCH_K' not in self.df.columns or 'STOCH_D' not in self.df.columns:
+            result.update({"signal": "neutral", "score": 0, "detail": "Stochastic 데이터 없음"})
+            return result
+
+        k_series = self.df['STOCH_K'].dropna()
+        d_series = self.df['STOCH_D'].dropna()
+
+        if len(k_series) < 3 or len(d_series) < 3:
+            result.update({"signal": "neutral", "score": 0, "detail": "데이터 부족"})
+            return result
+
+        k_val = float(k_series.iloc[-1])
+        d_val = float(d_series.iloc[-1])
+
+        # K/D 크로스
+        cross = "none"
+        if len(k_series) >= 2 and len(d_series) >= 2:
+            prev_diff = float(k_series.iloc[-2] - d_series.iloc[-2])
+            curr_diff = float(k_series.iloc[-1] - d_series.iloc[-1])
+            if prev_diff < 0 and curr_diff > 0:
+                cross = "bullish_cross"
+            elif prev_diff > 0 and curr_diff < 0:
+                cross = "bearish_cross"
+
+        # 구간 판단
+        zone = "neutral"
+        if k_val > 80:
+            zone = "overbought"
+        elif k_val < 20:
+            zone = "oversold"
+
+        score = 0
+        if zone == "oversold" and cross == "bullish_cross":
+            score += 6  # 과매도 + 골든크로스 = 강한 매수
+        elif zone == "overbought" and cross == "bearish_cross":
+            score -= 6  # 과매수 + 데드크로스 = 강한 매도
+        elif cross == "bullish_cross":
+            score += 3
+        elif cross == "bearish_cross":
+            score -= 3
+        elif zone == "overbought":
+            score -= 2
+        elif zone == "oversold":
+            score += 2
+
+        score = max(-10, min(10, score))
+        signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+
+        result.update({
+            "signal": signal,
+            "score": round(score, 1),
+            "stoch_k": round(k_val, 2),
+            "stoch_d": round(d_val, 2),
+            "cross": cross,
+            "zone": zone,
+            "detail": f"%K={k_val:.1f}, %D={d_val:.1f}, 크로스={cross}, 구간={zone}"
+        })
+        return result
+
+    def ichimoku_analysis(self) -> dict:
+        """[확장2] 일목균형표 분석 - 구름, 전환/기준선, 추세 통합 판단"""
+        result = {"tool": "ichimoku_analysis", "name": "일목균형표 분석"}
+
+        required = ['ICHI_TENKAN', 'ICHI_KIJUN', 'ICHI_SENKOU_A', 'ICHI_SENKOU_B']
+        if not all(col in self.df.columns for col in required):
+            result.update({"signal": "neutral", "score": 0, "detail": "일목균형표 데이터 없음"})
+            return result
+
+        price = float(self.latest['Close'])
+        tenkan = self.df['ICHI_TENKAN'].dropna()
+        kijun = self.df['ICHI_KIJUN'].dropna()
+        senkou_a = self.df['ICHI_SENKOU_A'].dropna()
+        senkou_b = self.df['ICHI_SENKOU_B'].dropna()
+
+        if len(tenkan) < 2 or len(senkou_a) < 1 or len(senkou_b) < 1:
+            result.update({"signal": "neutral", "score": 0, "detail": "데이터 부족"})
+            return result
+
+        tenkan_val = float(tenkan.iloc[-1])
+        kijun_val = float(kijun.iloc[-1])
+        senkou_a_val = float(senkou_a.iloc[-1])
+        senkou_b_val = float(senkou_b.iloc[-1])
+        cloud_top = max(senkou_a_val, senkou_b_val)
+        cloud_bottom = min(senkou_a_val, senkou_b_val)
+
+        # 가격 vs 구름 위치
+        if price > cloud_top:
+            cloud_position = "above_cloud"
+        elif price < cloud_bottom:
+            cloud_position = "below_cloud"
+        else:
+            cloud_position = "inside_cloud"
+
+        # 구름 색상 (양운/음운)
+        cloud_color = "bullish" if senkou_a_val > senkou_b_val else "bearish"
+
+        # 전환선/기준선 크로스
+        tk_cross = "none"
+        if len(tenkan) >= 2 and len(kijun) >= 2:
+            prev_diff = float(tenkan.iloc[-2] - kijun.iloc[-2])
+            curr_diff = float(tenkan.iloc[-1] - kijun.iloc[-1])
+            if prev_diff < 0 and curr_diff > 0:
+                tk_cross = "bullish_cross"
+            elif prev_diff > 0 and curr_diff < 0:
+                tk_cross = "bearish_cross"
+
+        score = 0
+        # 구름 위치 판단
+        if cloud_position == "above_cloud":
+            score += 3
+        elif cloud_position == "below_cloud":
+            score -= 3
+
+        # 구름 색상
+        if cloud_color == "bullish":
+            score += 1
+        else:
+            score -= 1
+
+        # 전환/기준선 크로스
+        if tk_cross == "bullish_cross":
+            score += 3
+        elif tk_cross == "bearish_cross":
+            score -= 3
+
+        # 가격 vs 기준선
+        if price > kijun_val:
+            score += 1
+        else:
+            score -= 1
+
+        score = max(-10, min(10, score))
+        signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+
+        result.update({
+            "signal": signal,
+            "score": round(score, 1),
+            "tenkan": round(tenkan_val, 2),
+            "kijun": round(kijun_val, 2),
+            "senkou_a": round(senkou_a_val, 2),
+            "senkou_b": round(senkou_b_val, 2),
+            "cloud_position": cloud_position,
+            "cloud_color": cloud_color,
+            "tk_cross": tk_cross,
+            "detail": f"구름={cloud_position}({cloud_color}), TK크로스={tk_cross}, 기준선={'위' if price > kijun_val else '아래'}"
+        })
+        return result
+
+    def sector_relative_strength_analysis(self) -> dict:
+        """[확장3] 섹터 상대강도 분석 - SPY/섹터 ETF 대비 성과"""
+        result = {"tool": "sector_relative_strength_analysis", "name": "섹터 상대강도 분석"}
+
+        try:
+            from core.data_collector import DataCollector
+            collector = DataCollector(self.ticker)
+            collector._ohlcv = self.df  # 기존 데이터 재사용
+            rs_data = collector.get_sector_relative_strength()
+
+            if not rs_data:
+                result.update({"signal": "neutral", "score": 0, "detail": "상대강도 데이터 수집 실패"})
+                return result
+
+            vs_spy = rs_data.get("vs_spy", {})
+            vs_sector = rs_data.get("vs_sector", {})
+            rs_rating = rs_data.get("rs_rating", "neutral")
+
+            score = 0
+            # SPY 대비 점수
+            spy_1m = vs_spy.get("1m", {}).get("relative", 0)
+            spy_3m = vs_spy.get("3m", {}).get("relative", 0)
+            weighted_rs = spy_1m * 0.4 + spy_3m * 0.6
+
+            if weighted_rs > 10:
+                score += 4
+            elif weighted_rs > 5:
+                score += 2
+            elif weighted_rs < -10:
+                score -= 4
+            elif weighted_rs < -5:
+                score -= 2
+
+            # 섹터 대비 보정
+            if vs_sector:
+                sector_1m = vs_sector.get("1m", {}).get("relative", 0)
+                if sector_1m > 5:
+                    score += 1
+                elif sector_1m < -5:
+                    score -= 1
+
+            score = max(-10, min(10, score))
+            signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+
+            result.update({
+                "signal": signal,
+                "score": round(score, 1),
+                "sector": rs_data.get("sector", "N/A"),
+                "rs_rating": rs_rating,
+                "vs_spy_1m": spy_1m,
+                "vs_spy_3m": spy_3m,
+                "vs_sector_1m": vs_sector.get("1m", {}).get("relative", None),
+                "detail": f"RS={rs_rating}, SPY대비 1m={spy_1m:+.1f}% 3m={spy_3m:+.1f}%"
+            })
+            return result
+
+        except Exception as e:
+            result.update({"signal": "neutral", "score": 0, "detail": f"오류: {e}"})
+            return result
+
+    def market_sentiment_analysis(self) -> dict:
+        """[확장4] 시장 심리 종합 분석 - VIX, P/C비율, 거시지표, CMF, Williams %R"""
+        result = {"tool": "market_sentiment_analysis", "name": "시장 심리 종합 분석"}
+
+        indicators = {}
+        score = 0
+        components = 0
+
+        # (1) Williams %R - 단기 모멘텀
+        if 'WILLIAMS_R' in self.df.columns:
+            wr = self.df['WILLIAMS_R'].dropna()
+            if len(wr) >= 1:
+                wr_val = float(wr.iloc[-1])
+                indicators["williams_r"] = round(wr_val, 2)
+                components += 1
+                if wr_val > -20:
+                    score -= 2  # 과매수
+                elif wr_val < -80:
+                    score += 2  # 과매도
+
+        # (2) CMF - 자금 유입/유출
+        if 'CMF' in self.df.columns:
+            cmf = self.df['CMF'].dropna()
+            if len(cmf) >= 1:
+                cmf_val = float(cmf.iloc[-1])
+                indicators["cmf"] = round(cmf_val, 4)
+                components += 1
+                if cmf_val > 0.1:
+                    score += 2  # 강한 자금 유입
+                elif cmf_val > 0:
+                    score += 1
+                elif cmf_val < -0.1:
+                    score -= 2  # 강한 자금 유출
+                elif cmf_val < 0:
+                    score -= 1
+
+        # (3) VIX (FRED에서 가져온 거시 데이터)
+        try:
+            from core.data_collector import DataCollector
+            macro = DataCollector.get_macro_data()
+            if macro:
+                if "vix" in macro:
+                    vix = macro["vix"]["value"]
+                    indicators["vix"] = vix
+                    components += 1
+                    if vix > 30:
+                        score -= 3  # 극단적 공포
+                    elif vix > 25:
+                        score -= 1
+                    elif vix < 15:
+                        score += 2  # 안정
+                    elif vix < 20:
+                        score += 1
+
+                if "consumer_sentiment" in macro:
+                    cs = macro["consumer_sentiment"]["value"]
+                    indicators["consumer_sentiment"] = cs
+                    components += 1
+                    if cs > 80:
+                        score += 1
+                    elif cs < 60:
+                        score -= 1
+
+                if "yield_spread_10y_2y" in macro:
+                    spread = macro["yield_spread_10y_2y"]["value"]
+                    indicators["yield_spread"] = spread
+                    components += 1
+                    if spread < 0:
+                        score -= 2  # 수익률 곡선 역전 = 경기침체 우려
+                    elif spread > 1:
+                        score += 1
+        except Exception:
+            pass
+
+        if components == 0:
+            result.update({"signal": "neutral", "score": 0, "detail": "심리 지표 데이터 없음"})
+            return result
+
+        score = max(-10, min(10, score))
+        signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+
+        # 종합 심리 등급
+        if score >= 4:
+            sentiment = "extreme_greed"
+        elif score >= 2:
+            sentiment = "greed"
+        elif score <= -4:
+            sentiment = "extreme_fear"
+        elif score <= -2:
+            sentiment = "fear"
+        else:
+            sentiment = "neutral"
+
+        result.update({
+            "signal": signal,
+            "score": round(score, 1),
+            "sentiment_grade": sentiment,
+            "components_used": components,
+            "indicators": indicators,
+            "detail": f"심리={sentiment}, 구성요소={components}개, W%R={indicators.get('williams_r', 'N/A')}, CMF={indicators.get('cmf', 'N/A')}"
+        })
+        return result
+
 
 # ═══════════════════════════════════════════════════════════════
 #  Tool 정의 (LLM에 제공할 스키마)
@@ -914,6 +1231,34 @@ TOOL_DEFINITIONS = [
             "description": "수익률 자기상관 분석. Hurst 지수로 추세 지속/평균 회귀/랜덤워크 체제 판단. 전략 선택 근거.",
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "stochastic_analysis",
+            "description": "스토캐스틱 오실레이터 분석. %K/%D 크로스, 과매수(>80)/과매도(<20) 구간 판단. 단기 반전 신호 포착.",
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ichimoku_analysis",
+            "description": "일목균형표 분석. 구름 위치, 전환선/기준선 크로스, 양운/음운 판단. 추세/지지/저항 통합 분석.",
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sector_relative_strength_analysis",
+            "description": "섹터 상대강도 분석. SPY 및 섹터 ETF 대비 상대수익률. 종목의 시장 내 위치 파악.",
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "market_sentiment_analysis",
+            "description": "시장 심리 종합 분석. VIX, Williams %R, CMF, 소비자심리, 장단기스프레드로 공포/탐욕 판단.",
+        }
+    },
 ]
 
 # Ollama용 간소화 tool 이름 목록
@@ -925,7 +1270,7 @@ TOOL_NAMES = [t["function"]["name"] for t in TOOL_DEFINITIONS]
 # ═══════════════════════════════════════════════════════════════
 
 class ChartAnalysisAgent:
-    """LLM이 12개 tool 중 필요한 것을 선택하여 분석을 수행하는 에이전트"""
+    """LLM이 16개 tool 중 필요한 것을 선택하여 분석을 수행하는 에이전트"""
 
     MAX_ITERATIONS = 5  # tool call 최대 반복 횟수
 
@@ -947,6 +1292,10 @@ class ChartAnalysisAgent:
             "momentum_rank_analysis": self.tools.momentum_rank_analysis,
             "support_resistance_analysis": self.tools.support_resistance_analysis,
             "correlation_regime_analysis": self.tools.correlation_regime_analysis,
+            "stochastic_analysis": self.tools.stochastic_analysis,
+            "ichimoku_analysis": self.tools.ichimoku_analysis,
+            "sector_relative_strength_analysis": self.tools.sector_relative_strength_analysis,
+            "market_sentiment_analysis": self.tools.market_sentiment_analysis,
         }
 
     def _execute_tool(self, name: str) -> dict:
@@ -966,6 +1315,59 @@ class ChartAnalysisAgent:
                 results.append({"tool": name, "error": str(e), "signal": "neutral", "score": 0})
         self.tool_results = results
         return results
+
+    def _compute_confidence(self, scores: list, signals: dict, total: int, avg_score: float) -> float:
+        """
+        다차원 신뢰도 산출 (0 ~ 10)
+
+        4가지 요소를 가중 합산:
+        1. 의견 일치도 (30%) - buy/sell/neutral 중 다수 비율
+        2. 점수 강도   (25%) - 개별 점수 절대값 평균 (확신 강도)
+        3. 점수 일관성 (25%) - 표준편차가 낮을수록 일관된 분석
+        4. 방향 정합성 (20%) - 다수 신호 방향과 평균 점수 부호 일치 여부
+        """
+        if total == 0:
+            return 0.0
+
+        # (1) 의견 일치도: 다수 신호가 차지하는 비율
+        max_agreement = max(signals.values())
+        agreement_ratio = max_agreement / total  # 0.33 ~ 1.0
+        # 0.33(균등) → 0, 1.0(만장일치) → 10 으로 정규화
+        agreement_score = max(0, (agreement_ratio - 1 / 3) / (1 - 1 / 3)) * 10
+
+        # (2) 점수 강도: 절대값 평균 (0~10 범위, 점수가 클수록 확신)
+        abs_scores = [abs(s) for s in scores]
+        avg_abs = float(np.mean(abs_scores))  # 0 ~ 10
+        strength_score = avg_abs  # 이미 0~10 범위
+
+        # (3) 점수 일관성: 표준편차가 낮을수록 높은 점수
+        score_std = float(np.std(scores))
+        # std 0 → 10, std 10 → 0
+        consistency_score = max(0, 10 - score_std)
+
+        # (4) 방향 정합성: 다수 신호 방향과 avg_score 부호가 일치하면 가산
+        majority_signal = max(signals, key=signals.get)
+        if majority_signal == "neutral":
+            # neutral 다수이면 avg_score도 0 근처일 때 높음
+            direction_score = 10 - min(abs(avg_score) * 2, 10)
+        else:
+            # buy 다수 → avg > 0 일치, sell 다수 → avg < 0 일치
+            expected_positive = (majority_signal == "buy")
+            actual_positive = (avg_score > 0)
+            if expected_positive == actual_positive:
+                direction_score = min(abs(avg_score), 10)  # 일치 + 강도
+            else:
+                direction_score = 0  # 불일치 = 신뢰 불가
+
+        # 가중 합산
+        confidence = (
+            agreement_score * 0.30 +
+            strength_score * 0.25 +
+            consistency_score * 0.25 +
+            direction_score * 0.20
+        )
+
+        return round(max(0, min(10, confidence)), 1)
 
     def compute_composite_score(self) -> dict:
         """전체 결과를 종합하여 최종 스코어 산출"""
@@ -999,9 +1401,8 @@ class ChartAnalysisAgent:
         else:
             final_signal = "HOLD"
 
-        # 신뢰도 (의견 일치도 기반)
-        max_agreement = max(signals.values())
-        confidence = round(max_agreement / total * 10, 1) if total > 0 else 0
+        # 신뢰도 (다차원 산출)
+        confidence = self._compute_confidence(scores, signals, total, avg_score)
 
         return {
             "ticker": self.ticker,
@@ -1038,17 +1439,20 @@ class ChartAnalysisAgent:
 
 역할:
 - {self.ticker} 종목에 대해 제공된 분석 도구(tool)를 사용하여 종합 판단을 내린다.
-- 12개의 분석 도구가 있다. 상황에 따라 필요한 도구를 선택하여 호출한다.
-- 최소 6개 이상의 도구를 사용해야 한다.
+- 16개의 분석 도구가 있다. 상황에 따라 필요한 도구를 선택하여 호출한다.
+- 최소 8개 이상의 도구를 사용해야 한다.
 - 각 도구의 결과를 종합하여 최종 매수/매도/관망 판단을 내린다.
 
 분석 도구 목록:
+[기술적 분석 6개]
 1. trend_ma_analysis - 이동평균선 배열 (골든/데드크로스)
 2. rsi_divergence_analysis - RSI 다이버전스
 3. bollinger_squeeze_analysis - 볼린저밴드 스퀴즈
 4. macd_momentum_analysis - MACD 모멘텀
 5. adx_trend_strength_analysis - ADX 추세 강도
 6. volume_profile_analysis - 거래량 프로파일
+
+[퀀트 분석 6개]
 7. fibonacci_retracement_analysis - 피보나치 되돌림
 8. volatility_regime_analysis - 변동성 체제
 9. mean_reversion_analysis - 평균 회귀 (Z-Score)
@@ -1056,8 +1460,14 @@ class ChartAnalysisAgent:
 11. support_resistance_analysis - 지지/저항선
 12. correlation_regime_analysis - 수익률 자기상관
 
+[확장 분석 4개]
+13. stochastic_analysis - 스토캐스틱 오실레이터 (%K/%D)
+14. ichimoku_analysis - 일목균형표 (구름, 전환/기준선)
+15. sector_relative_strength_analysis - 섹터 상대강도 (SPY/섹터 ETF 비교)
+16. market_sentiment_analysis - 시장 심리 종합 (VIX, CMF, Williams %R, 거시지표)
+
 규칙:
-1. 먼저 기본 도구(1~6)를 실행하고, 결과를 보고 필요한 퀀트 도구(7~12)를 추가 실행한다.
+1. 먼저 기본 도구(1~6)를 실행하고, 결과를 보고 퀀트(7~12) 및 확장(13~16) 도구를 추가 실행한다.
 2. 각 도구는 인자 없이 호출한다.
 3. 모든 도구 실행이 끝나면 종합 판단을 한국어로 작성한다.
 4. 감정 없이 데이터 기반으로만 판단한다."""
@@ -1139,7 +1549,7 @@ class ChartAnalysisAgent:
             return self.compute_composite_score()
 
         # Step 1: 전체 tool 실행 (Ollama는 function calling 미지원 모델이 많으므로)
-        print("    [Step 1] 12개 분석 도구 실행...")
+        print("    [Step 1] 16개 분석 도구 실행...")
         self.run_all_tools()
 
         for r in self.tool_results:
@@ -1160,7 +1570,7 @@ class ChartAnalysisAgent:
 - 신호 분포: 매수 {composite['signal_distribution']['buy']}개, 매도 {composite['signal_distribution']['sell']}개, 중립 {composite['signal_distribution']['neutral']}개
 - 시스템 판단: {composite['final_signal']}
 
-위 12개 도구의 분석 결과를 종합하여 최종 판단을 한국어로 작성하라.
+위 16개 도구의 분석 결과를 종합하여 최종 판단을 한국어로 작성하라.
 다음 형식을 따르라:
 
 ## 종합 판단
@@ -1171,6 +1581,9 @@ class ChartAnalysisAgent:
 
 ## 퀀트 분석 요약
 [6개 퀀트 도구 결과 종합]
+
+## 확장 분석 요약
+[4개 확장 도구 결과 종합: 스토캐스틱, 일목균형표, 섹터 상대강도, 시장 심리]
 
 ## 핵심 근거
 [판단의 핵심 근거 3~5개]

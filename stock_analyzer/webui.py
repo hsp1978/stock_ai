@@ -219,7 +219,7 @@ def render_dashboard():
 
     # 테이블
     st.dataframe(
-        df.style.applymap(
+        df.style.map(
             lambda v: "color: #26a69a" if v == "BUY" else ("color: #ef5350" if v == "SELL" else "color: #ffd700"),
             subset=["신호"]
         ),

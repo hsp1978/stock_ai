@@ -169,6 +169,12 @@ class DataCollector:
             "cpi_yoy": "CPIAUCSL",              # 소비자물가지수
             "unemployment": "UNRATE",           # 실업률
             "vix": "VIXCLS",                    # VIX 공포지수
+            # ── 추가 거시경제 지표 ──
+            "gdp_growth": "A191RL1Q225SBEA",    # 실질 GDP 성장률 (분기)
+            "ism_pmi": "MANEMP",                # ISM 제조업 고용지수 (PMI 프록시)
+            "consumer_sentiment": "UMCSENT",    # 미시간 소비자심리지수
+            "initial_claims": "ICSA",           # 신규 실업수당 청구건수 (주간)
+            "m2_money": "M2SL",                 # M2 통화량
         }
 
         macro = {}
@@ -205,6 +211,97 @@ class DataCollector:
             }
 
         return macro
+
+    # ── 내부자 거래 데이터 (보고서에 없던 부분 - 보완) ──────
+
+    # ── 섹터 상대강도 ────────────────────────────────────────
+
+    def get_sector_relative_strength(self, period: str = "6mo") -> Optional[dict]:
+        """종목의 SPY/섹터 ETF 대비 상대 수익률"""
+        # 주요 섹터 → ETF 매핑
+        SECTOR_ETF_MAP = {
+            "Technology": "XLK",
+            "Healthcare": "XLV",
+            "Financial Services": "XLF",
+            "Financials": "XLF",
+            "Consumer Cyclical": "XLY",
+            "Consumer Defensive": "XLP",
+            "Communication Services": "XLC",
+            "Industrials": "XLI",
+            "Energy": "XLE",
+            "Utilities": "XLU",
+            "Real Estate": "XLRE",
+            "Basic Materials": "XLB",
+        }
+
+        try:
+            info = self._info or self.yf_ticker.info
+            sector = info.get("sector", "")
+            sector_etf = SECTOR_ETF_MAP.get(sector)
+
+            # SPY 데이터
+            spy = yf.Ticker("SPY").history(period=period, auto_adjust=True)
+            stock = self._ohlcv if self._ohlcv is not None else self.yf_ticker.history(period=period, auto_adjust=True)
+
+            if spy.empty or stock.empty:
+                return None
+
+            # 기간별 상대 수익률 계산
+            def _relative_returns(stock_s: pd.Series, bench_s: pd.Series):
+                """여러 기간의 상대수익률"""
+                result = {}
+                for days, label in [(5, "1w"), (21, "1m"), (63, "3m"), (126, "6m")]:
+                    if len(stock_s) > days and len(bench_s) > days:
+                        stock_ret = float(stock_s.iloc[-1] / stock_s.iloc[-days] - 1) * 100
+                        bench_ret = float(bench_s.iloc[-1] / bench_s.iloc[-days] - 1) * 100
+                        result[label] = {
+                            "stock": round(stock_ret, 2),
+                            "benchmark": round(bench_ret, 2),
+                            "relative": round(stock_ret - bench_ret, 2),
+                        }
+                return result
+
+            spy_close = spy['Close']
+            stock_close = stock['Close']
+
+            rs_vs_spy = _relative_returns(stock_close, spy_close)
+
+            result = {
+                "sector": sector,
+                "vs_spy": rs_vs_spy,
+            }
+
+            # 섹터 ETF 비교
+            if sector_etf:
+                try:
+                    sector_df = yf.Ticker(sector_etf).history(period=period, auto_adjust=True)
+                    if not sector_df.empty:
+                        sector_close = sector_df['Close']
+                        rs_vs_sector = _relative_returns(stock_close, sector_close)
+                        result["sector_etf"] = sector_etf
+                        result["vs_sector"] = rs_vs_sector
+                except Exception:
+                    pass
+
+            # 상대강도 점수 산출 (SPY 대비 6m 초과수익률 기준)
+            if "6m" in rs_vs_spy:
+                rel = rs_vs_spy["6m"]["relative"]
+                if rel > 15:
+                    result["rs_rating"] = "very_strong"
+                elif rel > 5:
+                    result["rs_rating"] = "strong"
+                elif rel > -5:
+                    result["rs_rating"] = "neutral"
+                elif rel > -15:
+                    result["rs_rating"] = "weak"
+                else:
+                    result["rs_rating"] = "very_weak"
+
+            return result
+
+        except Exception as e:
+            print(f"  [경고] 섹터 상대강도 수집 실패: {e}")
+            return None
 
     # ── 내부자 거래 데이터 (보고서에 없던 부분 - 보완) ──────
 
