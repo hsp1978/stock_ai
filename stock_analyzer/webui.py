@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 AGENT_API_URL = os.getenv("AGENT_API_URL", "http://100.108.11.20:8100")
+WATCHLIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.txt")
 
 # ═══════════════════════════════════════════════════════════════
 #  페이지 설정
@@ -367,6 +368,57 @@ def get_chart_url(ticker: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  Watchlist 관리
+# ═══════════════════════════════════════════════════════════════
+
+def load_watchlist() -> list[str]:
+    """watchlist.txt에서 종목 목록 로드 (주석/빈줄 제외)"""
+    if not os.path.exists(WATCHLIST_PATH):
+        return []
+    with open(WATCHLIST_PATH, "r", encoding="utf-8") as f:
+        return [
+            line.strip().upper()
+            for line in f
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+
+def save_watchlist(tickers: list[str]):
+    """watchlist.txt에 종목 목록 저장 (기존 주석 헤더 유지)"""
+    header = "# 관심 종목 리스트 (한 줄에 하나, #은 주석)\n# 빈 줄과 주석은 무시됨\n\n"
+    with open(WATCHLIST_PATH, "w", encoding="utf-8") as f:
+        f.write(header)
+        for t in tickers:
+            f.write(f"{t}\n")
+
+
+def add_to_watchlist(ticker: str) -> tuple[bool, str]:
+    """종목 추가. (성공여부, 메시지) 반환"""
+    ticker = ticker.strip().upper()
+    if not ticker:
+        return False, "Empty ticker"
+    if not ticker.isalpha() and not all(c.isalnum() or c in ".-^=" for c in ticker):
+        return False, f"Invalid ticker: {ticker}"
+    current = load_watchlist()
+    if ticker in current:
+        return False, f"{ticker} already in watchlist"
+    current.append(ticker)
+    save_watchlist(current)
+    return True, f"{ticker} added"
+
+
+def remove_from_watchlist(ticker: str) -> tuple[bool, str]:
+    """종목 삭제. (성공여부, 메시지) 반환"""
+    ticker = ticker.strip().upper()
+    current = load_watchlist()
+    if ticker not in current:
+        return False, f"{ticker} not found"
+    current.remove(ticker)
+    save_watchlist(current)
+    return True, f"{ticker} removed"
+
+
+# ═══════════════════════════════════════════════════════════════
 #  공통 컴포넌트
 # ═══════════════════════════════════════════════════════════════
 
@@ -450,6 +502,47 @@ with st.sidebar:
         with st.spinner("Scanning watchlist..."):
             api_post("/scan")
             st.rerun()
+
+    st.divider()
+
+    # Watchlist 관리
+    st.markdown('<div style="font-size:12px; font-weight:600; color:#5a6270; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:8px;">Watchlist</div>', unsafe_allow_html=True)
+
+    watchlist = load_watchlist()
+
+    # 현재 종목 표시
+    if watchlist:
+        wl_chips = " ".join(
+            f'<span style="display:inline-block; background:#161b28; border:1px solid #252a3a; border-radius:4px; padding:2px 8px; margin:2px; font-size:12px; font-family:JetBrains Mono,monospace; color:#c8ccd4;">{t}</span>'
+            for t in watchlist
+        )
+        st.markdown(f'<div style="margin-bottom:8px; line-height:1.8;">{wl_chips}</div>', unsafe_allow_html=True)
+        st.caption(f"{len(watchlist)} tickers")
+    else:
+        st.caption("No tickers in watchlist")
+
+    # 추가
+    add_ticker = st.text_input("Add ticker", placeholder="TSLA", label_visibility="collapsed", key="wl_add")
+    wl_col1, wl_col2 = st.columns(2)
+    if wl_col1.button("Add", use_container_width=True, key="wl_add_btn"):
+        if add_ticker:
+            ok, msg = add_to_watchlist(add_ticker)
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.warning(msg)
+
+    # 삭제
+    if watchlist:
+        remove_target = wl_col2.selectbox("Remove", watchlist, label_visibility="collapsed", key="wl_remove")
+        if wl_col2.button("Remove", use_container_width=True, key="wl_rm_btn"):
+            ok, msg = remove_from_watchlist(remove_target)
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.warning(msg)
 
     st.divider()
 
