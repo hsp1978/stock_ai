@@ -27,74 +27,239 @@ AGENT_API_URL = os.getenv("AGENT_API_URL", "http://100.108.11.20:8100")
 # ═══════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="Stock Analysis Agent",
+    page_title="Stock AI Agent",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# 다크 테마 CSS
+# ── 글로벌 CSS ────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .stApp { background-color: #0e1117; }
-    .metric-card {
-        background: #1a1d23;
-        border-radius: 10px;
-        padding: 15px;
-        border-left: 4px solid #444;
+    /* ── Base ── */
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+    .stApp {
+        background: #0b0e14;
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     }
-    .buy-card { border-left-color: #26a69a !important; }
-    .sell-card { border-left-color: #ef5350 !important; }
-    .hold-card { border-left-color: #ffd700 !important; }
-    .signal-buy { color: #26a69a; font-size: 24px; font-weight: bold; }
-    .signal-sell { color: #ef5350; font-size: 24px; font-weight: bold; }
-    .signal-hold { color: #ffd700; font-size: 24px; font-weight: bold; }
-    .score-positive { color: #26a69a; }
-    .score-negative { color: #ef5350; }
-    div[data-testid="stSidebar"] { background-color: #1a1d23; }
-    .index-card {
-        background: #1a1d23;
-        border-radius: 8px;
-        padding: 12px 14px;
-        border-left: 3px solid #444;
+    div[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #10141c 0%, #0d1018 100%);
+        border-right: 1px solid #1c2030;
+    }
+    div[data-testid="stSidebar"] .stMarkdown p,
+    div[data-testid="stSidebar"] .stMarkdown li {
+        font-size: 13px;
+    }
+
+    /* ── 기본 텍스트 ── */
+    h1, h2, h3 { font-family: 'Inter', sans-serif !important; letter-spacing: -0.02em; }
+    .page-title {
+        font-size: 26px;
+        font-weight: 700;
+        color: #f0f2f5;
+        margin-bottom: 4px;
+        letter-spacing: -0.03em;
+    }
+    .page-subtitle {
+        font-size: 13px;
+        color: #5a6270;
+        margin-bottom: 24px;
+    }
+
+    /* ── 시장 지수 티커 바 ── */
+    .ticker-bar {
+        display: flex;
+        gap: 0;
+        background: #111520;
+        border: 1px solid #1c2030;
+        border-radius: 12px;
+        padding: 6px 8px;
+        margin-bottom: 24px;
+        overflow-x: auto;
+    }
+    .ticker-item {
+        flex: 1;
+        min-width: 0;
+        padding: 10px 14px;
+        text-align: center;
+        border-right: 1px solid #1c2030;
+        transition: background 0.15s;
+    }
+    .ticker-item:last-child { border-right: none; }
+    .ticker-item:hover { background: #161b28; }
+    .ticker-item .t-name {
+        font-size: 10px;
+        font-weight: 600;
+        color: #5a6270;
+        text-transform: uppercase;
+        letter-spacing: 0.8px;
         margin-bottom: 4px;
     }
-    .index-card .idx-name {
-        color: #999;
-        font-size: 11px;
-        margin-bottom: 2px;
-        letter-spacing: 0.5px;
-    }
-    .index-card .idx-price {
-        color: #e0e0e0;
-        font-size: 18px;
+    .ticker-item .t-price {
+        font-size: 15px;
         font-weight: 700;
-        margin-bottom: 1px;
+        color: #e8eaed;
+        font-family: 'JetBrains Mono', monospace;
+        letter-spacing: -0.03em;
     }
-    .index-card .idx-change-up {
-        color: #26a69a;
-        font-size: 13px;
+    .ticker-item .t-change {
+        font-size: 11px;
         font-weight: 600;
+        margin-top: 2px;
+        font-family: 'JetBrains Mono', monospace;
     }
-    .index-card .idx-change-down {
-        color: #ef5350;
-        font-size: 13px;
-        font-weight: 600;
+    .t-up { color: #00d4a1; }
+    .t-down { color: #ff5370; }
+    .t-flat { color: #5a6270; }
+    .ticker-group-label {
+        writing-mode: vertical-lr;
+        text-orientation: mixed;
+        font-size: 9px;
+        font-weight: 700;
+        color: #3a4050;
+        letter-spacing: 1.5px;
+        text-transform: uppercase;
+        padding: 8px 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-right: 1px solid #1c2030;
     }
-    .index-card .idx-change-flat {
-        color: #888;
-        font-size: 13px;
-        font-weight: 600;
+
+    /* ── 요약 메트릭 카드 ── */
+    .summary-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 12px;
+        margin-bottom: 24px;
     }
-    .idx-section-title {
-        color: #888;
-        font-size: 12px;
+    .summary-card {
+        background: #111520;
+        border: 1px solid #1c2030;
+        border-radius: 10px;
+        padding: 18px 20px;
+        text-align: center;
+    }
+    .summary-card .sc-label {
+        font-size: 11px;
         font-weight: 600;
+        color: #5a6270;
+        text-transform: uppercase;
+        letter-spacing: 0.8px;
+        margin-bottom: 8px;
+    }
+    .summary-card .sc-value {
+        font-size: 28px;
+        font-weight: 700;
+        font-family: 'JetBrains Mono', monospace;
+        color: #e8eaed;
+    }
+    .sc-buy { border-bottom: 3px solid #00d4a1; }
+    .sc-sell { border-bottom: 3px solid #ff5370; }
+    .sc-hold { border-bottom: 3px solid #ffb347; }
+    .sc-total { border-bottom: 3px solid #5b8def; }
+
+    /* ── 상세 시그널 배지 ── */
+    .signal-badge {
+        display: inline-block;
+        padding: 6px 20px;
+        border-radius: 6px;
+        font-size: 20px;
+        font-weight: 700;
         letter-spacing: 1px;
-        margin-bottom: 6px;
-        padding-bottom: 4px;
-        border-bottom: 1px solid #2a2d33;
     }
+    .signal-badge.buy  { background: rgba(0,212,161,0.12); color: #00d4a1; border: 1px solid rgba(0,212,161,0.25); }
+    .signal-badge.sell { background: rgba(255,83,112,0.12); color: #ff5370; border: 1px solid rgba(255,83,112,0.25); }
+    .signal-badge.hold { background: rgba(255,179,71,0.12); color: #ffb347; border: 1px solid rgba(255,179,71,0.25); }
+
+    /* ── 상세 메트릭 ── */
+    .detail-metrics {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+        margin-bottom: 20px;
+    }
+    .dm-card {
+        background: #111520;
+        border: 1px solid #1c2030;
+        border-radius: 10px;
+        padding: 16px 20px;
+        text-align: center;
+    }
+    .dm-card .dm-label {
+        font-size: 11px;
+        font-weight: 600;
+        color: #5a6270;
+        text-transform: uppercase;
+        letter-spacing: 0.8px;
+        margin-bottom: 6px;
+    }
+    .dm-card .dm-value {
+        font-size: 22px;
+        font-weight: 700;
+        font-family: 'JetBrains Mono', monospace;
+        color: #e8eaed;
+    }
+
+    /* ── 섹션 타이틀 ── */
+    .section-title {
+        font-size: 15px;
+        font-weight: 700;
+        color: #c8ccd4;
+        margin: 28px 0 14px 0;
+        padding-bottom: 8px;
+        border-bottom: 1px solid #1c2030;
+        letter-spacing: -0.01em;
+    }
+
+    /* ── 히스토리 타임스탬프 ── */
+    .hist-ts {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 13px;
+        color: #8890a0;
+    }
+
+    /* ── Streamlit 기본 요소 오버라이드 ── */
+    .stDivider { opacity: 0.15; }
+    div[data-testid="stMetric"] {
+        background: #111520;
+        border: 1px solid #1c2030;
+        border-radius: 10px;
+        padding: 14px 18px;
+    }
+    div[data-testid="stMetric"] label { font-size: 12px !important; color: #5a6270 !important; }
+    div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+        font-family: 'JetBrains Mono', monospace !important;
+        font-size: 18px !important;
+    }
+    .stDataFrame { border-radius: 10px; overflow: hidden; }
+    .stSelectbox > div > div { background: #111520 !important; border-color: #1c2030 !important; }
+    .stTextInput > div > div > input { background: #111520 !important; border-color: #1c2030 !important; }
+
+    /* ── 사이드바 버튼 ── */
+    div[data-testid="stSidebar"] .stButton > button {
+        background: #161b28;
+        border: 1px solid #252a3a;
+        color: #c8ccd4;
+        font-weight: 600;
+        font-size: 13px;
+        transition: all 0.15s;
+    }
+    div[data-testid="stSidebar"] .stButton > button:hover {
+        background: #1e2436;
+        border-color: #5b8def;
+        color: #e8eaed;
+    }
+
+    /* ── Empty state ── */
+    .empty-state {
+        text-align: center;
+        padding: 60px 20px;
+        color: #3a4050;
+    }
+    .empty-state .es-icon { font-size: 48px; margin-bottom: 12px; }
+    .empty-state .es-text { font-size: 14px; color: #5a6270; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -103,10 +268,9 @@ st.markdown("""
 #  시장 지수 데이터 수집
 # ═══════════════════════════════════════════════════════════════
 
-# 지수 정의: (yfinance 티커, 표시명, 소수점 자릿수)
 MARKET_INDICES = {
     "us_market": {
-        "title": "US MARKET",
+        "title": "US",
         "items": [
             ("^GSPC", "S&P 500", 2),
             ("^IXIC", "NASDAQ", 2),
@@ -114,7 +278,7 @@ MARKET_INDICES = {
         ],
     },
     "kr_market": {
-        "title": "KR MARKET",
+        "title": "KR",
         "items": [
             ("^KS11", "KOSPI", 2),
             ("^KQ11", "KOSDAQ", 2),
@@ -122,7 +286,7 @@ MARKET_INDICES = {
         ],
     },
     "commodities": {
-        "title": "COMMODITIES",
+        "title": "CMDTY",
         "items": [
             ("GC=F", "Gold", 2),
             ("SI=F", "Silver", 2),
@@ -133,7 +297,7 @@ MARKET_INDICES = {
 }
 
 
-@st.cache_data(ttl=300)  # 5분 캐시
+@st.cache_data(ttl=300)
 def fetch_market_indices() -> dict:
     """주요 시장 지수 현재가 및 등락률 수집"""
     results = {}
@@ -144,11 +308,8 @@ def fetch_market_indices() -> dict:
 
     try:
         data = yf.download(
-            all_tickers,
-            period="5d",
-            auto_adjust=True,
-            progress=False,
-            threads=True,
+            all_tickers, period="5d", auto_adjust=True,
+            progress=False, threads=True,
         )
     except Exception:
         return results
@@ -156,31 +317,20 @@ def fetch_market_indices() -> dict:
     for group_key, group in MARKET_INDICES.items():
         for sym, name, decimals in group["items"]:
             try:
-                if len(all_tickers) == 1:
-                    close_series = data['Close']
-                else:
-                    close_series = data['Close'][sym]
-
+                close_series = data['Close'] if len(all_tickers) == 1 else data['Close'][sym]
                 close_series = close_series.dropna()
                 if len(close_series) < 2:
                     continue
-
                 price = float(close_series.iloc[-1])
                 prev = float(close_series.iloc[-2])
                 change = price - prev
                 change_pct = (change / prev) * 100
-
                 results[sym] = {
-                    "name": name,
-                    "price": price,
-                    "change": change,
-                    "change_pct": change_pct,
-                    "decimals": decimals,
-                    "group": group_key,
+                    "name": name, "price": price, "change": change,
+                    "change_pct": change_pct, "decimals": decimals,
                 }
             except Exception:
                 continue
-
     return results
 
 
@@ -189,7 +339,6 @@ def fetch_market_indices() -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 def api_get(path: str, timeout: int = 10):
-    """에이전트 API GET 요청"""
     try:
         resp = httpx.get(f"{AGENT_API_URL}{path}", timeout=timeout)
         resp.raise_for_status()
@@ -197,12 +346,11 @@ def api_get(path: str, timeout: int = 10):
     except httpx.ConnectError:
         return None
     except Exception as e:
-        st.error(f"API 오류: {e}")
+        st.error(f"API Error: {e}")
         return None
 
 
 def api_post(path: str, timeout: int = 300):
-    """에이전트 API POST 요청"""
     try:
         resp = httpx.post(f"{AGENT_API_URL}{path}", timeout=timeout)
         resp.raise_for_status()
@@ -210,7 +358,7 @@ def api_post(path: str, timeout: int = 300):
     except httpx.ConnectError:
         return None
     except Exception as e:
-        st.error(f"API 오류: {e}")
+        st.error(f"API Error: {e}")
         return None
 
 
@@ -219,11 +367,31 @@ def get_chart_url(ticker: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  공통 컴포넌트
+# ═══════════════════════════════════════════════════════════════
+
+def _plotly_base_layout(**overrides) -> dict:
+    """공통 plotly 레이아웃"""
+    base = dict(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#0f1319",
+        font=dict(family="Inter, sans-serif", color="#8890a0", size=12),
+        margin=dict(l=0, r=0, t=0, b=0),
+        xaxis=dict(gridcolor="#1c2030", zerolinecolor="#1c2030"),
+        yaxis=dict(gridcolor="#1c2030", zerolinecolor="#1c2030"),
+    )
+    base.update(overrides)
+    return base
+
+
+# ═══════════════════════════════════════════════════════════════
 #  사이드바
 # ═══════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.title("📊 Stock Agent")
+    st.markdown('<div class="page-title">Stock AI Agent</div>', unsafe_allow_html=True)
+    st.caption("LLM-powered 16-Tool Analysis")
 
     # 서비스 상태
     health = api_get("/health")
@@ -231,132 +399,117 @@ with st.sidebar:
         ollama_status = health.get("ollama", "disconnected")
         cached = health.get("cached_results", 0)
         scans = health.get("scan_count", 0)
-
-        col1, col2 = st.columns(2)
-        col1.metric("Ollama", "🟢" if ollama_status == "connected" else "🔴")
-        col2.metric("캐시", f"{cached}종목")
-        st.caption(f"스캔 횟수: {scans}회")
+        status_color = "#00d4a1" if ollama_status == "connected" else "#ff5370"
+        st.markdown(f"""
+        <div style="display:flex; gap:16px; margin:12px 0;">
+            <div style="flex:1; background:#111520; border:1px solid #1c2030; border-radius:8px; padding:10px 12px; text-align:center;">
+                <div style="font-size:10px; color:#5a6270; text-transform:uppercase; letter-spacing:0.5px;">Ollama</div>
+                <div style="font-size:14px; font-weight:700; color:{status_color}; margin-top:4px;">{'Online' if ollama_status == 'connected' else 'Offline'}</div>
+            </div>
+            <div style="flex:1; background:#111520; border:1px solid #1c2030; border-radius:8px; padding:10px 12px; text-align:center;">
+                <div style="font-size:10px; color:#5a6270; text-transform:uppercase; letter-spacing:0.5px;">Cached</div>
+                <div style="font-size:14px; font-weight:700; color:#e8eaed; margin-top:4px;">{cached}</div>
+            </div>
+            <div style="flex:1; background:#111520; border:1px solid #1c2030; border-radius:8px; padding:10px 12px; text-align:center;">
+                <div style="font-size:10px; color:#5a6270; text-transform:uppercase; letter-spacing:0.5px;">Scans</div>
+                <div style="font-size:14px; font-weight:700; color:#e8eaed; margin-top:4px;">{scans}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
     else:
-        st.error(f"에이전트 연결 실패\n{AGENT_API_URL}")
-
-    st.divider()
+        st.error(f"Agent Offline: {AGENT_API_URL}")
 
     # 서비스 정보
     info = api_get("/")
     if info:
-        st.caption(f"모델: {info.get('model', '?')}")
-        st.caption(f"스캔 주기: {info.get('scan_interval', '?')}")
-        st.caption(f"매수 임계: ≥{info.get('thresholds', {}).get('buy', '?')}")
-        st.caption(f"매도 임계: ≤{info.get('thresholds', {}).get('sell', '?')}")
         last_scan = info.get("last_scan", "")
-        if last_scan:
-            st.caption(f"마지막 스캔: {last_scan[:16]}")
+        st.markdown(f"""
+        <div style="background:#111520; border:1px solid #1c2030; border-radius:8px; padding:12px 14px; margin:8px 0 16px 0; font-size:12px; color:#8890a0; line-height:1.8;">
+            Model: <span style="color:#c8ccd4;">{info.get('model', '?')}</span><br>
+            Interval: <span style="color:#c8ccd4;">{info.get('scan_interval', '?')}</span><br>
+            Buy &ge; <span style="color:#00d4a1;">{info.get('thresholds', {}).get('buy', '?')}</span>
+            &nbsp; Sell &le; <span style="color:#ff5370;">{info.get('thresholds', {}).get('sell', '?')}</span>
+            {'<br>Last: <span style="color:#c8ccd4;">' + last_scan[:16] + '</span>' if last_scan else ''}
+        </div>
+        """, unsafe_allow_html=True)
 
     st.divider()
 
-    # 즉시 스캔
-    st.subheader("수동 스캔")
-    scan_ticker = st.text_input("종목 티커", placeholder="AAPL")
+    # 수동 스캔
+    st.markdown('<div style="font-size:12px; font-weight:600; color:#5a6270; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:8px;">Manual Scan</div>', unsafe_allow_html=True)
+    scan_ticker = st.text_input("Ticker", placeholder="AAPL", label_visibility="collapsed")
     col1, col2 = st.columns(2)
-    if col1.button("종목 스캔", use_container_width=True):
+    if col1.button("Scan", use_container_width=True):
         if scan_ticker:
-            with st.spinner(f"{scan_ticker.upper()} 분석 중..."):
+            with st.spinner(f"Analyzing {scan_ticker.upper()}..."):
                 result = api_post(f"/scan/{scan_ticker.upper()}")
                 if result:
                     st.success(f"{scan_ticker.upper()}: {result.get('final_signal')} ({result.get('composite_score', 0):+.1f})")
                     st.rerun()
-    if col2.button("전체 스캔", use_container_width=True):
-        with st.spinner("전체 watchlist 스캔 중..."):
+    if col2.button("Scan All", use_container_width=True):
+        with st.spinner("Scanning watchlist..."):
             api_post("/scan")
             st.rerun()
 
     st.divider()
 
     # 페이지 선택
-    page = st.radio("페이지", ["대시보드", "종목 상세", "스캔 히스토리"], label_visibility="collapsed")
+    page = st.radio("Navigation", ["Dashboard", "Detail", "History"], label_visibility="collapsed")
 
 
 # ═══════════════════════════════════════════════════════════════
 #  대시보드 페이지
 # ═══════════════════════════════════════════════════════════════
 
-def _render_index_card(info: dict) -> str:
-    """단일 지수 카드 HTML 생성"""
-    price = info["price"]
-    decimals = info["decimals"]
-    change = info["change"]
-    change_pct = info["change_pct"]
-
-    # 가격 포맷
-    price_str = f"{price:,.{decimals}f}"
-
-    # 등락 포맷
-    if change_pct > 0:
-        arrow = "▲"
-        css_class = "idx-change-up"
-    elif change_pct < 0:
-        arrow = "▼"
-        css_class = "idx-change-down"
-    else:
-        arrow = "−"
-        css_class = "idx-change-flat"
-
-    change_str = f"{arrow} {abs(change):,.{decimals}f} ({abs(change_pct):.2f}%)"
-
-    # 카드 좌측 보더 색상
-    if change_pct > 0:
-        border_color = "#26a69a"
-    elif change_pct < 0:
-        border_color = "#ef5350"
-    else:
-        border_color = "#444"
-
-    return f"""
-    <div class="index-card" style="border-left-color: {border_color};">
-        <div class="idx-name">{info['name']}</div>
-        <div class="idx-price">{price_str}</div>
-        <div class="{css_class}">{change_str}</div>
-    </div>
-    """
-
-
-def render_market_indices():
-    """대시보드 상단에 시장 지수 표시"""
+def render_market_ticker_bar():
+    """시장 지수를 가로 티커 바 형태로 렌더링"""
     indices = fetch_market_indices()
     if not indices:
         return
 
-    # 3개 그룹을 3개 컬럼으로 배치
-    cols = st.columns(3)
+    html_parts = ['<div class="ticker-bar">']
 
-    for col_idx, (group_key, group) in enumerate(MARKET_INDICES.items()):
-        with cols[col_idx]:
-            st.markdown(f'<div class="idx-section-title">{group["title"]}</div>', unsafe_allow_html=True)
-            for sym, name, decimals in group["items"]:
-                info = indices.get(sym)
-                if info:
-                    st.markdown(_render_index_card(info), unsafe_allow_html=True)
-                else:
-                    st.markdown(f"""
-                    <div class="index-card">
-                        <div class="idx-name">{name}</div>
-                        <div class="idx-price" style="color: #555;">-</div>
-                        <div class="idx-change-flat">데이터 없음</div>
-                    </div>
-                    """, unsafe_allow_html=True)
+    for group_key, group in MARKET_INDICES.items():
+        html_parts.append(f'<div class="ticker-group-label">{group["title"]}</div>')
+        for sym, name, decimals in group["items"]:
+            info = indices.get(sym)
+            if info:
+                pct = info["change_pct"]
+                css = "t-up" if pct > 0 else ("t-down" if pct < 0 else "t-flat")
+                arrow = "+" if pct > 0 else ""
+                html_parts.append(f"""
+                <div class="ticker-item">
+                    <div class="t-name">{info['name']}</div>
+                    <div class="t-price">{info['price']:,.{info['decimals']}f}</div>
+                    <div class="t-change {css}">{arrow}{pct:.2f}%</div>
+                </div>""")
+            else:
+                html_parts.append(f"""
+                <div class="ticker-item">
+                    <div class="t-name">{name}</div>
+                    <div class="t-price" style="color:#3a4050;">--</div>
+                    <div class="t-change t-flat">N/A</div>
+                </div>""")
 
-    st.divider()
+    html_parts.append('</div>')
+    st.markdown("".join(html_parts), unsafe_allow_html=True)
 
 
 def render_dashboard():
-    st.header("📊 에이전트 대시보드")
+    st.markdown('<div class="page-title">Dashboard</div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-subtitle">Real-time market overview and agent analysis results</div>', unsafe_allow_html=True)
 
-    # 시장 지수 표시
-    render_market_indices()
+    # 시장 지수 티커 바
+    render_market_ticker_bar()
 
     data = api_get("/results")
     if not data or not data.get("results"):
-        st.info("분석 결과 없음. 사이드바에서 스캔을 실행하세요.")
+        st.markdown("""
+        <div class="empty-state">
+            <div class="es-icon">📡</div>
+            <div class="es-text">No analysis results yet. Run a scan from the sidebar.</div>
+        </div>
+        """, unsafe_allow_html=True)
         return
 
     results = data["results"]
@@ -366,28 +519,41 @@ def render_dashboard():
     sell_list = {k: v for k, v in results.items() if v.get("signal") == "SELL"}
     hold_list = {k: v for k, v in results.items() if v.get("signal") == "HOLD"}
 
-    # 상단 요약 카드
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("전체 종목", len(results))
-    col2.metric("🟢 매수", len(buy_list))
-    col3.metric("🔴 매도", len(sell_list))
-    col4.metric("🟡 관망", len(hold_list))
+    # 요약 카드
+    st.markdown(f"""
+    <div class="summary-grid">
+        <div class="summary-card sc-total">
+            <div class="sc-label">Total</div>
+            <div class="sc-value">{len(results)}</div>
+        </div>
+        <div class="summary-card sc-buy">
+            <div class="sc-label">Buy</div>
+            <div class="sc-value" style="color:#00d4a1;">{len(buy_list)}</div>
+        </div>
+        <div class="summary-card sc-sell">
+            <div class="sc-label">Sell</div>
+            <div class="sc-value" style="color:#ff5370;">{len(sell_list)}</div>
+        </div>
+        <div class="summary-card sc-hold">
+            <div class="sc-label">Hold</div>
+            <div class="sc-value" style="color:#ffb347;">{len(hold_list)}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    st.divider()
-
-    # 종목 테이블
+    # 종목 테이블 데이터
     rows = []
     for ticker, r in sorted(results.items(), key=lambda x: x[1].get("score", 0), reverse=True):
         dist = r.get("signal_distribution", {})
         rows.append({
-            "종목": ticker,
-            "신호": r.get("signal", "?"),
-            "점수": r.get("score", 0),
-            "신뢰도": r.get("confidence", 0),
-            "매수": dist.get("buy", 0),
-            "매도": dist.get("sell", 0),
-            "중립": dist.get("neutral", 0),
-            "분석시간": str(r.get("analyzed_at", ""))[:16],
+            "Ticker": ticker,
+            "Signal": r.get("signal", "?"),
+            "Score": r.get("score", 0),
+            "Confidence": r.get("confidence", 0),
+            "Buy": dist.get("buy", 0),
+            "Sell": dist.get("sell", 0),
+            "Neutral": dist.get("neutral", 0),
+            "Time": str(r.get("analyzed_at", ""))[:16],
         })
 
     df = pd.DataFrame(rows)
@@ -395,36 +561,34 @@ def render_dashboard():
         return
 
     # 점수 바 차트
+    st.markdown('<div class="section-title">Score Overview</div>', unsafe_allow_html=True)
+
     fig = go.Figure()
-    colors = ["#26a69a" if s > 0 else "#ef5350" if s < 0 else "#888" for s in df["점수"]]
+    bar_colors = ["#00d4a1" if s > 0 else "#ff5370" if s < 0 else "#3a4050" for s in df["Score"]]
     fig.add_trace(go.Bar(
-        x=df["점수"],
-        y=df["종목"],
-        orientation='h',
-        marker_color=colors,
-        text=[f"{s:+.1f} ({sig})" for s, sig in zip(df["점수"], df["신호"])],
+        x=df["Score"], y=df["Ticker"], orientation='h',
+        marker=dict(color=bar_colors, line=dict(width=0)),
+        text=[f"{s:+.1f}" for s in df["Score"]],
         textposition="outside",
-        textfont=dict(color="white"),
+        textfont=dict(color="#8890a0", size=11, family="JetBrains Mono"),
     ))
-    fig.update_layout(
-        title="종목별 종합 점수",
-        template="plotly_dark",
-        height=max(300, len(df) * 50),
-        xaxis=dict(range=[-10, 10], title="Score"),
-        yaxis=dict(autorange="reversed"),
-        margin=dict(l=80, r=120, t=40, b=30),
-    )
-    fig.add_vline(x=0, line_color="#666", line_width=1)
+    fig.update_layout(**_plotly_base_layout(
+        height=max(280, len(df) * 44),
+        xaxis=dict(range=[-10, 10], title="", gridcolor="#1c2030", zerolinecolor="#252a3a"),
+        yaxis=dict(autorange="reversed", gridcolor="rgba(0,0,0,0)"),
+        margin=dict(l=80, r=80, t=8, b=8),
+    ))
+    fig.add_vline(x=0, line_color="#252a3a", line_width=1)
     st.plotly_chart(fig, use_container_width=True)
 
-    # 테이블
+    # 종목 테이블
+    st.markdown('<div class="section-title">Analysis Results</div>', unsafe_allow_html=True)
     st.dataframe(
         df.style.map(
-            lambda v: "color: #26a69a" if v == "BUY" else ("color: #ef5350" if v == "SELL" else "color: #ffd700"),
-            subset=["신호"]
+            lambda v: "color: #00d4a1" if v == "BUY" else ("color: #ff5370" if v == "SELL" else "color: #ffb347"),
+            subset=["Signal"]
         ),
-        use_container_width=True,
-        hide_index=True,
+        use_container_width=True, hide_index=True,
     )
 
 
@@ -433,115 +597,137 @@ def render_dashboard():
 # ═══════════════════════════════════════════════════════════════
 
 def render_detail():
-    st.header("🔍 종목 상세 분석")
+    st.markdown('<div class="page-title">Detail Analysis</div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-subtitle">In-depth 16-tool analysis for individual stocks</div>', unsafe_allow_html=True)
 
-    # 종목 선택
     data = api_get("/results")
     if not data or not data.get("results"):
-        st.info("분석 결과 없음.")
+        st.markdown("""
+        <div class="empty-state">
+            <div class="es-icon">🔍</div>
+            <div class="es-text">No analysis results available.</div>
+        </div>
+        """, unsafe_allow_html=True)
         return
 
     tickers = sorted(data["results"].keys())
-    selected = st.selectbox("종목 선택", tickers)
-
+    selected = st.selectbox("Select Ticker", tickers, label_visibility="collapsed")
     if not selected:
         return
 
     detail = api_get(f"/results/{selected}")
     if not detail:
-        st.error(f"{selected} 상세 조회 실패")
+        st.error(f"Failed to load {selected}")
         return
 
-    # 상단 요약
     signal = detail.get("final_signal", "?")
     score = detail.get("composite_score", 0)
     confidence = detail.get("confidence", 0)
-    dist = detail.get("signal_distribution", {})
+    tool_count = detail.get("tool_count", 0)
 
-    signal_class = {"BUY": "signal-buy", "SELL": "signal-sell"}.get(signal, "signal-hold")
-    score_class = "score-positive" if score > 0 else "score-negative"
+    # 시그널 배지 + 메트릭
+    badge_class = "buy" if signal == "BUY" else ("sell" if signal == "SELL" else "hold")
+    score_color = "#00d4a1" if score > 0 else "#ff5370" if score < 0 else "#8890a0"
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.markdown(f"### <span class='{signal_class}'>{signal}</span>", unsafe_allow_html=True)
-    col2.metric("종합 점수", f"{score:+.2f}")
-    col3.metric("신뢰도", f"{confidence}/10")
-    col4.metric("분석 도구", f"{detail.get('tool_count', 0)}개")
+    st.markdown(f"""
+    <div style="display:flex; align-items:center; gap:20px; margin-bottom:20px;">
+        <div>
+            <div style="font-size:11px; color:#5a6270; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:6px;">Signal</div>
+            <div class="signal-badge {badge_class}">{signal}</div>
+        </div>
+    </div>
+    <div class="detail-metrics">
+        <div class="dm-card">
+            <div class="dm-label">Composite Score</div>
+            <div class="dm-value" style="color:{score_color};">{score:+.2f}</div>
+        </div>
+        <div class="dm-card">
+            <div class="dm-label">Confidence</div>
+            <div class="dm-value">{confidence}<span style="font-size:14px; color:#5a6270;">/10</span></div>
+        </div>
+        <div class="dm-card">
+            <div class="dm-label">Tools Used</div>
+            <div class="dm-value">{tool_count}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    st.divider()
-
-    # 12개 기법 스코어
+    # 분석 기법 결과
     summaries = detail.get("tool_summaries", [])
     if summaries:
-        st.subheader("12개 분석 기법 결과")
+        st.markdown(f'<div class="section-title">Tool Results ({len(summaries)} Tools)</div>', unsafe_allow_html=True)
 
         col_chart, col_table = st.columns([3, 2])
 
         with col_chart:
             names = [s["name"] for s in summaries]
             scores = [s["score"] for s in summaries]
-            bar_colors = ["#26a69a" if s > 0 else "#ef5350" if s < 0 else "#888" for s in scores]
+            bar_colors = ["#00d4a1" if s > 0 else "#ff5370" if s < 0 else "#3a4050" for s in scores]
 
             fig = go.Figure()
             fig.add_trace(go.Bar(
-                y=names,
-                x=scores,
-                orientation='h',
-                marker_color=bar_colors,
+                y=names, x=scores, orientation='h',
+                marker=dict(color=bar_colors, line=dict(width=0)),
                 text=[f"{s:+.1f}" for s in scores],
                 textposition="outside",
-                textfont=dict(color="white"),
+                textfont=dict(color="#8890a0", size=11, family="JetBrains Mono"),
             ))
-            fig.update_layout(
-                template="plotly_dark",
-                height=450,
-                xaxis=dict(range=[-10, 10], title="Score"),
-                yaxis=dict(autorange="reversed"),
-                margin=dict(l=120, r=60, t=10, b=30),
-            )
-            fig.add_vline(x=0, line_color="#666", line_width=1)
+            fig.update_layout(**_plotly_base_layout(
+                height=max(400, len(summaries) * 34),
+                xaxis=dict(range=[-10, 10], title="", gridcolor="#1c2030", zerolinecolor="#252a3a"),
+                yaxis=dict(autorange="reversed", gridcolor="rgba(0,0,0,0)"),
+                margin=dict(l=160, r=60, t=8, b=8),
+            ))
+            fig.add_vline(x=0, line_color="#252a3a", line_width=1)
             st.plotly_chart(fig, use_container_width=True)
 
         with col_table:
             tool_rows = []
             for s in summaries:
-                emoji = "🟢" if s["signal"] == "buy" else ("🔴" if s["signal"] == "sell" else "🟡")
+                sig = s["signal"]
+                color = "#00d4a1" if sig == "buy" else ("#ff5370" if sig == "sell" else "#ffb347")
                 tool_rows.append({
-                    "": emoji,
-                    "기법": s["name"],
-                    "신호": s["signal"],
-                    "점수": s["score"],
-                    "요약": s.get("detail", "")[:50],
+                    "Tool": s["name"],
+                    "Signal": sig.upper(),
+                    "Score": s["score"],
+                    "Summary": s.get("detail", "")[:60],
                 })
-            st.dataframe(pd.DataFrame(tool_rows), use_container_width=True, hide_index=True, height=450)
+            tdf = pd.DataFrame(tool_rows)
+            st.dataframe(
+                tdf.style.map(
+                    lambda v: "color: #00d4a1" if v == "BUY" else ("color: #ff5370" if v == "SELL" else "color: #ffb347"),
+                    subset=["Signal"]
+                ),
+                use_container_width=True, hide_index=True,
+                height=max(400, len(summaries) * 34),
+            )
 
-    st.divider()
-
-    # 에이전트 차트 이미지
-    st.subheader("분석 차트")
+    # 차트 이미지
+    st.markdown('<div class="section-title">Chart</div>', unsafe_allow_html=True)
     chart_url = get_chart_url(selected)
     try:
         resp = httpx.get(chart_url, timeout=5)
         if resp.status_code == 200:
             st.image(resp.content, use_container_width=True)
         else:
-            st.caption("차트 이미지 없음")
+            st.caption("No chart image available")
     except Exception:
-        st.caption("차트 로드 실패")
-
-    st.divider()
+        st.caption("Chart load failed")
 
     # LLM 종합 판단
     llm = detail.get("llm_conclusion", "")
     if llm and not llm.startswith("[오류]") and not llm.startswith("[LLM"):
-        st.subheader("LLM 종합 판단")
-        st.markdown(llm)
+        st.markdown('<div class="section-title">LLM Conclusion</div>', unsafe_allow_html=True)
+        st.markdown(f"""
+        <div style="background:#111520; border:1px solid #1c2030; border-radius:10px; padding:20px 24px; line-height:1.7; color:#c8ccd4; font-size:14px;">
+        {llm}
+        </div>
+        """, unsafe_allow_html=True)
 
-    st.divider()
-
-    # 12개 기법 상세 데이터
+    # 상세 JSON
     tool_details = detail.get("tool_details", [])
     if tool_details:
-        with st.expander("12개 기법 상세 데이터 (JSON)", expanded=False):
+        with st.expander("Raw Tool Data (JSON)", expanded=False):
             for td in tool_details:
                 st.json(td)
 
@@ -551,15 +737,21 @@ def render_detail():
 # ═══════════════════════════════════════════════════════════════
 
 def render_history():
-    st.header("📜 스캔 히스토리")
+    st.markdown('<div class="page-title">Scan History</div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-subtitle">Recent scan results and alert timeline</div>', unsafe_allow_html=True)
 
     data = api_get("/history?limit=20")
     if not data or not data.get("history"):
-        st.info("히스토리 없음.")
+        st.markdown("""
+        <div class="empty-state">
+            <div class="es-icon">📜</div>
+            <div class="es-text">No scan history yet.</div>
+        </div>
+        """, unsafe_allow_html=True)
         return
 
     history = data["history"]
-    st.caption(f"전체 {data.get('count', 0)}회 중 최근 {len(history)}회")
+    st.caption(f"Showing {len(history)} of {data.get('count', 0)} scans")
 
     for i, entry in enumerate(reversed(history)):
         ts = entry.get("timestamp", "")[:16]
@@ -567,33 +759,42 @@ def render_history():
         results = entry.get("results", {})
         alerts = entry.get("alerts", [])
 
-        with st.expander(f"**{ts}** — {len(tickers)}종목 스캔" + (f" ⚡ 알림 {len(alerts)}건" if alerts else ""), expanded=(i == 0)):
+        alert_badge = f'<span style="background:rgba(255,83,112,0.15); color:#ff5370; padding:2px 8px; border-radius:4px; font-size:11px; margin-left:8px;">{len(alerts)} alerts</span>' if alerts else ""
+
+        with st.expander(f"**{ts}** -- {len(tickers)} tickers{' ' if alerts else ''}", expanded=(i == 0)):
+            if alerts:
+                st.markdown(alert_badge, unsafe_allow_html=True)
             if not results:
-                st.caption("결과 없음")
+                st.caption("No results")
                 continue
 
             rows = []
             for ticker, r in sorted(results.items(), key=lambda x: x[1].get("score", 0), reverse=True):
                 signal = r.get("signal", "?")
-                emoji = "🟢" if signal == "BUY" else ("🔴" if signal == "SELL" else "🟡")
-                alert_mark = " ⚡" if ticker in alerts else ""
                 rows.append({
-                    "종목": f"{emoji} {ticker}{alert_mark}",
-                    "신호": signal,
-                    "점수": r.get("score", 0),
-                    "신뢰도": r.get("confidence", 0),
+                    "Ticker": ticker,
+                    "Signal": signal,
+                    "Score": r.get("score", 0),
+                    "Confidence": r.get("confidence", 0),
                 })
 
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            hdf = pd.DataFrame(rows)
+            st.dataframe(
+                hdf.style.map(
+                    lambda v: "color: #00d4a1" if v == "BUY" else ("color: #ff5370" if v == "SELL" else "color: #ffb347"),
+                    subset=["Signal"]
+                ),
+                use_container_width=True, hide_index=True,
+            )
 
 
 # ═══════════════════════════════════════════════════════════════
 #  라우팅
 # ═══════════════════════════════════════════════════════════════
 
-if page == "대시보드":
+if page == "Dashboard":
     render_dashboard()
-elif page == "종목 상세":
+elif page == "Detail":
     render_detail()
-elif page == "스캔 히스토리":
+elif page == "History":
     render_history()
