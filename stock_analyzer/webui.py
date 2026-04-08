@@ -235,8 +235,15 @@ st.markdown("""
         font-size: 18px !important;
     }
     .stDataFrame { border-radius: 10px; overflow: hidden; }
-    .stSelectbox > div > div { background: #111520 !important; border-color: #1c2030 !important; }
-    .stTextInput > div > div > input { background: #111520 !important; border-color: #1c2030 !important; }
+    .stSelectbox > div > div { background: #111520 !important; border-color: #1c2030 !important; color: #e8eaed !important; }
+    .stSelectbox [data-testid="stMarkdownContainer"] p { color: #e8eaed !important; }
+    .stTextInput > div > div > input {
+        background: #111520 !important;
+        border-color: #1c2030 !important;
+        color: #e8eaed !important;
+        caret-color: #e8eaed !important;
+    }
+    .stTextInput > div > div > input::placeholder { color: #5a6270 !important; }
 
     /* ── 사이드바 버튼 ── */
     div[data-testid="stSidebar"] .stButton > button {
@@ -668,8 +675,11 @@ def render_dashboard():
     fig.update_layout(**_plotly_base_layout(
         height=max(280, len(df) * 44),
         xaxis=dict(range=[-10, 10], title="", gridcolor="#1c2030", zerolinecolor="#252a3a"),
-        yaxis=dict(autorange="reversed", gridcolor="rgba(0,0,0,0)"),
-        margin=dict(l=80, r=80, t=8, b=8),
+        yaxis=dict(
+            autorange="reversed", gridcolor="rgba(0,0,0,0)",
+            tickfont=dict(family="Inter, sans-serif", size=12, color="#c8ccd4"),
+        ),
+        margin=dict(l=90, r=80, t=8, b=8),
     ))
     fig.add_vline(x=0, line_color="#252a3a", line_width=1)
     st.plotly_chart(fig, use_container_width=True)
@@ -768,8 +778,11 @@ def render_detail():
             fig.update_layout(**_plotly_base_layout(
                 height=max(400, len(summaries) * 34),
                 xaxis=dict(range=[-10, 10], title="", gridcolor="#1c2030", zerolinecolor="#252a3a"),
-                yaxis=dict(autorange="reversed", gridcolor="rgba(0,0,0,0)"),
-                margin=dict(l=160, r=60, t=8, b=8),
+                yaxis=dict(
+                    autorange="reversed", gridcolor="rgba(0,0,0,0)",
+                    tickfont=dict(family="Inter, sans-serif", size=11, color="#c8ccd4"),
+                ),
+                margin=dict(l=200, r=60, t=8, b=8),
             ))
             fig.add_vline(x=0, line_color="#252a3a", line_width=1)
             st.plotly_chart(fig, use_container_width=True)
