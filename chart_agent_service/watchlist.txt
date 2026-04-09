@@ -1,20 +1,6 @@
 # 관심 종목 리스트 (한 줄에 하나, #은 주석)
 # .env의 WATCHLIST와 자동 병합됨
 
-# ── 빅테크 ──
-AAPL
-MSFT
-GOOGL
-AMZN
 NVDA
-META
 TSLA
-
-# ── 반도체 ──
-# AMD
-# AVGO
-# QCOM
-
-# ── ETF ──
-# SPY
-# QQQ
+IONQ

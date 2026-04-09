@@ -1418,13 +1418,12 @@ def render_backtest():
     </div>
     """, unsafe_allow_html=True)
 
-    data = api_get("/results")
-    results = data.get("results", {}) if data else {}
-    if not results:
-        st.info("No analysis results. Run a scan first.")
+    tickers = load_watchlist()
+    if not tickers:
+        st.info("Watchlist is empty. Add tickers first.")
         return
 
-    ticker = st.selectbox("Select Ticker", sorted(results.keys()))
+    ticker = st.selectbox("Select Ticker", sorted(tickers))
     if st.button("Run Backtest", type="primary"):
         with st.spinner(f"Backtesting {ticker}..."):
             bt = api_get(f"/backtest/{ticker}", timeout=60)
@@ -1465,14 +1464,12 @@ def render_ml_predict():
     </div>
     """, unsafe_allow_html=True)
 
-    data = api_get("/results")
-    results = data.get("results", {}) if data else {}
-    tickers = sorted(results.keys()) if results else load_watchlist()
+    tickers = load_watchlist()
     if not tickers:
-        st.info("No tickers available.")
+        st.info("Watchlist is empty. Add tickers first.")
         return
 
-    ticker = st.selectbox("Select Ticker", tickers, key="ml_ticker")
+    ticker = st.selectbox("Select Ticker", sorted(tickers), key="ml_ticker")
     if st.button("Run ML Prediction", type="primary"):
         with st.spinner(f"Training model for {ticker}..."):
             ml = api_get(f"/ml/{ticker}", timeout=120)
@@ -1529,10 +1526,9 @@ def render_portfolio():
     </div>
     """, unsafe_allow_html=True)
 
-    data = api_get("/results")
-    results = data.get("results", {}) if data else {}
-    if len(results) < 2:
-        st.info("Need at least 2 analyzed tickers for portfolio optimization.")
+    tickers = load_watchlist()
+    if len(tickers) < 2:
+        st.info("Need at least 2 tickers in watchlist for portfolio optimization.")
         return
 
     tab1, tab2 = st.tabs(["Optimization", "Correlation / Beta"])
