@@ -942,7 +942,11 @@ def render_dashboard():
         """, unsafe_allow_html=True)
         return
 
-    results = data["results"]
+    _wl = set(load_watchlist())
+    results = {k: v for k, v in data["results"].items() if k in _wl} if _wl else data["results"]
+    if not results:
+        st.info("No results for current watchlist. Run a scan first.")
+        return
     total = len(results)
     buy_list = {k: v for k, v in results.items() if v.get("signal") == "BUY"}
     sell_list = {k: v for k, v in results.items() if v.get("signal") == "SELL"}
@@ -1227,7 +1231,8 @@ def render_detail():
         """, unsafe_allow_html=True)
         return
 
-    tickers = sorted(data["results"].keys())
+    wl = set(load_watchlist())
+    tickers = sorted(t for t in data["results"].keys() if t in wl) if wl else sorted(data["results"].keys())
     selected = st.selectbox("Select Ticker", tickers, label_visibility="collapsed")
     if not selected:
         return
