@@ -19,7 +19,10 @@ import pandas as pd
 from config import (
     OPENAI_API_KEY, OLLAMA_BASE_URL, OLLAMA_MODEL, OUTPUT_DIR,
     BOLLINGER_PERIOD, BOLLINGER_STD, MACD_FAST, MACD_SLOW, MACD_SIGNAL,
-    ADX_PERIOD, RSI_PERIOD, SMA_PERIODS
+    ADX_PERIOD, RSI_PERIOD, SMA_PERIODS,
+    ATR_STOP_MULTIPLIER, ACCOUNT_SIZE, RISK_PER_TRADE_PCT,
+    MAX_POSITION_PCT, TAKE_PROFIT_RR_RATIO, TRADING_STYLE, TIMEFRAME,
+    COOLING_OFF_DAYS,
 )
 
 
@@ -824,6 +827,84 @@ class AnalysisTools:
         })
         return result
 
+    def risk_position_sizing(self) -> dict:
+        """[리스크] 포지션 사이징 및 손절/익절 산출 (ATR 기반)"""
+        result = {"tool": "risk_position_sizing", "name": "포지션 사이징 / 리스크 관리"}
+
+        if 'ATR' not in self.df.columns:
+            result.update({"signal": "neutral", "score": 0, "detail": "ATR 데이터 없음"})
+            return result
+
+        price = float(self.latest['Close'])
+        atr = float(self.df['ATR'].dropna().iloc[-1])
+
+        stop_distance = atr * ATR_STOP_MULTIPLIER
+        stop_loss = round(price - stop_distance, 2)
+        take_profit = round(price + stop_distance * TAKE_PROFIT_RR_RATIO, 2)
+
+        risk_amount = ACCOUNT_SIZE * (RISK_PER_TRADE_PCT / 100)
+        qty = int(risk_amount / stop_distance) if stop_distance > 0 else 0
+        position_value = qty * price
+        position_pct = (position_value / ACCOUNT_SIZE * 100) if ACCOUNT_SIZE > 0 else 0
+
+        warnings = []
+        if position_pct > MAX_POSITION_PCT:
+            max_qty = int(ACCOUNT_SIZE * MAX_POSITION_PCT / 100 / price)
+            warnings.append(f"비중 초과({position_pct:.1f}%>{MAX_POSITION_PCT}%), 최대 {max_qty}주로 제한")
+            qty = max_qty
+            position_value = qty * price
+            position_pct = position_value / ACCOUNT_SIZE * 100
+        if position_value > ACCOUNT_SIZE:
+            warnings.append("잔고 부족")
+            qty = int(ACCOUNT_SIZE / price)
+            position_value = qty * price
+            position_pct = position_value / ACCOUNT_SIZE * 100
+        if stop_distance / price > 0.10:
+            warnings.append(f"손절가 이격 과다({stop_distance / price:.1%})")
+
+        split_entry = [
+            {"tranche": 1, "pct": 40, "qty": int(qty * 0.4), "note": "1차 진입"},
+            {"tranche": 2, "pct": 30, "qty": int(qty * 0.3), "note": "확인 후 추가"},
+            {"tranche": 3, "pct": 30, "qty": qty - int(qty * 0.4) - int(qty * 0.3), "note": "최종 진입"},
+        ]
+
+        rr_ratio = TAKE_PROFIT_RR_RATIO
+        score = 0
+        if rr_ratio >= 2.0 and not warnings:
+            score += 3
+        elif rr_ratio >= 1.5:
+            score += 1
+        if warnings:
+            score -= len(warnings) * 2
+        score = max(-10, min(10, score))
+        signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+
+        result.update({
+            "signal": signal,
+            "score": round(score, 1),
+            "entry_price": price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "stop_distance": round(stop_distance, 2),
+            "stop_pct": round(stop_distance / price * 100, 2),
+            "atr": round(atr, 2),
+            "atr_multiplier": ATR_STOP_MULTIPLIER,
+            "risk_reward_ratio": rr_ratio,
+            "account_size": ACCOUNT_SIZE,
+            "risk_per_trade_pct": RISK_PER_TRADE_PCT,
+            "risk_amount": round(risk_amount, 2),
+            "recommended_qty": qty,
+            "position_value": round(position_value, 2),
+            "position_pct": round(position_pct, 2),
+            "split_entry": split_entry,
+            "trading_style": TRADING_STYLE,
+            "warnings": warnings,
+            "detail": f"진입=${price:.2f}, 손절=${stop_loss:.2f}(-{stop_distance/price:.1%}), "
+                       f"익절=${take_profit:.2f}(+{stop_distance*TAKE_PROFIT_RR_RATIO/price:.1%}), "
+                       f"수량={qty}주(${position_value:,.0f}, {position_pct:.1f}%)"
+        })
+        return result
+
 
 # ═══════════════════════════════════════════════════════════════
 #  Tool 정의 (LLM에 제공할 스키마)
@@ -914,6 +995,13 @@ TOOL_DEFINITIONS = [
             "description": "수익률 자기상관 분석. Hurst 지수로 추세 지속/평균 회귀/랜덤워크 체제 판단. 전략 선택 근거.",
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "risk_position_sizing",
+            "description": "포지션 사이징/리스크 관리. ATR 기반 손절/익절가, 권장 매수 수량, 분할 진입 계획, 비중 경고를 산출.",
+        }
+    },
 ]
 
 # Ollama용 간소화 tool 이름 목록
@@ -947,6 +1035,7 @@ class ChartAnalysisAgent:
             "momentum_rank_analysis": self.tools.momentum_rank_analysis,
             "support_resistance_analysis": self.tools.support_resistance_analysis,
             "correlation_regime_analysis": self.tools.correlation_regime_analysis,
+            "risk_position_sizing": self.tools.risk_position_sizing,
         }
 
     def _execute_tool(self, name: str) -> dict:
@@ -1055,6 +1144,7 @@ class ChartAnalysisAgent:
 10. momentum_rank_analysis - 모멘텀 순위
 11. support_resistance_analysis - 지지/저항선
 12. correlation_regime_analysis - 수익률 자기상관
+13. risk_position_sizing - 포지션 사이징/리스크 관리 (ATR 손절, 매수 수량, 분할 진입)
 
 규칙:
 1. 먼저 기본 도구(1~6)를 실행하고, 결과를 보고 필요한 퀀트 도구(7~12)를 추가 실행한다.
@@ -1063,7 +1153,7 @@ class ChartAnalysisAgent:
 4. 감정 없이 데이터 기반으로만 판단한다."""
 
     def _run_gpt4o_agent(self) -> dict:
-        """GPT-4o function calling 기반 에이전트"""
+        """GPT-4o function calling + vision 기반 에이전트"""
         if not OPENAI_API_KEY:
             print("  [경고] OPENAI_API_KEY 없음. 전수 분석 모드로 전환.")
             return self.compute_composite_score()
@@ -1098,12 +1188,10 @@ class ChartAnalysisAgent:
                 msg = choice["message"]
                 messages.append(msg)
 
-                # tool call이 없으면 최종 응답
                 if not msg.get("tool_calls"):
                     llm_conclusion = msg.get("content", "")
                     break
 
-                # tool call 실행
                 for tc in msg["tool_calls"]:
                     fn_name = tc["function"]["name"]
                     print(f"    → tool: {fn_name}")
@@ -1124,6 +1212,41 @@ class ChartAnalysisAgent:
 
         self.tool_results = all_tool_results
         composite = self.compute_composite_score()
+
+        chart_path = generate_agent_chart(self.ticker, self.df, composite)
+        if chart_path and os.path.exists(chart_path):
+            composite["chart_path"] = chart_path
+            try:
+                print("    [Vision] 차트 이미지를 GPT-4o에 전달하여 패턴 분석...")
+                with open(chart_path, "rb") as f:
+                    img_b64 = base64.b64encode(f.read()).decode("utf-8")
+                vision_resp = httpx.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "gpt-4o",
+                        "messages": [
+                            {"role": "system", "content": "당신은 주식 차트 패턴 분석 전문가다. 차트 이미지를 보고 기술적 패턴(헤드앤숄더, 더블탑/바텀, 삼각수렴, 채널, 깃발 등)을 식별하고 한국어로 분석하라."},
+                            {"role": "user", "content": [
+                                {"type": "text", "text": f"{self.ticker} 차트를 분석하라. 가격 패턴, 이동평균선 배열, 거래량 특성, RSI/MACD 상태를 종합하여 기술적 소견을 작성하라."},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"}},
+                            ]},
+                        ],
+                        "max_tokens": 1500,
+                        "temperature": 0.2,
+                    },
+                    timeout=90,
+                )
+                vision_resp.raise_for_status()
+                vision_text = vision_resp.json()["choices"][0]["message"]["content"]
+                llm_conclusion = f"{llm_conclusion}\n\n## 차트 패턴 분석 (Vision)\n{vision_text}"
+                print("    [Vision] 차트 패턴 분석 완료")
+            except Exception as e:
+                print(f"    [Vision 오류] {e}")
+
         composite["llm_conclusion"] = llm_conclusion
         composite["agent_mode"] = "gpt4o"
         return composite
@@ -1176,7 +1299,10 @@ class ChartAnalysisAgent:
 [판단의 핵심 근거 3~5개]
 
 ## 리스크 요인
-[주의사항 2~3개]"""
+[주의사항 2~3개]
+
+## 매매 전략
+[포지션 사이징 결과 기반 진입/손절/익절 가격, 분할 매수 계획, 경고 사항]"""
 
         try:
             print("    [Step 2] LLM 종합 판단 요청 중...")
@@ -1221,7 +1347,7 @@ class ChartAnalysisAgent:
 # ═══════════════════════════════════════════════════════════════
 
 def generate_agent_chart(ticker: str, df: pd.DataFrame, composite: dict, save_path: str = None) -> Optional[str]:
-    """에이전트 분석 결과를 포함한 차트 이미지 생성"""
+    """4패널 에이전트 차트: 가격+MA / 거래량 / RSI / MACD"""
     if save_path is None:
         save_path = os.path.join(OUTPUT_DIR, f"{ticker}_agent_analysis.png")
 
@@ -1229,62 +1355,122 @@ def generate_agent_chart(ticker: str, df: pd.DataFrame, composite: dict, save_pa
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        import matplotlib.font_manager as fm
+        from matplotlib.gridspec import GridSpec
 
-        fig = plt.figure(figsize=(16, 12), facecolor='#1e1e1e')
+        BG = '#0b0e14'
+        CARD = '#1d2026'
+        GRID = '#32353c'
+        TEXT = '#e1e2eb'
+        GREEN = '#02d4a1'
+        RED = '#fd526f'
+        GOLD = '#ffb347'
 
-        # 상단: 가격 차트
-        ax1 = fig.add_axes([0.06, 0.55, 0.88, 0.38])
-        ax1.set_facecolor('#1e1e1e')
-        ax1.tick_params(colors='white')
+        display_df = df.tail(120).copy()
+        fig = plt.figure(figsize=(18, 14), facecolor=BG)
+        gs = GridSpec(4, 1, height_ratios=[3, 1, 1, 1], hspace=0.08, figure=fig)
 
-        display_df = df.tail(120)
-        ax1.plot(display_df.index, display_df['Close'], color='white', linewidth=1.2)
+        signal_color = {'BUY': GREEN, 'SELL': RED, 'HOLD': GOLD}.get(
+            composite.get('final_signal', 'HOLD'), GOLD)
 
-        for ma, color in {'SMA_20': '#FFD700', 'SMA_50': '#FF8C00', 'SMA_200': '#FF1493'}.items():
-            if ma in display_df.columns:
-                ax1.plot(display_df.index, display_df[ma], color=color, linewidth=0.8, alpha=0.7, label=ma)
+        risk_info = ""
+        for td in composite.get("tool_details", []):
+            if td.get("tool") == "risk_position_sizing":
+                sl = td.get("stop_loss", "")
+                tp = td.get("take_profit", "")
+                qty = td.get("recommended_qty", "")
+                risk_info = f"  |  SL: ${sl}  TP: ${tp}  Qty: {qty}"
+                break
 
-        signal_color = {'BUY': '#26a69a', 'SELL': '#ef5350', 'HOLD': '#FFD700'}.get(
-            composite.get('final_signal', 'HOLD'), '#FFD700')
+        # ── Panel 1: Price + MA ──
+        ax1 = fig.add_subplot(gs[0])
+        ax1.set_facecolor(CARD)
+        ax1.plot(display_df.index, display_df['Close'], color=TEXT, linewidth=1.3, label='Close')
+
+        ma_colors = {}
+        for p in SMA_PERIODS:
+            col = f'SMA_{p}'
+            if col in display_df.columns:
+                c = {'5': '#aec6ff', '20': '#FFD700', '50': '#FF8C00', '120': '#aec6ff', '200': '#FF1493'}.get(str(p), '#aec6ff')
+                ma_colors[col] = c
+                ax1.plot(display_df.index, display_df[col], color=c, linewidth=0.8, alpha=0.7, label=col)
+
+        bbu = f'BBU_{BOLLINGER_PERIOD}_{BOLLINGER_STD}'
+        bbl = f'BBL_{BOLLINGER_PERIOD}_{BOLLINGER_STD}'
+        if bbu in display_df.columns:
+            ax1.fill_between(display_df.index, display_df[bbu], display_df[bbl], alpha=0.08, color='#aec6ff')
+
         ax1.set_title(
-            f"{ticker}  |  Agent: {composite.get('final_signal', '?')}  |  Score: {composite.get('composite_score', 0)}  |  Confidence: {composite.get('confidence', 0)}",
-            color=signal_color, fontsize=14, fontweight='bold'
+            f"{ticker}  |  {composite.get('final_signal', '?')} ({composite.get('composite_score', 0):+.2f})"
+            f"  |  Confidence: {composite.get('confidence', 0)}/10  |  Style: {TRADING_STYLE}{risk_info}",
+            color=signal_color, fontsize=13, fontweight='bold', loc='left', pad=10
         )
-        ax1.legend(loc='upper left', fontsize=7, facecolor='#2e2e2e', edgecolor='#444', labelcolor='white')
+        ax1.legend(loc='upper left', fontsize=7, facecolor=CARD, edgecolor=GRID, labelcolor=TEXT)
+        ax1.tick_params(colors=TEXT, labelsize=8)
+        ax1.set_ylabel('Price', color=TEXT, fontsize=9)
+        ax1.grid(True, color=GRID, alpha=0.3, linewidth=0.5)
         for spine in ax1.spines.values():
-            spine.set_color('#444')
+            spine.set_color(GRID)
+        ax1.set_xticklabels([])
 
-        # 하단: 12개 tool 스코어 바 차트
-        ax2 = fig.add_axes([0.06, 0.08, 0.88, 0.38])
-        ax2.set_facecolor('#1e1e1e')
-        ax2.tick_params(colors='white')
-
-        summaries = composite.get('tool_summaries', [])
-        if summaries:
-            names = [s['name'][:10] for s in summaries]
-            scores = [s['score'] for s in summaries]
-            colors = ['#26a69a' if s > 0 else '#ef5350' if s < 0 else '#888' for s in scores]
-
-            bars = ax2.barh(range(len(names)), scores, color=colors, height=0.6)
-            ax2.set_yticks(range(len(names)))
-            ax2.set_yticklabels(names, color='white', fontsize=9)
-            ax2.set_xlim(-10, 10)
-            ax2.axvline(0, color='#666', linewidth=0.5)
-            ax2.set_xlabel('Score (-10 ~ +10)', color='white')
-            ax2.set_title('Analysis Tool Scores', color='white', fontsize=12)
-
-            for i, (score, bar) in enumerate(zip(scores, bars)):
-                signal = summaries[i]['signal']
-                label = f"{score:+.1f} ({signal})"
-                x_pos = score + 0.3 if score >= 0 else score - 0.3
-                ha = 'left' if score >= 0 else 'right'
-                ax2.text(x_pos, i, label, va='center', ha=ha, color='white', fontsize=8)
-
+        # ── Panel 2: Volume ──
+        ax2 = fig.add_subplot(gs[1], sharex=ax1)
+        ax2.set_facecolor(CARD)
+        vol_colors = [GREEN if display_df['Close'].iloc[i] >= display_df['Close'].iloc[max(0, i-1)]
+                      else RED for i in range(len(display_df))]
+        ax2.bar(display_df.index, display_df['Volume'], color=vol_colors, alpha=0.6, width=0.8)
+        if 'Volume_SMA_20' in display_df.columns:
+            ax2.plot(display_df.index, display_df['Volume_SMA_20'], color=GOLD, linewidth=0.8, label='Vol MA20')
+        ax2.set_ylabel('Volume', color=TEXT, fontsize=9)
+        ax2.tick_params(colors=TEXT, labelsize=8)
+        ax2.grid(True, color=GRID, alpha=0.3, linewidth=0.5)
+        ax2.legend(loc='upper left', fontsize=7, facecolor=CARD, edgecolor=GRID, labelcolor=TEXT)
         for spine in ax2.spines.values():
-            spine.set_color('#444')
+            spine.set_color(GRID)
+        ax2.set_xticklabels([])
 
-        fig.savefig(save_path, dpi=150, facecolor='#1e1e1e', bbox_inches='tight')
+        # ── Panel 3: RSI ──
+        ax3 = fig.add_subplot(gs[2], sharex=ax1)
+        ax3.set_facecolor(CARD)
+        if 'RSI' in display_df.columns:
+            rsi = display_df['RSI']
+            ax3.plot(display_df.index, rsi, color='#aec6ff', linewidth=1.0)
+            ax3.axhline(70, color=RED, linewidth=0.6, linestyle='--', alpha=0.7)
+            ax3.axhline(30, color=GREEN, linewidth=0.6, linestyle='--', alpha=0.7)
+            ax3.axhline(50, color=GRID, linewidth=0.4, linestyle=':')
+            ax3.fill_between(display_df.index, rsi, 70, where=(rsi >= 70), alpha=0.15, color=RED)
+            ax3.fill_between(display_df.index, rsi, 30, where=(rsi <= 30), alpha=0.15, color=GREEN)
+            ax3.set_ylim(10, 90)
+        ax3.set_ylabel('RSI', color=TEXT, fontsize=9)
+        ax3.tick_params(colors=TEXT, labelsize=8)
+        ax3.grid(True, color=GRID, alpha=0.3, linewidth=0.5)
+        for spine in ax3.spines.values():
+            spine.set_color(GRID)
+        ax3.set_xticklabels([])
+
+        # ── Panel 4: MACD ──
+        macd_col = f'MACD_{MACD_FAST}_{MACD_SLOW}_{MACD_SIGNAL}'
+        sig_col = f'MACDs_{MACD_FAST}_{MACD_SLOW}_{MACD_SIGNAL}'
+        hist_col = f'MACDh_{MACD_FAST}_{MACD_SLOW}_{MACD_SIGNAL}'
+
+        ax4 = fig.add_subplot(gs[3], sharex=ax1)
+        ax4.set_facecolor(CARD)
+        if macd_col in display_df.columns:
+            ax4.plot(display_df.index, display_df[macd_col], color='#aec6ff', linewidth=1.0, label='MACD')
+            ax4.plot(display_df.index, display_df[sig_col], color=GOLD, linewidth=0.8, label='Signal')
+            hist = display_df[hist_col]
+            hist_colors = [GREEN if v >= 0 else RED for v in hist]
+            ax4.bar(display_df.index, hist, color=hist_colors, alpha=0.5, width=0.8)
+            ax4.axhline(0, color=GRID, linewidth=0.4)
+        ax4.set_ylabel('MACD', color=TEXT, fontsize=9)
+        ax4.tick_params(colors=TEXT, labelsize=8)
+        ax4.grid(True, color=GRID, alpha=0.3, linewidth=0.5)
+        ax4.legend(loc='upper left', fontsize=7, facecolor=CARD, edgecolor=GRID, labelcolor=TEXT)
+        for spine in ax4.spines.values():
+            spine.set_color(GRID)
+
+        plt.xticks(rotation=30, ha='right')
+
+        fig.savefig(save_path, dpi=150, facecolor=BG, bbox_inches='tight')
         plt.close(fig)
         return save_path
 

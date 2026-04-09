@@ -12,7 +12,9 @@
 """
 import json
 import os
+import sys
 import time
+import subprocess
 from datetime import datetime
 from typing import Optional
 
@@ -27,8 +29,9 @@ from config import (
     WATCHLIST, OLLAMA_MODEL,
     BUY_THRESHOLD, SELL_THRESHOLD, MIN_CONFIDENCE,
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, OUTPUT_DIR,
+    COOLING_OFF_DAYS, TRADING_STYLE,
 )
-from data_collector import fetch_ohlcv, calculate_indicators
+from data_collector import fetch_ohlcv, calculate_indicators, fetch_fundamentals, fetch_options_pcr, fetch_insider_trades
 from analysis_tools import ChartAnalysisAgent, generate_agent_chart
 
 
@@ -41,6 +44,9 @@ latest_results: dict = {}
 
 # 분석 히스토리 (최근 100건)
 scan_history: list = []
+
+# 냉각기 추적 {ticker: {"signal": "SELL", "triggered_at": isoformat}}
+cooling_off_state: dict = {}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -135,11 +141,31 @@ def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
         df = fetch_ohlcv(ticker)
         df = calculate_indicators(df)
 
-        print(f"  [{ticker}] 12개 기법 분석...")
+        print(f"  [{ticker}] 펀더멘털/옵션/내부자 데이터 수집...")
+        fundamentals = {}
+        options_pcr = {}
+        insider_trades = []
+        try:
+            fundamentals = fetch_fundamentals(ticker)
+        except Exception as e:
+            print(f"  [{ticker}] 펀더멘털 수집 실패: {e}")
+        try:
+            options_pcr = fetch_options_pcr(ticker)
+        except Exception as e:
+            print(f"  [{ticker}] 옵션 PCR 수집 실패: {e}")
+        try:
+            insider_trades = fetch_insider_trades(ticker)
+        except Exception as e:
+            print(f"  [{ticker}] 내부자 거래 수집 실패: {e}")
+
+        print(f"  [{ticker}] 13개 기법 분석...")
         agent = ChartAnalysisAgent(ticker, df)
         result = agent.run(mode=ai_mode)
 
-        # 차트 생성
+        result["fundamentals"] = fundamentals
+        result["options_pcr"] = options_pcr
+        result["insider_trades"] = insider_trades
+
         chart_path = None
         try:
             chart_path = generate_agent_chart(ticker, df, result)
@@ -147,7 +173,6 @@ def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
         except Exception as e:
             print(f"  [{ticker}] 차트 생성 실패: {e}")
 
-        # JSON 저장
         json_path = os.path.join(OUTPUT_DIR, f"{ticker}_agent_{datetime.now().strftime('%Y%m%d_%H%M')}.json")
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(result, f, indent=2, ensure_ascii=False, default=str)
@@ -185,6 +210,23 @@ def check_alert_condition(ticker: str, result: dict) -> Optional[dict]:
             reason.append(f"점수 범위 밖({SELL_THRESHOLD}<{score}<{BUY_THRESHOLD})")
         print(f"  [{ticker}] 알림 조건 미충족: {', '.join(reason)}")
         return None
+
+    # 1.5) 냉각기 체크 — 손절(SELL) 알림 이후 COOLING_OFF_DAYS 동안 BUY 알림 억제
+    if signal == "BUY" and ticker in cooling_off_state:
+        cool = cooling_off_state[ticker]
+        elapsed_days = (datetime.now() - datetime.fromisoformat(cool["triggered_at"])).total_seconds() / 86400
+        if elapsed_days < COOLING_OFF_DAYS:
+            remaining = COOLING_OFF_DAYS - elapsed_days
+            print(f"  [{ticker}] 냉각기 활성 중 ({remaining:.1f}일 남음, SELL 이후 BUY 억제)")
+            return None
+        else:
+            del cooling_off_state[ticker]
+
+    if signal == "SELL":
+        cooling_off_state[ticker] = {
+            "signal": signal,
+            "triggered_at": datetime.now().isoformat(),
+        }
 
     # 2) 중복 알림 억제 (동일 종목 + 동일 신호 → 1시간 내 1회만)
     COOLDOWN_SECONDS = 1 * 3600  # 1시간
@@ -251,25 +293,32 @@ def send_summary_alert(alerts: list):
         }
 
 
-def run_scheduled_scan():
-    """스케줄된 전체 종목 스캔"""
-    tickers = [t.strip().upper() for t in WATCHLIST.split(",") if t.strip()]
+def _load_watchlist_files() -> list[str]:
+    seen = set()
+    tickers = []
+    for t in WATCHLIST.split(","):
+        t = t.strip().upper()
+        if t and t not in seen:
+            tickers.append(t)
+            seen.add(t)
+    wl_paths = [
+        os.path.join(os.path.dirname(__file__), "watchlist.txt"),
+        os.path.join(os.path.dirname(__file__), "..", "stock_analyzer", "watchlist.txt"),
+    ]
+    for wl_file in wl_paths:
+        if os.path.exists(wl_file):
+            with open(wl_file, 'r') as f:
+                for line in f:
+                    t = line.strip().upper()
+                    if t and not t.startswith('#') and t not in seen:
+                        tickers.append(t)
+                        seen.add(t)
+    return tickers
 
-    # watchlist.txt 파일이 있으면 병합
-    wl_file = os.path.join(os.path.dirname(__file__), "watchlist.txt")
-    if os.path.exists(wl_file):
-        with open(wl_file, 'r') as f:
-            file_tickers = [
-                line.strip().upper()
-                for line in f
-                if line.strip() and not line.strip().startswith('#')
-            ]
-        # 중복 제거
-        seen = set(tickers)
-        for t in file_tickers:
-            if t not in seen:
-                tickers.append(t)
-                seen.add(t)
+
+def run_scheduled_scan(override_tickers: list[str] | None = None):
+    """스케줄된 전체 종목 스캔. override_tickers가 주어지면 해당 목록만 스캔."""
+    tickers = override_tickers if override_tickers else _load_watchlist_files()
 
     print(f"\n{'='*60}")
     print(f"  스캔 시작: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -341,6 +390,7 @@ def root():
         "service": "chart-analysis-agent",
         "status": "running",
         "model": OLLAMA_MODEL,
+        "trading_style": TRADING_STYLE,
         "watchlist": WATCHLIST,
         "scan_interval": f"{SCAN_INTERVAL_MINUTES}분",
         "thresholds": {
@@ -348,6 +398,8 @@ def root():
             "sell": SELL_THRESHOLD,
             "min_confidence": MIN_CONFIDENCE,
         },
+        "cooling_off_days": COOLING_OFF_DAYS,
+        "cooling_off_active": {k: v for k, v in cooling_off_state.items()},
         "last_scan": scan_history[-1]["timestamp"] if scan_history else None,
         "cached_tickers": list(latest_results.keys()),
     }
@@ -405,9 +457,10 @@ def scan_ticker(ticker: str, ai_mode: str = "ollama"):
 
 
 @app.post("/scan")
-def scan_all(ai_mode: str = "ollama"):
-    """전체 watchlist 즉시 스캔"""
-    run_scheduled_scan()
+def scan_all(ai_mode: str = "ollama", tickers: str = ""):
+    """전체 watchlist 즉시 스캔. tickers 쿼리로 종목 지정 가능 (콤마 구분)."""
+    override = [t.strip().upper() for t in tickers.split(",") if t.strip()] if tickers else None
+    run_scheduled_scan(override_tickers=override)
     return {"status": "completed", "results": get_all_results()}
 
 
@@ -445,6 +498,22 @@ def health():
         "scan_count": len(scan_history),
         "uptime_scans": len(scan_history),
     }
+
+
+@app.post("/restart")
+def restart_service():
+    """서비스 자체 재시작. 현재 프로세스를 동일 인자로 다시 실행."""
+    print(f"\n{'='*60}")
+    print(f"  재시작 요청 수신: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}\n")
+
+    def _restart():
+        time.sleep(1)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    import threading
+    threading.Thread(target=_restart, daemon=True).start()
+    return {"status": "restarting", "message": "Service will restart in 1 second."}
 
 
 # ═══════════════════════════════════════════════════════════════

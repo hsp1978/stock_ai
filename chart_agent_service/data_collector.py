@@ -84,3 +84,77 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['Volume_SMA_20'] = df['Volume'].rolling(window=20, min_periods=20).mean()
 
     return df
+
+
+def fetch_fundamentals(ticker: str) -> dict:
+    t = yf.Ticker(ticker)
+    info = t.info or {}
+    return {
+        "market_cap": info.get("marketCap"),
+        "pe_ratio": info.get("trailingPE"),
+        "forward_pe": info.get("forwardPE"),
+        "peg_ratio": info.get("pegRatio"),
+        "price_to_book": info.get("priceToBook"),
+        "dividend_yield": info.get("dividendYield"),
+        "eps": info.get("trailingEps"),
+        "revenue_growth": info.get("revenueGrowth"),
+        "profit_margin": info.get("profitMargins"),
+        "debt_to_equity": info.get("debtToEquity"),
+        "free_cash_flow": info.get("freeCashflow"),
+        "beta": info.get("beta"),
+        "52w_high": info.get("fiftyTwoWeekHigh"),
+        "52w_low": info.get("fiftyTwoWeekLow"),
+        "avg_volume": info.get("averageVolume"),
+        "short_ratio": info.get("shortRatio"),
+        "sector": info.get("sector"),
+        "industry": info.get("industry"),
+    }
+
+
+def fetch_options_pcr(ticker: str) -> dict:
+    t = yf.Ticker(ticker)
+    try:
+        expirations = t.options
+        if not expirations:
+            return {"put_call_ratio": None, "error": "No options data"}
+        nearest_exp = expirations[0]
+        chain = t.option_chain(nearest_exp)
+        total_call_oi = int(chain.calls['openInterest'].sum()) if 'openInterest' in chain.calls.columns else 0
+        total_put_oi = int(chain.puts['openInterest'].sum()) if 'openInterest' in chain.puts.columns else 0
+        pcr = round(total_put_oi / total_call_oi, 3) if total_call_oi > 0 else None
+        total_call_vol = int(chain.calls['volume'].fillna(0).sum()) if 'volume' in chain.calls.columns else 0
+        total_put_vol = int(chain.puts['volume'].fillna(0).sum()) if 'volume' in chain.puts.columns else 0
+        pcr_vol = round(total_put_vol / total_call_vol, 3) if total_call_vol > 0 else None
+        return {
+            "expiration": nearest_exp,
+            "call_oi": total_call_oi,
+            "put_oi": total_put_oi,
+            "put_call_ratio_oi": pcr,
+            "call_volume": total_call_vol,
+            "put_volume": total_put_vol,
+            "put_call_ratio_vol": pcr_vol,
+        }
+    except Exception as e:
+        return {"put_call_ratio": None, "error": str(e)}
+
+
+def fetch_insider_trades(ticker: str) -> list:
+    t = yf.Ticker(ticker)
+    try:
+        insiders = t.insider_transactions
+        if insiders is None or insiders.empty:
+            return []
+        recent = insiders.head(10)
+        trades = []
+        for _, row in recent.iterrows():
+            trades.append({
+                "date": str(row.get("Start Date", "")),
+                "insider": str(row.get("Insider", "")),
+                "relation": str(row.get("Relationship", "")),
+                "transaction": str(row.get("Transaction", "")),
+                "shares": row.get("Shares", 0),
+                "value": row.get("Value", 0),
+            })
+        return trades
+    except Exception:
+        return []

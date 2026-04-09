@@ -23,258 +23,310 @@ load_dotenv()
 AGENT_API_URL = os.getenv("AGENT_API_URL", "http://100.108.11.20:8100")
 WATCHLIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.txt")
 
-# ═══════════════════════════════════════════════════════════════
-#  페이지 설정
-# ═══════════════════════════════════════════════════════════════
-
 st.set_page_config(
-    page_title="Stock AI Agent",
-    page_icon="📊",
+    page_title="Stock AI",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── 글로벌 CSS ────────────────────────────────────────────────
+# ── Kinetic Terminal Design System CSS ──────────────────────────
 st.markdown("""
 <style>
-    /* ── Base ── */
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap');
 
-    .stApp {
-        background: #0b0e14;
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    :root {
+        --L0: #0b0e14;
+        --L1: #1d2026;
+        --L2: #32353c;
+        --surface-low: #191c22;
+        --surface-bright: #363940;
+        --outline: #8d909e;
+        --outline-variant: #424752;
+        --ghost: rgba(66,71,82,0.20);
+        --on-bg: #e1e2eb;
+        --on-surface: #e1e2eb;
+        --on-surface-variant: #c3c6d4;
+        --primary: #aec6ff;
+        --primary-ctr: #5d8ef1;
+        --buy: #02d4a1;
+        --buy-bright: #46f1bc;
+        --sell: #fd526f;
+        --sell-bright: #ffb2b8;
+        --hold: #ffb347;
     }
+
+    /* ── Base ── */
+    .stApp {
+        background: var(--L0) !important;
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+        color: var(--on-bg);
+    }
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: var(--L0); }
+    ::-webkit-scrollbar-thumb { background: var(--L2); border-radius: 10px; }
+    h1, h2, h3 { font-family: 'Inter', sans-serif !important; letter-spacing: -0.02em; color: var(--on-surface) !important; }
+
+    /* ── Sidebar — No-Line: tonal shift only ── */
     div[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #10141c 0%, #0d1018 100%);
-        border-right: 1px solid #1c2030;
+        background: var(--L0) !important;
+        border-right: none !important;
     }
     div[data-testid="stSidebar"] .stMarkdown p,
-    div[data-testid="stSidebar"] .stMarkdown li {
-        font-size: 13px;
-    }
+    div[data-testid="stSidebar"] .stMarkdown li { font-size: 13px; color: var(--on-surface-variant); }
 
-    /* ── 기본 텍스트 ── */
-    h1, h2, h3 { font-family: 'Inter', sans-serif !important; letter-spacing: -0.02em; }
+    /* ── Page header ── */
+    .page-header { margin-bottom: 28px; }
     .page-title {
-        font-size: 26px;
-        font-weight: 700;
-        color: #f0f2f5;
-        margin-bottom: 4px;
-        letter-spacing: -0.03em;
+        font-size: 2rem; font-weight: 800; color: var(--on-surface);
+        letter-spacing: -0.03em; line-height: 1.2;
     }
     .page-subtitle {
-        font-size: 13px;
-        color: #5a6270;
-        margin-bottom: 24px;
+        font-size: 0.8rem; color: var(--on-surface-variant);
+        opacity: 0.7; margin-top: 4px;
     }
 
-    /* ── 시장 지수 티커 바 ── */
-    .ticker-bar {
-        display: flex;
-        gap: 0;
-        background: #111520;
-        border: 1px solid #1c2030;
-        border-radius: 12px;
-        padding: 6px 8px;
-        margin-bottom: 24px;
-        overflow-x: auto;
-    }
-    .ticker-item {
-        flex: 1;
-        min-width: 0;
-        padding: 10px 14px;
-        text-align: center;
-        border-right: 1px solid #1c2030;
-        transition: background 0.15s;
-    }
-    .ticker-item:last-child { border-right: none; }
-    .ticker-item:hover { background: #161b28; }
-    .ticker-item .t-name {
-        font-size: 10px;
-        font-weight: 600;
-        color: #5a6270;
-        text-transform: uppercase;
-        letter-spacing: 0.8px;
-        margin-bottom: 4px;
-    }
-    .ticker-item .t-price {
-        font-size: 15px;
-        font-weight: 700;
-        color: #e8eaed;
-        font-family: 'JetBrains Mono', monospace;
-        letter-spacing: -0.03em;
-    }
-    .ticker-item .t-change {
-        font-size: 11px;
-        font-weight: 600;
-        margin-top: 2px;
-        font-family: 'JetBrains Mono', monospace;
-    }
-    .t-up { color: #00d4a1; }
-    .t-down { color: #ff5370; }
-    .t-flat { color: #5a6270; }
-    .ticker-group-label {
-        writing-mode: vertical-lr;
-        text-orientation: mixed;
-        font-size: 9px;
-        font-weight: 700;
-        color: #3a4050;
-        letter-spacing: 1.5px;
-        text-transform: uppercase;
-        padding: 8px 6px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        border-right: 1px solid #1c2030;
-    }
-
-    /* ── 요약 메트릭 카드 ── */
-    .summary-grid {
+    /* ── Ticker bar — No-Line: L1 card on L0, no border ── */
+    .ticker-expanded {
         display: grid;
-        grid-template-columns: repeat(4, 1fr);
-        gap: 12px;
+        grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+        gap: 2px;
+        background: var(--L1);
+        border-radius: 12px;
+        padding: 4px;
         margin-bottom: 24px;
+    }
+    .ticker-cell {
+        padding: 12px 8px; text-align: center;
+        border-radius: 10px; transition: background 0.2s;
+    }
+    .ticker-cell:hover { background: var(--surface-bright); }
+    .ticker-cell .tc-name {
+        font-family: 'Inter'; font-size: 0.625rem; font-weight: 700;
+        color: var(--on-surface-variant); text-transform: uppercase;
+        letter-spacing: 0.5px; margin-bottom: 4px;
+    }
+    .ticker-cell .tc-price {
+        font-family: 'JetBrains Mono'; font-size: 0.9rem; font-weight: 700;
+        color: var(--on-surface); letter-spacing: -0.03em;
+    }
+    .ticker-cell .tc-change {
+        font-family: 'JetBrains Mono'; font-size: 0.7rem; font-weight: 600; margin-top: 2px;
+    }
+    .ts-up { color: var(--buy); }
+    .ts-down { color: var(--sell); }
+    .ts-flat { color: var(--outline); }
+
+    /* ── Summary Cards — No-Line: L1 on L0, progress bar ── */
+    .summary-grid {
+        display: grid; grid-template-columns: repeat(4, 1fr);
+        gap: 16px; margin-bottom: 24px;
     }
     .summary-card {
-        background: #111520;
-        border: 1px solid #1c2030;
-        border-radius: 10px;
-        padding: 18px 20px;
-        text-align: center;
+        background: var(--L1); border-radius: 12px;
+        padding: 24px; position: relative; overflow: hidden;
+        transition: background 0.3s;
+    }
+    .summary-card:hover { background: var(--surface-bright); }
+    .summary-card .sc-icon {
+        position: absolute; top: 16px; right: 20px;
+        font-size: 32px; opacity: 0.06;
     }
     .summary-card .sc-label {
-        font-size: 11px;
-        font-weight: 600;
-        color: #5a6270;
-        text-transform: uppercase;
-        letter-spacing: 0.8px;
-        margin-bottom: 8px;
+        font-family: 'Inter'; font-size: 0.625rem; font-weight: 700;
+        color: var(--on-surface-variant); text-transform: uppercase;
+        letter-spacing: 1.2px; margin-bottom: 12px;
     }
     .summary-card .sc-value {
-        font-size: 28px;
-        font-weight: 700;
-        font-family: 'JetBrains Mono', monospace;
-        color: #e8eaed;
+        font-family: 'JetBrains Mono'; font-size: 2.5rem; font-weight: 700;
+        line-height: 1;
     }
-    .sc-buy { border-bottom: 3px solid #00d4a1; }
-    .sc-sell { border-bottom: 3px solid #ff5370; }
-    .sc-hold { border-bottom: 3px solid #ffb347; }
-    .sc-total { border-bottom: 3px solid #5b8def; }
-
-    /* ── 상세 시그널 배지 ── */
-    .signal-badge {
-        display: inline-block;
-        padding: 6px 20px;
-        border-radius: 6px;
-        font-size: 20px;
-        font-weight: 700;
-        letter-spacing: 1px;
+    .summary-card .sc-sub {
+        font-family: 'Inter'; font-size: 0.7rem;
+        color: var(--on-surface-variant); margin-top: 4px;
     }
-    .signal-badge.buy  { background: rgba(0,212,161,0.12); color: #00d4a1; border: 1px solid rgba(0,212,161,0.25); }
-    .signal-badge.sell { background: rgba(255,83,112,0.12); color: #ff5370; border: 1px solid rgba(255,83,112,0.25); }
-    .signal-badge.hold { background: rgba(255,179,71,0.12); color: #ffb347; border: 1px solid rgba(255,179,71,0.25); }
-
-    /* ── 상세 메트릭 ── */
-    .detail-metrics {
-        display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 12px;
-        margin-bottom: 20px;
+    .summary-card .sc-bar {
+        margin-top: 16px; height: 3px; border-radius: 2px;
+        background: var(--L0);
     }
-    .dm-card {
-        background: #111520;
-        border: 1px solid #1c2030;
-        border-radius: 10px;
-        padding: 16px 20px;
-        text-align: center;
-    }
-    .dm-card .dm-label {
-        font-size: 11px;
-        font-weight: 600;
-        color: #5a6270;
-        text-transform: uppercase;
-        letter-spacing: 0.8px;
-        margin-bottom: 6px;
-    }
-    .dm-card .dm-value {
-        font-size: 22px;
-        font-weight: 700;
-        font-family: 'JetBrains Mono', monospace;
-        color: #e8eaed;
+    .summary-card .sc-bar-fill {
+        height: 100%; border-radius: 2px; transition: width 0.6s ease;
     }
 
-    /* ── 섹션 타이틀 ── */
-    .section-title {
-        font-size: 15px;
-        font-weight: 700;
-        color: #c8ccd4;
+    /* ── Section headers ── */
+    .section-header {
+        display: flex; justify-content: space-between; align-items: center;
         margin: 28px 0 14px 0;
-        padding-bottom: 8px;
-        border-bottom: 1px solid #1c2030;
-        letter-spacing: -0.01em;
+    }
+    .section-title {
+        font-family: 'Inter'; font-size: 1.1rem; font-weight: 700;
+        color: var(--on-surface); letter-spacing: -0.01em;
+    }
+    .section-subtitle {
+        font-family: 'JetBrains Mono'; font-size: 0.7rem;
+        color: var(--outline);
     }
 
-    /* ── 히스토리 타임스탬프 ── */
-    .hist-ts {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 13px;
-        color: #8890a0;
+    /* ── Signal pills & badges ── */
+    .signal-pill {
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 3px 10px; border-radius: 4px;
+        font-family: 'JetBrains Mono'; font-size: 0.625rem; font-weight: 700;
+        text-transform: uppercase; letter-spacing: 0.5px;
     }
+    .signal-pill .sp-dot { width: 5px; height: 5px; border-radius: 50%; }
+    .signal-pill.buy { background: rgba(2,212,161,0.10); color: var(--buy-bright); }
+    .signal-pill.buy .sp-dot { background: var(--buy); }
+    .signal-pill.sell { background: rgba(253,82,111,0.10); color: var(--sell-bright); }
+    .signal-pill.sell .sp-dot { background: var(--sell); }
+    .signal-pill.hold { background: rgba(255,179,71,0.10); color: var(--hold); }
+    .signal-pill.hold .sp-dot { background: var(--hold); }
 
-    /* ── Streamlit 기본 요소 오버라이드 ── */
-    .stDivider { opacity: 0.15; }
+    .signal-badge-lg {
+        display: inline-flex; align-items: center; gap: 8px;
+        padding: 8px 28px; border-radius: 8px;
+        font-family: 'JetBrains Mono'; font-size: 1.1rem; font-weight: 800;
+        letter-spacing: 2px; text-transform: uppercase;
+    }
+    .signal-badge-lg.buy { background: var(--buy); color: #003828; }
+    .signal-badge-lg.sell { background: var(--sell); color: #40000f; }
+    .signal-badge-lg.hold { background: var(--L2); color: var(--on-surface); }
+
+    /* ── Metric cards (Streamlit stMetric) — L1 on L0 ── */
     div[data-testid="stMetric"] {
-        background: #111520;
-        border: 1px solid #1c2030;
-        border-radius: 10px;
-        padding: 14px 18px;
+        background: var(--L1) !important;
+        border: none !important;
+        border-radius: 10px !important;
+        padding: 16px 18px !important;
     }
-    div[data-testid="stMetric"] label { font-size: 12px !important; color: #5a6270 !important; }
+    div[data-testid="stMetric"] label {
+        font-family: 'Inter' !important;
+        font-size: 0.625rem !important;
+        font-weight: 700 !important;
+        color: var(--on-surface-variant) !important;
+        text-transform: uppercase !important;
+        letter-spacing: 0.8px !important;
+    }
     div[data-testid="stMetric"] [data-testid="stMetricValue"] {
         font-family: 'JetBrains Mono', monospace !important;
-        font-size: 18px !important;
+        font-size: 1.25rem !important;
+        font-weight: 700 !important;
+        color: var(--on-surface) !important;
     }
-    .stDataFrame { border-radius: 10px; overflow: hidden; }
-    .stSelectbox > div > div { background: #111520 !important; border-color: #1c2030 !important; color: #e8eaed !important; }
-    .stSelectbox [data-testid="stMarkdownContainer"] p { color: #e8eaed !important; }
-    .stTextInput > div > div > input {
-        background: #111520 !important;
-        border-color: #1c2030 !important;
-        color: #e8eaed !important;
-        caret-color: #e8eaed !important;
+    div[data-testid="stMetric"] [data-testid="stMetricDelta"] {
+        font-family: 'JetBrains Mono' !important;
+        font-size: 0.75rem !important;
     }
-    .stTextInput > div > div > input::placeholder { color: #5a6270 !important; }
 
-    /* ── 사이드바 버튼 ── */
-    div[data-testid="stSidebar"] .stButton > button {
-        background: #161b28;
-        border: 1px solid #252a3a;
-        color: #c8ccd4;
-        font-weight: 600;
-        font-size: 13px;
-        transition: all 0.15s;
-    }
-    div[data-testid="stSidebar"] .stButton > button:hover {
-        background: #1e2436;
-        border-color: #5b8def;
-        color: #e8eaed;
+    /* ── Timestamp meta ── */
+    .ts-meta {
+        font-family: 'JetBrains Mono'; font-size: 0.625rem;
+        color: var(--outline); text-align: right;
+        margin-bottom: 8px; letter-spacing: 0.3px;
     }
 
     /* ── Empty state ── */
-    .empty-state {
-        text-align: center;
-        padding: 60px 20px;
-        color: #3a4050;
+    .empty-state { text-align: center; padding: 80px 20px; }
+    .empty-state .es-icon { font-size: 48px; margin-bottom: 16px; opacity: 0.2; }
+    .empty-state .es-text { font-size: 0.875rem; color: var(--on-surface-variant); opacity: 0.5; }
+
+    /* ── Streamlit widget overrides ── */
+    .stDivider { opacity: 0.06; }
+    .stDataFrame { border-radius: 10px; overflow: hidden; }
+    .stSelectbox > div > div {
+        background: var(--L1) !important;
+        border-color: var(--ghost) !important;
+        color: var(--on-surface) !important;
     }
-    .empty-state .es-icon { font-size: 48px; margin-bottom: 12px; }
-    .empty-state .es-text { font-size: 14px; color: #5a6270; }
+    .stSelectbox [data-testid="stMarkdownContainer"] p { color: var(--on-surface) !important; }
+    .stTextInput > div > div > input {
+        background: var(--surface-low) !important;
+        border-color: var(--ghost) !important;
+        color: var(--on-surface) !important;
+        caret-color: var(--primary) !important;
+        border-radius: 10px !important;
+    }
+    .stTextInput > div > div > input:focus {
+        border-color: var(--primary-ctr) !important;
+        box-shadow: 0 0 0 1px rgba(93,142,241,0.25) !important;
+    }
+    .stTextInput > div > div > input::placeholder { color: var(--outline) !important; }
+
+    /* ── Sidebar components ── */
+    div[data-testid="stSidebar"] .stButton > button {
+        background: var(--L1); border: none;
+        color: var(--on-surface-variant); font-weight: 600; font-size: 13px;
+        border-radius: 10px; transition: all 0.2s;
+    }
+    div[data-testid="stSidebar"] .stButton > button:hover {
+        background: var(--surface-bright); color: var(--on-surface);
+    }
+    .sidebar-brand {
+        font-size: 1.15rem; font-weight: 900;
+        color: var(--primary-ctr); letter-spacing: -0.04em; margin-bottom: 2px;
+    }
+    .sidebar-label {
+        font-family: 'JetBrains Mono'; font-size: 0.6rem; font-weight: 700;
+        color: var(--primary-ctr); text-transform: uppercase;
+        letter-spacing: 1.5px; opacity: 0.7;
+    }
+    .sidebar-section-label {
+        font-family: 'Inter'; font-size: 0.625rem; font-weight: 700;
+        color: var(--on-surface-variant); text-transform: uppercase;
+        letter-spacing: 1px; margin-bottom: 8px;
+    }
+    .sidebar-status-grid { display: flex; gap: 6px; margin: 12px 0; }
+    .sidebar-status-item {
+        flex: 1; background: var(--L1); border-radius: 10px;
+        padding: 10px 6px; text-align: center;
+    }
+    .sidebar-status-item .ssi-label {
+        font-family: 'Inter'; font-size: 0.55rem; font-weight: 700;
+        color: var(--outline); text-transform: uppercase; letter-spacing: 0.5px;
+    }
+    .sidebar-status-item .ssi-value {
+        font-family: 'JetBrains Mono'; font-size: 0.85rem; font-weight: 700;
+        color: var(--on-surface); margin-top: 3px;
+    }
+    .sidebar-info {
+        background: var(--L1); border-radius: 10px;
+        padding: 12px 14px; margin: 8px 0 16px 0;
+        font-size: 0.75rem; color: var(--outline); line-height: 1.9;
+    }
+    .sidebar-info span { color: var(--on-surface-variant); }
+    .wl-chip {
+        display: inline-block; background: var(--L2); border-radius: 6px;
+        padding: 3px 10px; margin: 2px;
+        font-family: 'JetBrains Mono'; font-size: 0.7rem; font-weight: 500;
+        color: var(--on-surface-variant);
+    }
+
+    /* ── Expander — No-Line: L1 on L0 ── */
+    .stExpander {
+        border: none !important;
+        background: var(--L1) !important;
+        border-radius: 10px !important;
+    }
+    .stExpander [data-testid="stExpanderDetails"] {
+        background: var(--L1) !important;
+    }
+
+    /* ── Markdown body inside LLM conclusion ── */
+    .llm-body {
+        background: var(--L1); border-radius: 10px;
+        padding: 24px 28px; line-height: 1.8;
+        color: var(--on-surface-variant); font-size: 0.875rem;
+    }
+    .llm-body h2, .llm-body h3 {
+        color: var(--on-surface) !important;
+        font-size: 1rem !important; margin-top: 20px !important;
+    }
+    .llm-body strong { color: var(--on-surface); }
+    .llm-body ul, .llm-body ol { padding-left: 20px; }
+    .llm-body li { margin-bottom: 4px; }
 </style>
 """, unsafe_allow_html=True)
 
-
-# ═══════════════════════════════════════════════════════════════
-#  시장 지수 데이터 수집
-# ═══════════════════════════════════════════════════════════════
 
 MARKET_INDICES = {
     "us_market": {
@@ -306,9 +358,9 @@ MARKET_INDICES = {
 
 
 @st.cache_data(ttl=300)
-def fetch_market_indices() -> dict:
-    """주요 시장 지수 현재가 및 등락률 수집"""
+def fetch_market_indices() -> tuple[dict, str]:
     results = {}
+    fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     all_tickers = []
     for group in MARKET_INDICES.values():
         for sym, name, decimals in group["items"]:
@@ -320,7 +372,7 @@ def fetch_market_indices() -> dict:
             progress=False, threads=True,
         )
     except Exception:
-        return results
+        return results, fetched_at
 
     for group_key, group in MARKET_INDICES.items():
         for sym, name, decimals in group["items"]:
@@ -339,12 +391,8 @@ def fetch_market_indices() -> dict:
                 }
             except Exception:
                 continue
-    return results
+    return results, fetched_at
 
-
-# ═══════════════════════════════════════════════════════════════
-#  API 호출 함수
-# ═══════════════════════════════════════════════════════════════
 
 def api_get(path: str, timeout: int = 10):
     try:
@@ -374,12 +422,7 @@ def get_chart_url(ticker: str) -> str:
     return f"{AGENT_API_URL}/chart/{ticker}"
 
 
-# ═══════════════════════════════════════════════════════════════
-#  Watchlist 관리
-# ═══════════════════════════════════════════════════════════════
-
 def load_watchlist() -> list[str]:
-    """watchlist.txt에서 종목 목록 로드 (주석/빈줄 제외)"""
     if not os.path.exists(WATCHLIST_PATH):
         return []
     with open(WATCHLIST_PATH, "r", encoding="utf-8") as f:
@@ -391,7 +434,6 @@ def load_watchlist() -> list[str]:
 
 
 def save_watchlist(tickers: list[str]):
-    """watchlist.txt에 종목 목록 저장 (기존 주석 헤더 유지)"""
     header = "# 관심 종목 리스트 (한 줄에 하나, #은 주석)\n# 빈 줄과 주석은 무시됨\n\n"
     with open(WATCHLIST_PATH, "w", encoding="utf-8") as f:
         f.write(header)
@@ -400,7 +442,6 @@ def save_watchlist(tickers: list[str]):
 
 
 def add_to_watchlist(ticker: str) -> tuple[bool, str]:
-    """종목 추가. (성공여부, 메시지) 반환"""
     ticker = ticker.strip().upper()
     if not ticker:
         return False, "Empty ticker"
@@ -415,7 +456,6 @@ def add_to_watchlist(ticker: str) -> tuple[bool, str]:
 
 
 def remove_from_watchlist(ticker: str) -> tuple[bool, str]:
-    """종목 삭제. (성공여부, 메시지) 반환"""
     ticker = ticker.strip().upper()
     current = load_watchlist()
     if ticker not in current:
@@ -425,23 +465,24 @@ def remove_from_watchlist(ticker: str) -> tuple[bool, str]:
     return True, f"{ticker} removed"
 
 
-# ═══════════════════════════════════════════════════════════════
-#  공통 컴포넌트
-# ═══════════════════════════════════════════════════════════════
-
 def _plotly_base_layout(**overrides) -> dict:
-    """공통 plotly 레이아웃"""
     base = dict(
         template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="#0f1319",
-        font=dict(family="Inter, sans-serif", color="#8890a0", size=12),
+        plot_bgcolor="#0b0e14",
+        font=dict(family="Inter, sans-serif", color="#c3c6d4", size=12),
         margin=dict(l=0, r=0, t=0, b=0),
-        xaxis=dict(gridcolor="#1c2030", zerolinecolor="#1c2030"),
-        yaxis=dict(gridcolor="#1c2030", zerolinecolor="#1c2030"),
+        xaxis=dict(gridcolor="rgba(66,71,82,0.12)", zerolinecolor="rgba(66,71,82,0.18)"),
+        yaxis=dict(gridcolor="rgba(66,71,82,0.12)", zerolinecolor="rgba(66,71,82,0.18)"),
     )
     base.update(overrides)
     return base
+
+
+def _signal_pill_html(signal: str) -> str:
+    s = signal.upper()
+    cls = "buy" if s == "BUY" else ("sell" if s == "SELL" else "hold")
+    return f'<span class="signal-pill {cls}"><span class="sp-dot"></span>{s}</span>'
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -449,53 +490,56 @@ def _plotly_base_layout(**overrides) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.markdown('<div class="page-title">Stock AI Agent</div>', unsafe_allow_html=True)
-    st.caption("LLM-powered 16-Tool Analysis")
+    st.markdown('<div class="sidebar-brand">Stock AI</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-label">Precision Terminal</div>', unsafe_allow_html=True)
 
-    # 서비스 상태
     health = api_get("/health")
     if health:
         ollama_status = health.get("ollama", "disconnected")
         cached = health.get("cached_results", 0)
         scans = health.get("scan_count", 0)
-        status_color = "#00d4a1" if ollama_status == "connected" else "#ff5370"
+        status_color = "#02d4a1" if ollama_status == "connected" else "#fd526f"
         st.markdown(f"""
-        <div style="display:flex; gap:16px; margin:12px 0;">
-            <div style="flex:1; background:#111520; border:1px solid #1c2030; border-radius:8px; padding:10px 12px; text-align:center;">
-                <div style="font-size:10px; color:#5a6270; text-transform:uppercase; letter-spacing:0.5px;">Ollama</div>
-                <div style="font-size:14px; font-weight:700; color:{status_color}; margin-top:4px;">{'Online' if ollama_status == 'connected' else 'Offline'}</div>
+        <div class="sidebar-status-grid">
+            <div class="sidebar-status-item">
+                <div class="ssi-label">Ollama</div>
+                <div class="ssi-value" style="color:{status_color};">{'Online' if ollama_status == 'connected' else 'Offline'}</div>
             </div>
-            <div style="flex:1; background:#111520; border:1px solid #1c2030; border-radius:8px; padding:10px 12px; text-align:center;">
-                <div style="font-size:10px; color:#5a6270; text-transform:uppercase; letter-spacing:0.5px;">Cached</div>
-                <div style="font-size:14px; font-weight:700; color:#e8eaed; margin-top:4px;">{cached}</div>
+            <div class="sidebar-status-item">
+                <div class="ssi-label">Cached</div>
+                <div class="ssi-value">{cached}</div>
             </div>
-            <div style="flex:1; background:#111520; border:1px solid #1c2030; border-radius:8px; padding:10px 12px; text-align:center;">
-                <div style="font-size:10px; color:#5a6270; text-transform:uppercase; letter-spacing:0.5px;">Scans</div>
-                <div style="font-size:14px; font-weight:700; color:#e8eaed; margin-top:4px;">{scans}</div>
+            <div class="sidebar-status-item">
+                <div class="ssi-label">Scans</div>
+                <div class="ssi-value">{scans}</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
     else:
         st.error(f"Agent Offline: {AGENT_API_URL}")
 
-    # 서비스 정보
     info = api_get("/")
     if info:
         last_scan = info.get("last_scan", "")
+        thresholds = info.get("thresholds", {})
+        buy_th = thresholds.get("buy", "?")
+        sell_th = thresholds.get("sell", "?")
+        model_name = info.get("model", "?")
+        scan_interval = info.get("scan_interval", "?")
+        last_line = f'<br>Last: <span>{last_scan[:16]}</span>' if last_scan else ""
         st.markdown(f"""
-        <div style="background:#111520; border:1px solid #1c2030; border-radius:8px; padding:12px 14px; margin:8px 0 16px 0; font-size:12px; color:#8890a0; line-height:1.8;">
-            Model: <span style="color:#c8ccd4;">{info.get('model', '?')}</span><br>
-            Interval: <span style="color:#c8ccd4;">{info.get('scan_interval', '?')}</span><br>
-            Buy &ge; <span style="color:#00d4a1;">{info.get('thresholds', {}).get('buy', '?')}</span>
-            &nbsp; Sell &le; <span style="color:#ff5370;">{info.get('thresholds', {}).get('sell', '?')}</span>
-            {'<br>Last: <span style="color:#c8ccd4;">' + last_scan[:16] + '</span>' if last_scan else ''}
+        <div class="sidebar-info">
+            Model: <span>{model_name}</span><br>
+            Interval: <span>{scan_interval}</span><br>
+            Buy &ge; <span style="color:#02d4a1;">{buy_th}</span>
+            &nbsp; Sell &le; <span style="color:#fd526f;">{sell_th}</span>
+            {last_line}
         </div>
         """, unsafe_allow_html=True)
 
     st.divider()
 
-    # 수동 스캔
-    st.markdown('<div style="font-size:12px; font-weight:600; color:#5a6270; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:8px;">Manual Scan</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section-label">Manual Scan</div>', unsafe_allow_html=True)
     scan_ticker = st.text_input("Ticker", placeholder="AAPL", label_visibility="collapsed")
     col1, col2 = st.columns(2)
     if col1.button("Scan", use_container_width=True):
@@ -506,29 +550,29 @@ with st.sidebar:
                     st.success(f"{scan_ticker.upper()}: {result.get('final_signal')} ({result.get('composite_score', 0):+.1f})")
                     st.rerun()
     if col2.button("Scan All", use_container_width=True):
-        with st.spinner("Scanning watchlist..."):
-            api_post("/scan")
+        wl = load_watchlist()
+        if wl:
+            tickers_param = ",".join(wl)
+            with st.spinner(f"Scanning {len(wl)} tickers..."):
+                result = api_post(f"/scan?tickers={tickers_param}", timeout=600)
+                if result:
+                    st.success(f"Done! {len(wl)} tickers scanned.")
             st.rerun()
+        else:
+            st.warning("Watchlist is empty")
 
     st.divider()
 
-    # Watchlist 관리
-    st.markdown('<div style="font-size:12px; font-weight:600; color:#5a6270; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:8px;">Watchlist</div>', unsafe_allow_html=True)
-
+    st.markdown('<div class="sidebar-section-label">Watchlist</div>', unsafe_allow_html=True)
     watchlist = load_watchlist()
 
-    # 현재 종목 표시
     if watchlist:
-        wl_chips = " ".join(
-            f'<span style="display:inline-block; background:#161b28; border:1px solid #252a3a; border-radius:4px; padding:2px 8px; margin:2px; font-size:12px; font-family:JetBrains Mono,monospace; color:#c8ccd4;">{t}</span>'
-            for t in watchlist
-        )
-        st.markdown(f'<div style="margin-bottom:8px; line-height:1.8;">{wl_chips}</div>', unsafe_allow_html=True)
+        wl_chips = " ".join(f'<span class="wl-chip">{t}</span>' for t in watchlist)
+        st.markdown(f'<div style="margin-bottom:8px; line-height:2;">{wl_chips}</div>', unsafe_allow_html=True)
         st.caption(f"{len(watchlist)} tickers")
     else:
         st.caption("No tickers in watchlist")
 
-    # 추가
     add_ticker = st.text_input("Add ticker", placeholder="TSLA", label_visibility="collapsed", key="wl_add")
     wl_col1, wl_col2 = st.columns(2)
     if wl_col1.button("Add", use_container_width=True, key="wl_add_btn"):
@@ -540,7 +584,6 @@ with st.sidebar:
             else:
                 st.warning(msg)
 
-    # 삭제
     if watchlist:
         remove_target = wl_col2.selectbox("Remove", watchlist, label_visibility="collapsed", key="wl_remove")
         if wl_col2.button("Remove", use_container_width=True, key="wl_rm_btn"):
@@ -553,8 +596,112 @@ with st.sidebar:
 
     st.divider()
 
-    # 페이지 선택
-    page = st.radio("Navigation", ["Dashboard", "Detail", "History"], label_visibility="collapsed")
+    st.markdown('<div class="sidebar-section-label">Agent Control</div>', unsafe_allow_html=True)
+    if st.button("Restart Agent", use_container_width=True, type="secondary"):
+        with st.spinner("Restarting agent service..."):
+            resp = api_post("/restart", timeout=5)
+            if resp and resp.get("status") == "restarting":
+                st.success("Agent restarting...")
+                import time as _time
+                _time.sleep(3)
+                st.rerun()
+            else:
+                st.error("Restart failed. Agent may be offline.")
+
+    st.divider()
+
+    page = st.radio("Navigation", ["Home", "Dashboard", "Detail", "History"], label_visibility="collapsed")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  홈 페이지
+# ═══════════════════════════════════════════════════════════════
+
+def render_home():
+    render_market_ticker_bar()
+
+    data = api_get("/results")
+    results = data.get("results", {}) if data else {}
+    total = len(results)
+    buy_count = sum(1 for r in results.values() if r.get("signal") == "BUY")
+    sell_count = sum(1 for r in results.values() if r.get("signal") == "SELL")
+    hold_count = sum(1 for r in results.values() if r.get("signal") == "HOLD")
+
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">Stock AI</div>
+        <div class="page-subtitle">AI-Powered Multi-Tool Stock Analysis Terminal</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total", str(total))
+    m2.metric("Buy", str(buy_count))
+    m3.metric("Sell", str(sell_count))
+    m4.metric("Hold", str(hold_count))
+
+    health = api_get("/health")
+    info = api_get("/")
+    watchlist = load_watchlist()
+
+    st.markdown("""
+    <div class="section-header">
+        <div class="section-title">System Status</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    s1, s2, s3, s4 = st.columns(4)
+    if health:
+        ollama_status = health.get("ollama", "disconnected")
+        s1.metric("Agent", "Online" if ollama_status == "connected" else "Offline")
+        s2.metric("Cached Results", str(health.get("cached_results", 0)))
+        s3.metric("Total Scans", str(health.get("scan_count", 0)))
+    else:
+        s1.metric("Agent", "Offline")
+        s2.metric("Cached Results", "—")
+        s3.metric("Total Scans", "—")
+
+    if info:
+        s4.metric("Model", info.get("model", "—"))
+    else:
+        s4.metric("Model", "—")
+
+    st.markdown("""
+    <div class="section-header">
+        <div class="section-title">Watchlist</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if watchlist:
+        wl_chips = " ".join(f'<span class="wl-chip">{t}</span>' for t in watchlist)
+        st.markdown(f'<div style="line-height:2.2;">{wl_chips}</div>', unsafe_allow_html=True)
+    else:
+        st.caption("No tickers in watchlist. Add tickers from the sidebar.")
+
+    if results:
+        st.markdown("""
+        <div class="section-header">
+            <div class="section-title">Latest Signals</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        rows = []
+        for ticker, r in sorted(results.items(), key=lambda x: abs(x[1].get("score", 0)), reverse=True):
+            rows.append({
+                "Ticker": ticker,
+                "Signal": r.get("signal", "?"),
+                "Score": r.get("score", 0),
+                "Confidence": r.get("confidence", 0),
+                "Time": str(r.get("analyzed_at", ""))[:16],
+            })
+        df = pd.DataFrame(rows)
+        st.dataframe(
+            df.style.map(
+                lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+                subset=["Signal"],
+            ),
+            use_container_width=True, hide_index=True,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -562,146 +709,331 @@ with st.sidebar:
 # ═══════════════════════════════════════════════════════════════
 
 def render_market_ticker_bar():
-    """시장 지수를 가로 티커 바 형태로 렌더링"""
-    indices = fetch_market_indices()
+    indices, market_updated_at = fetch_market_indices()
     if not indices:
         return
 
-    html_parts = ['<div class="ticker-bar">']
+    st.markdown(f'<div class="ts-meta">Updated {market_updated_at}</div>', unsafe_allow_html=True)
 
+    cells = []
     for group_key, group in MARKET_INDICES.items():
-        html_parts.append(f'<div class="ticker-group-label">{group["title"]}</div>')
         for sym, name, decimals in group["items"]:
             info = indices.get(sym)
             if info:
                 pct = info["change_pct"]
-                css = "t-up" if pct > 0 else ("t-down" if pct < 0 else "t-flat")
+                css = "ts-up" if pct > 0 else ("ts-down" if pct < 0 else "ts-flat")
                 arrow = "+" if pct > 0 else ""
-                html_parts.append(f"""
-                <div class="ticker-item">
-                    <div class="t-name">{info['name']}</div>
-                    <div class="t-price">{info['price']:,.{info['decimals']}f}</div>
-                    <div class="t-change {css}">{arrow}{pct:.2f}%</div>
+                cells.append(f"""
+                <div class="ticker-cell">
+                    <div class="tc-name">{info['name']}</div>
+                    <div class="tc-price">{info['price']:,.{info['decimals']}f}</div>
+                    <div class="tc-change {css}">{arrow}{pct:.2f}%</div>
                 </div>""")
             else:
-                html_parts.append(f"""
-                <div class="ticker-item">
-                    <div class="t-name">{name}</div>
-                    <div class="t-price" style="color:#3a4050;">--</div>
-                    <div class="t-change t-flat">N/A</div>
+                cells.append(f"""
+                <div class="ticker-cell">
+                    <div class="tc-name">{name}</div>
+                    <div class="tc-price" style="color:var(--outline);">--</div>
+                    <div class="tc-change ts-flat">N/A</div>
                 </div>""")
 
-    html_parts.append('</div>')
-    st.markdown("".join(html_parts), unsafe_allow_html=True)
+    st.markdown(f'<div class="ticker-expanded">{"".join(cells)}</div>', unsafe_allow_html=True)
 
 
 def render_dashboard():
-    st.markdown('<div class="page-title">Dashboard</div>', unsafe_allow_html=True)
-    st.markdown('<div class="page-subtitle">Real-time market overview and agent analysis results</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">Dashboard</div>
+        <div class="page-subtitle">Market Analysis & Signal Overview</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    # 시장 지수 티커 바
     render_market_ticker_bar()
 
     data = api_get("/results")
     if not data or not data.get("results"):
         st.markdown("""
         <div class="empty-state">
-            <div class="es-icon">📡</div>
+            <div class="es-icon">⚡</div>
             <div class="es-text">No analysis results yet. Run a scan from the sidebar.</div>
         </div>
         """, unsafe_allow_html=True)
         return
 
     results = data["results"]
-
-    # 신호별 분류
+    total = len(results)
     buy_list = {k: v for k, v in results.items() if v.get("signal") == "BUY"}
     sell_list = {k: v for k, v in results.items() if v.get("signal") == "SELL"}
     hold_list = {k: v for k, v in results.items() if v.get("signal") == "HOLD"}
 
-    # 요약 카드
+    analyzed_times = [r.get("analyzed_at", "") for r in results.values() if r.get("analyzed_at")]
+    if analyzed_times:
+        latest_analysis = max(analyzed_times)[:19].replace("T", " ")
+        oldest_analysis = min(analyzed_times)[:19].replace("T", " ")
+        analysis_ts = f"Last analyzed: {latest_analysis}" if latest_analysis == oldest_analysis else f"Analyzed: {oldest_analysis} ~ {latest_analysis}"
+    else:
+        analysis_ts = ""
+
+    buy_pct = int(len(buy_list) / total * 100) if total else 0
+    sell_pct = int(len(sell_list) / total * 100) if total else 0
+    hold_pct = int(len(hold_list) / total * 100) if total else 0
+
     st.markdown(f"""
     <div class="summary-grid">
-        <div class="summary-card sc-total">
-            <div class="sc-label">Total</div>
-            <div class="sc-value">{len(results)}</div>
+        <div class="summary-card">
+            <div class="sc-label">Total Coverage</div>
+            <div class="sc-value" style="color:var(--primary-ctr);">{total}</div>
+            <div class="sc-sub">Instruments</div>
+            <div class="sc-bar"><div class="sc-bar-fill" style="width:100%; background:var(--primary-ctr);"></div></div>
         </div>
-        <div class="summary-card sc-buy">
-            <div class="sc-label">Buy</div>
-            <div class="sc-value" style="color:#00d4a1;">{len(buy_list)}</div>
+        <div class="summary-card">
+            <div class="sc-label">Buy Signals</div>
+            <div class="sc-value" style="color:var(--buy);">{len(buy_list)}</div>
+            <div class="sc-sub">Optimal Entry</div>
+            <div class="sc-bar"><div class="sc-bar-fill" style="width:{buy_pct}%; background:var(--buy);"></div></div>
         </div>
-        <div class="summary-card sc-sell">
-            <div class="sc-label">Sell</div>
-            <div class="sc-value" style="color:#ff5370;">{len(sell_list)}</div>
+        <div class="summary-card">
+            <div class="sc-label">Sell Signals</div>
+            <div class="sc-value" style="color:var(--sell);">{len(sell_list)}</div>
+            <div class="sc-sub">Risk Detected</div>
+            <div class="sc-bar"><div class="sc-bar-fill" style="width:{sell_pct}%; background:var(--sell);"></div></div>
         </div>
-        <div class="summary-card sc-hold">
-            <div class="sc-label">Hold</div>
-            <div class="sc-value" style="color:#ffb347;">{len(hold_list)}</div>
+        <div class="summary-card">
+            <div class="sc-label">Hold Signals</div>
+            <div class="sc-value" style="color:var(--hold);">{len(hold_list)}</div>
+            <div class="sc-sub">Neutral Weight</div>
+            <div class="sc-bar"><div class="sc-bar-fill" style="width:{hold_pct}%; background:var(--hold);"></div></div>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # 종목 테이블 데이터
+    if analysis_ts:
+        st.markdown(f'<div class="ts-meta">{analysis_ts}</div>', unsafe_allow_html=True)
+
     rows = []
     for ticker, r in sorted(results.items(), key=lambda x: x[1].get("score", 0), reverse=True):
         dist = r.get("signal_distribution", {})
         rows.append({
-            "Ticker": ticker,
-            "Signal": r.get("signal", "?"),
-            "Score": r.get("score", 0),
-            "Confidence": r.get("confidence", 0),
-            "Buy": dist.get("buy", 0),
-            "Sell": dist.get("sell", 0),
-            "Neutral": dist.get("neutral", 0),
-            "Time": str(r.get("analyzed_at", ""))[:16],
+            "ticker": ticker,
+            "signal": r.get("signal", "?"),
+            "score": r.get("score", 0),
+            "confidence": r.get("confidence", 0),
+            "buy": dist.get("buy", 0),
+            "sell": dist.get("sell", 0),
+            "neutral": dist.get("neutral", 0),
+            "time": str(r.get("analyzed_at", ""))[:16],
         })
 
-    df = pd.DataFrame(rows)
-    if df.empty:
+    if not rows:
         return
 
-    # 점수 바 차트
-    st.markdown('<div class="section-title">Score Overview</div>', unsafe_allow_html=True)
+    df = pd.DataFrame(rows)
 
-    fig = go.Figure()
-    bar_colors = ["#00d4a1" if s > 0 else "#ff5370" if s < 0 else "#3a4050" for s in df["Score"]]
-    fig.add_trace(go.Bar(
-        x=df["Score"], y=df["Ticker"], orientation='h',
-        marker=dict(color=bar_colors, line=dict(width=0)),
-        text=[f"{s:+.1f}" for s in df["Score"]],
-        textposition="outside",
-        textfont=dict(color="#8890a0", size=11, family="JetBrains Mono"),
-    ))
-    fig.update_layout(**_plotly_base_layout(
-        height=max(280, len(df) * 44),
-        xaxis=dict(range=[-10, 10], title="", gridcolor="#1c2030", zerolinecolor="#252a3a"),
-        yaxis=dict(
-            autorange="reversed", gridcolor="rgba(0,0,0,0)",
-            tickfont=dict(family="Inter, sans-serif", size=12, color="#c8ccd4"),
-        ),
-        margin=dict(l=90, r=80, t=8, b=8),
-    ))
-    fig.add_vline(x=0, line_color="#252a3a", line_width=1)
-    st.plotly_chart(fig, use_container_width=True)
+    col_score, col_table = st.columns([2, 3])
 
-    # 종목 테이블
-    st.markdown('<div class="section-title">Analysis Results</div>', unsafe_allow_html=True)
-    st.dataframe(
-        df.style.map(
-            lambda v: "color: #00d4a1" if v == "BUY" else ("color: #ff5370" if v == "SELL" else "color: #ffb347"),
-            subset=["Signal"]
-        ),
-        use_container_width=True, hide_index=True,
-    )
+    with col_score:
+        st.markdown('<div class="section-title">Signal Score Matrix</div>', unsafe_allow_html=True)
+
+        fig = go.Figure()
+        bar_colors = ["#02d4a1" if s > 0 else "#fd526f" if s < 0 else "#32353c" for s in df["score"]]
+        fig.add_trace(go.Bar(
+            x=df["score"], y=df["ticker"], orientation='h',
+            marker=dict(color=bar_colors, line=dict(width=0)),
+            text=[f"{s:+.1f}" for s in df["score"]],
+            textposition="outside",
+            textfont=dict(color="#8d909e", size=11, family="JetBrains Mono"),
+        ))
+        fig.update_layout(**_plotly_base_layout(
+            height=max(280, len(df) * 52),
+            xaxis=dict(range=[-10, 10], title="", gridcolor="rgba(66,71,82,0.15)", zerolinecolor="rgba(66,71,82,0.25)"),
+            yaxis=dict(
+                autorange="reversed", gridcolor="rgba(0,0,0,0)",
+                tickfont=dict(family="JetBrains Mono", size=12, color="#e1e2eb"),
+            ),
+            margin=dict(l=70, r=60, t=8, b=8),
+        ))
+        fig.add_vline(x=0, line_color="rgba(66,71,82,0.3)", line_width=1)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_table:
+        st.markdown('<div class="section-title">Analysis Execution Results</div>', unsafe_allow_html=True)
+
+        display_df = df[["ticker", "signal", "score", "confidence"]].rename(columns={
+            "ticker": "Ticker", "signal": "Signal", "score": "Score", "confidence": "Confidence",
+        })
+        st.dataframe(
+            display_df.style.map(
+                lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+                subset=["Signal"],
+            ),
+            use_container_width=True, hide_index=True,
+            height=max(280, len(df) * 52),
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
 #  종목 상세 페이지
 # ═══════════════════════════════════════════════════════════════
 
+def _fmt_num(v, decimals=2):
+    if v is None:
+        return "—"
+    if isinstance(v, str):
+        return v
+    return f"{v:,.{decimals}f}"
+
+
+def _render_tool_detail_card(td: dict):
+    tool_name = td.get("tool", "")
+    name = td.get("name", tool_name)
+    sig = td.get("signal", "neutral")
+    sc = td.get("score", 0)
+    detail_text = td.get("detail", "")
+    sig_color = "#02d4a1" if sig == "buy" else ("#fd526f" if sig == "sell" else "#ffb347")
+
+    st.markdown(f"**{name}**")
+    st.markdown(
+        f'<span style="color:{sig_color}; font-weight:700; font-size:13px;">'
+        f'{sig.upper()} ({sc:+.1f})</span>',
+        unsafe_allow_html=True,
+    )
+
+    if tool_name == "trend_ma_analysis":
+        sma = td.get("sma_values", {})
+        pvs = td.get("price_vs_sma", {})
+        cols = st.columns(len(sma)) if sma else []
+        for col, (period, val) in zip(cols, sma.items()):
+            pos = pvs.get(f"SMA_{period}", "—")
+            col.metric(f"SMA {period}", f"${_fmt_num(val)}", pos)
+        alignment = td.get("alignment", "—")
+        cross = td.get("cross_signal", "none")
+        c1, c2 = st.columns(2)
+        c1.metric("Alignment", alignment.title())
+        c2.metric("Cross Signal", cross.title() if cross != "none" else "—")
+
+    elif tool_name == "rsi_divergence_analysis":
+        c1, c2, c3 = st.columns(3)
+        c1.metric("RSI", _fmt_num(td.get("current_rsi"), 1))
+        c2.metric("Zone", str(td.get("rsi_zone", "—")).title())
+        c3.metric("Divergence", str(td.get("divergence", "none")).title())
+
+    elif tool_name == "bollinger_squeeze_analysis":
+        c1, c2, c3 = st.columns(3)
+        c1.metric("BB Upper", f"${_fmt_num(td.get('bb_upper'))}")
+        c2.metric("BB Lower", f"${_fmt_num(td.get('bb_lower'))}")
+        c3.metric("%B", _fmt_num(td.get("pct_b")))
+        c4, c5, c6 = st.columns(3)
+        c4.metric("Width %", _fmt_num(td.get("bb_width_pct"), 1))
+        c5.metric("Squeeze", "Yes" if td.get("squeeze") else "No")
+        c6.metric("Expanding", "Yes" if td.get("expanding") else "No")
+
+    elif tool_name == "macd_momentum_analysis":
+        c1, c2, c3 = st.columns(3)
+        c1.metric("MACD", _fmt_num(td.get("macd"), 4))
+        c2.metric("Signal Line", _fmt_num(td.get("signal_line"), 4))
+        c3.metric("Histogram", _fmt_num(td.get("histogram"), 4))
+        c4, c5, c6 = st.columns(3)
+        c4.metric("Cross", str(td.get("cross", "none")).title())
+        c5.metric("Acceleration", str(td.get("histogram_acceleration", "—")).title())
+        c6.metric("Zero Position", str(td.get("zero_position", "—")).title())
+
+    elif tool_name == "adx_trend_strength_analysis":
+        c1, c2 = st.columns(2)
+        c1.metric("ADX", _fmt_num(td.get("adx"), 1))
+        c2.metric("Trend Strength", str(td.get("trend_strength", "—")).title())
+        c3, c4, c5 = st.columns(3)
+        c3.metric("+DI", _fmt_num(td.get("plus_di"), 1))
+        c4.metric("-DI", _fmt_num(td.get("minus_di"), 1))
+        c5.metric("Direction", str(td.get("trend_direction", "—")).title())
+
+    elif tool_name == "volume_profile_analysis":
+        c1, c2 = st.columns(2)
+        c1.metric("Volume Ratio", f"{_fmt_num(td.get('volume_ratio'), 2)}x")
+        c2.metric("OBV Trend", str(td.get("obv_trend", "—")).title())
+
+    elif tool_name == "fibonacci_retracement_analysis":
+        levels = td.get("levels", {})
+        if levels:
+            level_data = {f"Fib {k}": f"${_fmt_num(v)}" for k, v in levels.items()}
+            cols = st.columns(min(len(level_data), 4))
+            for col, (label, val) in zip(cols, list(level_data.items())[:4]):
+                col.metric(label, val)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Retracement", _fmt_num(td.get("current_retracement"), 1))
+        c2.metric("Nearest Support", f"${_fmt_num(td.get('nearest_support'))}")
+        c3.metric("Nearest Resistance", f"${_fmt_num(td.get('nearest_resistance'))}")
+
+    elif tool_name == "volatility_regime_analysis":
+        c1, c2, c3 = st.columns(3)
+        c1.metric("ATR", f"${_fmt_num(td.get('current_atr'))}")
+        c2.metric("ATR %", f"{_fmt_num(td.get('atr_pct'), 1)}%")
+        c3.metric("Regime", str(td.get("regime", "—")).title())
+        c4, c5 = st.columns(2)
+        c4.metric("Percentile", f"{_fmt_num(td.get('percentile'), 0)}%")
+        c5.metric("Annualized Vol", f"{_fmt_num(td.get('annualized_volatility'), 1)}%")
+
+    elif tool_name == "mean_reversion_analysis":
+        zscores = td.get("z_scores", {})
+        if zscores:
+            cols = st.columns(min(len(zscores), 4))
+            for col, (period, val) in zip(cols, list(zscores.items())[:4]):
+                col.metric(f"Z-Score {period}", _fmt_num(val))
+        c1, c2 = st.columns(2)
+        c1.metric("Avg Z-Score", _fmt_num(td.get("avg_z_score")))
+        c2.metric("Reversion Prob", f"{_fmt_num(td.get('reversion_probability'), 0)}%")
+
+    elif tool_name == "momentum_rank_analysis":
+        returns = td.get("returns", {})
+        if returns:
+            cols = st.columns(min(len(returns), 4))
+            for col, (period, val) in zip(cols, list(returns.items())[:4]):
+                color = "normal" if val is None else ("off" if val < 0 else "normal")
+                col.metric(f"Return {period}", f"{_fmt_num(val, 1)}%" if val is not None else "—")
+        c1, c2 = st.columns(2)
+        c1.metric("Weighted Return", f"{_fmt_num(td.get('weighted_return'), 2)}%")
+        c2.metric("Acceleration", str(td.get("acceleration", "—")).title())
+
+    elif tool_name == "support_resistance_analysis":
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Pivot", f"${_fmt_num(td.get('pivot'))}")
+        c2.metric("Upside %", f"{_fmt_num(td.get('upside_pct'), 1)}%")
+        c3.metric("Downside %", f"{_fmt_num(td.get('downside_pct'), 1)}%")
+        resistance = td.get("resistance", {})
+        support = td.get("support", {})
+        if resistance:
+            cols = st.columns(len(resistance))
+            for col, (level, val) in zip(cols, resistance.items()):
+                col.metric(f"R{level}", f"${_fmt_num(val)}")
+        if support:
+            cols = st.columns(len(support))
+            for col, (level, val) in zip(cols, support.items()):
+                col.metric(f"S{level}", f"${_fmt_num(val)}")
+        rr = td.get("risk_reward_ratio")
+        if rr is not None:
+            st.metric("Risk/Reward Ratio", _fmt_num(rr))
+
+    elif tool_name == "correlation_regime_analysis":
+        ac = td.get("autocorrelations", {})
+        if ac:
+            cols = st.columns(min(len(ac), 5))
+            for col, (lag, val) in zip(cols, list(ac.items())[:5]):
+                col.metric(f"Lag {lag}", _fmt_num(val, 3))
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Avg Autocorrelation", _fmt_num(td.get("avg_autocorrelation"), 3))
+        c2.metric("Hurst Exponent", _fmt_num(td.get("hurst_exponent"), 3))
+        c3.metric("Regime", str(td.get("regime", "—")).title())
+
+    if detail_text:
+        st.caption(detail_text)
+
+
 def render_detail():
-    st.markdown('<div class="page-title">Detail Analysis</div>', unsafe_allow_html=True)
-    st.markdown('<div class="page-subtitle">In-depth 16-tool analysis for individual stocks</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">Detail Analysis</div>
+        <div class="page-subtitle">In-depth 16-tool analysis for individual stocks</div>
+    </div>
+    """, unsafe_allow_html=True)
 
     data = api_get("/results")
     if not data or not data.get("results"):
@@ -727,89 +1059,80 @@ def render_detail():
     score = detail.get("composite_score", 0)
     confidence = detail.get("confidence", 0)
     tool_count = detail.get("tool_count", 0)
+    dist = detail.get("signal_distribution", {})
+    analyzed_at = str(detail.get("analyzed_at", ""))[:19].replace("T", " ")
 
-    # 시그널 배지 + 메트릭
     badge_class = "buy" if signal == "BUY" else ("sell" if signal == "SELL" else "hold")
-    score_color = "#00d4a1" if score > 0 else "#ff5370" if score < 0 else "#8890a0"
+    score_color = "var(--buy)" if score > 0 else "var(--sell)" if score < 0 else "var(--outline)"
 
     st.markdown(f"""
-    <div style="display:flex; align-items:center; gap:20px; margin-bottom:20px;">
-        <div>
-            <div style="font-size:11px; color:#5a6270; text-transform:uppercase; letter-spacing:0.8px; margin-bottom:6px;">Signal</div>
-            <div class="signal-badge {badge_class}">{signal}</div>
-        </div>
-    </div>
-    <div class="detail-metrics">
-        <div class="dm-card">
-            <div class="dm-label">Composite Score</div>
-            <div class="dm-value" style="color:{score_color};">{score:+.2f}</div>
-        </div>
-        <div class="dm-card">
-            <div class="dm-label">Confidence</div>
-            <div class="dm-value">{confidence}<span style="font-size:14px; color:#5a6270;">/10</span></div>
-        </div>
-        <div class="dm-card">
-            <div class="dm-label">Tools Used</div>
-            <div class="dm-value">{tool_count}</div>
-        </div>
+    <div style="margin-bottom:24px;">
+        <div style="font-size:10px; color:var(--on-surface-variant); text-transform:uppercase; letter-spacing:1px; margin-bottom:8px;">Signal</div>
+        <span class="signal-badge-lg {badge_class}">{signal}</span>
     </div>
     """, unsafe_allow_html=True)
 
-    # 분석 기법 결과
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Composite Score", f"{score:+.2f}")
+    m2.metric("Confidence", f"{confidence}/10")
+    m3.metric("Tools", str(tool_count))
+    m4.metric("Buy Votes", str(dist.get("buy", 0)))
+    m5.metric("Sell Votes", str(dist.get("sell", 0)))
+    m6.metric("Neutral Votes", str(dist.get("neutral", 0)))
+
+    if analyzed_at:
+        st.markdown(f'<div class="ts-meta">Analyzed: {analyzed_at}</div>', unsafe_allow_html=True)
+
     summaries = detail.get("tool_summaries", [])
     if summaries:
-        st.markdown(f'<div class="section-title">Tool Results ({len(summaries)} Tools)</div>', unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="section-header">
+            <div class="section-title">Tool Score Overview</div>
+            <div class="section-subtitle">{len(summaries)} TOOLS</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-        col_chart, col_table = st.columns([3, 2])
+        names = [s["name"] for s in summaries]
+        scores = [s["score"] for s in summaries]
+        bar_colors = ["#02d4a1" if s > 0 else "#fd526f" if s < 0 else "#32353c" for s in scores]
 
-        with col_chart:
-            names = [s["name"] for s in summaries]
-            scores = [s["score"] for s in summaries]
-            bar_colors = ["#00d4a1" if s > 0 else "#ff5370" if s < 0 else "#3a4050" for s in scores]
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            y=names, x=scores, orientation='h',
+            marker=dict(color=bar_colors, line=dict(width=0)),
+            text=[f"{s:+.1f}" for s in scores],
+            textposition="outside",
+            textfont=dict(color="#8d909e", size=11, family="JetBrains Mono"),
+        ))
+        fig.update_layout(**_plotly_base_layout(
+            height=max(400, len(summaries) * 38),
+            xaxis=dict(range=[-10, 10], title="", gridcolor="rgba(66,71,82,0.15)", zerolinecolor="rgba(66,71,82,0.25)"),
+            yaxis=dict(
+                autorange="reversed", gridcolor="rgba(0,0,0,0)",
+                tickfont=dict(family="Inter, sans-serif", size=11, color="#c3c6d4"),
+            ),
+            margin=dict(l=200, r=60, t=8, b=8),
+        ))
+        fig.add_vline(x=0, line_color="rgba(66,71,82,0.3)", line_width=1)
+        st.plotly_chart(fig, use_container_width=True)
 
-            fig = go.Figure()
-            fig.add_trace(go.Bar(
-                y=names, x=scores, orientation='h',
-                marker=dict(color=bar_colors, line=dict(width=0)),
-                text=[f"{s:+.1f}" for s in scores],
-                textposition="outside",
-                textfont=dict(color="#8890a0", size=11, family="JetBrains Mono"),
-            ))
-            fig.update_layout(**_plotly_base_layout(
-                height=max(400, len(summaries) * 34),
-                xaxis=dict(range=[-10, 10], title="", gridcolor="#1c2030", zerolinecolor="#252a3a"),
-                yaxis=dict(
-                    autorange="reversed", gridcolor="rgba(0,0,0,0)",
-                    tickfont=dict(family="Inter, sans-serif", size=11, color="#c8ccd4"),
-                ),
-                margin=dict(l=200, r=60, t=8, b=8),
-            ))
-            fig.add_vline(x=0, line_color="#252a3a", line_width=1)
-            st.plotly_chart(fig, use_container_width=True)
+    tool_details = detail.get("tool_details", [])
+    if tool_details:
+        st.markdown("""
+        <div class="section-header">
+            <div class="section-title">Detailed Tool Analysis</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-        with col_table:
-            tool_rows = []
-            for s in summaries:
-                sig = s["signal"]
-                color = "#00d4a1" if sig == "buy" else ("#ff5370" if sig == "sell" else "#ffb347")
-                tool_rows.append({
-                    "Tool": s["name"],
-                    "Signal": sig.upper(),
-                    "Score": s["score"],
-                    "Summary": s.get("detail", "")[:60],
-                })
-            tdf = pd.DataFrame(tool_rows)
-            st.dataframe(
-                tdf.style.map(
-                    lambda v: "color: #00d4a1" if v == "BUY" else ("color: #ff5370" if v == "SELL" else "color: #ffb347"),
-                    subset=["Signal"]
-                ),
-                use_container_width=True, hide_index=True,
-                height=max(400, len(summaries) * 34),
-            )
+        for td in tool_details:
+            with st.expander(f"**{td.get('name', td.get('tool', '?'))}** — {td.get('signal', '?').upper()} ({td.get('score', 0):+.1f})", expanded=False):
+                _render_tool_detail_card(td)
 
-    # 차트 이미지
-    st.markdown('<div class="section-title">Chart</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="section-header">
+        <div class="section-title">Chart</div>
+    </div>
+    """, unsafe_allow_html=True)
     chart_url = get_chart_url(selected)
     try:
         resp = httpx.get(chart_url, timeout=5)
@@ -820,22 +1143,14 @@ def render_detail():
     except Exception:
         st.caption("Chart load failed")
 
-    # LLM 종합 판단
     llm = detail.get("llm_conclusion", "")
     if llm and not llm.startswith("[오류]") and not llm.startswith("[LLM"):
-        st.markdown('<div class="section-title">LLM Conclusion</div>', unsafe_allow_html=True)
-        st.markdown(f"""
-        <div style="background:#111520; border:1px solid #1c2030; border-radius:10px; padding:20px 24px; line-height:1.7; color:#c8ccd4; font-size:14px;">
-        {llm}
+        st.markdown("""
+        <div class="section-header">
+            <div class="section-title">LLM Conclusion</div>
         </div>
         """, unsafe_allow_html=True)
-
-    # 상세 JSON
-    tool_details = detail.get("tool_details", [])
-    if tool_details:
-        with st.expander("Raw Tool Data (JSON)", expanded=False):
-            for td in tool_details:
-                st.json(td)
+        st.markdown(f'<div class="llm-body">\n\n{llm}\n\n</div>', unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -843,8 +1158,12 @@ def render_detail():
 # ═══════════════════════════════════════════════════════════════
 
 def render_history():
-    st.markdown('<div class="page-title">Scan History</div>', unsafe_allow_html=True)
-    st.markdown('<div class="page-subtitle">Recent scan results and alert timeline</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">Scan History</div>
+        <div class="page-subtitle">Recent scan results and alert timeline</div>
+    </div>
+    """, unsafe_allow_html=True)
 
     data = api_get("/history?limit=20")
     if not data or not data.get("history"):
@@ -865,30 +1184,31 @@ def render_history():
         results = entry.get("results", {})
         alerts = entry.get("alerts", [])
 
-        alert_badge = f'<span style="background:rgba(255,83,112,0.15); color:#ff5370; padding:2px 8px; border-radius:4px; font-size:11px; margin-left:8px;">{len(alerts)} alerts</span>' if alerts else ""
+        alert_label = f" | {len(alerts)} alerts" if alerts else ""
 
-        with st.expander(f"**{ts}** -- {len(tickers)} tickers{' ' if alerts else ''}", expanded=(i == 0)):
+        with st.expander(f"**{ts}** — {len(tickers)} tickers{alert_label}", expanded=(i == 0)):
             if alerts:
-                st.markdown(alert_badge, unsafe_allow_html=True)
+                st.markdown(
+                    f'<span class="signal-pill sell" style="margin-bottom:8px;">{len(alerts)} alerts</span>',
+                    unsafe_allow_html=True,
+                )
             if not results:
                 st.caption("No results")
                 continue
 
-            rows = []
+            h_rows = []
             for ticker, r in sorted(results.items(), key=lambda x: x[1].get("score", 0), reverse=True):
-                signal = r.get("signal", "?")
-                rows.append({
+                h_rows.append({
                     "Ticker": ticker,
-                    "Signal": signal,
+                    "Signal": r.get("signal", "?"),
                     "Score": r.get("score", 0),
                     "Confidence": r.get("confidence", 0),
                 })
-
-            hdf = pd.DataFrame(rows)
+            hdf = pd.DataFrame(h_rows)
             st.dataframe(
                 hdf.style.map(
-                    lambda v: "color: #00d4a1" if v == "BUY" else ("color: #ff5370" if v == "SELL" else "color: #ffb347"),
-                    subset=["Signal"]
+                    lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+                    subset=["Signal"],
                 ),
                 use_container_width=True, hide_index=True,
             )
@@ -898,7 +1218,9 @@ def render_history():
 #  라우팅
 # ═══════════════════════════════════════════════════════════════
 
-if page == "Dashboard":
+if page == "Home":
+    render_home()
+elif page == "Dashboard":
     render_dashboard()
 elif page == "Detail":
     render_detail()
