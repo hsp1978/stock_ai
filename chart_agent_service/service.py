@@ -33,6 +33,17 @@ from config import (
 )
 from data_collector import fetch_ohlcv, calculate_indicators, fetch_fundamentals, fetch_options_pcr, fetch_insider_trades
 from analysis_tools import ChartAnalysisAgent, generate_agent_chart
+from backtest_engine import run_all_backtests
+from ml_predictor import run_ml_prediction
+from portfolio_optimizer import (
+    markowitz_optimize, risk_parity_optimize,
+    compute_factor_ranking, compute_correlation_beta,
+)
+from paper_trader import (
+    get_portfolio_status, execute_paper_order,
+    process_agent_signal, update_position_prices,
+    reset_paper_trading,
+)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -158,7 +169,7 @@ def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
         except Exception as e:
             print(f"  [{ticker}] 내부자 거래 수집 실패: {e}")
 
-        print(f"  [{ticker}] 13개 기법 분석...")
+        print(f"  [{ticker}] 16개 기법 분석...")
         agent = ChartAnalysisAgent(ticker, df)
         result = agent.run(mode=ai_mode)
 
@@ -379,7 +390,7 @@ def run_scheduled_scan(override_tickers: list[str] | None = None):
 
 app = FastAPI(
     title="Chart Analysis Agent",
-    description="12개 기법 차트 분석 에이전트 API (Mac Studio)",
+    description="16개 기법 차트 분석 에이전트 + 퀀트 시스템 API",
     version="1.0.0",
 )
 
@@ -498,6 +509,106 @@ def health():
         "scan_count": len(scan_history),
         "uptime_scans": len(scan_history),
     }
+
+
+@app.get("/backtest/{ticker}")
+def get_backtest(ticker: str):
+    """단일 종목 백테스트 결과"""
+    ticker = ticker.upper()
+    data = latest_results.get(ticker, {})
+    r = data.get("result", {})
+    if not r:
+        raise HTTPException(404, f"{ticker}: 분석 결과 없음. 먼저 /scan/{ticker} 실행 필요.")
+    try:
+        df = fetch_ohlcv(ticker)
+        df = calculate_indicators(df)
+        tool_results = r.get("tool_details", [])
+        return run_all_backtests(ticker, df, tool_results)
+    except Exception as e:
+        raise HTTPException(500, f"백테스트 실패: {e}")
+
+
+@app.get("/ml/{ticker}")
+def get_ml_prediction(ticker: str):
+    """ML 방향 예측"""
+    ticker = ticker.upper()
+    try:
+        df = fetch_ohlcv(ticker)
+        df = calculate_indicators(df)
+        return run_ml_prediction(ticker, df)
+    except Exception as e:
+        raise HTTPException(500, f"ML 예측 실패: {e}")
+
+
+@app.get("/portfolio/optimize")
+def get_portfolio_optimization(method: str = "markowitz"):
+    """포트폴리오 최적화 (마코위츠/리스크패리티)"""
+    tickers = list(latest_results.keys())
+    if len(tickers) < 2:
+        raise HTTPException(400, "최소 2개 종목 분석 결과 필요")
+    if method == "risk_parity":
+        return risk_parity_optimize(tickers)
+    return markowitz_optimize(tickers)
+
+
+@app.get("/portfolio/correlation")
+def get_correlation_beta():
+    """종목 간 상관관계/베타 분석"""
+    tickers = list(latest_results.keys())
+    if not tickers:
+        raise HTTPException(400, "분석 결과 없음")
+    return compute_correlation_beta(tickers)
+
+
+@app.get("/ranking")
+def get_factor_ranking():
+    """팩터 기반 크로스섹션 종목 랭킹"""
+    ranking = compute_factor_ranking(latest_results)
+    return {"count": len(ranking), "ranking": ranking}
+
+
+@app.get("/paper")
+def get_paper_status():
+    """페이퍼 트레이딩 포트폴리오 현황"""
+    return get_portfolio_status()
+
+
+@app.post("/paper/order")
+def paper_order(ticker: str, action: str, qty: int, price: float, reason: str = ""):
+    """페이퍼 트레이딩 수동 주문"""
+    ticker = ticker.upper()
+    action = action.upper()
+    if action not in ("BUY", "SELL"):
+        raise HTTPException(400, "action은 BUY 또는 SELL")
+    return execute_paper_order(ticker, action, qty, price, reason)
+
+
+@app.post("/paper/auto")
+def paper_auto_trade():
+    """최신 분석 결과 기반 자동 모의매매 실행"""
+    orders = []
+    for ticker, data in latest_results.items():
+        r = data.get("result", {})
+        if not r:
+            continue
+        try:
+            price = float(r.get("tool_details", [{}])[0].get("entry_price", 0))
+            if price <= 0:
+                df = fetch_ohlcv(ticker)
+                price = float(df["Close"].iloc[-1])
+        except Exception:
+            continue
+        update_position_prices({ticker: price})
+        order = process_agent_signal(ticker, r, price)
+        if order:
+            orders.append(order)
+    return {"executed": len(orders), "orders": orders}
+
+
+@app.post("/paper/reset")
+def paper_reset():
+    """페이퍼 트레이딩 초기화"""
+    return reset_paper_trading()
 
 
 @app.post("/restart")

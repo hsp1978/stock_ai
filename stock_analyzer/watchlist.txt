@@ -1,9 +1,7 @@
 # 관심 종목 리스트 (한 줄에 하나, #은 주석)
 # 빈 줄과 주석은 무시됨
 
-MSFT
-GOOGL
-AMZN
 NVDA
-META
 TSLA
+아이온큐
+INTC

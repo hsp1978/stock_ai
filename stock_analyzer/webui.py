@@ -394,6 +394,174 @@ def fetch_market_indices() -> tuple[dict, str]:
     return results, fetched_at
 
 
+KR_NAME_TO_TICKER = {
+    "애플": "AAPL", "아이폰": "AAPL",
+    "마이크로소프트": "MSFT", "엠에스": "MSFT",
+    "구글": "GOOGL", "알파벳": "GOOGL",
+    "아마존": "AMZN",
+    "메타": "META", "페이스북": "META",
+    "엔비디아": "NVDA",
+    "테슬라": "TSLA",
+    "넷플릭스": "NFLX",
+    "디즈니": "DIS",
+    "나이키": "NKE",
+    "코카콜라": "KO",
+    "펩시": "PEP", "펩시코": "PEP",
+    "맥도날드": "MCD",
+    "스타벅스": "SBUX",
+    "비자": "V",
+    "마스터카드": "MA",
+    "존슨앤존슨": "JNJ",
+    "프록터앤갬블": "PG",
+    "월마트": "WMT",
+    "코스트코": "COST",
+    "보잉": "BA",
+    "인텔": "INTC",
+    "AMD": "AMD", "에이엠디": "AMD",
+    "브로드컴": "AVGO",
+    "퀄컴": "QCOM",
+    "텍사스인스트루먼트": "TXN",
+    "어도비": "ADBE",
+    "세일즈포스": "CRM",
+    "오라클": "ORCL",
+    "시스코": "CSCO",
+    "아이비엠": "IBM", "IBM": "IBM",
+    "팔란티어": "PLTR",
+    "스노우플레이크": "SNOW",
+    "크라우드스트라이크": "CRWD",
+    "우버": "UBER",
+    "에어비앤비": "ABNB",
+    "스포티파이": "SPOT",
+    "쇼피파이": "SHOP",
+    "줌": "ZM", "줌비디오": "ZM",
+    "페이팔": "PYPL",
+    "블록": "SQ", "스퀘어": "SQ",
+    "로빈후드": "HOOD",
+    "코인베이스": "COIN",
+    "리비안": "RIVN",
+    "루시드": "LCID",
+    "소파이": "SOFI",
+    "램리서치": "LRCX",
+    "어플라이드머티어리얼즈": "AMAT", "어플라이드": "AMAT",
+    "ASML": "ASML", "에이에스엠엘": "ASML",
+    "마이크론": "MU",
+    "슈퍼마이크로": "SMCI",
+    "아리스타네트웍스": "ANET",
+    "서비스나우": "NOW",
+    "워크데이": "WDAY",
+    "몽고디비": "MDB",
+    "데이터독": "DDOG",
+    "유니티": "U",
+    "로블록스": "RBLX",
+    "일라이릴리": "LLY",
+    "화이자": "PFE",
+    "머크": "MRK",
+    "애브비": "ABBV",
+    "암젠": "AMGN",
+    "모더나": "MRNA",
+    "유나이티드헬스": "UNH",
+    "버크셔해서웨이": "BRK-B", "버크셔": "BRK-B",
+    "제이피모건": "JPM", "JP모건": "JPM",
+    "골드만삭스": "GS",
+    "모건스탠리": "MS",
+    "뱅크오브아메리카": "BAC",
+    "웰스파고": "WFC",
+    "찰스슈왑": "SCHW",
+    "블랙록": "BLK",
+    "아메리칸익스프레스": "AXP", "아멕스": "AXP",
+    "시티그룹": "C", "시티": "C",
+    "엑슨모빌": "XOM",
+    "셰브론": "CVX",
+    "록히드마틴": "LMT",
+    "레이시온": "RTX",
+    "캐터필러": "CAT",
+    "3M": "MMM", "쓰리엠": "MMM",
+    "허니웰": "HON",
+    "제너럴일렉트릭": "GE", "GE": "GE",
+    "포드": "F",
+    "제너럴모터스": "GM", "GM": "GM",
+    "홈디포": "HD",
+    "로우스": "LOW",
+    "타겟": "TGT",
+    "달러제너럴": "DG",
+    "크로거": "KR",
+    "AT&T": "T", "에이티앤티": "T",
+    "버라이즌": "VZ",
+    "티모바일": "TMUS",
+    "컴캐스트": "CMCSA",
+    "넥스트에라에너지": "NEE",
+    "서던컴퍼니": "SO",
+    "듀크에너지": "DUK",
+    "리얼티인컴": "O",
+    "아메리칸타워": "AMT",
+    "프롤로지스": "PLD",
+    "ARM": "ARM", "에이알엠": "ARM", "암": "ARM",
+    "팔로알토": "PANW", "팔로알토네트웍스": "PANW",
+    "지스케일러": "ZS",
+    "포티넷": "FTNT",
+    "델": "DELL", "델테크놀로지": "DELL",
+    "HP": "HPQ", "에이치피": "HPQ",
+    "트위터": "X",
+    "핀터레스트": "PINS",
+    "스냅": "SNAP", "스냅챗": "SNAP",
+    "레딧": "RDDT",
+    "앱러빈": "APP",
+    "덱스컴": "DXCM",
+    "인튜이티브서지컬": "ISRG",
+    "일루미나": "ILMN",
+    "도미노피자": "DPZ",
+    "치폴레": "CMG",
+    "힐튼": "HLT",
+    "마리어트": "MAR",
+}
+
+_KR_LOOKUP = {k.lower(): v for k, v in KR_NAME_TO_TICKER.items()}
+
+
+def resolve_ticker(user_input: str) -> tuple[str, str]:
+    text = user_input.strip()
+    if not text:
+        return "", ""
+
+    upper = text.upper()
+    if upper.isascii() and len(upper) <= 10:
+        return upper, ""
+
+    query = text.lower()
+
+    exact = _KR_LOOKUP.get(query)
+    if exact:
+        return exact, f"{text} → {exact}"
+
+    best_match = None
+    best_len = 0
+    for name, ticker in _KR_LOOKUP.items():
+        if name == query or query == name:
+            return ticker, f"{text} → {ticker}"
+        if query.startswith(name) or name.startswith(query):
+            if len(name) > best_len:
+                best_match = (ticker, name)
+                best_len = len(name)
+
+    try:
+        import yfinance as _yf
+        results = _yf.Search(text, max_results=3)
+        quotes = results.quotes if hasattr(results, 'quotes') else []
+        if quotes:
+            best = quotes[0]
+            sym = best.get("symbol", "")
+            sname = best.get("shortname", best.get("longname", ""))
+            if sym:
+                return sym, f"{text} → {sym} ({sname})"
+    except Exception:
+        pass
+
+    if best_match:
+        return best_match[0], f"{text} → {best_match[0]} ({best_match[1]})"
+
+    return text, ""
+
+
 def api_get(path: str, timeout: int = 10):
     try:
         resp = httpx.get(f"{AGENT_API_URL}{path}", timeout=timeout)
@@ -425,12 +593,18 @@ def get_chart_url(ticker: str) -> str:
 def load_watchlist() -> list[str]:
     if not os.path.exists(WATCHLIST_PATH):
         return []
+    result = []
     with open(WATCHLIST_PATH, "r", encoding="utf-8") as f:
-        return [
-            line.strip().upper()
-            for line in f
-            if line.strip() and not line.strip().startswith("#")
-        ]
+        for line in f:
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            if raw.isascii():
+                result.append(raw.upper())
+            else:
+                ticker, _ = resolve_ticker(raw)
+                result.append(ticker if ticker else raw)
+    return result
 
 
 def save_watchlist(tickers: list[str]):
@@ -540,26 +714,18 @@ with st.sidebar:
     st.divider()
 
     st.markdown('<div class="sidebar-section-label">Manual Scan</div>', unsafe_allow_html=True)
-    scan_ticker = st.text_input("Ticker", placeholder="AAPL", label_visibility="collapsed")
-    col1, col2 = st.columns(2)
-    if col1.button("Scan", use_container_width=True):
+    scan_ticker = st.text_input("Ticker", placeholder="AAPL or 애플", label_visibility="collapsed")
+    if st.button("Scan", use_container_width=True):
         if scan_ticker:
-            with st.spinner(f"Analyzing {scan_ticker.upper()}..."):
-                result = api_post(f"/scan/{scan_ticker.upper()}")
-                if result:
-                    st.success(f"{scan_ticker.upper()}: {result.get('final_signal')} ({result.get('composite_score', 0):+.1f})")
-                    st.rerun()
-    if col2.button("Scan All", use_container_width=True):
-        wl = load_watchlist()
-        if wl:
-            tickers_param = ",".join(wl)
-            with st.spinner(f"Scanning {len(wl)} tickers..."):
-                result = api_post(f"/scan?tickers={tickers_param}", timeout=600)
-                if result:
-                    st.success(f"Done! {len(wl)} tickers scanned.")
-            st.rerun()
-        else:
-            st.warning("Watchlist is empty")
+            resolved, hint = resolve_ticker(scan_ticker)
+            if hint:
+                st.info(hint)
+            if resolved:
+                with st.spinner(f"Analyzing {resolved}..."):
+                    result = api_post(f"/scan/{resolved}")
+                    if result:
+                        st.success(f"{resolved}: {result.get('final_signal')} ({result.get('composite_score', 0):+.1f})")
+                        st.rerun()
 
     st.divider()
 
@@ -573,16 +739,20 @@ with st.sidebar:
     else:
         st.caption("No tickers in watchlist")
 
-    add_ticker = st.text_input("Add ticker", placeholder="TSLA", label_visibility="collapsed", key="wl_add")
+    add_ticker = st.text_input("Add ticker", placeholder="TSLA or 테슬라", label_visibility="collapsed", key="wl_add")
     wl_col1, wl_col2 = st.columns(2)
     if wl_col1.button("Add", use_container_width=True, key="wl_add_btn"):
         if add_ticker:
-            ok, msg = add_to_watchlist(add_ticker)
-            if ok:
-                st.success(msg)
-                st.rerun()
-            else:
-                st.warning(msg)
+            resolved, hint = resolve_ticker(add_ticker)
+            if hint:
+                st.info(hint)
+            if resolved:
+                ok, msg = add_to_watchlist(resolved)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.warning(msg)
 
     if watchlist:
         remove_target = wl_col2.selectbox("Remove", watchlist, label_visibility="collapsed", key="wl_remove")
@@ -593,6 +763,18 @@ with st.sidebar:
                 st.rerun()
             else:
                 st.warning(msg)
+
+    if st.button("Scan All", use_container_width=True, key="scan_all_btn"):
+        wl = load_watchlist()
+        if wl:
+            tickers_param = ",".join(wl)
+            with st.spinner(f"Scanning {len(wl)} tickers..."):
+                result = api_post(f"/scan?tickers={tickers_param}", timeout=600)
+                if result:
+                    st.success(f"Done! {len(wl)} tickers scanned.")
+            st.rerun()
+        else:
+            st.warning("Watchlist is empty")
 
     st.divider()
 
@@ -610,7 +792,7 @@ with st.sidebar:
 
     st.divider()
 
-    page = st.radio("Navigation", ["Home", "Dashboard", "Detail", "History"], label_visibility="collapsed")
+    page = st.radio("Navigation", ["Home", "Dashboard", "Detail", "Backtest", "ML Predict", "Portfolio", "Ranking", "Paper Trade", "History"], label_visibility="collapsed")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1215,6 +1397,386 @@ def render_history():
 
 
 # ═══════════════════════════════════════════════════════════════
+#  백테스트 페이지
+# ═══════════════════════════════════════════════════════════════
+
+def render_backtest():
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">Backtest</div>
+        <div class="page-subtitle">Strategy backtesting with historical data</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    data = api_get("/results")
+    results = data.get("results", {}) if data else {}
+    if not results:
+        st.info("No analysis results. Run a scan first.")
+        return
+
+    ticker = st.selectbox("Select Ticker", sorted(results.keys()))
+    if st.button("Run Backtest", type="primary"):
+        with st.spinner(f"Backtesting {ticker}..."):
+            bt = api_get(f"/backtest/{ticker}", timeout=60)
+        if not bt:
+            st.error("Backtest failed")
+            return
+
+        st.markdown(f"""
+        <div class="section-header">
+            <div class="section-title">Best Strategy: {bt.get('best_strategy', '?')}</div>
+            <div class="section-subtitle">Sharpe: {bt.get('best_sharpe', 0):.3f}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        strategies = bt.get("strategies", {})
+        cols = st.columns(len(strategies))
+        for i, (name, s) in enumerate(strategies.items()):
+            with cols[i]:
+                st.markdown(f"**{s.get('strategy', name)}**")
+                st.metric("Total Return", f"{s.get('total_return_pct', 0):+.1f}%")
+                st.metric("Sharpe Ratio", f"{s.get('sharpe_ratio', 0):.3f}")
+                st.metric("Max Drawdown", f"{s.get('max_drawdown_pct', 0):.1f}%")
+                st.metric("Win Rate", f"{s.get('win_rate_pct', 0):.1f}%")
+                st.metric("Trades", str(s.get("total_trades", 0)))
+                st.metric("Profit Factor", f"{s.get('profit_factor', 0):.2f}")
+                st.metric("Avg Hold", f"{s.get('avg_holding_days', 0):.0f}d")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ML 예측 페이지
+# ═══════════════════════════════════════════════════════════════
+
+def render_ml_predict():
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">ML Prediction</div>
+        <div class="page-subtitle">Machine learning direction forecast</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    data = api_get("/results")
+    results = data.get("results", {}) if data else {}
+    tickers = sorted(results.keys()) if results else load_watchlist()
+    if not tickers:
+        st.info("No tickers available.")
+        return
+
+    ticker = st.selectbox("Select Ticker", tickers, key="ml_ticker")
+    if st.button("Run ML Prediction", type="primary"):
+        with st.spinner(f"Training model for {ticker}..."):
+            ml = api_get(f"/ml/{ticker}", timeout=120)
+        if not ml:
+            st.error("ML prediction failed")
+            return
+
+        st.markdown(f"""
+        <div class="section-header">
+            <div class="section-title">{ticker} — {ml.get('best_prediction', '?')}</div>
+            <div class="section-subtitle">Best model: {ml.get('best_model', '?').upper()}, Accuracy: {ml.get('best_accuracy', 0):.1%}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        models = ml.get("models", {})
+        for name, m in models.items():
+            if m.get("error"):
+                st.warning(f"{name}: {m['error']}")
+                continue
+
+            signal_color = "#02d4a1" if m.get("signal") == "buy" else ("#fd526f" if m.get("signal") == "sell" else "#ffb347")
+
+            with st.expander(f"**{m.get('name', name)}** — {m.get('prediction', '?')} ({m.get('up_probability', 0):.1%})", expanded=True):
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Prediction", m.get("prediction", "?"))
+                c2.metric("Up Prob", f"{m.get('up_probability', 0):.1%}")
+                c3.metric("Test Accuracy", f"{m.get('test_accuracy', 0):.1%}")
+                c4.metric("CV Accuracy", f"{m.get('cv_accuracy_mean', 0):.1%}")
+
+                top_feat = m.get("top_features", [])
+                if top_feat:
+                    feat_df = pd.DataFrame(top_feat)
+                    fig = go.Figure(go.Bar(
+                        x=[f["importance"] for f in top_feat],
+                        y=[f["name"] for f in top_feat],
+                        orientation="h",
+                        marker_color="#aec6ff",
+                    ))
+                    fig.update_layout(**_plotly_base_layout(
+                        height=300, margin=dict(l=140, r=10, t=10, b=10),
+                    ))
+                    st.plotly_chart(fig, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  포트폴리오 최적화 페이지
+# ═══════════════════════════════════════════════════════════════
+
+def render_portfolio():
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">Portfolio</div>
+        <div class="page-subtitle">Optimization & Correlation Analysis</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    data = api_get("/results")
+    results = data.get("results", {}) if data else {}
+    if len(results) < 2:
+        st.info("Need at least 2 analyzed tickers for portfolio optimization.")
+        return
+
+    tab1, tab2 = st.tabs(["Optimization", "Correlation / Beta"])
+
+    with tab1:
+        method = st.selectbox("Method", ["markowitz", "risk_parity"])
+        if st.button("Optimize Portfolio", type="primary"):
+            with st.spinner("Optimizing..."):
+                opt = api_get(f"/portfolio/optimize?method={method}", timeout=60)
+            if not opt:
+                st.error("Optimization failed")
+                return
+            if opt.get("error"):
+                st.error(opt["error"])
+                return
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Expected Return", f"{opt.get('portfolio_return_pct', 0):+.1f}%")
+            c2.metric("Volatility", f"{opt.get('portfolio_volatility_pct', 0):.1f}%")
+            c3.metric("Sharpe", f"{opt.get('sharpe_ratio', 0):.3f}")
+
+            alloc = opt.get("allocation", {})
+            if alloc:
+                st.markdown("**Allocation**")
+                alloc_rows = []
+                for t, a in sorted(alloc.items(), key=lambda x: x[1].get("weight_pct", 0), reverse=True):
+                    alloc_rows.append({
+                        "Ticker": t,
+                        "Weight %": a.get("weight_pct", 0),
+                        "Amount $": f"${a.get('amount', 0):,.0f}",
+                        "Exp Return %": a.get("expected_return_pct", 0),
+                        "Volatility %": a.get("volatility_pct", 0),
+                    })
+                st.dataframe(pd.DataFrame(alloc_rows), use_container_width=True, hide_index=True)
+
+                fig = go.Figure(go.Pie(
+                    labels=[r["Ticker"] for r in alloc_rows],
+                    values=[r["Weight %"] for r in alloc_rows],
+                    hole=0.4,
+                    marker=dict(colors=["#aec6ff", "#02d4a1", "#fd526f", "#ffb347", "#c3c6d4", "#5d8ef1"]),
+                    textfont=dict(color="#e1e2eb"),
+                ))
+                fig.update_layout(**_plotly_base_layout(height=350))
+                st.plotly_chart(fig, use_container_width=True)
+
+    with tab2:
+        if st.button("Analyze Correlation & Beta", type="primary"):
+            with st.spinner("Analyzing..."):
+                corr = api_get("/portfolio/correlation", timeout=60)
+            if not corr:
+                st.error("Analysis failed")
+                return
+
+            st.metric("Portfolio Beta", f"{corr.get('portfolio_beta', 0):.3f}")
+
+            individual = corr.get("individual", {})
+            if individual:
+                st.markdown("**Individual Beta / Alpha**")
+                beta_rows = []
+                for t, v in individual.items():
+                    beta_rows.append({
+                        "Ticker": t,
+                        "Beta": v.get("beta", 0),
+                        "Alpha %": v.get("alpha_annualized", 0),
+                        "Correlation": v.get("correlation", 0),
+                        "R-Squared": v.get("r_squared", 0),
+                        "Info Ratio": v.get("information_ratio", 0),
+                    })
+                st.dataframe(pd.DataFrame(beta_rows), use_container_width=True, hide_index=True)
+
+            pairs = corr.get("pair_correlations", {})
+            if pairs:
+                st.markdown("**Pair Correlations**")
+                pair_rows = [{"Pair": k, "Correlation": v} for k, v in sorted(pairs.items(), key=lambda x: abs(x[1]), reverse=True)]
+                st.dataframe(pd.DataFrame(pair_rows), use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  팩터 랭킹 페이지
+# ═══════════════════════════════════════════════════════════════
+
+def render_ranking():
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">Factor Ranking</div>
+        <div class="page-subtitle">Cross-sectional factor-based stock ranking</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    ranking_data = api_get("/ranking")
+    if not ranking_data or not ranking_data.get("ranking"):
+        st.info("No ranking data. Run scans for multiple tickers first.")
+        return
+
+    ranking = ranking_data["ranking"]
+    st.caption(f"{len(ranking)} tickers ranked")
+
+    rows = []
+    for r in ranking:
+        signal = r.get("signal", "HOLD")
+        rows.append({
+            "Rank": r.get("rank", 0),
+            "Ticker": r.get("ticker", "?"),
+            "Signal": signal,
+            "Composite": r.get("composite_score", 0),
+            "Factor Score": r.get("weighted_factor_score", 0),
+            "Momentum": r.get("factor_momentum", 0),
+            "Trend": r.get("factor_trend", 0),
+            "Value": r.get("factor_value", 0),
+            "Volume": r.get("factor_volume", 0),
+            "Percentile": r.get("percentile", 0),
+        })
+
+    df = pd.DataFrame(rows)
+    st.dataframe(
+        df.style.map(
+            lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+            subset=["Signal"],
+        ).background_gradient(
+            subset=["Factor Score"], cmap="RdYlGn", vmin=-5, vmax=5
+        ),
+        use_container_width=True, hide_index=True,
+    )
+
+    if len(ranking) >= 2:
+        fig = go.Figure()
+        tickers = [r["ticker"] for r in ranking]
+        factors = ["factor_momentum", "factor_trend", "factor_value", "factor_volume"]
+        colors = ["#aec6ff", "#02d4a1", "#ffb347", "#fd526f"]
+        for factor, color in zip(factors, colors):
+            fig.add_trace(go.Bar(
+                name=factor.replace("factor_", "").title(),
+                x=tickers,
+                y=[r.get(factor, 0) for r in ranking],
+                marker_color=color,
+            ))
+        fig.update_layout(**_plotly_base_layout(
+            height=350, barmode="group",
+            margin=dict(l=50, r=10, t=30, b=60),
+            legend=dict(font=dict(color="#c3c6d4")),
+        ))
+        st.plotly_chart(fig, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  페이퍼 트레이딩 페이지
+# ═══════════════════════════════════════════════════════════════
+
+def render_paper_trade():
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">Paper Trading</div>
+        <div class="page-subtitle">Simulated trading based on agent signals</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    status = api_get("/paper")
+    if not status:
+        st.error("Paper trading service unavailable")
+        return
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    total_pnl = status.get("total_pnl", 0)
+    pnl_color = "#02d4a1" if total_pnl >= 0 else "#fd526f"
+    c1.metric("Total Equity", f"${status.get('total_equity', 0):,.0f}")
+    c2.metric("Cash", f"${status.get('cash', 0):,.0f}")
+    c3.metric("P&L", f"${total_pnl:+,.0f}")
+    c4.metric("P&L %", f"{status.get('total_pnl_pct', 0):+.2f}%")
+    c5.metric("Win Rate", f"{status.get('win_rate_pct', 0):.1f}%")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Open Positions", str(status.get("open_positions", 0)))
+    m2.metric("Closed Trades", str(status.get("total_closed_trades", 0)))
+    m3.metric("Realized P&L", f"${status.get('realized_pnl', 0):+,.0f}")
+    m4.metric("Unrealized P&L", f"${status.get('unrealized_pnl', 0):+,.0f}")
+
+    positions = status.get("positions", {})
+    if positions:
+        st.markdown("**Open Positions**")
+        pos_rows = []
+        for t, p in positions.items():
+            pos_rows.append({
+                "Ticker": t,
+                "Qty": p.get("qty", 0),
+                "Entry": f"${p.get('entry_price', 0):.2f}",
+                "Current": f"${p.get('current_price', 0):.2f}",
+                "P&L": f"${p.get('pnl', 0):+.2f}",
+                "P&L %": f"{p.get('pnl_pct', 0):+.2f}%",
+                "Entry Date": str(p.get("entry_date", ""))[:10],
+            })
+        st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+
+    recent = status.get("recent_trades", [])
+    if recent:
+        st.markdown("**Recent Closed Trades**")
+        trade_rows = []
+        for t in reversed(recent):
+            trade_rows.append({
+                "Ticker": t.get("ticker", "?"),
+                "Entry": f"${t.get('entry_price', 0):.2f}",
+                "Exit": f"${t.get('exit_price', 0):.2f}",
+                "Qty": t.get("qty", 0),
+                "P&L": f"${t.get('pnl', 0):+.2f}",
+                "Return %": f"{t.get('pnl_pct', 0):+.2f}%",
+                "Reason": t.get("reason", ""),
+            })
+        st.dataframe(pd.DataFrame(trade_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    tab1, tab2 = st.tabs(["Auto Trade", "Manual Order"])
+
+    with tab1:
+        st.caption("Execute paper trades based on latest agent signals")
+        if st.button("Execute Auto Trades", type="primary"):
+            with st.spinner("Executing..."):
+                result = api_post("/paper/auto", timeout=60)
+            if result:
+                orders = result.get("orders", [])
+                if orders:
+                    st.success(f"{len(orders)} orders executed")
+                    for o in orders:
+                        st.json(o)
+                else:
+                    st.info("No trades triggered by current signals")
+
+    with tab2:
+        oc1, oc2, oc3, oc4 = st.columns(4)
+        order_ticker = oc1.text_input("Ticker", placeholder="AAPL", key="pt_ticker")
+        order_action = oc2.selectbox("Action", ["BUY", "SELL"], key="pt_action")
+        order_qty = oc3.number_input("Qty", min_value=1, value=10, key="pt_qty")
+        order_price = oc4.number_input("Price", min_value=0.01, value=100.0, step=0.01, key="pt_price")
+
+        if st.button("Submit Order"):
+            if order_ticker:
+                result = api_post(
+                    f"/paper/order?ticker={order_ticker.upper()}&action={order_action}&qty={order_qty}&price={order_price}",
+                    timeout=10,
+                )
+                if result:
+                    if result.get("status") == "filled":
+                        st.success(f"Order filled: {order_action} {order_qty} {order_ticker.upper()} @ ${order_price}")
+                    else:
+                        st.warning(f"Order {result.get('status')}: {result.get('reject_reason', '')}")
+
+    st.divider()
+    if st.button("Reset Paper Trading", type="secondary"):
+        result = api_post("/paper/reset", timeout=5)
+        if result:
+            st.success("Paper trading reset")
+            st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════
 #  라우팅
 # ═══════════════════════════════════════════════════════════════
 
@@ -1224,5 +1786,15 @@ elif page == "Dashboard":
     render_dashboard()
 elif page == "Detail":
     render_detail()
+elif page == "Backtest":
+    render_backtest()
+elif page == "ML Predict":
+    render_ml_predict()
+elif page == "Portfolio":
+    render_portfolio()
+elif page == "Ranking":
+    render_ranking()
+elif page == "Paper Trade":
+    render_paper_trade()
 elif page == "History":
     render_history()

@@ -1,6 +1,6 @@
 """
-차트 분석 에이전트 - 12개 기법을 tool로 제공, LLM이 판단/조합
-기술적 분석 6개 + 퀀트 분석 6개
+차트 분석 에이전트 - 16개 기법을 tool로 제공, LLM이 판단/조합
+기술적 분석 6개 + 퀀트 분석 6개 + 리스크/퀀트 확장 4개
 
 사용법:
     agent = ChartAnalysisAgent(ticker, df_indicators)
@@ -16,22 +16,24 @@ import httpx
 import numpy as np
 import pandas as pd
 
+import yfinance as yf
+
 from config import (
     OPENAI_API_KEY, OLLAMA_BASE_URL, OLLAMA_MODEL, OUTPUT_DIR,
     BOLLINGER_PERIOD, BOLLINGER_STD, MACD_FAST, MACD_SLOW, MACD_SIGNAL,
     ADX_PERIOD, RSI_PERIOD, SMA_PERIODS,
     ATR_STOP_MULTIPLIER, ACCOUNT_SIZE, RISK_PER_TRADE_PCT,
     MAX_POSITION_PCT, TAKE_PROFIT_RR_RATIO, TRADING_STYLE, TIMEFRAME,
-    COOLING_OFF_DAYS,
+    COOLING_OFF_DAYS, DEFAULT_HISTORY_PERIOD,
 )
 
 
 # ═══════════════════════════════════════════════════════════════
-#  12개 분석 기법 (각각 독립 함수, tool로 LLM에 노출)
+#  16개 분석 기법 (각각 독립 함수, tool로 LLM에 노출)
 # ═══════════════════════════════════════════════════════════════
 
 class AnalysisTools:
-    """12개 분석 기법. 각 메서드는 dict를 반환한다."""
+    """16개 분석 기법. 각 메서드는 dict를 반환한다."""
 
     def __init__(self, ticker: str, df: pd.DataFrame):
         self.ticker = ticker
@@ -905,6 +907,259 @@ class AnalysisTools:
         })
         return result
 
+    def kelly_criterion_analysis(self) -> dict:
+        """[퀀트7] 켈리 기준 최적 배팅 비율 산출"""
+        result = {"tool": "kelly_criterion_analysis", "name": "켈리 기준 배팅 분석"}
+
+        returns = self.close.pct_change().dropna()
+        if len(returns) < 60:
+            result.update({"signal": "neutral", "score": 0, "detail": "데이터 부족"})
+            return result
+
+        wins = returns[returns > 0]
+        losses = returns[returns < 0]
+
+        if len(wins) == 0 or len(losses) == 0:
+            result.update({"signal": "neutral", "score": 0, "detail": "승/패 데이터 부족"})
+            return result
+
+        win_rate = len(wins) / len(returns)
+        avg_win = float(wins.mean())
+        avg_loss = float(abs(losses.mean()))
+        win_loss_ratio = avg_win / avg_loss if avg_loss > 0 else 0
+
+        kelly_full = win_rate - (1 - win_rate) / win_loss_ratio if win_loss_ratio > 0 else 0
+        kelly_half = kelly_full / 2
+        kelly_quarter = kelly_full / 4
+
+        sharpe = float(returns.mean() / returns.std() * np.sqrt(252)) if returns.std() > 0 else 0
+        kelly_from_sharpe = sharpe / np.sqrt(252) if sharpe > 0 else 0
+
+        optimal_pct = max(0, min(kelly_half * 100, MAX_POSITION_PCT))
+
+        score = 0
+        if kelly_full > 0.15:
+            score += 4
+        elif kelly_full > 0.05:
+            score += 2
+        elif kelly_full < -0.05:
+            score -= 3
+        elif kelly_full < 0:
+            score -= 1
+
+        if win_rate > 0.55:
+            score += 1
+        elif win_rate < 0.40:
+            score -= 1
+
+        score = max(-10, min(10, score))
+        signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+
+        result.update({
+            "signal": signal,
+            "score": round(score, 1),
+            "win_rate": round(win_rate, 4),
+            "avg_win_pct": round(avg_win * 100, 3),
+            "avg_loss_pct": round(avg_loss * 100, 3),
+            "win_loss_ratio": round(win_loss_ratio, 3),
+            "kelly_full_pct": round(kelly_full * 100, 2),
+            "kelly_half_pct": round(kelly_half * 100, 2),
+            "kelly_quarter_pct": round(kelly_quarter * 100, 2),
+            "optimal_position_pct": round(optimal_pct, 2),
+            "sharpe_ratio": round(sharpe, 3),
+            "detail": f"승률={win_rate:.1%}, W/L비={win_loss_ratio:.2f}, "
+                       f"켈리={kelly_full:.1%}, 권장비중={optimal_pct:.1f}%"
+        })
+        return result
+
+    def beta_correlation_analysis(self) -> dict:
+        """[퀀트8] 베타/상관관계 분석 - SPY 대비 베타, 알파, 상관계수"""
+        result = {"tool": "beta_correlation_analysis", "name": "베타/상관관계 분석"}
+
+        try:
+            spy = yf.Ticker("SPY").history(period=DEFAULT_HISTORY_PERIOD)
+            if spy.empty:
+                result.update({"signal": "neutral", "score": 0, "detail": "SPY 데이터 없음"})
+                return result
+        except Exception as e:
+            result.update({"signal": "neutral", "score": 0, "detail": f"SPY 수집 실패: {e}"})
+            return result
+
+        common_idx = self.df.index.intersection(spy.index)
+        if len(common_idx) < 60:
+            result.update({"signal": "neutral", "score": 0, "detail": "공통 기간 부족"})
+            return result
+
+        stock_ret = self.close.loc[common_idx].pct_change().dropna()
+        spy_ret = spy["Close"].loc[common_idx].pct_change().dropna()
+        common_ret_idx = stock_ret.index.intersection(spy_ret.index)
+        stock_ret = stock_ret.loc[common_ret_idx]
+        spy_ret = spy_ret.loc[common_ret_idx]
+
+        if len(stock_ret) < 30:
+            result.update({"signal": "neutral", "score": 0, "detail": "수익률 데이터 부족"})
+            return result
+
+        cov = float(stock_ret.cov(spy_ret))
+        var_spy = float(spy_ret.var())
+        beta = cov / var_spy if var_spy > 0 else 1.0
+        alpha_daily = float(stock_ret.mean() - beta * spy_ret.mean())
+        alpha_annual = alpha_daily * 252
+        correlation = float(stock_ret.corr(spy_ret))
+        r_squared = correlation ** 2
+        tracking_error = float((stock_ret - beta * spy_ret).std() * np.sqrt(252))
+
+        info_ratio = alpha_annual / tracking_error if tracking_error > 0 else 0
+
+        beta_60d = beta
+        if len(stock_ret) >= 120:
+            sr_60 = stock_ret.tail(60)
+            sp_60 = spy_ret.loc[sr_60.index]
+            cov_60 = float(sr_60.cov(sp_60))
+            var_60 = float(sp_60.var())
+            beta_60d = cov_60 / var_60 if var_60 > 0 else beta
+
+        score = 0
+        if alpha_annual > 0.10:
+            score += 3
+        elif alpha_annual > 0.05:
+            score += 1
+        elif alpha_annual < -0.10:
+            score -= 3
+        elif alpha_annual < -0.05:
+            score -= 1
+
+        if beta < 0.8:
+            score += 1
+        elif beta > 1.5:
+            score -= 1
+
+        if info_ratio > 0.5:
+            score += 1
+
+        score = max(-10, min(10, score))
+        signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+
+        result.update({
+            "signal": signal,
+            "score": round(score, 1),
+            "beta": round(beta, 3),
+            "beta_60d": round(beta_60d, 3),
+            "alpha_annual_pct": round(alpha_annual * 100, 2),
+            "correlation": round(correlation, 3),
+            "r_squared": round(r_squared, 3),
+            "tracking_error_pct": round(tracking_error * 100, 2),
+            "information_ratio": round(info_ratio, 3),
+            "benchmark": "SPY",
+            "detail": f"β={beta:.2f}(60d:{beta_60d:.2f}), α={alpha_annual:.1%}, "
+                       f"상관={correlation:.2f}, IR={info_ratio:.2f}"
+        })
+        return result
+
+    def event_driven_analysis(self) -> dict:
+        """[퀀트9] 이벤트 드리븐 분석 - 실적발표, 배당락, 52주 신고/저가"""
+        result = {"tool": "event_driven_analysis", "name": "이벤트 드리븐 분석"}
+
+        try:
+            t = yf.Ticker(self.ticker)
+            info = t.info or {}
+        except Exception as e:
+            result.update({"signal": "neutral", "score": 0, "detail": f"데이터 수집 실패: {e}"})
+            return result
+
+        events = []
+        score = 0
+
+        earnings_dates = []
+        try:
+            cal = t.calendar
+            if cal is not None:
+                if isinstance(cal, dict):
+                    ed = cal.get("Earnings Date")
+                    if ed:
+                        earnings_dates = [str(d) for d in (ed if isinstance(ed, list) else [ed])]
+                elif isinstance(cal, pd.DataFrame) and not cal.empty:
+                    if "Earnings Date" in cal.index:
+                        ed = cal.loc["Earnings Date"]
+                        earnings_dates = [str(d) for d in ed.values if pd.notna(d)]
+        except Exception:
+            pass
+
+        if earnings_dates:
+            events.append({"type": "earnings", "dates": earnings_dates})
+            from datetime import datetime as dt
+            for ed_str in earnings_dates:
+                try:
+                    ed_dt = pd.Timestamp(ed_str)
+                    days_until = (ed_dt - pd.Timestamp.now()).days
+                    if 0 <= days_until <= 7:
+                        events.append({"type": "earnings_imminent", "days": days_until})
+                        score -= 1
+                    elif 7 < days_until <= 30:
+                        events.append({"type": "earnings_upcoming", "days": days_until})
+                except Exception:
+                    pass
+
+        price = float(self.latest["Close"])
+        high_52w = info.get("fiftyTwoWeekHigh")
+        low_52w = info.get("fiftyTwoWeekLow")
+
+        if high_52w and price >= high_52w * 0.97:
+            events.append({"type": "near_52w_high", "pct_from_high": round((price / high_52w - 1) * 100, 2)})
+            score += 2
+        if low_52w and price <= low_52w * 1.03:
+            events.append({"type": "near_52w_low", "pct_from_low": round((price / low_52w - 1) * 100, 2)})
+            score += 3
+
+        ex_div_date = info.get("exDividendDate")
+        if ex_div_date:
+            try:
+                ex_dt = pd.Timestamp(ex_div_date, unit="s") if isinstance(ex_div_date, (int, float)) else pd.Timestamp(ex_div_date)
+                days_to_ex = (ex_dt - pd.Timestamp.now()).days
+                if 0 < days_to_ex <= 14:
+                    events.append({"type": "ex_dividend_soon", "date": str(ex_dt.date()), "days": days_to_ex})
+                    div_yield = info.get("dividendYield", 0) or 0
+                    if div_yield > 0.03:
+                        score += 1
+            except Exception:
+                pass
+
+        if len(self.close) >= 20:
+            vol_10d = float(self.close.pct_change().tail(10).std())
+            vol_60d = float(self.close.pct_change().tail(60).std()) if len(self.close) >= 60 else vol_10d
+            if vol_10d > vol_60d * 2:
+                events.append({"type": "volatility_spike", "ratio": round(vol_10d / vol_60d, 2)})
+                score -= 1
+
+        if len(self.volume) >= 20:
+            vol_today = float(self.volume.iloc[-1])
+            vol_avg = float(self.volume.tail(20).mean())
+            if vol_avg > 0 and vol_today > vol_avg * 3:
+                events.append({"type": "volume_spike", "ratio": round(vol_today / vol_avg, 2)})
+
+        rec = info.get("recommendationKey", "")
+        rec_map = {"strong_buy": 2, "buy": 1, "hold": 0, "sell": -1, "strong_sell": -2}
+        if rec in rec_map:
+            events.append({"type": "analyst_consensus", "recommendation": rec})
+            score += rec_map[rec]
+
+        score = max(-10, min(10, score))
+        signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+
+        event_summary = ", ".join(e["type"] for e in events) if events else "특이 이벤트 없음"
+        result.update({
+            "signal": signal,
+            "score": round(score, 1),
+            "events": events,
+            "event_count": len(events),
+            "earnings_dates": earnings_dates,
+            "52w_high": high_52w,
+            "52w_low": low_52w,
+            "analyst_recommendation": rec or "N/A",
+            "detail": f"이벤트 {len(events)}건: {event_summary}"
+        })
+        return result
+
 
 # ═══════════════════════════════════════════════════════════════
 #  Tool 정의 (LLM에 제공할 스키마)
@@ -1002,6 +1257,27 @@ TOOL_DEFINITIONS = [
             "description": "포지션 사이징/리스크 관리. ATR 기반 손절/익절가, 권장 매수 수량, 분할 진입 계획, 비중 경고를 산출.",
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "kelly_criterion_analysis",
+            "description": "켈리 기준 배팅 분석. 과거 승률/손익비로 최적 투자 비중 산출. 풀켈리/하프켈리/쿼터켈리 제공.",
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "beta_correlation_analysis",
+            "description": "베타/상관관계 분석. SPY 대비 베타, 알파, 상관계수, 정보비율. 시장 대비 초과수익 판단.",
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "event_driven_analysis",
+            "description": "이벤트 드리븐 분석. 실적발표 일정, 52주 고저, 배당락, 변동성 스파이크, 애널리스트 컨센서스.",
+        }
+    },
 ]
 
 # Ollama용 간소화 tool 이름 목록
@@ -1013,7 +1289,7 @@ TOOL_NAMES = [t["function"]["name"] for t in TOOL_DEFINITIONS]
 # ═══════════════════════════════════════════════════════════════
 
 class ChartAnalysisAgent:
-    """LLM이 12개 tool 중 필요한 것을 선택하여 분석을 수행하는 에이전트"""
+    """LLM이 16개 tool 중 필요한 것을 선택하여 분석을 수행하는 에이전트"""
 
     MAX_ITERATIONS = 5  # tool call 최대 반복 횟수
 
@@ -1036,6 +1312,9 @@ class ChartAnalysisAgent:
             "support_resistance_analysis": self.tools.support_resistance_analysis,
             "correlation_regime_analysis": self.tools.correlation_regime_analysis,
             "risk_position_sizing": self.tools.risk_position_sizing,
+            "kelly_criterion_analysis": self.tools.kelly_criterion_analysis,
+            "beta_correlation_analysis": self.tools.beta_correlation_analysis,
+            "event_driven_analysis": self.tools.event_driven_analysis,
         }
 
     def _execute_tool(self, name: str) -> dict:
@@ -1046,7 +1325,7 @@ class ChartAnalysisAgent:
         return {"tool": name, "error": f"Unknown tool: {name}"}
 
     def run_all_tools(self) -> list:
-        """전체 12개 tool 실행 (LLM 없이 전수 분석)"""
+        """전체 16개 tool 실행 (LLM 없이 전수 분석)"""
         results = []
         for name, fn in self._tool_map.items():
             try:
@@ -1127,8 +1406,8 @@ class ChartAnalysisAgent:
 
 역할:
 - {self.ticker} 종목에 대해 제공된 분석 도구(tool)를 사용하여 종합 판단을 내린다.
-- 12개의 분석 도구가 있다. 상황에 따라 필요한 도구를 선택하여 호출한다.
-- 최소 6개 이상의 도구를 사용해야 한다.
+- 16개의 분석 도구가 있다. 상황에 따라 필요한 도구를 선택하여 호출한다.
+- 최소 8개 이상의 도구를 사용해야 한다.
 - 각 도구의 결과를 종합하여 최종 매수/매도/관망 판단을 내린다.
 
 분석 도구 목록:
@@ -1145,6 +1424,9 @@ class ChartAnalysisAgent:
 11. support_resistance_analysis - 지지/저항선
 12. correlation_regime_analysis - 수익률 자기상관
 13. risk_position_sizing - 포지션 사이징/리스크 관리 (ATR 손절, 매수 수량, 분할 진입)
+14. kelly_criterion_analysis - 켈리 기준 배팅 (승률/손익비 → 최적 비중)
+15. beta_correlation_analysis - 베타/상관관계 (SPY 대비 베타, 알파, 정보비율)
+16. event_driven_analysis - 이벤트 드리븐 (실적발표, 배당락, 52주 고저, 애널리스트)
 
 규칙:
 1. 먼저 기본 도구(1~6)를 실행하고, 결과를 보고 필요한 퀀트 도구(7~12)를 추가 실행한다.
@@ -1262,7 +1544,7 @@ class ChartAnalysisAgent:
             return self.compute_composite_score()
 
         # Step 1: 전체 tool 실행 (Ollama는 function calling 미지원 모델이 많으므로)
-        print("    [Step 1] 12개 분석 도구 실행...")
+        print("    [Step 1] 16개 분석 도구 실행...")
         self.run_all_tools()
 
         for r in self.tool_results:
@@ -1283,7 +1565,7 @@ class ChartAnalysisAgent:
 - 신호 분포: 매수 {composite['signal_distribution']['buy']}개, 매도 {composite['signal_distribution']['sell']}개, 중립 {composite['signal_distribution']['neutral']}개
 - 시스템 판단: {composite['final_signal']}
 
-위 12개 도구의 분석 결과를 종합하여 최종 판단을 한국어로 작성하라.
+위 16개 도구의 분석 결과를 종합하여 최종 판단을 한국어로 작성하라.
 다음 형식을 따르라:
 
 ## 종합 판단
