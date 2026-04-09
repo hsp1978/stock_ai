@@ -1234,8 +1234,18 @@ def render_detail():
 
     detail = api_get(f"/results/{selected}")
     if not detail:
-        st.error(f"Failed to load {selected}")
-        return
+        summary = data["results"].get(selected, {})
+        if not summary:
+            st.error(f"Failed to load {selected}")
+            return
+        detail = {
+            "final_signal": summary.get("signal", "?"),
+            "composite_score": summary.get("score", 0),
+            "confidence": summary.get("confidence", 0),
+            "signal_distribution": summary.get("signal_distribution", {}),
+            "analyzed_at": summary.get("analyzed_at", ""),
+        }
+        st.warning("Detail endpoint unavailable — showing summary data only.")
 
     signal = detail.get("final_signal", "?")
     score = detail.get("composite_score", 0)

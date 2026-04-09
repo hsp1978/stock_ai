@@ -20,8 +20,9 @@ from typing import Optional
 
 import httpx
 import uvicorn
+import math
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from config import (
@@ -384,6 +385,29 @@ def run_scheduled_scan(override_tickers: list[str] | None = None):
     print(f"{'='*60}\n")
 
 
+def _sanitize(obj):
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    try:
+        import numpy as np
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            v = float(obj)
+            return None if math.isnan(v) or math.isinf(v) else v
+        if isinstance(obj, np.ndarray):
+            return _sanitize(obj.tolist())
+    except (ImportError, TypeError):
+        pass
+    return obj
+
+
 # ═══════════════════════════════════════════════════════════════
 #  FastAPI 앱
 # ═══════════════════════════════════════════════════════════════
@@ -440,12 +464,13 @@ def get_ticker_result(ticker: str):
     if ticker not in latest_results:
         raise HTTPException(404, f"{ticker}: 분석 결과 없음. /scan/{ticker} 로 분석 실행 가능.")
     data = latest_results[ticker]
-    return {
+    payload = {
         "ticker": ticker,
         "timestamp": data.get("timestamp"),
         "alert_sent_at": data.get("alert_sent_at"),
         **data.get("result", {}),
     }
+    return JSONResponse(content=_sanitize(payload))
 
 
 @app.post("/scan/{ticker}")
