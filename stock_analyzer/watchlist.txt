@@ -3,5 +3,6 @@
 
 NVDA
 TSLA
-아이온큐
-INTC
+NTLA
+PLTR
+PL

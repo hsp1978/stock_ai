@@ -390,12 +390,19 @@ def _sanitize(obj):
         if math.isnan(obj) or math.isinf(obj):
             return None
         return obj
+    if isinstance(obj, (datetime,)):
+        return obj.isoformat()
     if isinstance(obj, dict):
-        return {k: _sanitize(v) for k, v in obj.items()}
+        return {str(k): _sanitize(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_sanitize(v) for v in obj]
     try:
         import numpy as np
+        import pandas as pd
+        if isinstance(obj, (pd.Timestamp,)):
+            return obj.isoformat()
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
         if isinstance(obj, (np.integer,)):
             return int(obj)
         if isinstance(obj, (np.floating,)):
