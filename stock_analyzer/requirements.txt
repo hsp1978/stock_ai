@@ -1,10 +1,28 @@
+# stock_analyzer — WebUI + local_engine bridge
+# chart_agent_service/ 의존성도 함께 필요 (local_engine에서 직접 import)
+
+# ── WebUI ──
+streamlit>=1.30.0
+plotly>=5.18.0
 yfinance>=0.2.31
+
+# ── 데이터/수학 ──
 pandas>=2.0.0
 numpy>=1.24.0
-matplotlib>=3.7.0
-plotly>=5.18.0
-kaleido>=0.2.1
-requests>=2.31.0
-python-dotenv>=1.0.0
-httpx>=0.25.0
 scipy>=1.11.0
+
+# ── ML (chart_agent_service/ml_predictor) ──
+scikit-learn>=1.3.0
+
+# ── 차트 생성 (chart_agent_service/analysis_tools) ──
+matplotlib>=3.7.0
+
+# ── HTTP / 설정 ──
+httpx>=0.25.0
+python-dotenv>=1.0.0
+
+# ── LLM ──
+google-generativeai>=0.3.0
+
+# ── 스케줄러 (scanner.py) ──
+apscheduler>=3.10.0
