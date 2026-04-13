@@ -1,3 +1,17 @@
+# local_engine.py (신규 생성)
+
+경로: `stock_analyzer/local_engine.py`
+
+Mac Studio의 `stock_analyzer/local_engine.py` 전체를 testdev의 동일 경로에 복사.
+
+```
+scp mac-studio:~/stock_auto/stock_ai/stock_analyzer/local_engine.py \
+    ~/stock_auto/stock_ai/stock_analyzer/local_engine.py
+```
+
+또는 아래 전체 코드를 파일로 저장:
+
+```python
 #!/usr/bin/env python3
 """
 로컬 엔진 — WebUI와 chart_agent_service를 연결하는 브릿지 모듈
@@ -21,12 +35,6 @@ from typing import Optional
 # ═══════════════════════════════════════════════════════════════
 
 from dotenv import load_dotenv
-from scan_logger import (
-    log_scan_result, query_scan_log, get_scan_detail,
-    get_ticker_history, get_scan_stats, get_signal_changes, export_to_csv,
-    get_weekly_summary, get_weekly_comparison, get_weekly_tool_trend,
-    get_weekly_context_for_prompt,
-)
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SERVICE_DIR = os.path.normpath(os.path.join(_THIS_DIR, "..", "chart_agent_service"))
@@ -271,14 +279,8 @@ def engine_scan_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
             "alert_sent_at": latest_results.get(ticker, {}).get("alert_sent_at"),
         }
 
-        # DB 로깅
-        sanitized = _sanitize(result)
-        scan_id = log_scan_result(ticker, sanitized)
-        if scan_id:
-            print(f"  [{ticker}] DB 기록 완료 (scan_id={scan_id})")
-
         print(f"  [{ticker}] 완료: {result.get('final_signal')} ({result.get('composite_score')})")
-        return sanitized
+        return _sanitize(result)
 
     except Exception as e:
         print(f"  [{ticker}] 분석 실패: {e}")
@@ -691,14 +693,13 @@ def _build_full_report_prompt(ticker: str, result: dict,
     )
 
     if extra_context:
-        prompt += f"\n## 추가 컨텍스트 (주간트렌드/뉴스/매크로/섹터/차트패턴)\n{extra_context}\n"
+        prompt += f"\n## 추가 컨텍스트 (뉴스/매크로/섹터/차트패턴)\n{extra_context}\n"
 
     prompt += (
         "\n## 분석 요청\n"
         "위 데이터를 종합하여 다음 형식으로 분석하라:\n\n"
         "### 종합 판단\n[매수/매도/관망] (신뢰도: X/10)\n\n"
         "### 기술적 분석 요약\n[16개 도구 결과 해석]\n\n"
-        "### 주간 추세 분석\n[DB 누적 데이터 기반 WoW 변화 해석 — 점수/신호 추이, 반전/지속 판단]\n\n"
         "### 펀더멘털 분석\n[재무 건전성, 밸류에이션]\n\n"
         "### 리스크 관리\n[손절/익절, 포지션 크기]\n\n"
         "### 시장 환경\n[거시경제, 섹터 동향]\n\n"
@@ -709,16 +710,8 @@ def _build_full_report_prompt(ticker: str, result: dict,
 
 
 def _gather_extra_context(ticker: str) -> str:
-    """뉴스+매크로+차트패턴+섹터+주간트렌드 수집"""
+    """뉴스+매크로+차트패턴+섹터 수집"""
     parts = []
-
-    # ── 주간 트렌드 (DB 누적 데이터 활용) ──
-    try:
-        weekly_ctx = get_weekly_context_for_prompt(ticker, weeks=4)
-        if weekly_ctx:
-            parts.append(f"**주간 트렌드 (DB 기반)**\n{weekly_ctx}")
-    except Exception as e:
-        print(f"  [{ticker}] 주간 트렌드 수집 실패: {e}")
 
     news = engine_fetch_news(ticker)
     if news and not news.get("error"):
@@ -846,95 +839,6 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
             return engine_sector_compare(ticker)
         elif path == "/macro":
             return engine_macro_context()
-
-        # ── Weekly Trend API ──
-        elif path.startswith("/weekly/comparison"):
-            ticker = ""
-            weeks = 8
-            if "ticker=" in path:
-                ticker = path.split("ticker=")[1].split("&")[0]
-            if "weeks=" in path:
-                try:
-                    weeks = int(path.split("weeks=")[1].split("&")[0])
-                except ValueError:
-                    pass
-            return get_weekly_comparison(ticker, weeks)
-        elif path.startswith("/weekly/tool-trend/"):
-            ticker = path.split("/weekly/tool-trend/")[1].split("?")[0]
-            weeks = 4
-            if "weeks=" in path:
-                try:
-                    weeks = int(path.split("weeks=")[1].split("&")[0])
-                except ValueError:
-                    pass
-            return {"ticker": ticker.upper(), "tools": get_weekly_tool_trend(ticker, weeks)}
-
-        # ── Scan Log 조회 API ──
-        elif path == "/scan-log/stats":
-            return get_scan_stats()
-        elif path.startswith("/scan-log/detail/"):
-            scan_id = int(path.split("/scan-log/detail/")[1].split("?")[0])
-            return get_scan_detail(scan_id)
-        elif path.startswith("/scan-log/ticker/"):
-            ticker = path.split("/scan-log/ticker/")[1].split("?")[0]
-            limit = 50
-            if "limit=" in path:
-                try:
-                    limit = int(path.split("limit=")[1].split("&")[0])
-                except ValueError:
-                    pass
-            return {"ticker": ticker.upper(), "history": get_ticker_history(ticker, limit)}
-        elif path.startswith("/scan-log/changes/"):
-            ticker = path.split("/scan-log/changes/")[1].split("?")[0]
-            limit = 20
-            if "limit=" in path:
-                try:
-                    limit = int(path.split("limit=")[1].split("&")[0])
-                except ValueError:
-                    pass
-            return {"ticker": ticker.upper(), "changes": get_signal_changes(ticker, limit)}
-        elif path.startswith("/scan-log/export"):
-            ticker = ""
-            from_date = ""
-            to_date = ""
-            if "ticker=" in path:
-                ticker = path.split("ticker=")[1].split("&")[0]
-            if "from=" in path:
-                from_date = path.split("from=")[1].split("&")[0]
-            if "to=" in path:
-                to_date = path.split("to=")[1].split("&")[0]
-            filepath = export_to_csv(ticker=ticker, from_date=from_date, to_date=to_date)
-            return {"ok": True, "filepath": filepath}
-        elif path.startswith("/scan-log"):
-            # 범용 조회: /scan-log?ticker=NVDA&signal=BUY&from=2025-01-01&limit=50
-            ticker = ""
-            signal = ""
-            from_date = ""
-            to_date = ""
-            limit = 100
-            offset = 0
-            if "ticker=" in path:
-                ticker = path.split("ticker=")[1].split("&")[0]
-            if "signal=" in path:
-                signal = path.split("signal=")[1].split("&")[0]
-            if "from=" in path:
-                from_date = path.split("from=")[1].split("&")[0]
-            if "to=" in path:
-                to_date = path.split("to=")[1].split("&")[0]
-            if "limit=" in path:
-                try:
-                    limit = int(path.split("limit=")[1].split("&")[0])
-                except ValueError:
-                    pass
-            if "offset=" in path:
-                try:
-                    offset = int(path.split("offset=")[1].split("&")[0])
-                except ValueError:
-                    pass
-            return query_scan_log(ticker=ticker, signal=signal,
-                                  from_date=from_date, to_date=to_date,
-                                  limit=limit, offset=offset)
-
     except Exception as e:
         print(f"[dispatch_get 오류] {path}: {e}")
         return {"error": str(e)}
@@ -983,4 +887,4 @@ def engine_dispatch_post(path: str) -> Optional[dict]:
     except Exception as e:
         print(f"[dispatch_post 오류] {path}: {e}")
         return {"error": str(e)}
-    return None
+```

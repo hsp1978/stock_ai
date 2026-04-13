@@ -14,6 +14,10 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 # ═══ OpenAI 설정 (선택) ═══
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
+# ═══ Gemini 설정 ═══
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
 # ═══ 텔레그램 설정 ═══
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")

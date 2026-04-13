@@ -1,6 +1,3 @@
-# 관심 종목 리스트 (한 줄에 하나, #은 주석)
-# .env의 WATCHLIST와 자동 병합됨
-
-NVDA
-TSLA
-IONQ
+# 관심 종목 리스트
+# WebUI(stock_analyzer/watchlist.txt)에서 통합 관리됨.
+# 이 파일에 직접 추가하지 마세요.

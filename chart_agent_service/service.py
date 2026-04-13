@@ -305,19 +305,25 @@ def send_summary_alert(alerts: list):
         }
 
 
+_WATCHLIST_PATHS = [
+    os.path.join(os.path.dirname(__file__), "..", "stock_analyzer", "watchlist.txt"),
+    os.path.join(os.path.dirname(__file__), "watchlist.txt"),
+]
+
+
+def _get_watchlist_path() -> str:
+    """쓰기 가능한 watchlist 파일 경로 반환 (stock_analyzer 우선)"""
+    for p in _WATCHLIST_PATHS:
+        if os.path.exists(p):
+            return p
+    return _WATCHLIST_PATHS[0]
+
+
 def _load_watchlist_files() -> list[str]:
+    """watchlist.txt 파일에서 동적으로 종목 로드 (매 호출 시 파일 읽기, 하드코딩 없음)"""
     seen = set()
     tickers = []
-    for t in WATCHLIST.split(","):
-        t = t.strip().upper()
-        if t and t not in seen:
-            tickers.append(t)
-            seen.add(t)
-    wl_paths = [
-        os.path.join(os.path.dirname(__file__), "watchlist.txt"),
-        os.path.join(os.path.dirname(__file__), "..", "stock_analyzer", "watchlist.txt"),
-    ]
-    for wl_file in wl_paths:
+    for wl_file in _WATCHLIST_PATHS:
         if os.path.exists(wl_file):
             with open(wl_file, 'r') as f:
                 for line in f:
@@ -326,6 +332,28 @@ def _load_watchlist_files() -> list[str]:
                         tickers.append(t)
                         seen.add(t)
     return tickers
+
+
+def _save_watchlist_file(tickers: list[str]):
+    """watchlist.txt 파일에 종목 저장"""
+    wl_path = _get_watchlist_path()
+    os.makedirs(os.path.dirname(wl_path), exist_ok=True)
+    header = "# 관심 종목 리스트 (한 줄에 하나, #은 주석)\n# WebUI에서 관리됨 — 직접 편집하지 마세요\n\n"
+    with open(wl_path, "w", encoding="utf-8") as f:
+        f.write(header)
+        for t in tickers:
+            f.write(f"{t}\n")
+    # 양쪽 파일 동기화
+    for p in _WATCHLIST_PATHS:
+        if p != wl_path:
+            try:
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(header)
+                    for t in tickers:
+                        f.write(f"{t}\n")
+            except Exception:
+                pass
 
 
 def run_scheduled_scan(override_tickers: list[str] | None = None):
@@ -433,7 +461,7 @@ def root():
         "status": "running",
         "model": OLLAMA_MODEL,
         "trading_style": TRADING_STYLE,
-        "watchlist": WATCHLIST,
+        "watchlist": _load_watchlist_files(),
         "scan_interval": f"{SCAN_INTERVAL_MINUTES}분",
         "thresholds": {
             "buy": BUY_THRESHOLD,
@@ -445,6 +473,49 @@ def root():
         "last_scan": scan_history[-1]["timestamp"] if scan_history else None,
         "cached_tickers": list(latest_results.keys()),
     }
+
+
+# ── Watchlist CRUD API (WebUI에서 동적 관리) ──────────────────
+
+@app.get("/watchlist")
+def get_watchlist():
+    """현재 watchlist 조회 (파일에서 동적 로드)"""
+    tickers = _load_watchlist_files()
+    return {"count": len(tickers), "tickers": tickers}
+
+
+@app.post("/watchlist/add")
+def add_to_watchlist(ticker: str):
+    """watchlist에 종목 추가"""
+    ticker = ticker.strip().upper()
+    if not ticker:
+        raise HTTPException(400, "Empty ticker")
+    current = _load_watchlist_files()
+    if ticker in current:
+        return {"ok": False, "msg": f"{ticker} already in watchlist", "tickers": current}
+    current.append(ticker)
+    _save_watchlist_file(current)
+    return {"ok": True, "msg": f"{ticker} added", "tickers": current}
+
+
+@app.post("/watchlist/remove")
+def remove_from_watchlist(ticker: str):
+    """watchlist에서 종목 제거"""
+    ticker = ticker.strip().upper()
+    current = _load_watchlist_files()
+    if ticker not in current:
+        return {"ok": False, "msg": f"{ticker} not found", "tickers": current}
+    current.remove(ticker)
+    _save_watchlist_file(current)
+    return {"ok": True, "msg": f"{ticker} removed", "tickers": current}
+
+
+@app.post("/watchlist/set")
+def set_watchlist(tickers: str):
+    """watchlist 전체 교체 (콤마 구분)"""
+    cleaned = list(dict.fromkeys(t.strip().upper() for t in tickers.split(",") if t.strip()))
+    _save_watchlist_file(cleaned)
+    return {"ok": True, "msg": f"{len(cleaned)} tickers set", "tickers": cleaned}
 
 
 @app.get("/results")
@@ -669,7 +740,7 @@ def main():
     print(f"  API: http://{API_HOST}:{API_PORT}")
     print(f"  모델: {OLLAMA_MODEL}")
     print(f"  스캔 주기: {SCAN_INTERVAL_MINUTES}분")
-    print(f"  종목: {WATCHLIST}")
+    print(f"  종목: {', '.join(_load_watchlist_files()) or '(watchlist.txt에서 로드)'}")
     print(f"  매수 임계: ≥{BUY_THRESHOLD}, 매도 임계: ≤{SELL_THRESHOLD}")
     print(f"{'='*60}\n")
 

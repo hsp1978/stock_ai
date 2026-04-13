@@ -10,3 +10,5 @@ output/
 *.egg-info/
 dist/
 build/
+*.db
+stock_analyzer/data/

@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
 주식 분석 시스템 WebUI (Streamlit)
-로컬 분석 엔진 직접 호출 + 전체 리포트 대시보드
+Mac Studio 에이전트 API 연동 + 전체 리포트 대시보드
 
 실행:
     streamlit run webui.py --server.port 8501
 """
 import json
 import os
+import sys
 from datetime import datetime
 
+import httpx
 import yfinance as yf
 import streamlit as st
 import pandas as pd
@@ -19,25 +21,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-WATCHLIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.txt")
+# ── local_engine 연결 (직접 import 우선, HTTP fallback) ──
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from local_engine import (
+        engine_dispatch_get, engine_dispatch_post, engine_get_chart_path,
+    )
+    _USE_LOCAL_ENGINE = True
+except ImportError:
+    _USE_LOCAL_ENGINE = False
 
-from local_engine import (
-    engine_health, engine_info, engine_get_all_results,
-    engine_get_ticker_result, engine_scan_ticker, engine_scan_all,
-    engine_get_history, engine_get_chart_path,
-    engine_backtest, engine_ml_predict,
-    engine_portfolio_optimize, engine_correlation_beta,
-    engine_factor_ranking,
-    engine_paper_status, engine_paper_order, engine_paper_auto, engine_paper_reset,
-    engine_available_llm, engine_interpret_tool, engine_interpret_full_report,
-    OLLAMA_MODEL,
-)
+AGENT_API_URL = os.getenv("AGENT_API_URL", "http://100.108.11.20:8100")
+WATCHLIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.txt")
 
 st.set_page_config(
     page_title="Stock AI",
     page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # ── Kinetic Terminal Design System CSS ──────────────────────────
@@ -84,64 +85,6 @@ st.markdown("""
     }
     div[data-testid="stSidebar"] .stMarkdown p,
     div[data-testid="stSidebar"] .stMarkdown li { font-size: 13px; color: var(--on-surface-variant); }
-
-    /* ── Top Navigation Bar ── */
-    .top-nav {
-        display: flex;
-        align-items: center;
-        gap: 0;
-        background: var(--L1);
-        border-radius: 12px;
-        padding: 4px;
-        margin-bottom: 20px;
-        position: sticky;
-        top: 0;
-        z-index: 999;
-    }
-    .top-nav-brand {
-        font-size: 1rem; font-weight: 900;
-        color: var(--primary-ctr); letter-spacing: -0.04em;
-        padding: 8px 18px 8px 14px;
-        white-space: nowrap;
-        border-right: 1px solid var(--outline-variant);
-        margin-right: 4px;
-    }
-    .top-nav-item {
-        padding: 8px 16px;
-        border-radius: 8px;
-        font-family: 'Inter', sans-serif;
-        font-size: 0.78rem;
-        font-weight: 600;
-        color: var(--on-surface-variant);
-        cursor: pointer;
-        transition: all 0.2s;
-        text-decoration: none;
-        white-space: nowrap;
-    }
-    .top-nav-item:hover {
-        background: var(--surface-bright);
-        color: var(--on-surface);
-    }
-    .top-nav-item.active {
-        background: var(--primary-ctr);
-        color: #0b0e14;
-        font-weight: 700;
-    }
-    .top-nav-right {
-        margin-left: auto;
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding-right: 8px;
-    }
-    .top-nav-status {
-        font-family: 'JetBrains Mono';
-        font-size: 0.65rem;
-        font-weight: 600;
-        padding: 4px 10px;
-        border-radius: 6px;
-        background: var(--L0);
-    }
 
     /* ── Page header ── */
     .page-header { margin-bottom: 28px; }
@@ -630,6 +573,39 @@ def resolve_ticker(user_input: str) -> tuple[str, str]:
     return text, ""
 
 
+def api_get(path: str, timeout: int = 10):
+    if _USE_LOCAL_ENGINE:
+        return engine_dispatch_get(path)
+    try:
+        resp = httpx.get(f"{AGENT_API_URL}{path}", timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.ConnectError:
+        return None
+    except Exception as e:
+        st.error(f"API Error: {e}")
+        return None
+
+
+def api_post(path: str, timeout: int = 300):
+    if _USE_LOCAL_ENGINE:
+        return engine_dispatch_post(path)
+    try:
+        resp = httpx.post(f"{AGENT_API_URL}{path}", timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.ConnectError:
+        return None
+    except Exception as e:
+        st.error(f"API Error: {e}")
+        return None
+
+
+def get_chart_url(ticker: str) -> str:
+    """local_engine 모드: 파일 경로 반환 / HTTP 모드: URL 반환"""
+    if _USE_LOCAL_ENGINE:
+        return engine_get_chart_path(ticker) or ""
+    return f"{AGENT_API_URL}/chart/{ticker}"
 
 
 def load_watchlist() -> list[str]:
@@ -702,14 +678,14 @@ def _signal_pill_html(signal: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  사이드바 (유틸리티)
+#  사이드바
 # ═══════════════════════════════════════════════════════════════
 
 with st.sidebar:
     st.markdown('<div class="sidebar-brand">Stock AI</div>', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-label">Precision Terminal</div>', unsafe_allow_html=True)
 
-    health = engine_health()
+    health = api_get("/health")
     if health:
         ollama_status = health.get("ollama", "disconnected")
         cached = health.get("cached_results", 0)
@@ -732,9 +708,9 @@ with st.sidebar:
         </div>
         """, unsafe_allow_html=True)
     else:
-        st.error("Engine not available")
+        st.error(f"Agent Offline: {AGENT_API_URL}")
 
-    info = engine_info()
+    info = api_get("/")
     if info:
         last_scan = info.get("last_scan", "")
         thresholds = info.get("thresholds", {})
@@ -764,7 +740,7 @@ with st.sidebar:
                 st.info(hint)
             if resolved:
                 with st.spinner(f"Analyzing {resolved}..."):
-                    result = engine_scan_ticker(resolved)
+                    result = api_post(f"/scan/{resolved}")
                     if result:
                         st.success(f"{resolved}: {result.get('final_signal')} ({result.get('composite_score', 0):+.1f})")
                         st.rerun()
@@ -809,41 +785,32 @@ with st.sidebar:
     if st.button("Scan All", use_container_width=True, key="scan_all_btn"):
         wl = load_watchlist()
         if wl:
+            tickers_param = ",".join(wl)
             with st.spinner(f"Scanning {len(wl)} tickers..."):
-                result = engine_scan_all(wl)
+                result = api_post(f"/scan?tickers={tickers_param}", timeout=600)
                 if result:
                     st.success(f"Done! {len(wl)} tickers scanned.")
             st.rerun()
         else:
             st.warning("Watchlist is empty")
 
+    st.divider()
 
+    st.markdown('<div class="sidebar-section-label">Agent Control</div>', unsafe_allow_html=True)
+    if st.button("Restart Agent", use_container_width=True, type="secondary"):
+        with st.spinner("Restarting agent service..."):
+            resp = api_post("/restart", timeout=5)
+            if resp and resp.get("status") == "restarting":
+                st.success("Agent restarting...")
+                import time as _time
+                _time.sleep(3)
+                st.rerun()
+            else:
+                st.error("Restart failed. Agent may be offline.")
 
-# ═══════════════════════════════════════════════════════════════
-#  상단 가로 네비게이션 바
-# ═══════════════════════════════════════════════════════════════
+    st.divider()
 
-NAV_ITEMS = ["Home", "Dashboard", "Report", "Detail", "Backtest", "ML Predict", "Portfolio", "Ranking", "Paper Trade", "History"]
-
-if "page" not in st.session_state:
-    st.session_state["page"] = "Home"
-
-nav_cols = st.columns([1.2] + [1] * len(NAV_ITEMS))
-
-with nav_cols[0]:
-    st.markdown('<div style="font-size:1rem;font-weight:900;color:var(--primary-ctr);padding:6px 0;letter-spacing:-0.04em;">Stock AI</div>', unsafe_allow_html=True)
-
-for i, nav_name in enumerate(NAV_ITEMS):
-    with nav_cols[i + 1]:
-        is_active = st.session_state["page"] == nav_name
-        btn_type = "primary" if is_active else "secondary"
-        if st.button(nav_name, key=f"nav_{nav_name}", use_container_width=True, type=btn_type):
-            st.session_state["page"] = nav_name
-            st.rerun()
-
-st.markdown('<div style="height:1px;background:var(--outline-variant);opacity:0.15;margin-bottom:16px;"></div>', unsafe_allow_html=True)
-
-page = st.session_state["page"]
+    page = st.radio("Navigation", ["Home", "Dashboard", "Detail", "Scan Log", "Backtest", "ML Predict", "Portfolio", "Ranking", "Paper Trade", "History"], label_visibility="collapsed")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -853,7 +820,7 @@ page = st.session_state["page"]
 def render_home():
     render_market_ticker_bar()
 
-    data = engine_get_all_results()
+    data = api_get("/results")
     results = data.get("results", {}) if data else {}
     total = len(results)
     buy_count = sum(1 for r in results.values() if r.get("signal") == "BUY")
@@ -873,8 +840,8 @@ def render_home():
     m3.metric("Sell", str(sell_count))
     m4.metric("Hold", str(hold_count))
 
-    health = engine_health()
-    info = engine_info()
+    health = api_get("/health")
+    info = api_get("/")
     watchlist = load_watchlist()
 
     st.markdown("""
@@ -983,7 +950,7 @@ def render_dashboard():
 
     render_market_ticker_bar()
 
-    data = engine_get_all_results()
+    data = api_get("/results")
     if not data or not data.get("results"):
         st.markdown("""
         <div class="empty-state">
@@ -993,11 +960,7 @@ def render_dashboard():
         """, unsafe_allow_html=True)
         return
 
-    _wl = set(load_watchlist())
-    results = {k: v for k, v in data["results"].items() if k in _wl} if _wl else data["results"]
-    if not results:
-        st.info("No results for current watchlist. Run a scan first.")
-        return
+    results = data["results"]
     total = len(results)
     buy_list = {k: v for k, v in results.items() if v.get("signal") == "BUY"}
     sell_list = {k: v for k, v in results.items() if v.get("signal") == "SELL"}
@@ -1272,7 +1235,7 @@ def render_detail():
     </div>
     """, unsafe_allow_html=True)
 
-    data = engine_get_all_results()
+    data = api_get("/results")
     if not data or not data.get("results"):
         st.markdown("""
         <div class="empty-state">
@@ -1282,13 +1245,12 @@ def render_detail():
         """, unsafe_allow_html=True)
         return
 
-    wl = set(load_watchlist())
-    tickers = sorted(t for t in data["results"].keys() if t in wl) if wl else sorted(data["results"].keys())
+    tickers = sorted(data["results"].keys())
     selected = st.selectbox("Select Ticker", tickers, label_visibility="collapsed")
     if not selected:
         return
 
-    detail = engine_get_ticker_result(selected)
+    detail = api_get(f"/results/{selected}")
     if not detail:
         summary = data["results"].get(selected, {})
         if not summary:
@@ -1381,11 +1343,21 @@ def render_detail():
         <div class="section-title">Chart</div>
     </div>
     """, unsafe_allow_html=True)
-    chart_path = engine_get_chart_path(selected)
-    if chart_path and os.path.exists(chart_path):
-        st.image(chart_path, use_container_width=True)
+    chart_ref = get_chart_url(selected)
+    if _USE_LOCAL_ENGINE:
+        if chart_ref and os.path.exists(chart_ref):
+            st.image(chart_ref, use_container_width=True)
+        else:
+            st.caption("No chart image available")
     else:
-        st.caption("No chart image available")
+        try:
+            resp = httpx.get(chart_ref, timeout=5)
+            if resp.status_code == 200:
+                st.image(resp.content, use_container_width=True)
+            else:
+                st.caption("No chart image available")
+        except Exception:
+            st.caption("Chart load failed")
 
     llm = detail.get("llm_conclusion", "")
     if llm and not llm.startswith("[오류]") and not llm.startswith("[LLM"):
@@ -1409,7 +1381,7 @@ def render_history():
     </div>
     """, unsafe_allow_html=True)
 
-    data = engine_get_history(20)
+    data = api_get("/history?limit=20")
     if not data or not data.get("history"):
         st.markdown("""
         <div class="empty-state">
@@ -1470,20 +1442,16 @@ def render_backtest():
     </div>
     """, unsafe_allow_html=True)
 
-    tickers = load_watchlist()
-    if not tickers:
-        st.info("Watchlist is empty. Add tickers first.")
+    data = api_get("/results")
+    results = data.get("results", {}) if data else {}
+    if not results:
+        st.info("No analysis results. Run a scan first.")
         return
 
-    ticker = st.selectbox("Select Ticker", sorted(tickers))
+    ticker = st.selectbox("Select Ticker", sorted(results.keys()))
     if st.button("Run Backtest", type="primary"):
-        with st.spinner(f"Scanning {ticker} for backtest..."):
-            scan = engine_scan_ticker(ticker)
-        if not scan:
-            st.error(f"Scan failed for {ticker}. Cannot run backtest.")
-            return
         with st.spinner(f"Backtesting {ticker}..."):
-            bt = engine_backtest(ticker)
+            bt = api_get(f"/backtest/{ticker}", timeout=60)
         if not bt:
             st.error("Backtest failed")
             return
@@ -1521,15 +1489,17 @@ def render_ml_predict():
     </div>
     """, unsafe_allow_html=True)
 
-    tickers = load_watchlist()
+    data = api_get("/results")
+    results = data.get("results", {}) if data else {}
+    tickers = sorted(results.keys()) if results else load_watchlist()
     if not tickers:
-        st.info("Watchlist is empty. Add tickers first.")
+        st.info("No tickers available.")
         return
 
-    ticker = st.selectbox("Select Ticker", sorted(tickers), key="ml_ticker")
+    ticker = st.selectbox("Select Ticker", tickers, key="ml_ticker")
     if st.button("Run ML Prediction", type="primary"):
         with st.spinner(f"Training model for {ticker}..."):
-            ml = engine_ml_predict(ticker)
+            ml = api_get(f"/ml/{ticker}", timeout=120)
         if not ml:
             st.error("ML prediction failed")
             return
@@ -1583,9 +1553,10 @@ def render_portfolio():
     </div>
     """, unsafe_allow_html=True)
 
-    tickers = load_watchlist()
-    if len(tickers) < 2:
-        st.info("Need at least 2 tickers in watchlist for portfolio optimization.")
+    data = api_get("/results")
+    results = data.get("results", {}) if data else {}
+    if len(results) < 2:
+        st.info("Need at least 2 analyzed tickers for portfolio optimization.")
         return
 
     tab1, tab2 = st.tabs(["Optimization", "Correlation / Beta"])
@@ -1594,7 +1565,7 @@ def render_portfolio():
         method = st.selectbox("Method", ["markowitz", "risk_parity"])
         if st.button("Optimize Portfolio", type="primary"):
             with st.spinner("Optimizing..."):
-                opt = engine_portfolio_optimize(method)
+                opt = api_get(f"/portfolio/optimize?method={method}", timeout=60)
             if not opt:
                 st.error("Optimization failed")
                 return
@@ -1634,7 +1605,7 @@ def render_portfolio():
     with tab2:
         if st.button("Analyze Correlation & Beta", type="primary"):
             with st.spinner("Analyzing..."):
-                corr = engine_correlation_beta()
+                corr = api_get("/portfolio/correlation", timeout=60)
             if not corr:
                 st.error("Analysis failed")
                 return
@@ -1675,7 +1646,7 @@ def render_ranking():
     </div>
     """, unsafe_allow_html=True)
 
-    ranking_data = engine_factor_ranking()
+    ranking_data = api_get("/ranking")
     if not ranking_data or not ranking_data.get("ranking"):
         st.info("No ranking data. Run scans for multiple tickers first.")
         return
@@ -1742,7 +1713,7 @@ def render_paper_trade():
     </div>
     """, unsafe_allow_html=True)
 
-    status = engine_paper_status()
+    status = api_get("/paper")
     if not status:
         st.error("Paper trading service unavailable")
         return
@@ -1802,7 +1773,7 @@ def render_paper_trade():
         st.caption("Execute paper trades based on latest agent signals")
         if st.button("Execute Auto Trades", type="primary"):
             with st.spinner("Executing..."):
-                result = engine_paper_auto()
+                result = api_post("/paper/auto", timeout=60)
             if result:
                 orders = result.get("orders", [])
                 if orders:
@@ -1821,7 +1792,10 @@ def render_paper_trade():
 
         if st.button("Submit Order"):
             if order_ticker:
-                result = engine_paper_order(order_ticker, order_action, int(order_qty), float(order_price))
+                result = api_post(
+                    f"/paper/order?ticker={order_ticker.upper()}&action={order_action}&qty={order_qty}&price={order_price}",
+                    timeout=10,
+                )
                 if result:
                     if result.get("status") == "filled":
                         st.success(f"Order filled: {order_action} {order_qty} {order_ticker.upper()} @ ${order_price}")
@@ -1830,739 +1804,586 @@ def render_paper_trade():
 
     st.divider()
     if st.button("Reset Paper Trading", type="secondary"):
-        result = engine_paper_reset()
+        result = api_post("/paper/reset", timeout=5)
         if result:
             st.success("Paper trading reset")
             st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════
-#  종합 레포트 페이지
+#  스캔 로그 (DB) 페이지
 # ═══════════════════════════════════════════════════════════════
 
-def _score_bar_html(score: float, max_val: float = 10) -> str:
-    pct = min(abs(score) / max_val * 100, 100)
-    color = "var(--buy)" if score > 0 else ("var(--sell)" if score < 0 else "var(--outline)")
-    direction = "right" if score >= 0 else "left"
-    return f"""
-    <div style="display:flex;align-items:center;gap:8px;">
-        <div style="width:60%;height:8px;background:var(--L2);border-radius:4px;position:relative;overflow:hidden;">
-            <div style="position:absolute;{direction}:50%;width:{pct/2}%;height:100%;background:{color};border-radius:4px;"></div>
-            <div style="position:absolute;left:50%;top:0;width:1px;height:100%;background:var(--outline);opacity:0.3;"></div>
-        </div>
-        <span style="font-family:'JetBrains Mono';font-size:0.75rem;font-weight:700;color:{color};min-width:45px;">{score:+.1f}</span>
-    </div>"""
-
-
-def _fmt_pct(v, decimals=1):
-    if v is None:
-        return "—"
-    return f"{v * 100:.{decimals}f}%" if abs(v) < 10 else f"{v:.{decimals}f}%"
-
-
-def _fmt_dollar(v):
-    if v is None:
-        return "—"
-    if abs(v) >= 1e12:
-        return f"${v/1e12:.1f}T"
-    if abs(v) >= 1e9:
-        return f"${v/1e9:.1f}B"
-    if abs(v) >= 1e6:
-        return f"${v/1e6:.1f}M"
-    return f"${v:,.0f}"
-
-
-TOOL_EXPLANATIONS = {
-    "trend_ma_analysis": {
-        "title": "이동평균선 배열 분석",
-        "desc": "단기(20일), 중기(50일), 장기(200일) 이동평균선의 배열 상태와 크로스 신호를 분석합니다.",
-        "metrics": {
-            "SMA 20/50/200": "각 기간의 단순이동평균(Simple Moving Average). 현재가가 이 선 위에 있으면 해당 기간 평균보다 강세.",
-            "정배열(Bullish Aligned)": "SMA20 > SMA50 > SMA200 순서. 강한 상승 추세를 의미하며, 추세 추종 매매에 적합.",
-            "역배열(Bearish Aligned)": "SMA20 < SMA50 < SMA200 순서. 하락 추세를 의미하며, 매수 진입 시 주의.",
-            "골든크로스": "단기 이평선이 장기 이평선을 상향 돌파. 중기적 상승 전환 신호.",
-            "데드크로스": "단기 이평선이 장기 이평선을 하향 돌파. 중기적 하락 전환 신호.",
-        },
-    },
-    "rsi_divergence_analysis": {
-        "title": "RSI 다이버전스 분석",
-        "desc": "RSI(Relative Strength Index)의 과매수/과매도 상태와 가격-RSI 간 다이버전스를 탐지합니다.",
-        "metrics": {
-            "RSI": "0~100 범위. 70 이상 과매수(단기 조정 가능), 30 이하 과매도(반등 가능). 50이 중립선.",
-            "일반 강세 다이버전스": "가격은 저점 갱신, RSI는 저점 상승 → 하락 힘이 약해지며 반등 가능성.",
-            "일반 약세 다이버전스": "가격은 고점 갱신, RSI는 고점 하락 → 상승 힘이 약해지며 조정 가능성.",
-            "히든 다이버전스": "추세 지속을 확인하는 신호. 히든 강세: 추세 내 매수 기회, 히든 약세: 추세 내 매도 기회.",
-        },
-    },
-    "bollinger_squeeze_analysis": {
-        "title": "볼린저밴드 스퀴즈/확장 분석",
-        "desc": "볼린저밴드의 폭 변화를 통해 변동성 축소(스퀴즈) 후 확장 패턴을 탐지합니다.",
-        "metrics": {
-            "BB Width %": "상단-하단밴드 간격을 중간밴드로 나눈 비율. 낮을수록 스퀴즈(변동성 축소), 높을수록 확장.",
-            "%B": "현재가의 볼린저밴드 내 위치. 0=하단밴드, 0.5=중간, 1=상단밴드. 0 이하나 1 이상은 밴드 이탈.",
-            "스퀴즈(Squeeze)": "밴드 폭이 최근 120일 중 최소 수준으로 좁아진 상태. 큰 움직임 직전의 '에너지 축적' 구간.",
-            "확장(Expanding)": "밴드가 넓어지는 상태. 강한 추세 움직임이 진행 중임을 의미.",
-        },
-    },
-    "macd_momentum_analysis": {
-        "title": "MACD 모멘텀 분석",
-        "desc": "MACD(이동평균수렴확산)의 크로스, 히스토그램 방향, 제로라인 돌파를 분석합니다.",
-        "metrics": {
-            "MACD": "12일 EMA - 26일 EMA. 양수이면 단기 모멘텀이 장기보다 강세.",
-            "Signal": "MACD의 9일 EMA. MACD가 시그널 위로 올라가면 매수 크로스.",
-            "Histogram": "MACD - Signal. 양수 증가 = 상승 가속, 양수 감소 = 상승 둔화, 음수 증가 = 하락 감속.",
-            "크로스": "MACD가 시그널선을 돌파하는 시점. 골든크로스(상향)=매수, 데드크로스(하향)=매도.",
-        },
-    },
-    "adx_trend_strength_analysis": {
-        "title": "ADX 추세 강도 분석",
-        "desc": "ADX(Average Directional Index)로 추세의 존재 여부와 강도를 측정합니다.",
-        "metrics": {
-            "ADX": "추세 강도 지표. 25 이상=추세 존재, 50 이상=매우 강한 추세, 20 이하=비추세(횡보).",
-            "+DI / -DI": "상승/하락 방향지표. +DI > -DI이면 상승 추세, +DI < -DI이면 하락 추세.",
-            "추세 강도(Trend Strength)": "ADX 값 기반 분류: weak(20 미만), moderate(20-25), strong(25-50), very_strong(50+).",
-        },
-    },
-    "volume_profile_analysis": {
-        "title": "거래량 프로파일 분석",
-        "desc": "거래량 패턴, OBV(On-Balance Volume), 매집/분산 상태를 분석합니다.",
-        "metrics": {
-            "Volume Ratio": "최근 거래량 / 평균 거래량. 1.5 이상이면 거래량 급증, 0.5 이하면 거래량 부족.",
-            "OBV Trend": "가격 상승일에는 거래량 더하고 하락일에는 빼는 누적선. 상승(rising)이면 매수 압력 우세.",
-            "매집/분산(Accum/Dist)": "가격 변화와 거래량으로 스마트머니의 매집(accumulation) 또는 분산(distribution) 판단.",
-        },
-    },
-    "fibonacci_retracement_analysis": {
-        "title": "피보나치 되돌림 분석",
-        "desc": "주요 피보나치 비율(23.6%, 38.2%, 50%, 61.8%, 78.6%)에서의 지지/저항을 분석합니다.",
-        "metrics": {
-            "Retracement": "현재가가 최고-최저 범위에서 어디에 위치하는지 비율. 0.382 근처 = 건전한 조정, 0.618 이상 = 깊은 조정.",
-            "지지선(Support)": "현재가 아래에서 가격이 반등할 가능성이 높은 피보나치 레벨.",
-            "저항선(Resistance)": "현재가 위에서 가격 상승이 막힐 가능성이 높은 피보나치 레벨.",
-            "Fib Levels": "0.236, 0.382, 0.5, 0.618, 0.786의 각 레벨별 가격. 이 가격대에서 매매 결정의 참고점.",
-        },
-    },
-    "volatility_regime_analysis": {
-        "title": "변동성 체제 분석",
-        "desc": "ATR(Average True Range) 기반으로 현재 변동성의 상대적 위치와 체제를 분류합니다.",
-        "metrics": {
-            "ATR %": "ATR을 현재가로 나눈 비율. 높을수록 변동성이 큰 상태.",
-            "Percentile": "최근 1년 기준 현재 ATR의 백분위. 90 이상=극도의 고변동성, 10 이하=극도의 저변동성.",
-            "Regime": "low_vol(저변동), normal(보통), high_vol(고변동), extreme(극단). 저변동 후 급등 가능성 높음.",
-            "Annualized Vol": "일간 수익률의 표준편차를 연간화한 변동성. S&P500 평균은 약 15~20%.",
-        },
-    },
-    "mean_reversion_analysis": {
-        "title": "평균 회귀 분석",
-        "desc": "Z-Score를 이용해 현재가가 평균에서 얼마나 벗어났는지, 평균으로 회귀할 확률을 계산합니다.",
-        "metrics": {
-            "Z-Score": "표준편차 단위로 평균에서의 이탈도. +2 이상=과매수(평균 회귀 매도), -2 이하=과매도(평균 회귀 매수).",
-            "Avg Z-Score": "여러 기간 Z-Score의 평균. 방향 일치시 신뢰도 상승.",
-            "Reversion Prob": "통계적 평균 회귀 확률. 높을수록 현재 가격이 극단적 위치에 있음을 의미.",
-        },
-    },
-    "momentum_rank_analysis": {
-        "title": "모멘텀 순위 분석",
-        "desc": "1주, 1개월, 3개월 수익률을 종합하여 모멘텀 강도와 가속/감속 상태를 판단합니다.",
-        "metrics": {
-            "기간별 수익률": "1w(1주), 1m(1개월), 3m(3개월) 수익률. 모두 양수이면 강한 상승 모멘텀.",
-            "Weighted Return": "기간별 가중 평균 수익률. 단기에 높은 가중치를 부여하여 최근 모멘텀을 강조.",
-            "Acceleration": "모멘텀의 변화율. 양수=모멘텀 가속(추가 상승 기대), 음수=모멘텀 둔화(조정 가능).",
-        },
-    },
-    "support_resistance_analysis": {
-        "title": "지지/저항선 분석",
-        "desc": "피봇포인트, 가격 클러스터, 스윙 고저점을 이용해 핵심 가격대를 산출합니다.",
-        "metrics": {
-            "Pivot": "전일 (고가+저가+종가)/3. 당일 거래의 중심축.",
-            "Upside %": "현재가에서 1차 저항선까지의 상승 여력.",
-            "Risk/Reward": "상승 여력 / 하방 리스크 비율. 2 이상이면 진입 매력 있음.",
-            "R1/R2/R3": "피봇 기반 저항선. 가격 상승 시 매도 압력이 예상되는 가격대.",
-            "S1/S2/S3": "피봇 기반 지지선. 가격 하락 시 매수 지지가 예상되는 가격대.",
-        },
-    },
-    "correlation_regime_analysis": {
-        "title": "자기상관/허스트 분석",
-        "desc": "수익률의 자기상관과 허스트 지수를 통해 추세 지속성 vs 평균회귀 성향을 판단합니다.",
-        "metrics": {
-            "Avg Autocorrelation": "수익률의 평균 자기상관. 양수=추세 지속 경향, 음수=평균 회귀 경향.",
-            "Hurst Exponent": "0.5=랜덤워크, >0.5=추세 추종, <0.5=평균 회귀. 0.7 이상=강한 추세 지속성.",
-            "Regime": "trending(추세형), mean_reverting(회귀형), random(랜덤). 매매 전략 선택의 근거.",
-        },
-    },
-    "risk_position_sizing": {
-        "title": "포지션 사이징",
-        "desc": "ATR 기반 손절가 산출, 계좌 리스크 비율에 따른 적정 수량, 분할 매수 계획을 제시합니다.",
-        "metrics": {
-            "Entry Price": "현재 종가 기준 진입 가격.",
-            "Stop Loss": "ATR x 배수로 산출한 손절 가격. 이 가격 아래로 내려가면 손절 실행.",
-            "Take Profit": "손절폭의 리스크:보상 비율만큼 위에 설정한 익절 가격.",
-            "Recommended Qty": "계좌 크기 x 리스크 비율 / (진입가-손절가)로 산출한 적정 수량.",
-            "Split Entries": "분할 매수 가격대. 한 번에 몰빵하지 않고 2~3차에 나눠 매수하여 리스크 분산.",
-        },
-    },
-    "kelly_criterion_analysis": {
-        "title": "켈리 기준 분석",
-        "desc": "과거 승률과 손익비를 기반으로 수학적 최적 베팅 비율을 산출합니다.",
-        "metrics": {
-            "Win Rate": "과거 거래에서의 승률. 50% 이상이면 양의 기대값 가능성.",
-            "Kelly Full %": "f* = (bp - q) / b 공식으로 산출한 풀 켈리 비율. 실전에서는 1/2~1/4만 사용.",
-            "Optimal Position %": "반 켈리(Half Kelly) 기준 추천 포지션 비율. 보수적으로 적용.",
-            "Sharpe Ratio": "초과수익률 / 변동성. 1 이상=양호, 2 이상=우수, 3 이상=탁월.",
-        },
-    },
-    "beta_correlation_analysis": {
-        "title": "베타/상관관계 분석",
-        "desc": "S&P 500(SPY) 대비 베타, 알파, 상관계수를 산출하여 시장 대비 성과를 평가합니다.",
-        "metrics": {
-            "Beta": "시장 대비 변동성 배수. 1=시장과 동일, >1=시장보다 변동 큼, <1=시장보다 안정적.",
-            "Beta 60d": "최근 60일 기준 단기 베타. 장기 베타와 비교하여 최근 변화 파악.",
-            "Alpha (Annual %)": "시장 수익률 대비 초과 수익률. 양수=시장 아웃퍼폼, 음수=언더퍼폼.",
-            "Correlation": "SPY와의 상관계수. 1에 가까울수록 시장과 동행, 0이면 무관, 음수이면 역행.",
-            "R-Squared": "시장 변동으로 설명되는 가격 변동 비율. 높으면 시장 의존도 높음.",
-            "Info Ratio": "정보 비율 = 알파 / 추적 오차. 1 이상이면 우수한 액티브 성과.",
-        },
-    },
-    "event_driven_analysis": {
-        "title": "이벤트 드리븐 분석",
-        "desc": "실적 발표, 배당락, 52주 신고/저가, 애널리스트 추천 등 이벤트를 추적합니다.",
-        "metrics": {
-            "52W High/Low": "52주 최고/최저가. 현재가가 고점 근처면 돌파 매매, 저점 근처면 반등 매매 기회.",
-            "Analyst Recommendation": "애널리스트 컨센서스 (buy/hold/sell). 시장 심리 파악에 참고.",
-            "Earnings Dates": "향후 실적 발표 예정일. 실적 시즌에는 변동성이 급등하므로 포지션 관리 필요.",
-        },
-    },
-}
-
-
-def _render_tool_explanation(tool_key: str):
-    info = TOOL_EXPLANATIONS.get(tool_key)
-    if not info:
-        return
-    st.markdown(f"""<div style="background:var(--surface-low);border-radius:8px;padding:12px 16px;margin:8px 0;border-left:3px solid var(--primary-ctr);">
-<div style="font-size:0.75rem;font-weight:700;color:var(--primary);margin-bottom:6px;">{info['title']}</div>
-<div style="font-size:0.7rem;color:var(--on-surface-variant);margin-bottom:8px;">{info['desc']}</div>
-</div>""", unsafe_allow_html=True)
-    for metric_name, metric_desc in info["metrics"].items():
-        st.markdown(f"""<div style="font-size:0.7rem;padding:2px 0 2px 16px;color:var(--on-surface-variant);">
-<span style="color:var(--on-surface);font-weight:600;">{metric_name}</span> — {metric_desc}</div>""", unsafe_allow_html=True)
-
-
-def _render_ai_interpret_btn(selected: str, tool_key: str, llm_providers: list):
-    if not llm_providers:
-        return
-    btn_key = f"ai_{tool_key}_{selected}"
-    result_key = f"ai_result_{tool_key}_{selected}"
-    if st.button("AI 해석", key=btn_key, type="secondary"):
-        with st.spinner("AI 분석 중..."):
-            st.session_state[result_key] = engine_interpret_tool(selected, tool_key, llm_providers[0])
-    if result_key in st.session_state:
-        st.markdown(st.session_state[result_key])
-
-
-def render_report():
+def render_scan_log():
     st.markdown("""
     <div class="page-header">
-        <div class="page-title">Report</div>
-        <div class="page-subtitle">Comprehensive analysis report for individual stocks</div>
+        <div class="page-title">Scan Log</div>
+        <div class="page-subtitle">Persistent scan result database &amp; analytics</div>
     </div>
     """, unsafe_allow_html=True)
 
-    data = engine_get_all_results()
-    tickers_available = sorted(data.get("results", {}).keys()) if data else []
-
-    wl = load_watchlist()
-    ticker_options = sorted(set(wl) | set(tickers_available)) if wl else tickers_available
-
-    if not ticker_options:
-        st.info("No tickers available. Add tickers to watchlist and run a scan first.")
-        return
-
-    llm_info = engine_available_llm()
-    llm_providers = llm_info.get("providers", [])
-
-    col_sel, col_btn, col_llm = st.columns([3, 1, 1.5])
-    with col_sel:
-        selected = st.selectbox("Select Ticker", ticker_options, label_visibility="collapsed")
-    with col_btn:
-        run_scan = st.button("Scan & Report", type="primary", use_container_width=True)
-    with col_llm:
-        provider_labels = {"openai": "GPT-4o", "gemini": "Gemini", "ollama": f"Ollama ({OLLAMA_MODEL})"}
-        if llm_providers:
-            llm_display = ", ".join(provider_labels.get(p, p) for p in llm_providers)
-            st.markdown(f'<div style="font-size:0.65rem;color:var(--on-surface-variant);padding:8px 0;">LLM: <span style="color:var(--buy);">{llm_display}</span></div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div style="font-size:0.65rem;color:var(--sell);padding:8px 0;">LLM: None (.env 설정 필요)</div>', unsafe_allow_html=True)
-
-    if run_scan and selected:
-        with st.spinner(f"Analyzing {selected}..."):
-            engine_scan_ticker(selected)
-
-    detail = engine_get_ticker_result(selected)
-    if not detail:
+    # ── 통계 요약 ──
+    stats = api_get("/scan-log/stats")
+    if not stats or stats.get("total_scans", 0) == 0:
         st.markdown("""
         <div class="empty-state">
             <div class="es-icon">📊</div>
-            <div class="es-text">No analysis data. Click "Scan & Report" to analyze.</div>
+            <div class="es-text">No scan logs yet. Run a scan to start building history.</div>
         </div>
         """, unsafe_allow_html=True)
         return
 
-    signal = detail.get("final_signal", "?")
-    score = detail.get("composite_score", 0)
-    confidence = detail.get("confidence", 0)
-    tool_count = detail.get("tool_count", 0)
-    dist = detail.get("signal_distribution", {})
-    analyzed_at = str(detail.get("analyzed_at", ""))[:19].replace("T", " ")
+    total_scans = stats.get("total_scans", 0)
+    signal_dist = stats.get("signal_distribution", [])
+    ticker_stats = stats.get("ticker_stats", [])
+    daily_counts = stats.get("daily_counts", [])
+    recent_scans = stats.get("recent_scans", [])
 
-    badge_class = "buy" if signal == "BUY" else ("sell" if signal == "SELL" else "hold")
-    score_color = "var(--buy)" if score > 0 else ("var(--sell)" if score < 0 else "var(--outline)")
+    # 카드 집계
+    buy_cnt = sum(d.get("cnt", 0) for d in signal_dist if d.get("final_signal") == "BUY")
+    sell_cnt = sum(d.get("cnt", 0) for d in signal_dist if d.get("final_signal") == "SELL")
+    hold_cnt = sum(d.get("cnt", 0) for d in signal_dist if d.get("final_signal") == "HOLD")
 
-    st.markdown(f"""
-    <div style="display:flex;align-items:center;gap:24px;margin-bottom:20px;">
-        <div>
-            <div style="font-size:1.8rem;font-weight:800;letter-spacing:-0.03em;">{selected}</div>
-            <div style="font-size:0.7rem;color:var(--on-surface-variant);margin-top:2px;">{analyzed_at}</div>
-        </div>
-        <span class="signal-badge-lg {badge_class}">{signal}</span>
-        <div style="margin-left:auto;text-align:right;">
-            <div style="font-family:'JetBrains Mono';font-size:2rem;font-weight:800;color:{score_color};">{score:+.2f}</div>
-            <div style="font-size:0.65rem;color:var(--on-surface-variant);text-transform:uppercase;letter-spacing:0.5px;">Composite Score</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Scans", str(total_scans))
+    m2.metric("Buy Records", str(buy_cnt))
+    m3.metric("Sell Records", str(sell_cnt))
+    m4.metric("Hold Records", str(hold_cnt))
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Confidence", f"{confidence}/10")
-    m2.metric("Tools", str(tool_count))
-    m3.metric("Buy Votes", str(dist.get("buy", 0)))
-    m4.metric("Sell Votes", str(dist.get("sell", 0)))
-    m5.metric("Neutral", str(dist.get("neutral", 0)))
+    # ── 탭 구성 ──
+    tab_overview, tab_weekly, tab_search, tab_ticker, tab_export = st.tabs(
+        ["Overview", "Weekly Trend", "Search", "Ticker History", "Export"]
+    )
 
-    chart_path = engine_get_chart_path(selected)
-    if chart_path and os.path.exists(chart_path):
-        st.image(chart_path, use_container_width=True)
-
-    tab_tech, tab_quant, tab_risk, tab_fund, tab_llm = st.tabs([
-        "Technical Analysis", "Quantitative", "Risk & Sizing", "Fundamentals", "AI Deep Analysis"
-    ])
-
-    tool_details = detail.get("tool_details", [])
-    tool_map = {td.get("tool"): td for td in tool_details}
-
-    with tab_tech:
-        tech_tools = [
-            ("trend_ma_analysis", "Moving Average"),
-            ("rsi_divergence_analysis", "RSI Divergence"),
-            ("bollinger_squeeze_analysis", "Bollinger Squeeze"),
-            ("macd_momentum_analysis", "MACD Momentum"),
-            ("adx_trend_strength_analysis", "ADX Trend Strength"),
-            ("volume_profile_analysis", "Volume Profile"),
-        ]
-
-        for tool_key, tool_label in tech_tools:
-            td = tool_map.get(tool_key)
-            if not td:
-                continue
-            tool_signal = td.get("signal", "neutral").upper()
-            tool_score = td.get("score", 0)
-            pill = _signal_pill_html(tool_signal)
-
-            with st.expander(f"**{tool_label}** — {pill} ({tool_score:+.1f})", expanded=False):
-                st.markdown(_score_bar_html(tool_score), unsafe_allow_html=True)
-                st.caption(td.get("detail", ""))
-
-                if tool_key == "trend_ma_analysis":
-                    sma = td.get("sma_values", {})
-                    price_vs = td.get("price_vs_sma", {})
-                    cols = st.columns(len(sma)) if sma else []
-                    for col, (period, val) in zip(cols, sma.items()):
-                        pos = price_vs.get(str(period), "")
-                        col.metric(f"SMA {period}", _fmt_num(val), pos)
-                    c1, c2 = st.columns(2)
-                    c1.metric("Alignment", str(td.get("alignment", "—")))
-                    c2.metric("Cross Signal", str(td.get("cross_signal", "—")))
-
-                elif tool_key == "rsi_divergence_analysis":
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("RSI", _fmt_num(td.get("current_rsi"), 1))
-                    c2.metric("Zone", str(td.get("rsi_zone", "—")))
-                    c3.metric("Divergence", str(td.get("divergence", "none")))
-
-                elif tool_key == "bollinger_squeeze_analysis":
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("BB Width %", _fmt_num(td.get("bb_width_pct"), 2))
-                    c2.metric("%B", _fmt_num(td.get("pct_b"), 3))
-                    c3.metric("Squeeze", str(td.get("squeeze", "—")))
-                    c4.metric("Expanding", str(td.get("expanding", "—")))
-
-                elif tool_key == "macd_momentum_analysis":
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("MACD", _fmt_num(td.get("macd"), 3))
-                    c2.metric("Signal", _fmt_num(td.get("signal_line"), 3))
-                    c3.metric("Histogram", _fmt_num(td.get("histogram"), 3))
-                    c4.metric("Cross", str(td.get("cross", "—")))
-
-                elif tool_key == "adx_trend_strength_analysis":
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("ADX", _fmt_num(td.get("adx"), 1))
-                    c2.metric("+DI", _fmt_num(td.get("plus_di"), 1))
-                    c3.metric("-DI", _fmt_num(td.get("minus_di"), 1))
-                    c4.metric("Trend", str(td.get("trend_strength", "—")))
-
-                elif tool_key == "volume_profile_analysis":
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Volume Ratio", _fmt_num(td.get("volume_ratio"), 2))
-                    c2.metric("OBV Trend", str(td.get("obv_trend", "—")))
-                    c3.metric("Accum/Dist", str(td.get("accumulation_distribution", "—")))
-
-                _render_tool_explanation(tool_key)
-                _render_ai_interpret_btn(selected, tool_key, llm_providers)
-
-    with tab_quant:
-        quant_tools = [
-            ("fibonacci_retracement_analysis", "Fibonacci Retracement"),
-            ("volatility_regime_analysis", "Volatility Regime"),
-            ("mean_reversion_analysis", "Mean Reversion"),
-            ("momentum_rank_analysis", "Momentum Ranking"),
-            ("support_resistance_analysis", "Support / Resistance"),
-            ("correlation_regime_analysis", "Correlation Regime"),
-        ]
-
-        for tool_key, tool_label in quant_tools:
-            td = tool_map.get(tool_key)
-            if not td:
-                continue
-            tool_signal = td.get("signal", "neutral").upper()
-            tool_score = td.get("score", 0)
-            pill = _signal_pill_html(tool_signal)
-
-            with st.expander(f"**{tool_label}** — {pill} ({tool_score:+.1f})", expanded=False):
-                st.markdown(_score_bar_html(tool_score), unsafe_allow_html=True)
-                st.caption(td.get("detail", ""))
-
-                if tool_key == "fibonacci_retracement_analysis":
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Retracement", _fmt_num(td.get("current_retracement"), 3))
-                    c2.metric("Nearest Support", _fmt_num(td.get("nearest_support")))
-                    c3.metric("Nearest Resistance", _fmt_num(td.get("nearest_resistance")))
-                    levels = td.get("levels", {})
-                    if levels:
-                        st.markdown("**Fib Levels**")
-                        level_cols = st.columns(len(levels))
-                        for col, (name, val) in zip(level_cols, levels.items()):
-                            col.metric(str(name), _fmt_num(val))
-
-                elif tool_key == "volatility_regime_analysis":
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("ATR %", _fmt_num(td.get("atr_pct"), 2))
-                    c2.metric("Percentile", _fmt_num(td.get("percentile"), 1))
-                    c3.metric("Regime", str(td.get("regime", "—")))
-                    c4.metric("Annualized Vol", _fmt_num(td.get("annualized_volatility"), 1))
-
-                elif tool_key == "mean_reversion_analysis":
-                    z_scores = td.get("z_scores", {})
-                    if z_scores:
-                        cols = st.columns(len(z_scores))
-                        for col, (period, val) in zip(cols, z_scores.items()):
-                            col.metric(f"Z-Score {period}", _fmt_num(val, 2))
-                    c1, c2 = st.columns(2)
-                    c1.metric("Avg Z-Score", _fmt_num(td.get("avg_z_score"), 2))
-                    c2.metric("Reversion Prob", _fmt_pct(td.get("reversion_probability")))
-
-                elif tool_key == "momentum_rank_analysis":
-                    returns = td.get("returns", {})
-                    if returns:
-                        cols = st.columns(len(returns))
-                        for col, (period, val) in zip(cols, returns.items()):
-                            col.metric(period, _fmt_pct(val))
-                    c1, c2 = st.columns(2)
-                    c1.metric("Weighted Return", _fmt_pct(td.get("weighted_return")))
-                    c2.metric("Acceleration", _fmt_num(td.get("acceleration"), 3))
-
-                elif tool_key == "support_resistance_analysis":
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Pivot", _fmt_num(td.get("pivot")))
-                    c2.metric("Upside %", _fmt_num(td.get("upside_pct"), 1))
-                    c3.metric("Risk/Reward", _fmt_num(td.get("risk_reward_ratio"), 2))
-                    r_levels = td.get("resistance", {})
-                    s_levels = td.get("support", {})
-                    if r_levels or s_levels:
-                        rc, sc = st.columns(2)
-                        with rc:
-                            st.markdown("**Resistance**")
-                            for name, val in r_levels.items():
-                                st.metric(str(name), _fmt_num(val))
-                        with sc:
-                            st.markdown("**Support**")
-                            for name, val in s_levels.items():
-                                st.metric(str(name), _fmt_num(val))
-
-                elif tool_key == "correlation_regime_analysis":
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Avg Autocorrelation", _fmt_num(td.get("avg_autocorrelation"), 3))
-                    c2.metric("Hurst Exponent", _fmt_num(td.get("hurst_exponent"), 3))
-                    c3.metric("Regime", str(td.get("regime", "—")).title())
-
-                _render_tool_explanation(tool_key)
-                _render_ai_interpret_btn(selected, tool_key, llm_providers)
-
-    with tab_risk:
-        risk_tools = [
-            ("risk_position_sizing", "Position Sizing"),
-            ("kelly_criterion_analysis", "Kelly Criterion"),
-            ("beta_correlation_analysis", "Beta / Correlation"),
-            ("event_driven_analysis", "Event-Driven"),
-        ]
-
-        for tool_key, tool_label in risk_tools:
-            td = tool_map.get(tool_key)
-            if not td:
-                continue
-            tool_signal = td.get("signal", "neutral").upper()
-            tool_score = td.get("score", 0)
-            pill = _signal_pill_html(tool_signal)
-
-            with st.expander(f"**{tool_label}** — {pill} ({tool_score:+.1f})", expanded=True):
-                st.markdown(_score_bar_html(tool_score), unsafe_allow_html=True)
-                st.caption(td.get("detail", ""))
-
-                if tool_key == "risk_position_sizing":
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Entry Price", f"${td.get('entry_price', 0):.2f}")
-                    c2.metric("Stop Loss", f"${td.get('stop_loss', 0):.2f}")
-                    c3.metric("Take Profit", f"${td.get('take_profit', 0):.2f}")
-                    c4.metric("Recommended Qty", str(td.get("recommended_qty", "—")))
-                    c5, c6 = st.columns(2)
-                    c5.metric("Position Value", _fmt_dollar(td.get("position_value")))
-                    split = td.get("split_entry", [])
-                    if split:
-                        parts = []
-                        for s in split:
-                            if isinstance(s, (int, float)):
-                                parts.append(f"${s:.2f}")
-                            elif isinstance(s, dict):
-                                parts.append(f"${s.get('price', 0):.2f} x{s.get('qty', '')}")
-                            else:
-                                parts.append(str(s))
-                        c6.metric("Split Entries", ", ".join(parts))
-                    warnings = td.get("warnings", [])
-                    if warnings:
-                        for w in warnings:
-                            st.warning(w)
-
-                elif tool_key == "kelly_criterion_analysis":
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Win Rate", _fmt_pct(td.get("win_rate")))
-                    c2.metric("Kelly Full %", _fmt_num(td.get("kelly_full_pct"), 1))
-                    c3.metric("Optimal Position %", _fmt_num(td.get("optimal_position_pct"), 1))
-                    c4, c5, c6 = st.columns(3)
-                    c4.metric("Avg Win %", _fmt_num(td.get("avg_win_pct"), 2))
-                    c5.metric("Avg Loss %", _fmt_num(td.get("avg_loss_pct"), 2))
-                    c6.metric("Sharpe Ratio", _fmt_num(td.get("sharpe_ratio"), 3))
-
-                elif tool_key == "beta_correlation_analysis":
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Beta", _fmt_num(td.get("beta"), 3))
-                    c2.metric("Beta 60d", _fmt_num(td.get("beta_60d"), 3))
-                    c3.metric("Alpha (Annual %)", _fmt_num(td.get("alpha_annual_pct"), 2))
-                    c4, c5, c6 = st.columns(3)
-                    c4.metric("Correlation", _fmt_num(td.get("correlation"), 3))
-                    c5.metric("R-Squared", _fmt_num(td.get("r_squared"), 3))
-                    c6.metric("Info Ratio", _fmt_num(td.get("information_ratio"), 3))
-
-                elif tool_key == "event_driven_analysis":
-                    events = td.get("events", [])
-                    c1, c2 = st.columns(2)
-                    c1.metric("52W High", _fmt_num(td.get("52w_high")))
-                    c2.metric("52W Low", _fmt_num(td.get("52w_low")))
-                    rec = td.get("analyst_recommendation")
-                    if rec:
-                        st.metric("Analyst Recommendation", str(rec))
-                    earnings = td.get("earnings_dates", [])
-                    if earnings:
-                        st.caption(f"Earnings: {', '.join(str(e)[:10] for e in earnings[:3])}")
-                    if events:
-                        for ev in events:
-                            st.caption(f"Event: {ev}")
-
-                _render_tool_explanation(tool_key)
-                _render_ai_interpret_btn(selected, tool_key, llm_providers)
-
-    with tab_fund:
-        fund = detail.get("fundamentals", {})
-        pcr = detail.get("options_pcr", {})
-        insiders = detail.get("insider_trades", [])
-
-        if fund:
+    # ── Overview 탭 ──
+    with tab_overview:
+        # 일별 스캔 수 차트
+        if daily_counts:
             st.markdown("""
             <div class="section-header">
-                <div class="section-title">Company Fundamentals</div>
+                <div class="section-title">Daily Scan Activity</div>
             </div>
             """, unsafe_allow_html=True)
+            dc_df = pd.DataFrame(daily_counts)
+            dc_df = dc_df.sort_values("date")
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=dc_df["date"], y=dc_df["cnt"],
+                marker_color="#5d8ef1",
+                text=dc_df["cnt"], textposition="outside",
+                textfont=dict(color="#8d909e", size=10, family="JetBrains Mono"),
+            ))
+            fig.update_layout(**_plotly_base_layout(
+                height=250,
+                margin=dict(l=40, r=10, t=10, b=40),
+                xaxis=dict(gridcolor="rgba(66,71,82,0.12)"),
+                yaxis=dict(gridcolor="rgba(66,71,82,0.12)"),
+            ))
+            st.plotly_chart(fig, use_container_width=True)
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Market Cap", _fmt_dollar(fund.get("market_cap")))
-            c2.metric("P/E (TTM)", _fmt_num(fund.get("pe_ratio"), 1))
-            c3.metric("Forward P/E", _fmt_num(fund.get("forward_pe"), 1))
-            c4.metric("PEG Ratio", _fmt_num(fund.get("peg_ratio"), 2))
+        # 신호 분포 (파이 차트) + 종목별 통계 테이블
+        col_pie, col_table = st.columns([1, 2])
 
-            c5, c6, c7, c8 = st.columns(4)
-            c5.metric("P/B", _fmt_num(fund.get("price_to_book"), 2))
-            c6.metric("EPS", _fmt_num(fund.get("eps"), 2))
-            c7.metric("Dividend Yield", _fmt_pct(fund.get("dividend_yield")))
-            c8.metric("Beta", _fmt_num(fund.get("beta"), 2))
+        with col_pie:
+            if signal_dist:
+                st.markdown("""
+                <div class="section-header">
+                    <div class="section-title">Signal Distribution</div>
+                </div>
+                """, unsafe_allow_html=True)
+                sig_labels = [d.get("final_signal", "?") for d in signal_dist]
+                sig_values = [d.get("cnt", 0) for d in signal_dist]
+                sig_colors = {
+                    "BUY": "#02d4a1", "SELL": "#fd526f", "HOLD": "#ffb347",
+                }
+                fig = go.Figure(go.Pie(
+                    labels=sig_labels, values=sig_values, hole=0.45,
+                    marker=dict(colors=[sig_colors.get(s, "#32353c") for s in sig_labels]),
+                    textfont=dict(color="#e1e2eb", size=12),
+                ))
+                fig.update_layout(**_plotly_base_layout(
+                    height=280, margin=dict(l=10, r=10, t=10, b=10),
+                    showlegend=True,
+                    legend=dict(font=dict(color="#c3c6d4", size=11)),
+                ))
+                st.plotly_chart(fig, use_container_width=True)
 
-            c9, c10, c11, c12 = st.columns(4)
-            c9.metric("Revenue Growth", _fmt_pct(fund.get("revenue_growth")))
-            c10.metric("Profit Margin", _fmt_pct(fund.get("profit_margin")))
-            c11.metric("D/E Ratio", _fmt_num(fund.get("debt_to_equity"), 1))
-            c12.metric("Free Cash Flow", _fmt_dollar(fund.get("free_cash_flow")))
+                # 평균 점수 표
+                for d in signal_dist:
+                    sig = d.get("final_signal", "?")
+                    avg_s = d.get("avg_score", 0)
+                    avg_c = d.get("avg_confidence", 0)
+                    cnt = d.get("cnt", 0)
+                    st.markdown(
+                        f'{_signal_pill_html(sig)} &nbsp; '
+                        f'<span style="font-family:JetBrains Mono; font-size:0.8rem; color:var(--on-surface-variant);">'
+                        f'{cnt}x &middot; avg score {avg_s:+.2f} &middot; conf {avg_c:.1f}</span>',
+                        unsafe_allow_html=True,
+                    )
 
-            c13, c14, c15, c16 = st.columns(4)
-            c13.metric("52W High", _fmt_num(fund.get("52w_high")))
-            c14.metric("52W Low", _fmt_num(fund.get("52w_low")))
-            c15.metric("Avg Volume", _fmt_dollar(fund.get("avg_volume")))
-            c16.metric("Short Ratio", _fmt_num(fund.get("short_ratio"), 2))
+        with col_table:
+            if ticker_stats:
+                st.markdown("""
+                <div class="section-header">
+                    <div class="section-title">Per-Ticker Stats</div>
+                </div>
+                """, unsafe_allow_html=True)
+                ts_rows = []
+                for ts in ticker_stats:
+                    ts_rows.append({
+                        "Ticker": ts.get("ticker", "?"),
+                        "Scans": ts.get("scan_count", 0),
+                        "Avg Score": ts.get("avg_score", 0),
+                        "First Scan": str(ts.get("first_scan", ""))[:10],
+                        "Last Scan": str(ts.get("last_scan", ""))[:10],
+                    })
+                st.dataframe(pd.DataFrame(ts_rows), use_container_width=True, hide_index=True)
 
-            sector = fund.get("sector", "")
-            industry = fund.get("industry", "")
-            if sector or industry:
-                st.caption(f"{sector} / {industry}" if sector and industry else (sector or industry))
-
-            st.markdown("""<div style="background:var(--surface-low);border-radius:8px;padding:12px 16px;margin:12px 0;border-left:3px solid var(--primary-ctr);">
-<div style="font-size:0.75rem;font-weight:700;color:var(--primary);margin-bottom:6px;">펀더멘털 지표 해설</div>
-<div style="font-size:0.7rem;color:var(--on-surface-variant);line-height:1.6;">
-<b>P/E (TTM)</b> — 주가/주당순이익. 업종 평균 대비 높으면 고평가, 낮으면 저평가 가능성.<br>
-<b>Forward P/E</b> — 향후 1년 예상 EPS 기준 P/E. TTM P/E보다 낮으면 이익 성장 기대.<br>
-<b>PEG Ratio</b> — P/E / 이익성장률. 1 미만이면 성장 대비 저평가, 2 이상이면 고평가 주의.<br>
-<b>P/B</b> — 주가/주당순자산. 1 미만이면 자산가치 대비 저평가. 기술주는 높은 경향.<br>
-<b>D/E Ratio</b> — 부채/자본. 1 이상이면 레버리지 높음. 업종별 기준 상이.<br>
-<b>Short Ratio</b> — 공매도 잔고/일평균거래량. 높으면 베어리시 심리, 숏스퀴즈 가능성.
-</div></div>""", unsafe_allow_html=True)
-        else:
-            st.info("No fundamental data available for this ticker.")
-
-        if pcr and pcr.get("put_call_ratio_oi") is not None:
+        # 최근 스캔
+        if recent_scans:
             st.markdown("""
             <div class="section-header">
-                <div class="section-title">Options Flow</div>
-                <div class="section-subtitle">Put/Call Ratio</div>
+                <div class="section-title">Recent Scans</div>
+                <div class="section-subtitle">LAST 10</div>
             </div>
             """, unsafe_allow_html=True)
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric("P/C Ratio (OI)", _fmt_num(pcr.get("put_call_ratio_oi"), 3))
-            c2.metric("P/C Ratio (Vol)", _fmt_num(pcr.get("put_call_ratio_vol"), 3))
-            c3.metric("Expiration", str(pcr.get("expiration", "—")))
-
-            c4, c5, c6, c7 = st.columns(4)
-            c4.metric("Call OI", f"{pcr.get('call_oi', 0):,}")
-            c5.metric("Put OI", f"{pcr.get('put_oi', 0):,}")
-            c6.metric("Call Volume", f"{pcr.get('call_volume', 0):,}")
-            c7.metric("Put Volume", f"{pcr.get('put_volume', 0):,}")
-
-            pcr_oi = pcr.get("put_call_ratio_oi", 0) or 0
-            pcr_sentiment = "Bearish (High Put Activity)" if pcr_oi > 1.2 else ("Bullish (High Call Activity)" if pcr_oi < 0.7 else "Neutral")
-            pcr_color = "#fd526f" if pcr_oi > 1.2 else ("#02d4a1" if pcr_oi < 0.7 else "var(--outline)")
-            st.markdown(f'<div style="font-size:0.8rem;color:{pcr_color};font-weight:600;margin-top:4px;">Sentiment: {pcr_sentiment}</div>', unsafe_allow_html=True)
-
-            st.markdown("""<div style="background:var(--surface-low);border-radius:8px;padding:12px 16px;margin:12px 0;border-left:3px solid var(--primary-ctr);">
-<div style="font-size:0.75rem;font-weight:700;color:var(--primary);margin-bottom:6px;">옵션 PCR 해설</div>
-<div style="font-size:0.7rem;color:var(--on-surface-variant);line-height:1.6;">
-<b>P/C Ratio (OI)</b> — 풋 미결제약정 / 콜 미결제약정. 1.0 이상이면 풋 선호(약세 심리), 0.7 이하면 콜 선호(강세 심리).<br>
-<b>P/C Ratio (Vol)</b> — 풋 거래량 / 콜 거래량. OI보다 단기 심리를 더 빠르게 반영.<br>
-<b>역발상 활용</b> — 극단적으로 높은 PCR(>1.5)은 오히려 반등 신호일 수 있음 (센티먼트 극단).
-</div></div>""", unsafe_allow_html=True)
-
-        if insiders:
-            st.markdown("""
-            <div class="section-header">
-                <div class="section-title">Insider Trades</div>
-                <div class="section-subtitle">Recent insider activity</div>
-            </div>
-            """, unsafe_allow_html=True)
-
-            insider_rows = []
-            for trade in insiders:
-                insider_rows.append({
-                    "Date": str(trade.get("date", ""))[:10],
-                    "Insider": trade.get("insider", ""),
-                    "Relation": trade.get("relation", ""),
-                    "Transaction": trade.get("transaction", ""),
-                    "Shares": f"{trade.get('shares', 0):,}" if trade.get("shares") else "—",
-                    "Value": _fmt_dollar(trade.get("value")) if trade.get("value") else "—",
+            rc_rows = []
+            for r in recent_scans:
+                rc_rows.append({
+                    "ID": r.get("id", 0),
+                    "Time": str(r.get("scanned_at", ""))[:19].replace("T", " "),
+                    "Ticker": r.get("ticker", "?"),
+                    "Signal": r.get("final_signal", "?"),
+                    "Score": r.get("composite_score", 0),
+                    "Confidence": r.get("confidence", 0),
                 })
-            st.dataframe(pd.DataFrame(insider_rows), use_container_width=True, hide_index=True)
+            rc_df = pd.DataFrame(rc_rows)
+            st.dataframe(
+                rc_df.style.map(
+                    lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+                    subset=["Signal"],
+                ),
+                use_container_width=True, hide_index=True,
+            )
 
-            st.markdown("""<div style="background:var(--surface-low);border-radius:8px;padding:12px 16px;margin:12px 0;border-left:3px solid var(--primary-ctr);">
-<div style="font-size:0.75rem;font-weight:700;color:var(--primary);margin-bottom:6px;">내부자 거래 해설</div>
-<div style="font-size:0.7rem;color:var(--on-surface-variant);line-height:1.6;">
-<b>내부자 매수</b> — 경영진/이사회가 자사주 매입. 회사 전망에 대한 자신감의 표현. 대량 매수 시 강한 긍정 신호.<br>
-<b>내부자 매도</b> — 스톡옵션 행사 등 일상적 매도는 중립. 단, 대량/다수 동시 매도는 주의.
-</div></div>""", unsafe_allow_html=True)
-
-    with tab_llm:
+    # ── Weekly Trend 탭 ──
+    with tab_weekly:
         st.markdown("""
         <div class="section-header">
-            <div class="section-title">AI Deep Analysis</div>
-            <div class="section-subtitle">LLM 기반 종합 분석 리포트 (GPT-4o / Gemini / Ollama)</div>
+            <div class="section-title">Weekly Trend Analysis</div>
+            <div class="section-subtitle">WoW COMPARISON</div>
         </div>
         """, unsafe_allow_html=True)
 
-        if not llm_providers:
-            st.warning("LLM이 설정되지 않았습니다. `.env` 파일에 OPENAI_API_KEY 또는 GOOGLE_API_KEY를 추가하세요.")
+        # 종목 선택
+        wt_tickers = [ts.get("ticker", "?") for ts in ticker_stats] if ticker_stats else load_watchlist()
+        wt_options = ["ALL (Global)"] + wt_tickers
+        wt_sel = st.selectbox("Scope", wt_options, key="wt_scope")
+        wt_weeks = st.slider("Weeks", 2, 16, 8, key="wt_weeks")
+
+        wt_ticker = "" if wt_sel == "ALL (Global)" else wt_sel
+        comp_data = api_get(f"/weekly/comparison?ticker={wt_ticker}&weeks={wt_weeks}")
+
+        if not comp_data or not comp_data.get("weeks"):
+            st.info("Not enough weekly data. Need at least 2 weeks of scans.")
         else:
-            provider_opts = {p: provider_labels.get(p, p) for p in llm_providers}
-            selected_provider = st.radio(
-                "LLM Provider",
-                options=list(provider_opts.keys()),
-                format_func=lambda x: provider_opts[x],
-                horizontal=True,
-                label_visibility="collapsed",
+            trend = comp_data.get("trend", {})
+            weeks_list = comp_data.get("weeks", [])
+            comparisons = comp_data.get("comparisons", [])
+
+            # 추세 배지
+            trend_dir = trend.get("direction", "?")
+            trend_colors = {
+                "strongly_bullish": ("var(--buy)", "STRONGLY BULLISH"),
+                "bullish": ("var(--buy)", "BULLISH"),
+                "strongly_bearish": ("var(--sell)", "STRONGLY BEARISH"),
+                "bearish": ("var(--sell)", "BEARISH"),
+                "sideways": ("var(--hold)", "SIDEWAYS"),
+            }
+            t_color, t_label = trend_colors.get(trend_dir, ("var(--outline)", trend_dir.upper()))
+            st.markdown(
+                f'<div style="margin:16px 0;">'
+                f'<span style="background:{t_color}; color:#0b0e14; padding:6px 20px; border-radius:6px; '
+                f'font-family:JetBrains Mono; font-size:0.9rem; font-weight:800; letter-spacing:1px;">'
+                f'{t_label}</span></div>',
+                unsafe_allow_html=True,
             )
 
-            full_report_key = f"full_report_{selected}_{selected_provider}"
-            if st.button("종합 분석 리포트 생성", type="primary", use_container_width=True):
-                with st.spinner(f"{provider_opts[selected_provider]}로 {selected} 종합 분석 중..."):
-                    st.session_state[full_report_key] = engine_interpret_full_report(selected, selected_provider)
+            t1, t2, t3, t4, t5 = st.columns(5)
+            t1.metric("Slope/Week", f"{trend.get('slope', 0):+.3f}")
+            t2.metric("Recent Slope", f"{trend.get('recent_slope', 0):+.3f}")
+            t3.metric("Streak", f"{trend.get('streak', 0):+d} weeks")
+            t4.metric("Total Change", f"{trend.get('total_change', 0):+.3f}")
+            t5.metric("Latest Score", f"{trend.get('latest_score', 0):+.3f}")
 
-            if full_report_key in st.session_state:
-                st.markdown(st.session_state[full_report_key])
+            # 주간 점수 차트
+            if weeks_list:
+                w_df = pd.DataFrame(weeks_list)
+                w_df = w_df.sort_values("week")
 
-        llm_orig = detail.get("llm_conclusion", "")
-        if llm_orig and not llm_orig.startswith("[오류]") and not llm_orig.startswith("[LLM"):
-            with st.expander("Scan-time LLM Summary (Original)", expanded=False):
-                st.markdown(llm_orig)
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=w_df["week"], y=w_df["avg_score"],
+                    mode="lines+markers",
+                    name="Avg Score",
+                    line=dict(color="#5d8ef1", width=3),
+                    marker=dict(size=10, color="#5d8ef1", line=dict(width=2, color="#0b0e14")),
+                    text=[f"Score: {s:+.2f}" for s in w_df["avg_score"]],
+                    hovertemplate="%{x}<br>%{text}<extra></extra>",
+                ))
+                # 신뢰도 보조 축
+                fig.add_trace(go.Bar(
+                    x=w_df["week"], y=w_df["avg_confidence"],
+                    name="Confidence",
+                    marker_color="rgba(174,198,255,0.2)",
+                    yaxis="y2",
+                ))
+                fig.add_hline(y=0, line_color="rgba(66,71,82,0.3)", line_width=1)
+                fig.update_layout(**_plotly_base_layout(
+                    height=320,
+                    margin=dict(l=50, r=50, t=10, b=40),
+                    xaxis=dict(gridcolor="rgba(66,71,82,0.12)"),
+                    yaxis=dict(title="Score", gridcolor="rgba(66,71,82,0.12)"),
+                    yaxis2=dict(title="Confidence", overlaying="y", side="right",
+                                gridcolor="rgba(0,0,0,0)", range=[0, 10]),
+                    legend=dict(font=dict(color="#c3c6d4", size=11), orientation="h", y=1.08),
+                ))
+                st.plotly_chart(fig, use_container_width=True)
 
+            # 신호 분포 스택 바
+            if weeks_list:
+                fig2 = go.Figure()
+                w_sorted = sorted(weeks_list, key=lambda w: w["week"])
+                wk_labels = [w["week"] for w in w_sorted]
+                fig2.add_trace(go.Bar(name="BUY", x=wk_labels,
+                    y=[w.get("buy_count", 0) for w in w_sorted], marker_color="#02d4a1"))
+                fig2.add_trace(go.Bar(name="SELL", x=wk_labels,
+                    y=[w.get("sell_count", 0) for w in w_sorted], marker_color="#fd526f"))
+                fig2.add_trace(go.Bar(name="HOLD", x=wk_labels,
+                    y=[w.get("hold_count", 0) for w in w_sorted], marker_color="#ffb347"))
+                fig2.update_layout(**_plotly_base_layout(
+                    height=250, barmode="stack",
+                    margin=dict(l=40, r=10, t=10, b=40),
+                    legend=dict(font=dict(color="#c3c6d4", size=11), orientation="h", y=1.08),
+                ))
+                st.plotly_chart(fig2, use_container_width=True)
+
+            # WoW 비교 테이블
+            if comparisons:
+                st.markdown("""
+                <div class="section-header">
+                    <div class="section-title">Week-over-Week Changes</div>
+                </div>
+                """, unsafe_allow_html=True)
+                cmp_rows = []
+                for c in reversed(comparisons):
+                    cmp_rows.append({
+                        "Week": c["week"],
+                        "Scans": c["scan_count"],
+                        "Avg Score": c["avg_score"],
+                        "Score Delta": c["score_delta"],
+                        "Score %": c["score_pct_change"],
+                        "Conf Delta": c["confidence_delta"],
+                        "BUY": c["buy_count"],
+                        "SELL": c["sell_count"],
+                        "HOLD": c["hold_count"],
+                        "Buy Delta": c["buy_delta"],
+                        "Sell Delta": c["sell_delta"],
+                    })
+                cmp_df = pd.DataFrame(cmp_rows)
+                st.dataframe(
+                    cmp_df.style.map(
+                        lambda v: "color: #02d4a1" if isinstance(v, (int, float)) and v > 0
+                        else ("color: #fd526f" if isinstance(v, (int, float)) and v < 0 else ""),
+                        subset=["Score Delta", "Score %", "Buy Delta", "Sell Delta"],
+                    ),
+                    use_container_width=True, hide_index=True,
+                )
+
+            # 도구별 주간 추이 (종목 선택 시)
+            if wt_ticker:
+                tool_data = api_get(f"/weekly/tool-trend/{wt_ticker}?weeks={min(wt_weeks, 4)}")
+                tools_list = tool_data.get("tools", []) if tool_data else []
+                if tools_list:
+                    st.markdown(f"""
+                    <div class="section-header">
+                        <div class="section-title">{wt_ticker} Tool Scores by Week</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # 피벗: week x tool_name
+                    tt_df = pd.DataFrame(tools_list)
+                    if not tt_df.empty and "week" in tt_df.columns and "tool_name" in tt_df.columns:
+                        pivot = tt_df.pivot_table(
+                            index="tool_name", columns="week",
+                            values="avg_score", aggfunc="first",
+                        ).sort_index()
+                        # 컬럼 시간순 정렬
+                        pivot = pivot[sorted(pivot.columns)]
+                        st.dataframe(
+                            pivot.style.background_gradient(cmap="RdYlGn", vmin=-5, vmax=5, axis=None),
+                            use_container_width=True,
+                        )
+
+    # ── Search 탭 ──
+    with tab_search:
+        st.markdown("""
+        <div class="section-header">
+            <div class="section-title">Search Scan Logs</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        search_ticker = fc1.text_input("Ticker", placeholder="NVDA", key="sl_search_ticker")
+        search_signal = fc2.selectbox("Signal", ["", "BUY", "SELL", "HOLD"], key="sl_search_signal")
+        search_from = fc3.text_input("From (YYYY-MM-DD)", placeholder="2025-01-01", key="sl_search_from")
+        search_limit = fc4.number_input("Limit", min_value=1, max_value=500, value=50, key="sl_search_limit")
+
+        if st.button("Search", type="primary", key="sl_search_btn"):
+            params = f"?limit={search_limit}"
+            if search_ticker:
+                params += f"&ticker={search_ticker.strip().upper()}"
+            if search_signal:
+                params += f"&signal={search_signal}"
+            if search_from:
+                params += f"&from={search_from.strip()}"
+
+            with st.spinner("Searching..."):
+                result = api_get(f"/scan-log{params}")
+
+            if not result:
+                st.error("Query failed")
+            elif result.get("total", 0) == 0:
+                st.info("No matching records found.")
+            else:
+                st.caption(f"Found {result['total']} records (showing {len(result.get('rows', []))})")
+                rows = result.get("rows", [])
+                if rows:
+                    sr_rows = []
+                    for r in rows:
+                        sr_rows.append({
+                            "ID": r.get("id", 0),
+                            "Time": str(r.get("scanned_at", ""))[:19].replace("T", " "),
+                            "Ticker": r.get("ticker", "?"),
+                            "Signal": r.get("final_signal", "?"),
+                            "Score": r.get("composite_score", 0),
+                            "Confidence": r.get("confidence", 0),
+                            "Tools": r.get("tool_count", 0),
+                            "Buy": r.get("buy_votes", 0),
+                            "Sell": r.get("sell_votes", 0),
+                            "Neutral": r.get("neutral_votes", 0),
+                            "LLM": r.get("llm_model", ""),
+                        })
+                    sr_df = pd.DataFrame(sr_rows)
+                    st.dataframe(
+                        sr_df.style.map(
+                            lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+                            subset=["Signal"],
+                        ),
+                        use_container_width=True, hide_index=True,
+                    )
+
+        # 개별 상세 조회
         st.divider()
         st.markdown("""
         <div class="section-header">
-            <div class="section-title">All Tool Scores</div>
+            <div class="section-title">Scan Detail</div>
+        </div>
+        """, unsafe_allow_html=True)
+        detail_id = st.number_input("Scan ID", min_value=1, value=1, key="sl_detail_id")
+        if st.button("Load Detail", key="sl_detail_btn"):
+            with st.spinner("Loading..."):
+                detail = api_get(f"/scan-log/detail/{detail_id}")
+            if not detail:
+                st.error(f"Scan #{detail_id} not found")
+            else:
+                signal = detail.get("final_signal", "?")
+                badge_class = "buy" if signal == "BUY" else ("sell" if signal == "SELL" else "hold")
+                st.markdown(
+                    f'<span class="signal-badge-lg {badge_class}">{signal}</span> &nbsp; '
+                    f'<span style="color:var(--on-surface-variant);">'
+                    f'{detail.get("ticker","?")} @ {str(detail.get("scanned_at",""))[:19]}</span>',
+                    unsafe_allow_html=True,
+                )
+
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("Score", f"{detail.get('composite_score', 0):+.2f}")
+                d2.metric("Confidence", f"{detail.get('confidence', 0)}/10")
+                d3.metric("Tools", str(detail.get("tool_count", 0)))
+                d4.metric("LLM", detail.get("llm_model", "N/A") or "N/A")
+
+                tool_results = detail.get("tool_results", [])
+                if tool_results:
+                    st.markdown("**Tool Results**")
+                    tr_rows = []
+                    for tr in tool_results:
+                        tr_rows.append({
+                            "Tool": tr.get("tool_name", tr.get("tool_key", "?")),
+                            "Signal": tr.get("signal", "?"),
+                            "Score": tr.get("score", 0),
+                            "Detail": str(tr.get("detail", ""))[:120],
+                        })
+                    tr_df = pd.DataFrame(tr_rows)
+                    st.dataframe(
+                        tr_df.style.map(
+                            lambda v: "color: #02d4a1" if v == "buy" else ("color: #fd526f" if v == "sell" else "color: #ffb347"),
+                            subset=["Signal"],
+                        ),
+                        use_container_width=True, hide_index=True,
+                    )
+
+                llm_text = detail.get("llm_conclusion", "")
+                if llm_text and not llm_text.startswith("[") :
+                    with st.expander("LLM Conclusion", expanded=False):
+                        # llm_meta 제거
+                        display_text = llm_text
+                        if display_text.startswith("<!-- llm_meta:"):
+                            end = display_text.find("-->\n")
+                            if end > 0:
+                                display_text = display_text[end + 4:]
+                        st.markdown(f'<div class="llm-body">\n\n{display_text}\n\n</div>', unsafe_allow_html=True)
+
+    # ── Ticker History 탭 ──
+    with tab_ticker:
+        st.markdown("""
+        <div class="section-header">
+            <div class="section-title">Ticker Scan History</div>
         </div>
         """, unsafe_allow_html=True)
 
-        summaries = detail.get("tool_summaries", [])
-        if summaries:
-            sorted_tools = sorted(summaries, key=lambda x: x.get("score", 0), reverse=True)
-            names = [s.get("name", "?")[:20] for s in sorted_tools]
-            scores = [s.get("score", 0) for s in sorted_tools]
-            colors = ["#02d4a1" if s > 0 else "#fd526f" if s < 0 else "#8d909e" for s in scores]
+        # 종목 선택
+        all_tickers = [ts.get("ticker", "?") for ts in ticker_stats] if ticker_stats else load_watchlist()
+        if not all_tickers:
+            st.info("No ticker data available.")
+        else:
+            sel_ticker = st.selectbox("Select Ticker", all_tickers, key="sl_ticker_hist")
+            if sel_ticker:
+                hist_data = api_get(f"/scan-log/ticker/{sel_ticker}?limit=50")
+                history = hist_data.get("history", []) if hist_data else []
 
-            fig = go.Figure(go.Bar(
-                x=scores, y=names, orientation='h',
-                marker=dict(color=colors),
-                text=[f"{s:+.1f}" for s in scores],
-                textposition='outside',
-                textfont=dict(family="JetBrains Mono", size=11, color="#c3c6d4"),
-            ))
-            fig.update_layout(**_plotly_base_layout(
-                height=max(350, len(names) * 32),
-                xaxis=dict(range=[-10, 10], gridcolor="rgba(66,71,82,0.12)", zerolinecolor="rgba(141,144,158,0.3)"),
-                yaxis=dict(autorange="reversed"),
-                margin=dict(l=160, r=50, t=10, b=10),
-            ))
-            st.plotly_chart(fig, use_container_width=True)
+                if not history:
+                    st.info(f"No scan history for {sel_ticker}")
+                else:
+                    st.caption(f"{len(history)} records for {sel_ticker}")
+
+                    # 점수 시계열 차트
+                    h_df = pd.DataFrame(history)
+                    h_df["scanned_at"] = pd.to_datetime(h_df["scanned_at"])
+                    h_df = h_df.sort_values("scanned_at")
+
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=h_df["scanned_at"], y=h_df["composite_score"],
+                        mode="lines+markers",
+                        line=dict(color="#5d8ef1", width=2),
+                        marker=dict(
+                            size=8,
+                            color=[
+                                "#02d4a1" if s == "BUY" else "#fd526f" if s == "SELL" else "#ffb347"
+                                for s in h_df["final_signal"]
+                            ],
+                            line=dict(width=1, color="#0b0e14"),
+                        ),
+                        text=[f"{s} ({sc:+.1f})" for s, sc in zip(h_df["final_signal"], h_df["composite_score"])],
+                        hovertemplate="%{text}<br>%{x}<extra></extra>",
+                    ))
+                    fig.add_hline(y=0, line_color="rgba(66,71,82,0.3)", line_width=1)
+                    fig.update_layout(**_plotly_base_layout(
+                        height=300,
+                        margin=dict(l=50, r=10, t=10, b=40),
+                        xaxis=dict(gridcolor="rgba(66,71,82,0.12)"),
+                        yaxis=dict(title="Score", gridcolor="rgba(66,71,82,0.12)"),
+                    ))
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    # 신호 변경 이력
+                    changes_data = api_get(f"/scan-log/changes/{sel_ticker}?limit=20")
+                    changes = changes_data.get("changes", []) if changes_data else []
+                    if changes and len(changes) > 1:
+                        st.markdown("""
+                        <div class="section-header">
+                            <div class="section-title">Signal Changes</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        for ch in changes:
+                            sig = ch.get("final_signal", "?")
+                            ts = str(ch.get("scanned_at", ""))[:19].replace("T", " ")
+                            sc = ch.get("composite_score", 0)
+                            st.markdown(
+                                f'{_signal_pill_html(sig)} &nbsp; '
+                                f'<span style="font-family:JetBrains Mono; font-size:0.8rem; color:var(--on-surface-variant);">'
+                                f'{ts} &middot; score {sc:+.2f}</span>',
+                                unsafe_allow_html=True,
+                            )
+
+                    # 이력 테이블
+                    th_rows = []
+                    for r in history:
+                        th_rows.append({
+                            "ID": r.get("id", 0),
+                            "Time": str(r.get("scanned_at", ""))[:19].replace("T", " "),
+                            "Signal": r.get("final_signal", "?"),
+                            "Score": r.get("composite_score", 0),
+                            "Confidence": r.get("confidence", 0),
+                            "Buy": r.get("buy_votes", 0),
+                            "Sell": r.get("sell_votes", 0),
+                            "Neutral": r.get("neutral_votes", 0),
+                        })
+                    th_df = pd.DataFrame(th_rows)
+                    st.dataframe(
+                        th_df.style.map(
+                            lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+                            subset=["Signal"],
+                        ),
+                        use_container_width=True, hide_index=True,
+                    )
+
+    # ── Export 탭 ──
+    with tab_export:
+        st.markdown("""
+        <div class="section-header">
+            <div class="section-title">Export Scan Logs</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        ec1, ec2, ec3 = st.columns(3)
+        export_ticker = ec1.text_input("Ticker (optional)", placeholder="NVDA", key="sl_export_ticker")
+        export_from = ec2.text_input("From Date", placeholder="2025-01-01", key="sl_export_from")
+        export_to = ec3.text_input("To Date", placeholder="2025-12-31", key="sl_export_to")
+
+        if st.button("Export CSV", type="primary", key="sl_export_btn"):
+            params = ""
+            parts = []
+            if export_ticker:
+                parts.append(f"ticker={export_ticker.strip().upper()}")
+            if export_from:
+                parts.append(f"from={export_from.strip()}")
+            if export_to:
+                parts.append(f"to={export_to.strip()}")
+            if parts:
+                params = "?" + "&".join(parts)
+
+            with st.spinner("Exporting..."):
+                result = api_get(f"/scan-log/export{params}")
+
+            if result and result.get("ok"):
+                filepath = result.get("filepath", "")
+                st.success(f"Exported to: {filepath}")
+
+                # 파일 다운로드 버튼 제공
+                if filepath and os.path.exists(filepath):
+                    with open(filepath, "r", encoding="utf-8-sig") as f:
+                        csv_data = f.read()
+                    st.download_button(
+                        label="Download CSV",
+                        data=csv_data,
+                        file_name=os.path.basename(filepath),
+                        mime="text/csv",
+                    )
+            else:
+                st.error("Export failed")
+
+        st.caption("CSV includes: scan time, ticker, signal, score, confidence, tool votes, LLM model")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2573,10 +2394,10 @@ if page == "Home":
     render_home()
 elif page == "Dashboard":
     render_dashboard()
-elif page == "Report":
-    render_report()
 elif page == "Detail":
     render_detail()
+elif page == "Scan Log":
+    render_scan_log()
 elif page == "Backtest":
     render_backtest()
 elif page == "ML Predict":
