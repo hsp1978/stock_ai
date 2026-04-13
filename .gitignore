@@ -12,3 +12,4 @@ dist/
 build/
 *.db
 stock_analyzer/data/
+chart_agent_service/data/
