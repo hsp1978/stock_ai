@@ -126,24 +126,17 @@ cooling_off_state: dict = {}
 # ═══════════════════════════════════════════════════════════════
 
 def _sanitize(obj):
-    """NaN/Inf → None, numpy/pandas → Python native 변환"""
+    """NaN/Inf → None, numpy → Python native 변환"""
     if isinstance(obj, float):
         if math.isnan(obj) or math.isinf(obj):
             return None
         return obj
-    if isinstance(obj, (datetime,)):
-        return obj.isoformat()
     if isinstance(obj, dict):
-        return {str(k): _sanitize(v) for k, v in obj.items()}
+        return {k: _sanitize(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_sanitize(v) for v in obj]
     try:
         import numpy as np
-        import pandas as pd
-        if isinstance(obj, (pd.Timestamp,)):
-            return obj.isoformat()
-        if isinstance(obj, (np.bool_,)):
-            return bool(obj)
         if isinstance(obj, (np.integer,)):
             return int(obj)
         if isinstance(obj, (np.floating,)):
@@ -698,14 +691,13 @@ def _build_full_report_prompt(ticker: str, result: dict,
     )
 
     if extra_context:
-        prompt += f"\n## 추가 컨텍스트 (주간트렌드/뉴스/매크로/섹터/차트패턴)\n{extra_context}\n"
+        prompt += f"\n## 추가 컨텍스트 (뉴스/매크로/섹터/차트패턴)\n{extra_context}\n"
 
     prompt += (
         "\n## 분석 요청\n"
         "위 데이터를 종합하여 다음 형식으로 분석하라:\n\n"
         "### 종합 판단\n[매수/매도/관망] (신뢰도: X/10)\n\n"
         "### 기술적 분석 요약\n[16개 도구 결과 해석]\n\n"
-        "### 주간 추세 분석\n[DB 누적 데이터 기반 WoW 변화 해석 — 점수/신호 추이, 반전/지속 판단]\n\n"
         "### 펀더멘털 분석\n[재무 건전성, 밸류에이션]\n\n"
         "### 리스크 관리\n[손절/익절, 포지션 크기]\n\n"
         "### 시장 환경\n[거시경제, 섹터 동향]\n\n"
@@ -716,22 +708,8 @@ def _build_full_report_prompt(ticker: str, result: dict,
 
 
 def _gather_extra_context(ticker: str) -> str:
-    """뉴스+매크로+차트패턴+섹터+주간트렌드 수집"""
+    """뉴스+매크로+차트패턴+섹터 수집"""
     parts = []
-
-    # ── 주간 트렌드 (DB 누적 데이터 활용) ──
-    try:
-        weekly = get_weekly_ticker(ticker, weeks_ago=0)
-        if weekly and weekly.get("stats", {}).get("scan_count", 0) > 0:
-            stats = weekly["stats"]
-            parts.append(
-                f"**주간 트렌드 (DB 기반)**\n"
-                f"  이번 주 스캔 {stats.get('scan_count', 0)}회, "
-                f"평균 점수 {stats.get('avg_score', 0):+.2f}, "
-                f"BUY {stats.get('buy_cnt', 0)} / SELL {stats.get('sell_cnt', 0)} / HOLD {stats.get('hold_cnt', 0)}"
-            )
-    except Exception as e:
-        print(f"  [{ticker}] 주간 트렌드 수집 실패: {e}")
 
     news = engine_fetch_news(ticker)
     if news and not news.get("error"):
@@ -859,7 +837,6 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
             return engine_sector_compare(ticker)
         elif path == "/macro":
             return engine_macro_context()
-
         # ── scan-log 엔드포인트 ──
         elif path == "/scan-log/latest":
             return get_scan_log_latest()
@@ -910,7 +887,6 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
                 except ValueError:
                     pass
             return get_weekly_summary(weeks_ago)
-
     except Exception as e:
         print(f"[dispatch_get 오류] {path}: {e}")
         return {"error": str(e)}
