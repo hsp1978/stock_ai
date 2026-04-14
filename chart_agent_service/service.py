@@ -45,12 +45,13 @@ from paper_trader import (
     process_agent_signal, update_position_prices,
     reset_paper_trading,
 )
-from scan_logger import (
-    log_scan_result, query_scan_log, get_scan_detail,
-    get_ticker_history, get_scan_stats, get_signal_changes, export_to_csv,
-    get_weekly_summary, get_weekly_comparison, get_weekly_tool_trend,
-    get_weekly_context_for_prompt,
-)
+from news_analyzer import fetch_news_with_sentiment
+from chart_pattern import detect_chart_patterns
+from sector_compare import compare_sector
+from macro_context import fetch_macro_context
+from db import init_db, insert_scan, get_scan_logs, get_scan_logs_by_ticker, \
+    get_scan_log_latest, get_scan_log_date_range, \
+    get_weekly_summary, get_weekly_ticker
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -198,15 +199,6 @@ def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
         result["json_path"] = json_path
         result["analyzed_at"] = datetime.now().isoformat()
 
-        # DB 로깅
-        try:
-            sanitized = _sanitize(result)
-            scan_id = log_scan_result(ticker, sanitized)
-            if scan_id:
-                print(f"  [{ticker}] DB 기록 완료 (scan_id={scan_id})")
-        except Exception as e:
-            print(f"  [{ticker}] DB 기록 실패: {e}")
-
         print(f"  [{ticker}] 완료: {result.get('final_signal')} (점수: {result.get('composite_score')})")
         return result
 
@@ -320,18 +312,14 @@ def send_summary_alert(alerts: list):
         }
 
 
-# 단일 소스: stock_analyzer/watchlist.txt
-_WATCHLIST_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "stock_analyzer", "watchlist.txt"
-)
-
-
 def _load_watchlist_files() -> list[str]:
-    """watchlist.txt 파일에서 동적으로 종목 로드 (단일 소스: stock_analyzer/watchlist.txt)"""
-    tickers = []
+    """stock_analyzer/watchlist.txt 단일 소스 로드 (WebUI에서 관리)"""
     seen = set()
-    if os.path.exists(_WATCHLIST_PATH):
-        with open(_WATCHLIST_PATH, 'r') as f:
+    tickers = []
+    # 단일 소스: stock_analyzer/watchlist.txt
+    wl_file = os.path.join(os.path.dirname(__file__), "..", "stock_analyzer", "watchlist.txt")
+    if os.path.exists(wl_file):
+        with open(wl_file, 'r') as f:
             for line in f:
                 t = line.strip().upper()
                 if t and not t.startswith('#') and t not in seen:
@@ -340,17 +328,7 @@ def _load_watchlist_files() -> list[str]:
     return tickers
 
 
-def _save_watchlist_file(tickers: list[str]):
-    """watchlist.txt 파일에 종목 저장 (단일 소스)"""
-    os.makedirs(os.path.dirname(_WATCHLIST_PATH), exist_ok=True)
-    header = "# 관심 종목 리스트 (한 줄에 하나, #은 주석)\n# WebUI에서 관리됨 — 직접 편집하지 마세요\n\n"
-    with open(_WATCHLIST_PATH, "w", encoding="utf-8") as f:
-        f.write(header)
-        for t in tickers:
-            f.write(f"{t}\n")
-
-
-def run_scheduled_scan(override_tickers: list[str] | None = None):
+def run_scheduled_scan(override_tickers: "list[str] | None" = None):
     """스케줄된 전체 종목 스캔. override_tickers가 주어지면 해당 목록만 스캔."""
     tickers = override_tickers if override_tickers else _load_watchlist_files()
 
@@ -389,6 +367,9 @@ def run_scheduled_scan(override_tickers: list[str] | None = None):
                 pending_alerts.append(alert)
                 scan_entry["alerts"].append(ticker)
 
+            # DB 기록
+            insert_scan(ticker, result, alert_sent=(alert is not None))
+
         time.sleep(3)  # API 부하 방지
 
     # 스캔 완료 후 기준치 도달 종목을 요약 1건으로 전송
@@ -412,19 +393,12 @@ def _sanitize(obj):
         if math.isnan(obj) or math.isinf(obj):
             return None
         return obj
-    if isinstance(obj, (datetime,)):
-        return obj.isoformat()
     if isinstance(obj, dict):
-        return {str(k): _sanitize(v) for k, v in obj.items()}
+        return {k: _sanitize(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_sanitize(v) for v in obj]
     try:
         import numpy as np
-        import pandas as pd
-        if isinstance(obj, (pd.Timestamp,)):
-            return obj.isoformat()
-        if isinstance(obj, (np.bool_,)):
-            return bool(obj)
         if isinstance(obj, (np.integer,)):
             return int(obj)
         if isinstance(obj, (np.floating,)):
@@ -455,7 +429,7 @@ def root():
         "status": "running",
         "model": OLLAMA_MODEL,
         "trading_style": TRADING_STYLE,
-        "watchlist": _load_watchlist_files(),
+        "watchlist": WATCHLIST,
         "scan_interval": f"{SCAN_INTERVAL_MINUTES}분",
         "thresholds": {
             "buy": BUY_THRESHOLD,
@@ -467,49 +441,6 @@ def root():
         "last_scan": scan_history[-1]["timestamp"] if scan_history else None,
         "cached_tickers": list(latest_results.keys()),
     }
-
-
-# ── Watchlist CRUD API (WebUI에서 동적 관리) ──────────────────
-
-@app.get("/watchlist")
-def get_watchlist():
-    """현재 watchlist 조회 (파일에서 동적 로드)"""
-    tickers = _load_watchlist_files()
-    return {"count": len(tickers), "tickers": tickers}
-
-
-@app.post("/watchlist/add")
-def add_to_watchlist(ticker: str):
-    """watchlist에 종목 추가"""
-    ticker = ticker.strip().upper()
-    if not ticker:
-        raise HTTPException(400, "Empty ticker")
-    current = _load_watchlist_files()
-    if ticker in current:
-        return {"ok": False, "msg": f"{ticker} already in watchlist", "tickers": current}
-    current.append(ticker)
-    _save_watchlist_file(current)
-    return {"ok": True, "msg": f"{ticker} added", "tickers": current}
-
-
-@app.post("/watchlist/remove")
-def remove_from_watchlist(ticker: str):
-    """watchlist에서 종목 제거"""
-    ticker = ticker.strip().upper()
-    current = _load_watchlist_files()
-    if ticker not in current:
-        return {"ok": False, "msg": f"{ticker} not found", "tickers": current}
-    current.remove(ticker)
-    _save_watchlist_file(current)
-    return {"ok": True, "msg": f"{ticker} removed", "tickers": current}
-
-
-@app.post("/watchlist/set")
-def set_watchlist(tickers: str):
-    """watchlist 전체 교체 (콤마 구분)"""
-    cleaned = list(dict.fromkeys(t.strip().upper() for t in tickers.split(",") if t.strip()))
-    _save_watchlist_file(cleaned)
-    return {"ok": True, "msg": f"{len(cleaned)} tickers set", "tickers": cleaned}
 
 
 @app.get("/results")
@@ -559,8 +490,11 @@ def scan_ticker(ticker: str, ai_mode: str = "ollama"):
         "alert_sent_at": latest_results.get(ticker, {}).get("alert_sent_at"),
     }
     alert = check_alert_condition(ticker, result)
+    alert_sent = False
     if alert:
         send_summary_alert([alert])
+        alert_sent = True
+    insert_scan(ticker, result, alert_sent=alert_sent)
     return result
 
 
@@ -708,69 +642,95 @@ def paper_reset():
     return reset_paper_trading()
 
 
-# ── Scan Log 조회 API ───────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+#  확장 API: 뉴스, 차트 패턴, 섹터 비교, 매크로
+# ═══════════════════════════════════════════════════════════════
 
-@app.get("/scan-log/stats")
-def get_scan_log_stats():
-    """스캔 로그 통계 요약"""
-    return get_scan_stats()
-
-
-@app.get("/scan-log/detail/{scan_id}")
-def get_scan_log_detail(scan_id: int):
-    """스캔 1건 상세 (tool_results 포함)"""
-    detail = get_scan_detail(scan_id)
-    if not detail:
-        raise HTTPException(404, f"scan_id={scan_id}: 결과 없음")
-    return JSONResponse(content=_sanitize(detail))
+@app.get("/news/{ticker}")
+def get_news(ticker: str):
+    """종목 뉴스 수집 + Ollama 감성 분석"""
+    ticker = ticker.upper()
+    try:
+        result = fetch_news_with_sentiment(ticker)
+        return JSONResponse(content=_sanitize(result))
+    except Exception as e:
+        raise HTTPException(500, f"뉴스 수집 실패: {e}")
 
 
-@app.get("/scan-log/ticker/{ticker}")
-def get_scan_log_ticker(ticker: str, limit: int = 50):
-    """특정 종목 스캔 이력"""
-    return {"ticker": ticker.upper(), "history": get_ticker_history(ticker, limit)}
+@app.get("/chart-pattern/{ticker}")
+def get_chart_pattern(ticker: str):
+    """알고리즘 기반 차트 패턴 인식"""
+    ticker = ticker.upper()
+    try:
+        df = fetch_ohlcv(ticker)
+        df = calculate_indicators(df)
+        # 기존 캐시된 차트 경로 활용
+        chart_path = latest_results.get(ticker, {}).get("result", {}).get("chart_path")
+        result = detect_chart_patterns(ticker, df, chart_path)
+        return JSONResponse(content=_sanitize(result))
+    except Exception as e:
+        raise HTTPException(500, f"차트 패턴 분석 실패: {e}")
 
 
-@app.get("/scan-log/changes/{ticker}")
-def get_scan_log_changes(ticker: str, limit: int = 20):
-    """종목 신호 변경 이력"""
-    return {"ticker": ticker.upper(), "changes": get_signal_changes(ticker, limit)}
+@app.get("/sector/{ticker}")
+def get_sector_compare(ticker: str):
+    """섹터/산업 내 상대 위치 비교"""
+    ticker = ticker.upper()
+    try:
+        result = compare_sector(ticker)
+        return JSONResponse(content=_sanitize(result))
+    except Exception as e:
+        raise HTTPException(500, f"섹터 비교 실패: {e}")
 
 
-@app.get("/scan-log/export")
-def get_scan_log_export(ticker: str = "", from_date: str = "", to_date: str = ""):
-    """스캔 로그 CSV 내보내기"""
-    filepath = export_to_csv(ticker=ticker, from_date=from_date, to_date=to_date)
-    return FileResponse(filepath, media_type="text/csv",
-                        filename=os.path.basename(filepath))
+@app.get("/macro")
+def get_macro():
+    """매크로 경제 지표 및 시장 분위기"""
+    try:
+        result = fetch_macro_context()
+        return JSONResponse(content=_sanitize(result))
+    except Exception as e:
+        raise HTTPException(500, f"매크로 데이터 수집 실패: {e}")
 
+
+# ═══════════════════════════════════════════════════════════════
+#  스캔 로그 / 주간 요약 API
+# ═══════════════════════════════════════════════════════════════
 
 @app.get("/scan-log")
-def get_scan_log_query(
-    ticker: str = "", signal: str = "",
-    from_date: str = "", to_date: str = "",
-    limit: int = 100, offset: int = 0,
-):
-    """스캔 로그 범용 조회"""
-    return query_scan_log(
-        ticker=ticker, signal=signal,
-        from_date=from_date, to_date=to_date,
-        limit=limit, offset=offset,
-    )
+def api_scan_log(limit: int = 50, offset: int = 0):
+    """스캔 로그 조회 (페이지네이션)"""
+    return get_scan_logs(limit, offset)
 
 
-# ── Weekly Trend API ────────────────────────────────────────
-
-@app.get("/weekly/comparison")
-def get_weekly_comp(ticker: str = "", weeks: int = 8):
-    """주간 비교 데이터 (WoW 변화)"""
-    return get_weekly_comparison(ticker, weeks)
+@app.get("/scan-log/latest")
+def api_scan_log_latest():
+    """가장 최근 스캔 라운드 결과"""
+    return get_scan_log_latest()
 
 
-@app.get("/weekly/tool-trend/{ticker}")
-def get_weekly_tool(ticker: str, weeks: int = 4):
-    """종목별 도구별 주간 점수 추이"""
-    return {"ticker": ticker.upper(), "tools": get_weekly_tool_trend(ticker, weeks)}
+@app.get("/scan-log/range")
+def api_scan_log_range(start: str, end: str):
+    """날짜 범위 조회 (?start=2026-04-07&end=2026-04-13)"""
+    return get_scan_log_date_range(start, end)
+
+
+@app.get("/scan-log/{ticker}")
+def api_scan_log_ticker(ticker: str, limit: int = 30):
+    """종목별 스캔 로그"""
+    return get_scan_logs_by_ticker(ticker, limit)
+
+
+@app.get("/weekly")
+def api_weekly(weeks_ago: int = 0):
+    """주간 요약 리포트 (?weeks_ago=0 이번주, 1 지난주)"""
+    return get_weekly_summary(weeks_ago)
+
+
+@app.get("/weekly/{ticker}")
+def api_weekly_ticker(ticker: str, weeks_ago: int = 0):
+    """종목별 주간 상세"""
+    return get_weekly_ticker(ticker, weeks_ago)
 
 
 @app.post("/restart")
@@ -799,9 +759,12 @@ def main():
     print(f"  API: http://{API_HOST}:{API_PORT}")
     print(f"  모델: {OLLAMA_MODEL}")
     print(f"  스캔 주기: {SCAN_INTERVAL_MINUTES}분")
-    print(f"  종목: {', '.join(_load_watchlist_files()) or '(watchlist.txt에서 로드)'}")
+    print(f"  종목: {WATCHLIST}")
     print(f"  매수 임계: ≥{BUY_THRESHOLD}, 매도 임계: ≤{SELL_THRESHOLD}")
     print(f"{'='*60}\n")
+
+    # DB 초기화
+    init_db()
 
     # 스케줄러 시작
     scheduler = BackgroundScheduler()

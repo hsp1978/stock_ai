@@ -1,1 +1,0 @@
-/home/ubuntu/stock_auto/stock_analyzer/scan_logger.py

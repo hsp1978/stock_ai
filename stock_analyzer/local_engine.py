@@ -21,12 +21,6 @@ from typing import Optional
 # ═══════════════════════════════════════════════════════════════
 
 from dotenv import load_dotenv
-from scan_logger import (
-    log_scan_result, query_scan_log, get_scan_detail,
-    get_ticker_history, get_scan_stats, get_signal_changes, export_to_csv,
-    get_weekly_summary, get_weekly_comparison, get_weekly_tool_trend,
-    get_weekly_context_for_prompt,
-)
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SERVICE_DIR = os.path.normpath(os.path.join(_THIS_DIR, "..", "chart_agent_service"))
@@ -73,6 +67,15 @@ from paper_trader import (
     process_agent_signal, update_position_prices,
     reset_paper_trading,
 )
+from db import (
+    init_db, insert_scan,
+    get_scan_logs, get_scan_logs_by_ticker,
+    get_scan_log_latest, get_scan_log_date_range,
+    get_weekly_summary, get_weekly_ticker,
+)
+
+# DB 초기화 (import 시 1회)
+init_db()
 
 # ── 뉴스/차트패턴/섹터/매크로: 직접 import 우선, HTTP fallback ──
 _DIRECT_NEWS = False
@@ -278,14 +281,11 @@ def engine_scan_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
             "alert_sent_at": latest_results.get(ticker, {}).get("alert_sent_at"),
         }
 
-        # DB 로깅
-        sanitized = _sanitize(result)
-        scan_id = log_scan_result(ticker, sanitized)
-        if scan_id:
-            print(f"  [{ticker}] DB 기록 완료 (scan_id={scan_id})")
+        # DB 기록
+        insert_scan(ticker, result)
 
         print(f"  [{ticker}] 완료: {result.get('final_signal')} ({result.get('composite_score')})")
-        return sanitized
+        return _sanitize(result)
 
     except Exception as e:
         print(f"  [{ticker}] 분석 실패: {e}")
@@ -721,9 +721,15 @@ def _gather_extra_context(ticker: str) -> str:
 
     # ── 주간 트렌드 (DB 누적 데이터 활용) ──
     try:
-        weekly_ctx = get_weekly_context_for_prompt(ticker, weeks=4)
-        if weekly_ctx:
-            parts.append(f"**주간 트렌드 (DB 기반)**\n{weekly_ctx}")
+        weekly = get_weekly_ticker(ticker, weeks_ago=0)
+        if weekly and weekly.get("stats", {}).get("scan_count", 0) > 0:
+            stats = weekly["stats"]
+            parts.append(
+                f"**주간 트렌드 (DB 기반)**\n"
+                f"  이번 주 스캔 {stats.get('scan_count', 0)}회, "
+                f"평균 점수 {stats.get('avg_score', 0):+.2f}, "
+                f"BUY {stats.get('buy_cnt', 0)} / SELL {stats.get('sell_cnt', 0)} / HOLD {stats.get('hold_cnt', 0)}"
+            )
     except Exception as e:
         print(f"  [{ticker}] 주간 트렌드 수집 실패: {e}")
 
@@ -854,80 +860,27 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
         elif path == "/macro":
             return engine_macro_context()
 
-        # ── Weekly Trend API ──
-        elif path.startswith("/weekly/comparison"):
-            ticker = ""
-            weeks = 8
-            if "ticker=" in path:
-                ticker = path.split("ticker=")[1].split("&")[0]
-            if "weeks=" in path:
-                try:
-                    weeks = int(path.split("weeks=")[1].split("&")[0])
-                except ValueError:
-                    pass
-            return get_weekly_comparison(ticker, weeks)
-        elif path.startswith("/weekly/tool-trend/"):
-            ticker = path.split("/weekly/tool-trend/")[1].split("?")[0]
-            weeks = 4
-            if "weeks=" in path:
-                try:
-                    weeks = int(path.split("weeks=")[1].split("&")[0])
-                except ValueError:
-                    pass
-            return {"ticker": ticker.upper(), "tools": get_weekly_tool_trend(ticker, weeks)}
-
-        # ── Scan Log 조회 API ──
-        elif path == "/scan-log/stats":
-            return get_scan_stats()
-        elif path.startswith("/scan-log/detail/"):
-            scan_id = int(path.split("/scan-log/detail/")[1].split("?")[0])
-            return get_scan_detail(scan_id)
-        elif path.startswith("/scan-log/ticker/"):
-            ticker = path.split("/scan-log/ticker/")[1].split("?")[0]
-            limit = 50
+        # ── scan-log 엔드포인트 ──
+        elif path == "/scan-log/latest":
+            return get_scan_log_latest()
+        elif path.startswith("/scan-log/range"):
+            start = end = ""
+            if "start=" in path:
+                start = path.split("start=")[1].split("&")[0]
+            if "end=" in path:
+                end = path.split("end=")[1].split("&")[0]
+            return get_scan_log_date_range(start, end)
+        elif path.startswith("/scan-log/"):
+            ticker = path.split("/scan-log/")[1].split("?")[0]
+            limit = 30
             if "limit=" in path:
                 try:
                     limit = int(path.split("limit=")[1].split("&")[0])
                 except ValueError:
                     pass
-            return {"ticker": ticker.upper(), "history": get_ticker_history(ticker, limit)}
-        elif path.startswith("/scan-log/changes/"):
-            ticker = path.split("/scan-log/changes/")[1].split("?")[0]
-            limit = 20
-            if "limit=" in path:
-                try:
-                    limit = int(path.split("limit=")[1].split("&")[0])
-                except ValueError:
-                    pass
-            return {"ticker": ticker.upper(), "changes": get_signal_changes(ticker, limit)}
-        elif path.startswith("/scan-log/export"):
-            ticker = ""
-            from_date = ""
-            to_date = ""
-            if "ticker=" in path:
-                ticker = path.split("ticker=")[1].split("&")[0]
-            if "from=" in path:
-                from_date = path.split("from=")[1].split("&")[0]
-            if "to=" in path:
-                to_date = path.split("to=")[1].split("&")[0]
-            filepath = export_to_csv(ticker=ticker, from_date=from_date, to_date=to_date)
-            return {"ok": True, "filepath": filepath}
+            return get_scan_logs_by_ticker(ticker, limit)
         elif path.startswith("/scan-log"):
-            # 범용 조회: /scan-log?ticker=NVDA&signal=BUY&from=2025-01-01&limit=50
-            ticker = ""
-            signal = ""
-            from_date = ""
-            to_date = ""
-            limit = 100
-            offset = 0
-            if "ticker=" in path:
-                ticker = path.split("ticker=")[1].split("&")[0]
-            if "signal=" in path:
-                signal = path.split("signal=")[1].split("&")[0]
-            if "from=" in path:
-                from_date = path.split("from=")[1].split("&")[0]
-            if "to=" in path:
-                to_date = path.split("to=")[1].split("&")[0]
+            limit, offset = 50, 0
             if "limit=" in path:
                 try:
                     limit = int(path.split("limit=")[1].split("&")[0])
@@ -938,9 +891,25 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
                     offset = int(path.split("offset=")[1].split("&")[0])
                 except ValueError:
                     pass
-            return query_scan_log(ticker=ticker, signal=signal,
-                                  from_date=from_date, to_date=to_date,
-                                  limit=limit, offset=offset)
+            return get_scan_logs(limit, offset)
+        # ── weekly 엔드포인트 ──
+        elif path.startswith("/weekly/"):
+            ticker = path.split("/weekly/")[1].split("?")[0]
+            weeks_ago = 0
+            if "weeks_ago=" in path:
+                try:
+                    weeks_ago = int(path.split("weeks_ago=")[1].split("&")[0])
+                except ValueError:
+                    pass
+            return get_weekly_ticker(ticker, weeks_ago)
+        elif path.startswith("/weekly"):
+            weeks_ago = 0
+            if "weeks_ago=" in path:
+                try:
+                    weeks_ago = int(path.split("weeks_ago=")[1].split("&")[0])
+                except ValueError:
+                    pass
+            return get_weekly_summary(weeks_ago)
 
     except Exception as e:
         print(f"[dispatch_get 오류] {path}: {e}")

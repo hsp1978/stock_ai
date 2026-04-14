@@ -1823,8 +1823,8 @@ def render_scan_log():
     """, unsafe_allow_html=True)
 
     # ── 통계 요약 ──
-    stats = api_get("/scan-log/stats")
-    if not stats or stats.get("total_scans", 0) == 0:
+    scan_data = api_get("/scan-log?limit=50")
+    if not scan_data or scan_data.get("total", 0) == 0:
         st.markdown("""
         <div class="empty-state">
             <div class="es-icon">📊</div>
@@ -1833,129 +1833,75 @@ def render_scan_log():
         """, unsafe_allow_html=True)
         return
 
-    total_scans = stats.get("total_scans", 0)
-    signal_dist = stats.get("signal_distribution", [])
-    ticker_stats = stats.get("ticker_stats", [])
-    daily_counts = stats.get("daily_counts", [])
-    recent_scans = stats.get("recent_scans", [])
+    total_scans = scan_data.get("total", 0)
+    logs = scan_data.get("logs", [])
 
     # 카드 집계
-    buy_cnt = sum(d.get("cnt", 0) for d in signal_dist if d.get("final_signal") == "BUY")
-    sell_cnt = sum(d.get("cnt", 0) for d in signal_dist if d.get("final_signal") == "SELL")
-    hold_cnt = sum(d.get("cnt", 0) for d in signal_dist if d.get("final_signal") == "HOLD")
+    buy_cnt = sum(1 for l in logs if l.get("signal") == "BUY")
+    sell_cnt = sum(1 for l in logs if l.get("signal") == "SELL")
+    hold_cnt = sum(1 for l in logs if l.get("signal") == "HOLD")
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total Scans", str(total_scans))
-    m2.metric("Buy Records", str(buy_cnt))
-    m3.metric("Sell Records", str(sell_cnt))
-    m4.metric("Hold Records", str(hold_cnt))
+    m2.metric("Buy (recent)", str(buy_cnt))
+    m3.metric("Sell (recent)", str(sell_cnt))
+    m4.metric("Hold (recent)", str(hold_cnt))
 
     # ── 탭 구성 ──
-    tab_overview, tab_weekly, tab_search, tab_ticker, tab_export = st.tabs(
-        ["Overview", "Weekly Trend", "Search", "Ticker History", "Export"]
+    tab_overview, tab_weekly, tab_search, tab_ticker = st.tabs(
+        ["Overview", "Weekly Summary", "Search / Range", "Ticker History"]
     )
 
     # ── Overview 탭 ──
     with tab_overview:
-        # 일별 스캔 수 차트
-        if daily_counts:
+        # 최근 스캔 라운드
+        latest = api_get("/scan-log/latest")
+        latest_logs = latest.get("logs", []) if latest else []
+        if latest_logs:
             st.markdown("""
             <div class="section-header">
-                <div class="section-title">Daily Scan Activity</div>
+                <div class="section-title">Latest Scan Round</div>
             </div>
             """, unsafe_allow_html=True)
-            dc_df = pd.DataFrame(daily_counts)
-            dc_df = dc_df.sort_values("date")
-            fig = go.Figure()
-            fig.add_trace(go.Bar(
-                x=dc_df["date"], y=dc_df["cnt"],
-                marker_color="#5d8ef1",
-                text=dc_df["cnt"], textposition="outside",
-                textfont=dict(color="#8d909e", size=10, family="JetBrains Mono"),
-            ))
-            fig.update_layout(**_plotly_base_layout(
-                height=250,
-                margin=dict(l=40, r=10, t=10, b=40),
-                xaxis=dict(gridcolor="rgba(66,71,82,0.12)"),
-                yaxis=dict(gridcolor="rgba(66,71,82,0.12)"),
-            ))
-            st.plotly_chart(fig, use_container_width=True)
+            lt_rows = []
+            for r in latest_logs:
+                lt_rows.append({
+                    "Ticker": r.get("ticker", "?"),
+                    "Signal": r.get("signal", "?"),
+                    "Score": r.get("score", 0),
+                    "Confidence": r.get("confidence", 0),
+                    "Alert": "Yes" if r.get("alert_sent") else "",
+                    "Time": str(r.get("scanned_at", ""))[:19].replace("T", " "),
+                })
+            lt_df = pd.DataFrame(lt_rows)
+            st.dataframe(
+                lt_df.style.map(
+                    lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+                    subset=["Signal"],
+                ),
+                use_container_width=True, hide_index=True,
+            )
 
-        # 신호 분포 (파이 차트) + 종목별 통계 테이블
-        col_pie, col_table = st.columns([1, 2])
-
-        with col_pie:
-            if signal_dist:
-                st.markdown("""
-                <div class="section-header">
-                    <div class="section-title">Signal Distribution</div>
-                </div>
-                """, unsafe_allow_html=True)
-                sig_labels = [d.get("final_signal", "?") for d in signal_dist]
-                sig_values = [d.get("cnt", 0) for d in signal_dist]
-                sig_colors = {
-                    "BUY": "#02d4a1", "SELL": "#fd526f", "HOLD": "#ffb347",
-                }
-                fig = go.Figure(go.Pie(
-                    labels=sig_labels, values=sig_values, hole=0.45,
-                    marker=dict(colors=[sig_colors.get(s, "#32353c") for s in sig_labels]),
-                    textfont=dict(color="#e1e2eb", size=12),
-                ))
-                fig.update_layout(**_plotly_base_layout(
-                    height=280, margin=dict(l=10, r=10, t=10, b=10),
-                    showlegend=True,
-                    legend=dict(font=dict(color="#c3c6d4", size=11)),
-                ))
-                st.plotly_chart(fig, use_container_width=True)
-
-                # 평균 점수 표
-                for d in signal_dist:
-                    sig = d.get("final_signal", "?")
-                    avg_s = d.get("avg_score", 0)
-                    avg_c = d.get("avg_confidence", 0)
-                    cnt = d.get("cnt", 0)
-                    st.markdown(
-                        f'{_signal_pill_html(sig)} &nbsp; '
-                        f'<span style="font-family:JetBrains Mono; font-size:0.8rem; color:var(--on-surface-variant);">'
-                        f'{cnt}x &middot; avg score {avg_s:+.2f} &middot; conf {avg_c:.1f}</span>',
-                        unsafe_allow_html=True,
-                    )
-
-        with col_table:
-            if ticker_stats:
-                st.markdown("""
-                <div class="section-header">
-                    <div class="section-title">Per-Ticker Stats</div>
-                </div>
-                """, unsafe_allow_html=True)
-                ts_rows = []
-                for ts in ticker_stats:
-                    ts_rows.append({
-                        "Ticker": ts.get("ticker", "?"),
-                        "Scans": ts.get("scan_count", 0),
-                        "Avg Score": ts.get("avg_score", 0),
-                        "First Scan": str(ts.get("first_scan", ""))[:10],
-                        "Last Scan": str(ts.get("last_scan", ""))[:10],
-                    })
-                st.dataframe(pd.DataFrame(ts_rows), use_container_width=True, hide_index=True)
-
-        # 최근 스캔
-        if recent_scans:
+        # 전체 최근 로그 테이블
+        if logs:
             st.markdown("""
             <div class="section-header">
                 <div class="section-title">Recent Scans</div>
-                <div class="section-subtitle">LAST 10</div>
+                <div class="section-subtitle">LAST 50</div>
             </div>
             """, unsafe_allow_html=True)
             rc_rows = []
-            for r in recent_scans:
+            for r in logs:
                 rc_rows.append({
                     "ID": r.get("id", 0),
                     "Time": str(r.get("scanned_at", ""))[:19].replace("T", " "),
                     "Ticker": r.get("ticker", "?"),
-                    "Signal": r.get("final_signal", "?"),
-                    "Score": r.get("composite_score", 0),
+                    "Signal": r.get("signal", "?"),
+                    "Score": r.get("score", 0),
                     "Confidence": r.get("confidence", 0),
+                    "BUY": r.get("buy_count", 0),
+                    "SELL": r.get("sell_count", 0),
+                    "HOLD": r.get("neutral_count", 0),
                 })
             rc_df = pd.DataFrame(rc_rows)
             st.dataframe(
@@ -1966,282 +1912,145 @@ def render_scan_log():
                 use_container_width=True, hide_index=True,
             )
 
-    # ── Weekly Trend 탭 ──
+    # ── Weekly Summary 탭 ──
     with tab_weekly:
         st.markdown("""
         <div class="section-header">
-            <div class="section-title">Weekly Trend Analysis</div>
-            <div class="section-subtitle">WoW COMPARISON</div>
+            <div class="section-title">Weekly Summary</div>
+            <div class="section-subtitle">WEEKLY REPORT</div>
         </div>
         """, unsafe_allow_html=True)
 
-        # 종목 선택
-        wt_tickers = [ts.get("ticker", "?") for ts in ticker_stats] if ticker_stats else load_watchlist()
-        wt_options = ["ALL (Global)"] + wt_tickers
-        wt_sel = st.selectbox("Scope", wt_options, key="wt_scope")
-        wt_weeks = st.slider("Weeks", 2, 16, 8, key="wt_weeks")
+        wt_weeks_ago = st.slider("Weeks Ago (0=this week)", 0, 8, 0, key="wt_weeks_ago")
+        weekly_data = api_get(f"/weekly?weeks_ago={wt_weeks_ago}")
 
-        wt_ticker = "" if wt_sel == "ALL (Global)" else wt_sel
-        comp_data = api_get(f"/weekly/comparison?ticker={wt_ticker}&weeks={wt_weeks}")
-
-        if not comp_data or not comp_data.get("weeks"):
-            st.info("Not enough weekly data. Need at least 2 weeks of scans.")
+        if not weekly_data or weekly_data.get("total_scans", 0) == 0:
+            st.info("No scan data for this week.")
         else:
-            trend = comp_data.get("trend", {})
-            weeks_list = comp_data.get("weeks", [])
-            comparisons = comp_data.get("comparisons", [])
+            w1, w2, w3, w4 = st.columns(4)
+            w1.metric("Period", f"{weekly_data.get('week_start','')} ~ {weekly_data.get('week_end','')}")
+            w2.metric("Total Scans", str(weekly_data.get("total_scans", 0)))
+            w3.metric("Alerts", str(weekly_data.get("alert_count", 0)))
+            sig_dist = weekly_data.get("signal_distribution", {})
+            w4.metric("Signal Ratio", f"B:{sig_dist.get('BUY',0)} S:{sig_dist.get('SELL',0)} H:{sig_dist.get('HOLD',0)}")
 
-            # 추세 배지
-            trend_dir = trend.get("direction", "?")
-            trend_colors = {
-                "strongly_bullish": ("var(--buy)", "STRONGLY BULLISH"),
-                "bullish": ("var(--buy)", "BULLISH"),
-                "strongly_bearish": ("var(--sell)", "STRONGLY BEARISH"),
-                "bearish": ("var(--sell)", "BEARISH"),
-                "sideways": ("var(--hold)", "SIDEWAYS"),
-            }
-            t_color, t_label = trend_colors.get(trend_dir, ("var(--outline)", trend_dir.upper()))
-            st.markdown(
-                f'<div style="margin:16px 0;">'
-                f'<span style="background:{t_color}; color:#0b0e14; padding:6px 20px; border-radius:6px; '
-                f'font-family:JetBrains Mono; font-size:0.9rem; font-weight:800; letter-spacing:1px;">'
-                f'{t_label}</span></div>',
-                unsafe_allow_html=True,
-            )
-
-            t1, t2, t3, t4, t5 = st.columns(5)
-            t1.metric("Slope/Week", f"{trend.get('slope', 0):+.3f}")
-            t2.metric("Recent Slope", f"{trend.get('recent_slope', 0):+.3f}")
-            t3.metric("Streak", f"{trend.get('streak', 0):+d} weeks")
-            t4.metric("Total Change", f"{trend.get('total_change', 0):+.3f}")
-            t5.metric("Latest Score", f"{trend.get('latest_score', 0):+.3f}")
-
-            # 주간 점수 차트
-            if weeks_list:
-                w_df = pd.DataFrame(weeks_list)
-                w_df = w_df.sort_values("week")
-
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=w_df["week"], y=w_df["avg_score"],
-                    mode="lines+markers",
-                    name="Avg Score",
-                    line=dict(color="#5d8ef1", width=3),
-                    marker=dict(size=10, color="#5d8ef1", line=dict(width=2, color="#0b0e14")),
-                    text=[f"Score: {s:+.2f}" for s in w_df["avg_score"]],
-                    hovertemplate="%{x}<br>%{text}<extra></extra>",
-                ))
-                # 신뢰도 보조 축
-                fig.add_trace(go.Bar(
-                    x=w_df["week"], y=w_df["avg_confidence"],
-                    name="Confidence",
-                    marker_color="rgba(174,198,255,0.2)",
-                    yaxis="y2",
-                ))
-                fig.add_hline(y=0, line_color="rgba(66,71,82,0.3)", line_width=1)
-                fig.update_layout(**_plotly_base_layout(
-                    height=320,
-                    margin=dict(l=50, r=50, t=10, b=40),
-                    xaxis=dict(gridcolor="rgba(66,71,82,0.12)"),
-                    yaxis=dict(title="Score", gridcolor="rgba(66,71,82,0.12)"),
-                    yaxis2=dict(title="Confidence", overlaying="y", side="right",
-                                gridcolor="rgba(0,0,0,0)", range=[0, 10]),
-                    legend=dict(font=dict(color="#c3c6d4", size=11), orientation="h", y=1.08),
-                ))
-                st.plotly_chart(fig, use_container_width=True)
-
-            # 신호 분포 스택 바
-            if weeks_list:
-                fig2 = go.Figure()
-                w_sorted = sorted(weeks_list, key=lambda w: w["week"])
-                wk_labels = [w["week"] for w in w_sorted]
-                fig2.add_trace(go.Bar(name="BUY", x=wk_labels,
-                    y=[w.get("buy_count", 0) for w in w_sorted], marker_color="#02d4a1"))
-                fig2.add_trace(go.Bar(name="SELL", x=wk_labels,
-                    y=[w.get("sell_count", 0) for w in w_sorted], marker_color="#fd526f"))
-                fig2.add_trace(go.Bar(name="HOLD", x=wk_labels,
-                    y=[w.get("hold_count", 0) for w in w_sorted], marker_color="#ffb347"))
-                fig2.update_layout(**_plotly_base_layout(
-                    height=250, barmode="stack",
-                    margin=dict(l=40, r=10, t=10, b=40),
-                    legend=dict(font=dict(color="#c3c6d4", size=11), orientation="h", y=1.08),
-                ))
-                st.plotly_chart(fig2, use_container_width=True)
-
-            # WoW 비교 테이블
-            if comparisons:
+            # 종목별 요약 테이블
+            tickers_data = weekly_data.get("tickers", [])
+            if tickers_data:
                 st.markdown("""
                 <div class="section-header">
-                    <div class="section-title">Week-over-Week Changes</div>
+                    <div class="section-title">Per-Ticker Summary</div>
                 </div>
                 """, unsafe_allow_html=True)
-                cmp_rows = []
-                for c in reversed(comparisons):
-                    cmp_rows.append({
-                        "Week": c["week"],
-                        "Scans": c["scan_count"],
-                        "Avg Score": c["avg_score"],
-                        "Score Delta": c["score_delta"],
-                        "Score %": c["score_pct_change"],
-                        "Conf Delta": c["confidence_delta"],
-                        "BUY": c["buy_count"],
-                        "SELL": c["sell_count"],
-                        "HOLD": c["hold_count"],
-                        "Buy Delta": c["buy_delta"],
-                        "Sell Delta": c["sell_delta"],
+                wt_rows = []
+                for t in tickers_data:
+                    wt_rows.append({
+                        "Ticker": t.get("ticker", "?"),
+                        "Scans": t.get("scan_count", 0),
+                        "Avg Score": t.get("avg_score", 0),
+                        "Avg Conf": t.get("avg_confidence", 0),
+                        "BUY": t.get("buy_cnt", 0),
+                        "SELL": t.get("sell_cnt", 0),
+                        "HOLD": t.get("hold_cnt", 0),
+                        "Alerts": t.get("alerts", 0),
                     })
-                cmp_df = pd.DataFrame(cmp_rows)
-                st.dataframe(
-                    cmp_df.style.map(
-                        lambda v: "color: #02d4a1" if isinstance(v, (int, float)) and v > 0
-                        else ("color: #fd526f" if isinstance(v, (int, float)) and v < 0 else ""),
-                        subset=["Score Delta", "Score %", "Buy Delta", "Sell Delta"],
-                    ),
-                    use_container_width=True, hide_index=True,
-                )
+                wt_df = pd.DataFrame(wt_rows)
+                st.dataframe(wt_df, use_container_width=True, hide_index=True)
 
-            # 도구별 주간 추이 (종목 선택 시)
-            if wt_ticker:
-                tool_data = api_get(f"/weekly/tool-trend/{wt_ticker}?weeks={min(wt_weeks, 4)}")
-                tools_list = tool_data.get("tools", []) if tool_data else []
-                if tools_list:
-                    st.markdown(f"""
-                    <div class="section-header">
-                        <div class="section-title">{wt_ticker} Tool Scores by Week</div>
-                    </div>
-                    """, unsafe_allow_html=True)
+            # Top BUY / Top SELL
+            col_buy, col_sell = st.columns(2)
+            with col_buy:
+                top_buy = weekly_data.get("top_buy", [])
+                if top_buy:
+                    st.markdown("**Top BUY Signals**")
+                    for b in top_buy:
+                        st.markdown(f'`{b.get("ticker","?")}` score: **{b.get("best_score",0):+.2f}**')
+            with col_sell:
+                top_sell = weekly_data.get("top_sell", [])
+                if top_sell:
+                    st.markdown("**Top SELL Signals**")
+                    for s in top_sell:
+                        st.markdown(f'`{s.get("ticker","?")}` score: **{s.get("worst_score",0):+.2f}**')
 
-                    # 피벗: week x tool_name
-                    tt_df = pd.DataFrame(tools_list)
-                    if not tt_df.empty and "week" in tt_df.columns and "tool_name" in tt_df.columns:
-                        pivot = tt_df.pivot_table(
-                            index="tool_name", columns="week",
-                            values="avg_score", aggfunc="first",
-                        ).sort_index()
-                        # 컬럼 시간순 정렬
-                        pivot = pivot[sorted(pivot.columns)]
-                        st.dataframe(
-                            pivot.style.background_gradient(cmap="RdYlGn", vmin=-5, vmax=5, axis=None),
-                            use_container_width=True,
-                        )
+            # 종목별 주간 상세
+            st.divider()
+            wt_tickers_list = [t.get("ticker", "?") for t in tickers_data] if tickers_data else load_watchlist()
+            wt_sel = st.selectbox("Ticker Detail", wt_tickers_list, key="wt_ticker_detail")
+            if wt_sel:
+                ticker_weekly = api_get(f"/weekly/{wt_sel}?weeks_ago={wt_weeks_ago}")
+                if ticker_weekly and ticker_weekly.get("stats", {}).get("scan_count", 0) > 0:
+                    tw_stats = ticker_weekly["stats"]
+                    tw1, tw2, tw3, tw4 = st.columns(4)
+                    tw1.metric("Scans", str(tw_stats.get("scan_count", 0)))
+                    tw2.metric("Avg Score", f"{tw_stats.get('avg_score', 0):+.2f}")
+                    tw3.metric("Min/Max", f"{tw_stats.get('min_score', 0):+.2f} / {tw_stats.get('max_score', 0):+.2f}")
+                    tw4.metric("Alerts", str(tw_stats.get("alert_count", 0)))
 
-    # ── Search 탭 ──
+                    daily_trend = ticker_weekly.get("daily_trend", [])
+                    if daily_trend:
+                        dt_df = pd.DataFrame(daily_trend)
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=dt_df["day"], y=dt_df["avg_score"],
+                            mode="lines+markers",
+                            name="Avg Score",
+                            line=dict(color="#5d8ef1", width=3),
+                            marker=dict(size=10, color="#5d8ef1"),
+                        ))
+                        fig.add_hline(y=0, line_color="rgba(66,71,82,0.3)", line_width=1)
+                        fig.update_layout(**_plotly_base_layout(
+                            height=280,
+                            margin=dict(l=40, r=10, t=10, b=40),
+                            xaxis=dict(gridcolor="rgba(66,71,82,0.12)"),
+                            yaxis=dict(title="Score", gridcolor="rgba(66,71,82,0.12)"),
+                        ))
+                        st.plotly_chart(fig, use_container_width=True)
+
+    # ── Search / Range 탭 ──
     with tab_search:
         st.markdown("""
         <div class="section-header">
-            <div class="section-title">Search Scan Logs</div>
+            <div class="section-title">Search by Date Range</div>
         </div>
         """, unsafe_allow_html=True)
 
-        fc1, fc2, fc3, fc4 = st.columns(4)
-        search_ticker = fc1.text_input("Ticker", placeholder="NVDA", key="sl_search_ticker")
-        search_signal = fc2.selectbox("Signal", ["", "BUY", "SELL", "HOLD"], key="sl_search_signal")
-        search_from = fc3.text_input("From (YYYY-MM-DD)", placeholder="2025-01-01", key="sl_search_from")
-        search_limit = fc4.number_input("Limit", min_value=1, max_value=500, value=50, key="sl_search_limit")
+        fc1, fc2 = st.columns(2)
+        search_start = fc1.text_input("Start (YYYY-MM-DD)", placeholder="2026-04-07", key="sl_search_start")
+        search_end = fc2.text_input("End (YYYY-MM-DD)", placeholder="2026-04-13", key="sl_search_end")
 
-        if st.button("Search", type="primary", key="sl_search_btn"):
-            params = f"?limit={search_limit}"
-            if search_ticker:
-                params += f"&ticker={search_ticker.strip().upper()}"
-            if search_signal:
-                params += f"&signal={search_signal}"
-            if search_from:
-                params += f"&from={search_from.strip()}"
+        if st.button("Search Range", type="primary", key="sl_search_btn"):
+            if search_start and search_end:
+                with st.spinner("Searching..."):
+                    result = api_get(f"/scan-log/range?start={search_start.strip()}&end={search_end.strip()}")
 
-            with st.spinner("Searching..."):
-                result = api_get(f"/scan-log{params}")
-
-            if not result:
-                st.error("Query failed")
-            elif result.get("total", 0) == 0:
-                st.info("No matching records found.")
+                if not result:
+                    st.error("Query failed")
+                elif result.get("count", 0) == 0:
+                    st.info("No records in this date range.")
+                else:
+                    st.caption(f"Found {result['count']} records")
+                    rows = result.get("logs", [])
+                    if rows:
+                        sr_rows = []
+                        for r in rows:
+                            sr_rows.append({
+                                "ID": r.get("id", 0),
+                                "Time": str(r.get("scanned_at", ""))[:19].replace("T", " "),
+                                "Ticker": r.get("ticker", "?"),
+                                "Signal": r.get("signal", "?"),
+                                "Score": r.get("score", 0),
+                                "Confidence": r.get("confidence", 0),
+                            })
+                        sr_df = pd.DataFrame(sr_rows)
+                        st.dataframe(
+                            sr_df.style.map(
+                                lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+                                subset=["Signal"],
+                            ),
+                            use_container_width=True, hide_index=True,
+                        )
             else:
-                st.caption(f"Found {result['total']} records (showing {len(result.get('rows', []))})")
-                rows = result.get("rows", [])
-                if rows:
-                    sr_rows = []
-                    for r in rows:
-                        sr_rows.append({
-                            "ID": r.get("id", 0),
-                            "Time": str(r.get("scanned_at", ""))[:19].replace("T", " "),
-                            "Ticker": r.get("ticker", "?"),
-                            "Signal": r.get("final_signal", "?"),
-                            "Score": r.get("composite_score", 0),
-                            "Confidence": r.get("confidence", 0),
-                            "Tools": r.get("tool_count", 0),
-                            "Buy": r.get("buy_votes", 0),
-                            "Sell": r.get("sell_votes", 0),
-                            "Neutral": r.get("neutral_votes", 0),
-                            "LLM": r.get("llm_model", ""),
-                        })
-                    sr_df = pd.DataFrame(sr_rows)
-                    st.dataframe(
-                        sr_df.style.map(
-                            lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
-                            subset=["Signal"],
-                        ),
-                        use_container_width=True, hide_index=True,
-                    )
-
-        # 개별 상세 조회
-        st.divider()
-        st.markdown("""
-        <div class="section-header">
-            <div class="section-title">Scan Detail</div>
-        </div>
-        """, unsafe_allow_html=True)
-        detail_id = st.number_input("Scan ID", min_value=1, value=1, key="sl_detail_id")
-        if st.button("Load Detail", key="sl_detail_btn"):
-            with st.spinner("Loading..."):
-                detail = api_get(f"/scan-log/detail/{detail_id}")
-            if not detail:
-                st.error(f"Scan #{detail_id} not found")
-            else:
-                signal = detail.get("final_signal", "?")
-                badge_class = "buy" if signal == "BUY" else ("sell" if signal == "SELL" else "hold")
-                st.markdown(
-                    f'<span class="signal-badge-lg {badge_class}">{signal}</span> &nbsp; '
-                    f'<span style="color:var(--on-surface-variant);">'
-                    f'{detail.get("ticker","?")} @ {str(detail.get("scanned_at",""))[:19]}</span>',
-                    unsafe_allow_html=True,
-                )
-
-                d1, d2, d3, d4 = st.columns(4)
-                d1.metric("Score", f"{detail.get('composite_score', 0):+.2f}")
-                d2.metric("Confidence", f"{detail.get('confidence', 0)}/10")
-                d3.metric("Tools", str(detail.get("tool_count", 0)))
-                d4.metric("LLM", detail.get("llm_model", "N/A") or "N/A")
-
-                tool_results = detail.get("tool_results", [])
-                if tool_results:
-                    st.markdown("**Tool Results**")
-                    tr_rows = []
-                    for tr in tool_results:
-                        tr_rows.append({
-                            "Tool": tr.get("tool_name", tr.get("tool_key", "?")),
-                            "Signal": tr.get("signal", "?"),
-                            "Score": tr.get("score", 0),
-                            "Detail": str(tr.get("detail", ""))[:120],
-                        })
-                    tr_df = pd.DataFrame(tr_rows)
-                    st.dataframe(
-                        tr_df.style.map(
-                            lambda v: "color: #02d4a1" if v == "buy" else ("color: #fd526f" if v == "sell" else "color: #ffb347"),
-                            subset=["Signal"],
-                        ),
-                        use_container_width=True, hide_index=True,
-                    )
-
-                llm_text = detail.get("llm_conclusion", "")
-                if llm_text and not llm_text.startswith("[") :
-                    with st.expander("LLM Conclusion", expanded=False):
-                        # llm_meta 제거
-                        display_text = llm_text
-                        if display_text.startswith("<!-- llm_meta:"):
-                            end = display_text.find("-->\n")
-                            if end > 0:
-                                display_text = display_text[end + 4:]
-                        st.markdown(f'<div class="llm-body">\n\n{display_text}\n\n</div>', unsafe_allow_html=True)
+                st.warning("Start and End dates are required.")
 
     # ── Ticker History 탭 ──
     with tab_ticker:
@@ -2252,19 +2061,19 @@ def render_scan_log():
         """, unsafe_allow_html=True)
 
         # 종목 선택
-        all_tickers = [ts.get("ticker", "?") for ts in ticker_stats] if ticker_stats else load_watchlist()
+        all_tickers = load_watchlist()
         if not all_tickers:
             st.info("No ticker data available.")
         else:
             sel_ticker = st.selectbox("Select Ticker", all_tickers, key="sl_ticker_hist")
             if sel_ticker:
-                hist_data = api_get(f"/scan-log/ticker/{sel_ticker}?limit=50")
-                history = hist_data.get("history", []) if hist_data else []
+                hist_data = api_get(f"/scan-log/{sel_ticker}?limit=50")
+                history = hist_data.get("logs", []) if hist_data else []
 
                 if not history:
                     st.info(f"No scan history for {sel_ticker}")
                 else:
-                    st.caption(f"{len(history)} records for {sel_ticker}")
+                    st.caption(f"{hist_data.get('total', len(history))} total records for {sel_ticker} (showing last 50)")
 
                     # 점수 시계열 차트
                     h_df = pd.DataFrame(history)
@@ -2273,18 +2082,18 @@ def render_scan_log():
 
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(
-                        x=h_df["scanned_at"], y=h_df["composite_score"],
+                        x=h_df["scanned_at"], y=h_df["score"],
                         mode="lines+markers",
                         line=dict(color="#5d8ef1", width=2),
                         marker=dict(
                             size=8,
                             color=[
                                 "#02d4a1" if s == "BUY" else "#fd526f" if s == "SELL" else "#ffb347"
-                                for s in h_df["final_signal"]
+                                for s in h_df["signal"]
                             ],
                             line=dict(width=1, color="#0b0e14"),
                         ),
-                        text=[f"{s} ({sc:+.1f})" for s, sc in zip(h_df["final_signal"], h_df["composite_score"])],
+                        text=[f"{s} ({sc:+.1f})" for s, sc in zip(h_df["signal"], h_df["score"])],
                         hovertemplate="%{text}<br>%{x}<extra></extra>",
                     ))
                     fig.add_hline(y=0, line_color="rgba(66,71,82,0.3)", line_width=1)
@@ -2296,38 +2105,19 @@ def render_scan_log():
                     ))
                     st.plotly_chart(fig, use_container_width=True)
 
-                    # 신호 변경 이력
-                    changes_data = api_get(f"/scan-log/changes/{sel_ticker}?limit=20")
-                    changes = changes_data.get("changes", []) if changes_data else []
-                    if changes and len(changes) > 1:
-                        st.markdown("""
-                        <div class="section-header">
-                            <div class="section-title">Signal Changes</div>
-                        </div>
-                        """, unsafe_allow_html=True)
-                        for ch in changes:
-                            sig = ch.get("final_signal", "?")
-                            ts = str(ch.get("scanned_at", ""))[:19].replace("T", " ")
-                            sc = ch.get("composite_score", 0)
-                            st.markdown(
-                                f'{_signal_pill_html(sig)} &nbsp; '
-                                f'<span style="font-family:JetBrains Mono; font-size:0.8rem; color:var(--on-surface-variant);">'
-                                f'{ts} &middot; score {sc:+.2f}</span>',
-                                unsafe_allow_html=True,
-                            )
-
                     # 이력 테이블
                     th_rows = []
                     for r in history:
                         th_rows.append({
                             "ID": r.get("id", 0),
                             "Time": str(r.get("scanned_at", ""))[:19].replace("T", " "),
-                            "Signal": r.get("final_signal", "?"),
-                            "Score": r.get("composite_score", 0),
+                            "Signal": r.get("signal", "?"),
+                            "Score": r.get("score", 0),
                             "Confidence": r.get("confidence", 0),
-                            "Buy": r.get("buy_votes", 0),
-                            "Sell": r.get("sell_votes", 0),
-                            "Neutral": r.get("neutral_votes", 0),
+                            "BUY": r.get("buy_count", 0),
+                            "SELL": r.get("sell_count", 0),
+                            "HOLD": r.get("neutral_count", 0),
+                            "Alert": "Yes" if r.get("alert_sent") else "",
                         })
                     th_df = pd.DataFrame(th_rows)
                     st.dataframe(
@@ -2337,53 +2127,6 @@ def render_scan_log():
                         ),
                         use_container_width=True, hide_index=True,
                     )
-
-    # ── Export 탭 ──
-    with tab_export:
-        st.markdown("""
-        <div class="section-header">
-            <div class="section-title">Export Scan Logs</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        ec1, ec2, ec3 = st.columns(3)
-        export_ticker = ec1.text_input("Ticker (optional)", placeholder="NVDA", key="sl_export_ticker")
-        export_from = ec2.text_input("From Date", placeholder="2025-01-01", key="sl_export_from")
-        export_to = ec3.text_input("To Date", placeholder="2025-12-31", key="sl_export_to")
-
-        if st.button("Export CSV", type="primary", key="sl_export_btn"):
-            params = ""
-            parts = []
-            if export_ticker:
-                parts.append(f"ticker={export_ticker.strip().upper()}")
-            if export_from:
-                parts.append(f"from={export_from.strip()}")
-            if export_to:
-                parts.append(f"to={export_to.strip()}")
-            if parts:
-                params = "?" + "&".join(parts)
-
-            with st.spinner("Exporting..."):
-                result = api_get(f"/scan-log/export{params}")
-
-            if result and result.get("ok"):
-                filepath = result.get("filepath", "")
-                st.success(f"Exported to: {filepath}")
-
-                # 파일 다운로드 버튼 제공
-                if filepath and os.path.exists(filepath):
-                    with open(filepath, "r", encoding="utf-8-sig") as f:
-                        csv_data = f.read()
-                    st.download_button(
-                        label="Download CSV",
-                        data=csv_data,
-                        file_name=os.path.basename(filepath),
-                        mime="text/csv",
-                    )
-            else:
-                st.error("Export failed")
-
-        st.caption("CSV includes: scan time, ticker, signal, score, confidence, tool votes, LLM model")
 
 
 # ═══════════════════════════════════════════════════════════════
