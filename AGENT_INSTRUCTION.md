@@ -241,7 +241,59 @@ engine_interpret_full_report(ticker, provider="auto")
 
 ---
 
-## 6. 에이전트 작업 시 준수 규칙
+## 6. 절대 제거 금지 항목 (DO NOT REMOVE / SIMPLIFY)
+
+> **경고:** 아래 항목들은 런타임 안정성의 핵심입니다. 축소/제거 시 JSON 직렬화 오류, LLM 컨텍스트 누락 등이 발생합니다.
+
+### 6-1. `_sanitize()` 함수 — `local_engine.py`
+
+분석 결과를 JSON으로 변환할 때 **모든 비표준 타입**을 처리합니다. **절대 축소하지 마세요.**
+
+| 타입 | 변환 | 제거 시 증상 |
+|------|------|-------------|
+| `datetime` | `.isoformat()` | `TypeError: Object of type datetime is not JSON serializable` |
+| `pd.Timestamp` | `.isoformat()` | 동일 — pandas 시각 데이터에서 발생 |
+| `np.bool_` | `bool()` | `TypeError: Object of type bool_ is not JSON serializable` |
+| `np.integer` | `int()` | 정수 직렬화 오류 |
+| `np.floating` | `float()` + NaN/Inf 체크 | NaN이 JSON에 포함되면 프론트엔드 크래시 |
+| `np.ndarray` | `.tolist()` 재귀 | 배열 직렬화 오류 |
+| dict key `str(k)` | 키를 문자열로 강제 변환 | Timestamp/int가 dict key인 경우 직렬화 오류 |
+
+### 6-2. `_gather_extra_context()` 주간 트렌드 DB 블록
+
+LLM이 종합 리포트 작성 시 **과거 스캔 이력(DB)**을 참조하여 WoW(Week-over-Week) 변화를 해석합니다.
+이 블록이 없으면 LLM은 현재 단일 스캔만 보고 판단하므로 **추세 반전/지속 판단이 불가능**합니다.
+
+```python
+# ⚠ 제거 금지 — _gather_extra_context() 내부
+try:
+    weekly = get_weekly_ticker(ticker, weeks_ago=0)
+    if weekly and weekly.get("stats", {}).get("scan_count", 0) > 0:
+        stats = weekly["stats"]
+        parts.append(f"**주간 트렌드 (DB 기반)**\n...")
+except Exception as e:
+    print(f"  [{ticker}] 주간 트렌드 수집 실패: {e}")
+```
+
+### 6-3. `_build_full_report_prompt()` 주간 추세 분석 섹션
+
+LLM 프롬프트에 아래 2가지가 반드시 포함되어야 합니다:
+
+1. **헤더:** `"## 추가 컨텍스트 (주간트렌드/뉴스/매크로/섹터/차트패턴)"` — "주간트렌드" 포함 필수
+2. **분석 섹션:** `"### 주간 추세 분석\n[DB 누적 데이터 기반 WoW 변화 해석 — 점수/신호 추이, 반전/지속 판단]"`
+
+### 6-4. 코드 수정 전 체크리스트
+
+- [ ] `git pull origin main` 으로 최신 코드 확인
+- [ ] `_sanitize()` 전체 타입 처리(datetime, pd.Timestamp, np.bool_ 포함)가 유지되는지 확인
+- [ ] `_gather_extra_context()` 주간 트렌드 블록이 있는지 확인
+- [ ] `_build_full_report_prompt()` 주간 추세 분석 섹션이 있는지 확인
+- [ ] 컴파일 검증: `python -c "import py_compile; py_compile.compile('파일', doraise=True)"`
+- [ ] 커밋 전 `git diff` 로 의도하지 않은 삭제가 없는지 확인
+
+---
+
+## 7. 에이전트 작업 시 준수 규칙
 
 1. **모든 결과는 JSON-serializable**: NaN/Inf -> None, datetime -> ISO string, numpy -> Python native
 2. **에러 응답 표준**: `{"error": "메시지"}` 형태로 반환, 에러도 dict로 감싸야 함
@@ -253,35 +305,46 @@ engine_interpret_full_report(ticker, provider="auto")
 8. **LLM 프롬프트 언어**: 한국어 응답, 마크다운 형식
 9. **`_sanitize()` 함수 필수 적용**: numpy/pandas 타입 -> JSON 호환 타입 변환
 10. **모니터링 종목은 하드코딩 금지**: 종목 목록은 반드시 `watchlist.txt` 파일에서 동적 로드해야 하며, 코드나 환경변수에 직접 기입하지 않는다. WebUI에서 실시간 추가/삭제가 가능해야 한다.
-11. **watchlist 변경 시 양쪽 파일 동기화**: `stock_analyzer/watchlist.txt`와 `chart_agent_service/watchlist.txt`는 항상 동일한 내용을 유지해야 한다. `_save_watchlist_file()`이 자동 동기화를 수행한다.
+11. **watchlist 단일 소스**: `stock_analyzer/watchlist.txt`가 정식 소스. `chart_agent_service/watchlist.txt`는 안내 파일(주석만 있음)이므로 종목을 직접 추가하지 않는다.
+12. **`_sanitize()` 축소 금지**: 섹션 6-1 참조. pd.Timestamp, np.bool_, datetime 등 전체 타입 처리를 유지해야 한다.
+13. **주간 트렌드 DB 연동 제거 금지**: 섹션 6-2, 6-3 참조. `_gather_extra_context()`와 `_build_full_report_prompt()`의 주간 트렌드 관련 코드를 유지해야 한다.
 
 ---
 
-## 7. 파일 구조 참조
+## 8. 리포지토리 규칙
+
+- **정식 리포:** `github.com:hsp1978/stock_ai.git` — Mac/Ubuntu 모두 이 리포에 push/pull
+- **stock_auto 리포는 사용하지 않음** (이전 착오로 생긴 중복 리포)
+- **DB 모듈:** `chart_agent_service/db.py` (단일 테이블 `scan_log`) — `scan_logger.py`는 삭제됨, 복원하지 마세요
+
+---
+
+## 9. 파일 구조 참조
 
 ```
 stock_auto/
+  AGENT_INSTRUCTION.md           # 이 파일 — 에이전트 코딩 규칙
   chart_agent_service/           # 에이전트 코어 (Mac Studio 배포 단위)
     config.py                    # 전역 설정 + 스타일 프리셋
+    db.py                        # SQLite 스캔 로그 DB (단일 테이블 scan_log)
     data_collector.py            # yfinance OHLCV + 지표 계산 + 펀더멘털/옵션/내부자
     analysis_tools.py            # 16개 분석 도구 + LLM 에이전트 오케스트레이션
     backtest_engine.py           # SMA크로스/RSI역추세/복합시그널 백테스트
     ml_predictor.py              # RandomForest/GradientBoosting 방향 예측
     portfolio_optimizer.py       # 마코위츠/리스크패리티/팩터랭킹/상관베타
     paper_trader.py              # 모의매매 시뮬레이터
+    news_analyzer.py             # 뉴스 감성 분석
+    chart_pattern.py             # 차트 패턴 인식 (알고리즘 기반)
+    sector_compare.py            # 섹터/산업 비교
+    macro_context.py             # 매크로 경제 지표
     service.py                   # FastAPI 서버 (Mac Studio 독립 실행용)
-    watchlist.txt                # 관심 종목 목록 (자동 동기화, 직접 편집 금지)
-    output/                      # 분석 결과 JSON + 차트 PNG
+    watchlist.txt                # 안내 파일 (종목 추가 금지 — stock_analyzer/ 참조)
+    output/                      # 분석 결과 JSON + 차트 PNG + scan_log.db
   stock_analyzer/                # WebUI + 로컬 엔진 (Ubuntu 서버)
     webui.py                     # Streamlit 대시보드 (watchlist Add/Remove UI 포함)
-    local_engine.py              # 로컬 분석 엔진 (watchlist CRUD + chart_agent_service 직접 import)
-    agent_client.py              # Mac Studio API CLI 클라이언트
+    local_engine.py              # 로컬 분석 엔진 (chart_agent_service 직접 import + Multi-LLM)
+    scanner.py                   # 백그라운드 스케줄러
     watchlist.txt                # 관심 종목 목록 (Single Source of Truth, WebUI에서 관리)
-    config/settings.py           # WebUI 설정
-    core/                        # 데이터 수집/지표 (레거시)
-    analysis/                    # AI 분석/차트 에이전트 (레거시)
-    visualization/               # 차트 생성 (레거시)
-    notification/                # 텔레그램 봇
-    risk/                        # 리스크 매니저
+    requirements.txt             # 통합 의존성 목록
     .streamlit/config.toml       # Streamlit 서버 설정
 ```
