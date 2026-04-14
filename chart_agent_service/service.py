@@ -328,6 +328,18 @@ def _load_watchlist_files() -> list[str]:
     return tickers
 
 
+_WL_FILE = os.path.join(os.path.dirname(__file__), "..", "stock_analyzer", "watchlist.txt")
+
+
+def _save_watchlist_file(tickers: list[str]):
+    """watchlist.txt에 종목 목록 기록"""
+    with open(_WL_FILE, 'w') as f:
+        f.write("# 관심 종목 리스트 (한 줄에 하나, #은 주석)\n")
+        f.write("# 빈 줄과 주석은 무시됨\n\n")
+        for t in tickers:
+            f.write(f"{t.upper()}\n")
+
+
 def run_scheduled_scan(override_tickers: "list[str] | None" = None):
     """스케줄된 전체 종목 스캔. override_tickers가 주어지면 해당 목록만 스캔."""
     tickers = override_tickers if override_tickers else _load_watchlist_files()
@@ -691,6 +703,49 @@ def get_macro():
         return JSONResponse(content=_sanitize(result))
     except Exception as e:
         raise HTTPException(500, f"매크로 데이터 수집 실패: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Watchlist 관리 API
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/watchlist")
+def api_get_watchlist():
+    """watchlist 조회"""
+    tickers = _load_watchlist_files()
+    return {"count": len(tickers), "tickers": tickers}
+
+
+@app.post("/watchlist/add")
+def api_watchlist_add(ticker: str):
+    """종목 추가"""
+    ticker = ticker.upper()
+    current = _load_watchlist_files()
+    if ticker in current:
+        return {"ok": False, "msg": f"{ticker} 이미 존재", "tickers": current}
+    current.append(ticker)
+    _save_watchlist_file(current)
+    return {"ok": True, "msg": f"{ticker} 추가됨", "tickers": current}
+
+
+@app.post("/watchlist/remove")
+def api_watchlist_remove(ticker: str):
+    """종목 제거"""
+    ticker = ticker.upper()
+    current = _load_watchlist_files()
+    if ticker not in current:
+        return {"ok": False, "msg": f"{ticker} 없음", "tickers": current}
+    current.remove(ticker)
+    _save_watchlist_file(current)
+    return {"ok": True, "msg": f"{ticker} 제거됨", "tickers": current}
+
+
+@app.post("/watchlist/set")
+def api_watchlist_set(tickers: str):
+    """watchlist 전체 교체 (콤마 구분)"""
+    clean = list(dict.fromkeys(t.strip().upper() for t in tickers.split(",") if t.strip()))
+    _save_watchlist_file(clean)
+    return {"ok": True, "msg": f"{len(clean)}개 종목 설정됨", "tickers": clean}
 
 
 # ═══════════════════════════════════════════════════════════════

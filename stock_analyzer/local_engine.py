@@ -185,8 +185,59 @@ def _load_watchlist_files() -> list[str]:
     return tickers
 
 
+_WL_FILE = os.path.join(_THIS_DIR, "watchlist.txt")
+
+
+def _save_watchlist_file(tickers: list[str]):
+    """watchlist.txt에 종목 목록 기록 (헤더 주석 유지)"""
+    with open(_WL_FILE, 'w') as f:
+        f.write("# 관심 종목 리스트 (한 줄에 하나, #은 주석)\n")
+        f.write("# 빈 줄과 주석은 무시됨\n\n")
+        for t in tickers:
+            f.write(f"{t.upper()}\n")
+
+
+def engine_load_watchlist() -> list[str]:
+    """watchlist 동적 로드"""
+    return _load_watchlist_files()
+
+
+def engine_save_watchlist(tickers: list[str]):
+    """watchlist 저장"""
+    _save_watchlist_file(tickers)
+
+
+def engine_add_ticker(ticker: str) -> dict:
+    """종목 추가"""
+    ticker = ticker.upper()
+    current = _load_watchlist_files()
+    if ticker in current:
+        return {"ok": False, "msg": f"{ticker} 이미 존재", "tickers": current}
+    current.append(ticker)
+    _save_watchlist_file(current)
+    return {"ok": True, "msg": f"{ticker} 추가됨", "tickers": current}
+
+
+def engine_remove_ticker(ticker: str) -> dict:
+    """종목 제거"""
+    ticker = ticker.upper()
+    current = _load_watchlist_files()
+    if ticker not in current:
+        return {"ok": False, "msg": f"{ticker} 없음", "tickers": current}
+    current.remove(ticker)
+    _save_watchlist_file(current)
+    return {"ok": True, "msg": f"{ticker} 제거됨", "tickers": current}
+
+
+def engine_set_watchlist(tickers: list[str]) -> dict:
+    """watchlist 전체 교체"""
+    clean = list(dict.fromkeys(t.upper() for t in tickers if t.strip()))
+    _save_watchlist_file(clean)
+    return {"ok": True, "msg": f"{len(clean)}개 종목 설정됨", "tickers": clean}
+
+
 # ═══════════════════════════════════════════════════════════════
-#  핵심 엔진 함수 (24개)
+#  핵심 엔진 함수
 # ═══════════════════════════════════════════════════════════════
 
 def engine_health() -> dict:
@@ -865,6 +916,10 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
             return engine_sector_compare(ticker)
         elif path == "/macro":
             return engine_macro_context()
+        # ── watchlist 엔드포인트 ──
+        elif path == "/watchlist":
+            tickers = engine_load_watchlist()
+            return {"count": len(tickers), "tickers": tickers}
         # ── scan-log 엔드포인트 ──
         elif path == "/scan-log/latest":
             return get_scan_log_latest()
@@ -955,6 +1010,23 @@ def engine_dispatch_post(path: str) -> Optional[dict]:
             )
         elif path == "/paper/reset":
             return engine_paper_reset()
+        # ── watchlist 관리 ──
+        elif path.startswith("/watchlist/add"):
+            ticker = ""
+            if "ticker=" in path:
+                ticker = path.split("ticker=")[1].split("&")[0]
+            return engine_add_ticker(ticker)
+        elif path.startswith("/watchlist/remove"):
+            ticker = ""
+            if "ticker=" in path:
+                ticker = path.split("ticker=")[1].split("&")[0]
+            return engine_remove_ticker(ticker)
+        elif path.startswith("/watchlist/set"):
+            tickers_str = ""
+            if "tickers=" in path:
+                tickers_str = path.split("tickers=")[1].split("&")[0]
+            tickers = [t.strip() for t in tickers_str.split(",") if t.strip()]
+            return engine_set_watchlist(tickers)
         elif path == "/restart":
             return {
                 "status": "restarting",
