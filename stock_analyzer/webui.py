@@ -21,6 +21,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ── 프로젝트 경로 설정 ──
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_THIS_DIR)
+_SERVICE_DIR = os.path.join(_PROJECT_ROOT, 'chart_agent_service')
+
+if _SERVICE_DIR not in sys.path:
+    sys.path.insert(0, _SERVICE_DIR)
+
+# ── config 모듈에서 API 설정 가져오기 ──
+try:
+    from chart_agent_service.config import AGENT_API_HOST, AGENT_API_PORT
+except ImportError:
+    # fallback to default values
+    AGENT_API_HOST = os.getenv("AGENT_API_HOST", "localhost")
+    AGENT_API_PORT = int(os.getenv("AGENT_API_PORT", "8100"))
+
 # ── local_engine 연결 (직접 import 우선, HTTP fallback) ──
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
@@ -31,7 +47,7 @@ try:
 except ImportError:
     _USE_LOCAL_ENGINE = False
 
-AGENT_API_URL = os.getenv("AGENT_API_URL", "http://100.108.11.20:8100")
+AGENT_API_URL = os.getenv("AGENT_API_URL", f"http://{AGENT_API_HOST}:{AGENT_API_PORT}")
 WATCHLIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.txt")
 
 st.set_page_config(
@@ -608,6 +624,66 @@ def get_chart_url(ticker: str) -> str:
     return f"{AGENT_API_URL}/chart/{ticker}"
 
 
+def export_comprehensive_data(ticker: str, include_multi_agent: bool = True) -> dict:
+    """
+    종목의 모든 분석 데이터를 수집하여 export용 dict 반환
+    - Single LLM (V1.0) 결과
+    - Multi-Agent (V2.0) 결과
+    - 백테스트 결과
+    - ML 예측 결과
+    """
+    export_data = {
+        "ticker": ticker,
+        "export_timestamp": datetime.now().isoformat(),
+        "version": "2.0"
+    }
+
+    # 1. Single LLM 분석 결과
+    single_result = api_get(f"/results/{ticker}")
+    if single_result:
+        export_data["single_llm_analysis"] = {
+            "final_signal": single_result.get("final_signal"),
+            "composite_score": single_result.get("composite_score"),
+            "confidence": single_result.get("confidence"),
+            "signal_distribution": single_result.get("signal_distribution"),
+            "tool_summaries": single_result.get("tool_summaries", []),
+            "tool_details": single_result.get("tool_details", []),
+            "llm_conclusion": single_result.get("llm_conclusion"),
+            "analyzed_at": single_result.get("analyzed_at")
+        }
+
+    # 2. Multi-Agent 분석 결과 (옵션)
+    if include_multi_agent:
+        multi_result = api_get(f"/multi-agent/{ticker}")
+        if multi_result and not multi_result.get("error"):
+            export_data["multi_agent_analysis"] = {
+                "ticker": multi_result.get("ticker"),
+                "multi_agent_mode": multi_result.get("multi_agent_mode"),
+                "agent_results": multi_result.get("agent_results", []),
+                "final_decision": multi_result.get("final_decision"),
+                "total_execution_time": multi_result.get("total_execution_time"),
+                "timestamp": multi_result.get("timestamp")
+            }
+
+    # 3. 백테스트 결과
+    backtest_result = api_get(f"/backtest/{ticker}")
+    if backtest_result:
+        export_data["backtest"] = backtest_result
+
+    # 4. ML 예측 결과
+    ml_result = api_get(f"/ml/{ticker}")
+    if ml_result:
+        export_data["ml_prediction"] = ml_result
+
+    # 5. 펀더멘털 데이터
+    if single_result:
+        export_data["fundamentals"] = single_result.get("fundamentals", {})
+        export_data["options_pcr"] = single_result.get("options_pcr", {})
+        export_data["insider_trades"] = single_result.get("insider_trades", [])
+
+    return export_data
+
+
 def load_watchlist() -> list[str]:
     if not os.path.exists(WATCHLIST_PATH):
         return []
@@ -622,29 +698,82 @@ def load_watchlist() -> list[str]:
             else:
                 ticker, _ = resolve_ticker(raw)
                 result.append(ticker if ticker else raw)
-    return result
+    return sorted(result)  # 알파벳 순으로 정렬
 
 
 def save_watchlist(tickers: list[str]):
     header = "# 관심 종목 리스트 (한 줄에 하나, #은 주석)\n# 빈 줄과 주석은 무시됨\n\n"
     with open(WATCHLIST_PATH, "w", encoding="utf-8") as f:
         f.write(header)
-        for t in tickers:
+        for t in sorted(tickers):  # 알파벳 순으로 정렬하여 저장
             f.write(f"{t}\n")
+
+
+def validate_ticker(ticker: str) -> tuple[bool, str]:
+    """
+    종목 코드 유효성 검증
+    Returns: (is_valid, error_message)
+    """
+    ticker = ticker.strip().upper()
+
+    # 기본 형식 검증
+    if not ticker:
+        return False, "종목 코드를 입력하세요"
+
+    if len(ticker) > 10:  # 대부분의 티커는 10자 이내
+        return False, f"종목 코드가 너무 깁니다: {ticker}"
+
+    # Yahoo Finance에서 실제 데이터 존재 여부 확인
+    try:
+        import yfinance as yf
+        stock = yf.Ticker(ticker)
+        info = stock.history(period="5d")
+
+        if info.empty:
+            return False, f"❌ '{ticker}'는 유효하지 않은 종목 코드입니다. Yahoo Finance에서 데이터를 찾을 수 없습니다."
+
+        # 추가 정보 가져오기 시도
+        try:
+            stock_info = stock.info
+            company_name = stock_info.get('longName', stock_info.get('shortName', ''))
+            if company_name:
+                return True, f"✅ {ticker} ({company_name})"
+            else:
+                return True, f"✅ {ticker}"
+        except:
+            return True, f"✅ {ticker}"
+
+    except Exception as e:
+        return False, f"❌ '{ticker}' 검증 실패: 유효하지 않은 종목 코드이거나 네트워크 오류입니다."
 
 
 def add_to_watchlist(ticker: str) -> tuple[bool, str]:
     ticker = ticker.strip().upper()
     if not ticker:
-        return False, "Empty ticker"
-    if not ticker.isalpha() and not all(c.isalnum() or c in ".-^=" for c in ticker):
-        return False, f"Invalid ticker: {ticker}"
+        return False, "종목 코드를 입력하세요"
+
+    # 기본 문자 검증
+    if not ticker.replace('.', '').replace('-', '').replace('^', '').replace('=', '').isalnum():
+        return False, f"❌ 잘못된 형식: '{ticker}'"
+
+    # 실제 종목 유효성 검증
+    is_valid, message = validate_ticker(ticker)
+    if not is_valid:
+        return False, message
+
+    # Watchlist에 추가
     current = load_watchlist()
     if ticker in current:
-        return False, f"{ticker} already in watchlist"
+        return False, f"⚠️ {ticker}는 이미 Watchlist에 있습니다"
+
     current.append(ticker)
     save_watchlist(current)
-    return True, f"{ticker} added"
+
+    # 성공 메시지에 회사명 포함
+    if "✅" in message:
+        return True, f"{message.replace('✅', '➕')} - Watchlist에 추가됨"
+    else:
+        return True, f"➕ {ticker} added to Watchlist"
 
 
 def remove_from_watchlist(ticker: str) -> tuple[bool, str]:
@@ -810,7 +939,7 @@ with st.sidebar:
 
     st.divider()
 
-    page = st.radio("Navigation", ["Home", "Dashboard", "Detail", "Scan Log", "Backtest", "ML Predict", "Portfolio", "Ranking", "Paper Trade", "History"], label_visibility="collapsed")
+    page = st.radio("Navigation", ["Home", "Dashboard", "Detail", "Multi-Agent", "Scan Log", "Backtest", "ML Predict", "Portfolio", "Ranking", "Paper Trade", "History"], label_visibility="collapsed")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1069,6 +1198,191 @@ def render_dashboard():
             use_container_width=True, hide_index=True,
             height=max(280, len(df) * 52),
         )
+
+    # Export functionality for Dashboard
+    st.markdown("---")
+    st.markdown('<div class="section-title">📤 Export All Data</div>', unsafe_allow_html=True)
+
+    col1, col2 = st.columns([3, 1])
+
+    with col1:
+        export_options = st.radio(
+            "Export Format:",
+            ["JSON (Full Data)", "CSV (Summary)", "Markdown (Report)"],
+            horizontal=True,
+            key="dashboard_export_format"
+        )
+
+        include_multi = st.checkbox(
+            "Include Multi-Agent Analysis",
+            value=True,
+            key="dashboard_include_multi",
+            help="Include detailed Multi-Agent analysis data for each ticker"
+        )
+
+    with col2:
+        if st.button("🚀 Export All", key="dashboard_export_all", use_container_width=True):
+            with st.spinner("Collecting data for all tickers..."):
+                all_export_data = {
+                    "export_timestamp": datetime.now().isoformat(),
+                    "total_tickers": total,
+                    "signal_summary": {
+                        "buy": len(buy_list),
+                        "sell": len(sell_list),
+                        "hold": len(hold_list)
+                    },
+                    "analysis_period": {
+                        "oldest": oldest_analysis if 'oldest_analysis' in locals() else None,
+                        "latest": latest_analysis if 'latest_analysis' in locals() else None
+                    },
+                    "tickers": {}
+                }
+
+                # Collect data for each ticker
+                progress_text = st.empty()
+                progress_bar = st.progress(0)
+
+                for idx, ticker in enumerate(sorted(results.keys())):
+                    progress_text.text(f"Processing {ticker}... ({idx+1}/{total})")
+                    progress_bar.progress((idx + 1) / total)
+
+                    try:
+                        ticker_data = export_comprehensive_data(ticker, include_multi_agent=include_multi)
+                        all_export_data["tickers"][ticker] = ticker_data
+                    except Exception as e:
+                        all_export_data["tickers"][ticker] = {"error": str(e)}
+
+                progress_text.empty()
+                progress_bar.empty()
+
+                # Prepare export based on selected format
+                if "JSON" in export_options:
+                    export_json = json.dumps(all_export_data, indent=2, ensure_ascii=False)
+                    st.download_button(
+                        label="📥 Download JSON",
+                        data=export_json,
+                        file_name=f"stock_analysis_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                        mime="application/json",
+                        key="dashboard_download_json"
+                    )
+
+                elif "CSV" in export_options:
+                    # Create summary CSV
+                    csv_rows = []
+                    for ticker, data in all_export_data["tickers"].items():
+                        if "error" not in data:
+                            row = {
+                                "Ticker": ticker,
+                                "Signal": data.get("single_llm_analysis", {}).get("signal", "N/A"),
+                                "Score": data.get("single_llm_analysis", {}).get("score", 0),
+                                "Confidence": data.get("single_llm_analysis", {}).get("confidence", 0),
+                                "Multi-Agent Signal": data.get("multi_agent_analysis", {}).get("final_decision", {}).get("final_signal", "N/A"),
+                                "Multi-Agent Confidence": data.get("multi_agent_analysis", {}).get("final_decision", {}).get("final_confidence", 0),
+                                "Buy Agents": data.get("multi_agent_analysis", {}).get("final_decision", {}).get("signal_distribution", {}).get("buy", 0),
+                                "Sell Agents": data.get("multi_agent_analysis", {}).get("final_decision", {}).get("signal_distribution", {}).get("sell", 0),
+                                "Neutral Agents": data.get("multi_agent_analysis", {}).get("final_decision", {}).get("signal_distribution", {}).get("neutral", 0),
+                                "Analyzed At": data.get("single_llm_analysis", {}).get("analyzed_at", "")
+                            }
+                        else:
+                            row = {
+                                "Ticker": ticker,
+                                "Signal": "ERROR",
+                                "Score": 0,
+                                "Confidence": 0,
+                                "Multi-Agent Signal": "ERROR",
+                                "Multi-Agent Confidence": 0,
+                                "Buy Agents": 0,
+                                "Sell Agents": 0,
+                                "Neutral Agents": 0,
+                                "Analyzed At": ""
+                            }
+                        csv_rows.append(row)
+
+                    if csv_rows:
+                        export_df = pd.DataFrame(csv_rows)
+                        csv_data = export_df.to_csv(index=False, encoding='utf-8-sig')
+
+                        st.download_button(
+                            label="📥 Download CSV",
+                            data=csv_data,
+                            file_name=f"stock_analysis_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv",
+                            key="dashboard_download_csv"
+                        )
+
+                else:  # Markdown Report
+                    # Create comprehensive markdown report
+                    report = f"""# Stock Analysis Report - All Tickers
+## 📅 Report Information
+- **Export Date**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+- **Total Tickers Analyzed**: {total}
+- **Analysis Period**: {oldest_analysis if 'oldest_analysis' in locals() else 'N/A'} ~ {latest_analysis if 'latest_analysis' in locals() else 'N/A'}
+
+## 📊 Market Overview
+- **Buy Signals**: {len(buy_list)} ({buy_pct}%)
+- **Sell Signals**: {len(sell_list)} ({sell_pct}%)
+- **Hold Signals**: {len(hold_list)} ({hold_pct}%)
+
+## 🎯 Top Buy Recommendations
+"""
+                    # Add top buy recommendations
+                    buy_sorted = sorted(buy_list.items(), key=lambda x: x[1].get("score", 0), reverse=True)[:5]
+                    for ticker, data in buy_sorted:
+                        report += f"### {ticker}\n"
+                        report += f"- **Score**: {data.get('score', 0):+.2f}\n"
+                        report += f"- **Confidence**: {data.get('confidence', 0)}/10\n"
+                        if include_multi and ticker in all_export_data["tickers"]:
+                            ma_data = all_export_data["tickers"][ticker].get("multi_agent_analysis", {})
+                            if ma_data:
+                                final = ma_data.get("final_decision", {})
+                                report += f"- **Multi-Agent Signal**: {final.get('final_signal', 'N/A')}\n"
+                                report += f"- **Multi-Agent Confidence**: {final.get('final_confidence', 0)}/10\n"
+                        report += "\n"
+
+                    report += """## 📉 Risk Alerts (Sell Signals)
+"""
+                    # Add sell signals
+                    sell_sorted = sorted(sell_list.items(), key=lambda x: x[1].get("score", 0))[:5]
+                    for ticker, data in sell_sorted:
+                        report += f"### {ticker}\n"
+                        report += f"- **Score**: {data.get('score', 0):+.2f}\n"
+                        report += f"- **Confidence**: {data.get('confidence', 0)}/10\n"
+                        report += "\n"
+
+                    report += """## 📋 Full Analysis Results
+| Ticker | Signal | Score | Confidence | Multi-Agent Signal | MA Confidence |
+|--------|--------|-------|------------|-------------------|---------------|
+"""
+                    # Add all tickers
+                    for ticker in sorted(results.keys()):
+                        r = results[ticker]
+                        ma_signal = "N/A"
+                        ma_conf = "N/A"
+
+                        if include_multi and ticker in all_export_data["tickers"]:
+                            ma_data = all_export_data["tickers"][ticker].get("multi_agent_analysis", {})
+                            if ma_data:
+                                final = ma_data.get("final_decision", {})
+                                ma_signal = final.get("final_signal", "N/A")
+                                ma_conf = f"{final.get('final_confidence', 0)}/10"
+
+                        report += f"| {ticker} | {r.get('signal', 'N/A')} | {r.get('score', 0):+.2f} | {r.get('confidence', 0)}/10 | {ma_signal} | {ma_conf} |\n"
+
+                    report += f"""
+---
+*Generated by Stock AI Analysis System v2.0*
+*Report Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*
+"""
+
+                    st.download_button(
+                        label="📥 Download Report",
+                        data=report,
+                        file_name=f"stock_analysis_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                        mime="text/markdown",
+                        key="dashboard_download_report"
+                    )
+
+                st.success(f"✅ Export prepared for {total} tickers!")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1367,6 +1681,189 @@ def render_detail():
         </div>
         """, unsafe_allow_html=True)
         st.markdown(f'<div class="llm-body">\n\n{llm}\n\n</div>', unsafe_allow_html=True)
+
+    # Export 섹션 추가
+    st.markdown("""
+    <div class="section-header">
+        <div class="section-title">📥 Export All Data</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Export 옵션
+    col1, col2 = st.columns(2)
+    with col1:
+        include_multi = st.checkbox("Include Multi-Agent Analysis", value=True,
+                                   help="Multi-Agent 분석 포함 (시간이 더 걸립니다)")
+
+    # Export 버튼들
+    export_col1, export_col2, export_col3 = st.columns(3)
+
+    with export_col1:
+        if st.button("📄 Export as JSON", use_container_width=True, key="detail_export_json"):
+            with st.spinner(f"Collecting all data for {selected}..."):
+                export_data = export_comprehensive_data(selected, include_multi)
+                json_str = json.dumps(export_data, indent=2, ensure_ascii=False, default=str)
+
+                st.download_button(
+                    label="📥 Download JSON",
+                    data=json_str,
+                    file_name=f"{selected}_comprehensive_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json",
+                    use_container_width=True
+                )
+                st.success(f"✅ Data collected! Click 'Download JSON' to save.")
+
+    with export_col2:
+        if st.button("📊 Export as CSV", use_container_width=True, key="detail_export_csv"):
+            with st.spinner(f"Preparing CSV for {selected}..."):
+                export_data = export_comprehensive_data(selected, include_multi)
+
+                # CSV로 변환 (주요 데이터만)
+                csv_data = []
+
+                # Single LLM 데이터
+                if "single_llm_analysis" in export_data:
+                    single = export_data["single_llm_analysis"]
+                    csv_data.append({
+                        "Type": "Single LLM",
+                        "Signal": single.get("final_signal"),
+                        "Score": single.get("composite_score"),
+                        "Confidence": single.get("confidence"),
+                        "Timestamp": single.get("analyzed_at")
+                    })
+
+                # Multi-Agent 데이터
+                if "multi_agent_analysis" in export_data:
+                    multi = export_data["multi_agent_analysis"]
+                    if multi.get("agent_results"):
+                        for agent in multi["agent_results"]:
+                            csv_data.append({
+                                "Type": f"Agent: {agent.get('agent')}",
+                                "Signal": agent.get("signal"),
+                                "Score": agent.get("score", 0),
+                                "Confidence": agent.get("confidence"),
+                                "Timestamp": multi.get("timestamp")
+                            })
+
+                    # Final decision
+                    if multi.get("final_decision"):
+                        final = multi["final_decision"]
+                        csv_data.append({
+                            "Type": "Multi-Agent Final",
+                            "Signal": final.get("final_signal"),
+                            "Score": 0,
+                            "Confidence": final.get("final_confidence"),
+                            "Timestamp": multi.get("timestamp")
+                        })
+
+                if csv_data:
+                    df = pd.DataFrame(csv_data)
+                    csv_str = df.to_csv(index=False, encoding='utf-8-sig')
+
+                    st.download_button(
+                        label="📥 Download CSV",
+                        data=csv_str,
+                        file_name=f"{selected}_comprehensive_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                    st.success(f"✅ CSV prepared! Click 'Download CSV' to save.")
+                else:
+                    st.warning("No data available for CSV export")
+
+    with export_col3:
+        if st.button("📝 Export as Report", use_container_width=True, key="detail_export_report"):
+            with st.spinner(f"Generating report for {selected}..."):
+                export_data = export_comprehensive_data(selected, include_multi)
+
+                # Markdown 리포트 생성
+                report = f"""# 📊 {selected} Comprehensive Analysis Report
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+---
+
+## 1. Single LLM Analysis (V1.0)
+"""
+                if "single_llm_analysis" in export_data:
+                    single = export_data["single_llm_analysis"]
+                    report += f"""
+- **Final Signal**: {single.get('final_signal')}
+- **Composite Score**: {single.get('composite_score')}
+- **Confidence**: {single.get('confidence')}/10
+- **Analyzed**: {single.get('analyzed_at')}
+
+### Signal Distribution
+- Buy votes: {single.get('signal_distribution', {}).get('buy', 0)}
+- Sell votes: {single.get('signal_distribution', {}).get('sell', 0)}
+- Neutral votes: {single.get('signal_distribution', {}).get('neutral', 0)}
+"""
+
+                report += """
+## 2. Multi-Agent Analysis (V2.0)
+"""
+                if "multi_agent_analysis" in export_data:
+                    multi = export_data["multi_agent_analysis"]
+                    if multi.get("final_decision"):
+                        final = multi["final_decision"]
+                        report += f"""
+### Final Decision
+- **Signal**: {final.get('final_signal')}
+- **Confidence**: {final.get('final_confidence')}/10
+- **Consensus**: {final.get('consensus')}
+
+### Agent Results
+"""
+                        for agent in multi.get("agent_results", []):
+                            report += f"""
+#### {agent.get('agent')}
+- Signal: {agent.get('signal')}
+- Confidence: {agent.get('confidence')}/10
+- LLM Provider: {agent.get('llm_provider')}
+- Reasoning: {agent.get('reasoning', 'N/A')[:200]}...
+"""
+                else:
+                    report += "\n*Multi-Agent analysis not included or not available*\n"
+
+                report += """
+## 3. Backtest Results
+"""
+                if "backtest" in export_data and export_data["backtest"]:
+                    bt = export_data["backtest"]
+                    report += f"""
+- **Strategy**: Composite
+- **Annual Return**: {bt.get('annual_return', 'N/A')}%
+- **Sharpe Ratio**: {bt.get('sharpe_ratio', 'N/A')}
+- **Max Drawdown**: {bt.get('max_drawdown', 'N/A')}%
+"""
+                else:
+                    report += "\n*Backtest data not available*\n"
+
+                report += """
+## 4. ML Prediction
+"""
+                if "ml_prediction" in export_data and export_data["ml_prediction"]:
+                    ml = export_data["ml_prediction"]
+                    report += f"""
+- **Direction**: {ml.get('ensemble_direction', 'N/A')}
+- **Probability**: {ml.get('ensemble_probability', 'N/A')}%
+- **Confidence**: {ml.get('ensemble_confidence', 'N/A')}/10
+"""
+                else:
+                    report += "\n*ML prediction not available*\n"
+
+                report += """
+---
+*Report generated by Stock AI Analysis System v2.0*
+"""
+
+                st.download_button(
+                    label="📥 Download Report",
+                    data=report,
+                    file_name=f"{selected}_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                    mime="text/markdown",
+                    use_container_width=True
+                )
+                st.success(f"✅ Report generated! Click 'Download Report' to save.")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1811,6 +2308,370 @@ def render_paper_trade():
 
 
 # ═══════════════════════════════════════════════════════════════
+#  Multi-Agent 페이지 (V2.0)
+# ═══════════════════════════════════════════════════════════════
+
+def render_multi_agent():
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">🤖 Multi-Agent Analysis</div>
+        <div class="page-subtitle">6개 전문 AI 에이전트 협업 분석 (V2.0)</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Watchlist 로드 (참고용)
+    watchlist = load_watchlist()
+
+    # 종목 입력 방식 선택
+    input_method = st.radio(
+        "종목 입력 방식",
+        ["Watchlist에서 선택", "직접 입력"],
+        horizontal=True,
+        label_visibility="collapsed"
+    )
+
+    # 종목 선택/입력
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        if input_method == "Watchlist에서 선택":
+            if not watchlist:
+                st.warning("Watchlist가 비어있습니다. 직접 입력을 선택하거나 사이드바에서 종목을 추가하세요.")
+                ticker = st.text_input("종목 코드 입력", placeholder="예: AAPL, TSLA, MSFT", label_visibility="collapsed")
+            else:
+                ticker = st.selectbox("분석할 종목 선택", watchlist, label_visibility="collapsed")
+        else:
+            ticker = st.text_input("종목 코드 입력", placeholder="예: AAPL, TSLA, MSFT", label_visibility="collapsed").upper()
+
+    with col2:
+        analyze_btn = st.button("🤖 Multi-Agent 분석", use_container_width=True, type="primary", disabled=not ticker)
+
+    if not ticker and not analyze_btn:
+        st.info("👆 종목을 선택하거나 입력하고 'Multi-Agent 분석' 버튼을 클릭하세요.")
+        return
+
+    if not analyze_btn and "multi_agent_result" not in st.session_state:
+        if ticker:
+            st.info(f"📊 {ticker}를 분석하려면 'Multi-Agent 분석' 버튼을 클릭하세요.")
+        return
+
+    # 분석 실행
+    if analyze_btn:
+        # 종목 코드 유효성 검증
+        is_valid, validation_message = validate_ticker(ticker)
+        if not is_valid:
+            st.error(validation_message)
+            return
+
+        with st.spinner(f"🤖 {ticker} 멀티에이전트 분석 중... (약 1-2분 소요)"):
+            # Single LLM 분석
+            single_result = api_get(f"/results/{ticker}")
+            if not single_result:
+                single_result = api_post(f"/scan/{ticker}")
+
+            # Multi-Agent 분석
+            multi_result = api_get(f"/multi-agent/{ticker}")
+
+            # API 실패 시 빈 딕셔너리로 설정
+            if multi_result is None:
+                multi_result = {
+                    "error": "Multi-Agent API not available",
+                    "final_decision": {
+                        "final_signal": "N/A",
+                        "final_confidence": 0,
+                        "consensus": "API Error"
+                    }
+                }
+
+            st.session_state.multi_agent_result = {
+                "ticker": ticker,
+                "single": single_result if single_result else {},
+                "multi": multi_result,
+                "timestamp": datetime.now().isoformat()
+            }
+
+    # 결과 표시
+    if "multi_agent_result" in st.session_state:
+        result = st.session_state.multi_agent_result
+        ticker = result["ticker"]
+        single = result.get("single", {})
+        multi = result.get("multi", {})
+
+        # === 비교 카드 ===
+        st.markdown("### 📊 Single LLM vs Multi-Agent 비교")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("""
+            <div class="summary-card">
+                <div style="font-size:0.7rem; color:var(--on-surface-variant); margin-bottom:8px;">Single LLM (V1.0)</div>
+                <div style="font-size:1.8rem; font-family:'JetBrains Mono'; font-weight:700; margin-bottom:12px;">
+                    {}
+                </div>
+                <div style="font-size:0.8rem; color:var(--on-surface-variant);">
+                    점수: <span style="color:{};">{:+.2f}</span> / 신뢰도: {}/10
+                </div>
+                <div style="margin-top:12px; font-size:0.7rem; opacity:0.6;">
+                    16개 도구 분석 → 단일 LLM 판단
+                </div>
+            </div>
+            """.format(
+                single.get("final_signal", "?"),
+                "var(--buy)" if single.get("composite_score", 0) > 0 else "var(--sell)" if single.get("composite_score", 0) < 0 else "var(--outline)",
+                single.get("composite_score", 0),
+                single.get("confidence", 0)
+            ), unsafe_allow_html=True)
+
+        with col2:
+            # multi가 None이거나 error가 있는 경우 처리
+            if multi is None:
+                multi = {"error": "Multi-Agent API not available"}
+
+            final_decision = multi.get("final_decision", {})
+
+            # API 에러가 있는 경우 에러 표시
+            if "error" in multi:
+                st.markdown("""
+                <div class="summary-card" style="border:2px solid var(--error);">
+                    <div style="font-size:0.7rem; color:var(--error); margin-bottom:8px;">Multi-Agent (V2.0) ⚠️</div>
+                    <div style="font-size:1.2rem; font-family:'JetBrains Mono'; font-weight:700; margin-bottom:12px; color:var(--error);">
+                        API 연결 실패
+                    </div>
+                    <div style="font-size:0.8rem; color:var(--on-surface-variant);">
+                        Multi-Agent 서버가 응답하지 않습니다
+                    </div>
+                    <div style="margin-top:12px; font-size:0.7rem; opacity:0.6;">
+                        chart_agent_service가 실행 중인지 확인하세요
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div class="summary-card" style="border:2px solid var(--primary-ctr);">
+                    <div style="font-size:0.7rem; color:var(--primary); margin-bottom:8px;">Multi-Agent (V2.0) ⭐</div>
+                    <div style="font-size:1.8rem; font-family:'JetBrains Mono'; font-weight:700; margin-bottom:12px;">
+                        {}
+                    </div>
+                    <div style="font-size:0.8rem; color:var(--on-surface-variant);">
+                        신뢰도: {:.1f}/10 | 의견: {}
+                    </div>
+                    <div style="margin-top:12px; font-size:0.7rem; opacity:0.6;">
+                        5개 에이전트 병렬 분석 → Decision Maker 종합
+                    </div>
+                </div>
+                """.format(
+                    final_decision.get("final_signal", "?"),
+                    final_decision.get("final_confidence", 0),
+                    final_decision.get("consensus", "?")
+                ), unsafe_allow_html=True)
+
+        # === 에이전트 의견 ===
+        st.markdown("### 👥 에이전트 의견")
+
+        if multi.get("error"):
+            st.error(f"멀티에이전트 분석 오류: {multi['error']}")
+            return
+
+        agent_results = multi.get("agent_results", [])
+
+        for agent in agent_results:
+            agent_name = agent.get("agent", "?")
+            signal = agent.get("signal", "neutral")
+            confidence = agent.get("confidence", 0)
+            reasoning = agent.get("reasoning", "")
+            llm = agent.get("llm_provider", "?")
+            exec_time = agent.get("execution_time", 0)
+            error = agent.get("error")
+
+            # 신호 색상
+            if signal == "buy":
+                signal_color = "var(--buy)"
+                signal_icon = "📈"
+            elif signal == "sell":
+                signal_color = "var(--sell)"
+                signal_icon = "📉"
+            else:
+                signal_color = "var(--hold)"
+                signal_icon = "➖"
+
+            # 에러 표시
+            status_icon = "✓" if not error else "✗"
+            status_color = "var(--agent-success)" if not error else "var(--agent-error)"
+
+            with st.expander(f"{status_icon} **{agent_name}**: {signal_icon} {signal.upper()} ({confidence:.1f}/10) — {llm} [{exec_time:.1f}s]"):
+                if error:
+                    st.error(f"에러: {error}")
+                else:
+                    st.markdown(f"**판단 근거:**\n\n{reasoning}")
+
+                # 신뢰도 바
+                st.progress(confidence / 10.0)
+
+        # === Decision Maker 종합 ===
+        st.markdown("### 🎯 Decision Maker 최종 판단")
+
+        # 최종 신호와 신뢰도
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            signal = final_decision.get('final_signal', 'N/A').upper()
+            color = {"BUY": "🟢", "SELL": "🔴", "NEUTRAL": "⚪"}.get(signal, "⚪")
+            st.metric("최종 신호", f"{color} {signal}")
+        with col2:
+            confidence = final_decision.get('final_confidence', 0)
+            st.metric("신뢰도", f"{confidence:.1f}/10")
+        with col3:
+            st.metric("의견 분포", final_decision.get('consensus', 'N/A'))
+
+        # 의견 충돌 해결
+        st.markdown("#### 의견 충돌 해결")
+        conflicts = final_decision.get('conflicts', 'N/A')
+        st.info(conflicts)
+
+        # 종합 판단 근거
+        st.markdown("#### 종합 판단 근거")
+        reasoning = final_decision.get('reasoning', 'N/A')
+        st.write(reasoning)
+
+        # 핵심 리스크
+        st.markdown("#### ⚠️ 핵심 리스크")
+        risks = final_decision.get('key_risks', [])
+        if risks:
+            for risk in risks:
+                st.write(f"• {risk}")
+        else:
+            st.write("• 리스크 정보 없음")
+
+        # === 실행 통계 ===
+        st.markdown("### 📈 실행 통계")
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("에이전트 수", final_decision.get("agent_count", 0))
+        with col2:
+            dist = final_decision.get("signal_distribution", {})
+            st.metric("BUY 의견", dist.get("buy", 0))
+        with col3:
+            st.metric("SELL 의견", dist.get("sell", 0))
+        with col4:
+            st.metric("실행 시간", f"{multi.get('total_execution_time', 0):.1f}s")
+
+        # === Export 기능 ===
+        st.markdown("### 💾 분석 결과 Export")
+
+        # Export 데이터 준비
+        export_data = {
+            "analysis_info": {
+                "ticker": ticker,
+                "analyzed_at": multi.get('analyzed_at', datetime.now().isoformat()),
+                "total_execution_time": multi.get('total_execution_time', 0)
+            },
+            "single_llm_analysis": {
+                "final_signal": single.get("final_signal"),
+                "composite_score": single.get("composite_score"),
+                "confidence": single.get("confidence"),
+                "llm_interpretation": single.get("llm_interpretation")
+            },
+            "multi_agent_analysis": {
+                "final_decision": final_decision,
+                "agent_results": multi.get("agent_results", [])
+            },
+            "tool_analysis_results": single.get("tool_results", {})
+        }
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            # JSON Export
+            json_str = json.dumps(export_data, indent=2, ensure_ascii=False)
+            st.download_button(
+                label="📄 JSON으로 다운로드",
+                data=json_str,
+                file_name=f"{ticker}_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                use_container_width=True
+            )
+
+        with col2:
+            # CSV Export (요약 정보)
+            summary_df = pd.DataFrame([{
+                "Ticker": ticker,
+                "분석시간": multi.get('analyzed_at', ''),
+                "Single LLM 신호": single.get("final_signal", "N/A"),
+                "Single LLM 점수": single.get("composite_score", 0),
+                "Multi-Agent 신호": final_decision.get('final_signal', 'N/A'),
+                "Multi-Agent 신뢰도": final_decision.get('final_confidence', 0),
+                "Buy 의견": dist.get("buy", 0),
+                "Sell 의견": dist.get("sell", 0),
+                "Neutral 의견": dist.get("neutral", 0),
+                "실행시간(초)": multi.get('total_execution_time', 0)
+            }])
+
+            csv_str = summary_df.to_csv(index=False, encoding='utf-8-sig')
+            st.download_button(
+                label="📊 CSV로 다운로드",
+                data=csv_str,
+                file_name=f"{ticker}_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+        with col3:
+            # Markdown Report Export
+            markdown_report = f"""# {ticker} 주식 분석 리포트
+
+## 📅 분석 정보
+- **종목**: {ticker}
+- **분석 일시**: {multi.get('analyzed_at', 'N/A')}
+- **총 실행 시간**: {multi.get('total_execution_time', 0):.1f}초
+
+## 🎯 분석 결과 요약
+
+### Single LLM Analysis (V1.0)
+- **최종 신호**: {single.get("final_signal", "N/A")}
+- **종합 점수**: {single.get("composite_score", 0):+.2f}
+- **신뢰도**: {single.get("confidence", 0)}/10
+
+### Multi-Agent Analysis (V2.0)
+- **최종 신호**: {final_decision.get('final_signal', 'N/A')}
+- **신뢰도**: {final_decision.get('final_confidence', 0)}/10
+- **의견 분포**: Buy({dist.get("buy", 0)}), Sell({dist.get("sell", 0)}), Neutral({dist.get("neutral", 0)})
+
+## 📊 에이전트별 분석 결과
+"""
+            for agent in multi.get("agent_results", []):
+                markdown_report += f"""
+### {agent['agent']}
+- **신호**: {agent['signal']}
+- **신뢰도**: {agent['confidence']}/10
+- **LLM**: {agent['llm_provider']}
+- **판단 근거**: {agent['reasoning'][:200]}...
+"""
+
+            markdown_report += f"""
+## 🎯 최종 판단 근거
+{final_decision.get('reasoning', 'N/A')}
+
+## ⚠️ 핵심 리스크
+"""
+            for risk in final_decision.get('key_risks', []):
+                markdown_report += f"- {risk}\n"
+
+            markdown_report += f"""
+---
+*생성일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*
+*Stock AI Multi-Agent Analysis System v2.0*
+"""
+
+            st.download_button(
+                label="📝 Markdown으로 다운로드",
+                data=markdown_report,
+                file_name=f"{ticker}_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                mime="text/markdown",
+                use_container_width=True
+            )
+
+
+# ═══════════════════════════════════════════════════════════════
 #  스캔 로그 (DB) 페이지
 # ═══════════════════════════════════════════════════════════════
 
@@ -2139,6 +3000,8 @@ elif page == "Dashboard":
     render_dashboard()
 elif page == "Detail":
     render_detail()
+elif page == "Multi-Agent":
+    render_multi_agent()
 elif page == "Scan Log":
     render_scan_log()
 elif page == "Backtest":

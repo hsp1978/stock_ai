@@ -1,0 +1,32 @@
+{
+  "sectors": {
+    "Technology": ["AAPL", "MSFT", "GOOGL", "META", "NVDA", "AMD", "INTC", "AVGO", "QCOM", "TXN"],
+    "Communication Services": ["GOOGL", "META", "NFLX", "DIS", "T", "VZ", "CMCSA"],
+    "Consumer Cyclical": ["AMZN", "TSLA", "HD", "NKE", "MCD", "SBUX", "TGT", "LOW"],
+    "Healthcare": ["JNJ", "UNH", "PFE", "ABBV", "TMO", "LLY", "CVS", "MRK", "ABT"],
+    "Financials": ["JPM", "BAC", "WFC", "GS", "MS", "C", "BLK", "SCHW", "AXP"],
+    "Industrials": ["BA", "CAT", "HON", "UPS", "LMT", "RTX", "GE", "MMM"],
+    "Consumer Staples": ["PG", "KO", "PEP", "WMT", "COST", "CL", "MDLZ", "PM"],
+    "Energy": ["XOM", "CVX", "COP", "SLB", "EOG", "PXD", "MPC", "VLO"],
+    "Real Estate": ["AMT", "PLD", "CCI", "EQIX", "SPG", "O", "WELL", "AVB"],
+    "Basic Materials": ["LIN", "APD", "SHW", "FCX", "NEM", "ECL", "DD", "DOW"],
+    "Utilities": ["NEE", "DUK", "SO", "D", "AEP", "EXC", "SRE", "XEL"]
+  },
+  "industries": {
+    "Semiconductors": ["NVDA", "AMD", "INTC", "AVGO", "QCOM", "MU", "AMAT", "LRCX", "KLAC", "TXN"],
+    "Software": ["MSFT", "CRM", "ORCL", "ADBE", "NOW", "INTU", "SNOW", "PANW"],
+    "E-commerce": ["AMZN", "SHOP", "EBAY", "ETSY", "MELI", "SE", "CPNG"],
+    "Cloud Computing": ["AMZN", "MSFT", "GOOGL", "CRM", "NOW", "NET", "DDOG"],
+    "Electric Vehicles": ["TSLA", "RIVN", "LCID", "NIO", "XPEV", "LI", "F", "GM"],
+    "Biotechnology": ["AMGN", "GILD", "BIIB", "VRTX", "REGN", "MRNA", "ILMN"],
+    "Banking": ["JPM", "BAC", "WFC", "C", "GS", "MS", "USB", "PNC"],
+    "Insurance": ["BRK.B", "UNH", "AIG", "MET", "PRU", "TRV", "ALL", "PGR"],
+    "Retail": ["WMT", "AMZN", "HD", "COST", "TGT", "LOW", "CVS", "WBA"],
+    "Social Media": ["META", "SNAP", "PINS", "TWTR", "MTCH", "BMBL"],
+    "Streaming": ["NFLX", "DIS", "WBD", "PARA", "ROKU", "SPOT"],
+    "Airlines": ["DAL", "UAL", "AAL", "LUV", "JBLU", "ALK"],
+    "Defense": ["LMT", "RTX", "BA", "NOC", "GD", "LHX"],
+    "Oil & Gas": ["XOM", "CVX", "COP", "SLB", "EOG", "OXY", "PSX"],
+    "Renewable Energy": ["ENPH", "SEDG", "FSLR", "RUN", "NEE", "AES", "PLUG"]
+  }
+}

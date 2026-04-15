@@ -93,6 +93,23 @@ MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "20.0"))
 TAKE_PROFIT_RR_RATIO = float(os.getenv("TAKE_PROFIT_RR_RATIO", "2.0"))
 COOLING_OFF_DAYS = int(os.getenv("COOLING_OFF_DAYS", "3"))
 
+# ═══ RSI 설정 ═══
+RSI_OVERSOLD = int(os.getenv("RSI_OVERSOLD", "30"))
+RSI_OVERBOUGHT = int(os.getenv("RSI_OVERBOUGHT", "70"))
+
+# ═══ 포지션 분할 설정 ═══
+POSITION_TRANCHE_1_PCT = float(os.getenv("POSITION_TRANCHE_1_PCT", "40"))
+POSITION_TRANCHE_2_PCT = float(os.getenv("POSITION_TRANCHE_2_PCT", "30"))
+POSITION_TRANCHE_3_PCT = float(os.getenv("POSITION_TRANCHE_3_PCT", "30"))
+
+# ═══ 테스트 설정 ═══
+DEFAULT_TEST_TICKER = os.getenv("DEFAULT_TEST_TICKER", "SPY")
+DEFAULT_SCAN_LIMIT = int(os.getenv("DEFAULT_SCAN_LIMIT", "30"))
+
+# ═══ API 설정 ═══
+AGENT_API_HOST = os.getenv("AGENT_API_HOST", "localhost")
+AGENT_API_PORT = int(os.getenv("AGENT_API_PORT", "8100"))
+
 # ═══ 출력 디렉토리 ═══
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)

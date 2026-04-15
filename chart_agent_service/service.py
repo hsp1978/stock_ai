@@ -53,6 +53,14 @@ from db import init_db, insert_scan, get_scan_logs, get_scan_logs_by_ticker, \
     get_scan_log_latest, get_scan_log_date_range, \
     get_weekly_summary, get_weekly_ticker
 
+# Multi-Agent import
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "stock_analyzer"))
+try:
+    from multi_agent import MultiAgentOrchestrator
+except ImportError:
+    MultiAgentOrchestrator = None
+    print("[WARNING] Multi-Agent module not available")
+
 
 # ═══════════════════════════════════════════════════════════════
 #  전역 상태 저장소
@@ -746,6 +754,39 @@ def api_watchlist_set(tickers: str):
     clean = list(dict.fromkeys(t.strip().upper() for t in tickers.split(",") if t.strip()))
     _save_watchlist_file(clean)
     return {"ok": True, "msg": f"{len(clean)}개 종목 설정됨", "tickers": clean}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Multi-Agent API (V2.0)
+# ═══════════════════════════════════════════════════════════════
+
+@app.get("/multi-agent/{ticker}")
+def get_multi_agent_analysis(ticker: str):
+    """Multi-Agent 분석 (V2.0) - 5개 에이전트 병렬 분석"""
+    ticker = ticker.upper()
+
+    if MultiAgentOrchestrator is None:
+        raise HTTPException(503, "Multi-Agent module not available")
+
+    try:
+        print(f"\n[Multi-Agent] Starting analysis for {ticker}")
+
+        # Multi-Agent 분석 실행
+        orchestrator = MultiAgentOrchestrator()
+        result = orchestrator.analyze(ticker)
+
+        print(f"[Multi-Agent] Analysis complete for {ticker}")
+
+        # 결과 정제
+        sanitized_result = _sanitize(result)
+
+        return JSONResponse(content=sanitized_result)
+
+    except Exception as e:
+        print(f"[Multi-Agent] Error analyzing {ticker}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Multi-Agent 분석 실패: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════

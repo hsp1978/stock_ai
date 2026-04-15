@@ -5,6 +5,8 @@
 """
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
+import json
+import os
 
 import numpy as np
 import yfinance as yf
@@ -12,20 +14,38 @@ import yfinance as yf
 
 # ── 피어 그룹 매핑 ────────────────────────────────────────────────
 
-SECTOR_PEERS: Dict[str, List[str]] = {
-    "Technology": ["AAPL", "MSFT", "GOOGL", "META", "NVDA", "AMD", "INTC", "AVGO", "QCOM", "TXN"],
-    "Communication Services": ["GOOGL", "META", "NFLX", "DIS", "T", "VZ", "CMCSA"],
-    "Consumer Cyclical": ["AMZN", "TSLA", "HD", "NKE", "MCD", "SBUX", "TGT", "LOW"],
-    "Consumer Defensive": ["WMT", "PG", "KO", "PEP", "COST", "PM", "MO", "CL"],
-    "Financials": ["JPM", "BAC", "WFC", "GS", "MS", "BLK", "AXP", "V", "MA"],
-    "Health Care": ["JNJ", "UNH", "PFE", "MRK", "ABBV", "TMO", "ABT", "BMY", "LLY"],
-    "Industrials": ["CAT", "BA", "HON", "UPS", "RTX", "DE", "GE", "MMM", "LMT"],
-    "Energy": ["XOM", "CVX", "COP", "SLB", "EOG", "MPC", "VLO", "PSX"],
-    "Utilities": ["NEE", "DUK", "SO", "D", "AEP", "EXC", "XEL", "WEC"],
-    "Real Estate": ["AMT", "PLD", "CCI", "EQIX", "PSA", "O", "WELL", "AVB"],
-    "Basic Materials": ["LIN", "APD", "SHW", "FCX", "NEM", "DOW", "DD", "ALB"],
-    "Semiconductors": ["NVDA", "AMD", "INTC", "AVGO", "QCOM", "MU", "AMAT", "LRCX", "KLAC", "TXN"],
-}
+def _load_sector_peers() -> Dict[str, List[str]]:
+    """JSON 파일에서 섹터/산업별 종목 리스트 로드"""
+    json_path = os.path.join(os.path.dirname(__file__), "sector_tickers.json")
+
+    # JSON 파일이 없으면 기본값 사용
+    if not os.path.exists(json_path):
+        return {
+            "Technology": ["AAPL", "MSFT", "GOOGL", "META", "NVDA"],
+            "Financials": ["JPM", "BAC", "WFC", "GS", "MS"],
+            "Healthcare": ["JNJ", "UNH", "PFE", "MRK", "ABBV"],
+        }
+
+    try:
+        with open(json_path, "r") as f:
+            data = json.load(f)
+            # sectors와 industries를 합쳐서 반환
+            result = {}
+            if "sectors" in data:
+                result.update(data["sectors"])
+            if "industries" in data:
+                result.update(data["industries"])
+            return result
+    except Exception as e:
+        print(f"Warning: Failed to load sector_tickers.json: {e}")
+        # 파일 로드 실패시 기본값 반환
+        return {
+            "Technology": ["AAPL", "MSFT", "GOOGL", "META", "NVDA"],
+            "Financials": ["JPM", "BAC", "WFC", "GS", "MS"],
+            "Healthcare": ["JNJ", "UNH", "PFE", "MRK", "ABBV"],
+        }
+
+SECTOR_PEERS = _load_sector_peers()
 
 
 def _safe_float(val) -> Optional[float]:

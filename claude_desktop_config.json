@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "stock-ai": {
+      "command": "python",
+      "args": ["/home/ubuntu/stock_auto/mcp_server_extended.py"],
+      "env": {
+        "PYTHONPATH": "/home/ubuntu/stock_auto"
+      }
+    }
+  }
+}

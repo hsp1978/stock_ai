@@ -9,3 +9,12 @@ matplotlib>=3.7.0
 httpx>=0.25.0
 python-dotenv>=1.0.0
 apscheduler>=3.10.0
+
+# ── 고급 ML (앙상블 + SHAP 설명력) ──
+shap>=0.44.0
+lightgbm>=4.1.0
+xgboost>=2.0.0
+tensorflow>=2.15.0
+
+# ── HyperOpt (Freqtrade 스타일) ──
+optuna>=3.5.0

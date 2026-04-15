@@ -25,6 +25,8 @@ from config import (
     ATR_STOP_MULTIPLIER, ACCOUNT_SIZE, RISK_PER_TRADE_PCT,
     MAX_POSITION_PCT, TAKE_PROFIT_RR_RATIO, TRADING_STYLE, TIMEFRAME,
     COOLING_OFF_DAYS, DEFAULT_HISTORY_PERIOD,
+    RSI_OVERSOLD, RSI_OVERBOUGHT,
+    POSITION_TRANCHE_1_PCT, POSITION_TRANCHE_2_PCT, POSITION_TRANCHE_3_PCT,
 )
 
 
@@ -154,9 +156,9 @@ class AnalysisTools:
             divergence = "bearish_hidden"
 
         score = 0
-        if current_rsi > 70:
+        if current_rsi > RSI_OVERBOUGHT:
             score -= 3
-        elif current_rsi < 30:
+        elif current_rsi < RSI_OVERSOLD:
             score += 3
         elif current_rsi > 60:
             score -= 1
@@ -175,7 +177,7 @@ class AnalysisTools:
             "signal": signal,
             "score": round(score, 1),
             "current_rsi": round(current_rsi, 2),
-            "rsi_zone": "overbought" if current_rsi > 70 else ("oversold" if current_rsi < 30 else "neutral"),
+            "rsi_zone": "overbought" if current_rsi > RSI_OVERBOUGHT else ("oversold" if current_rsi < RSI_OVERSOLD else "neutral"),
             "divergence": divergence,
             "detail": f"RSI={current_rsi:.1f}, 다이버전스={divergence}"
         })
@@ -864,10 +866,14 @@ class AnalysisTools:
         if stop_distance / price > 0.10:
             warnings.append(f"손절가 이격 과다({stop_distance / price:.1%})")
 
+        pct1 = POSITION_TRANCHE_1_PCT / 100
+        pct2 = POSITION_TRANCHE_2_PCT / 100
+        pct3 = POSITION_TRANCHE_3_PCT / 100
+
         split_entry = [
-            {"tranche": 1, "pct": 40, "qty": int(qty * 0.4), "note": "1차 진입"},
-            {"tranche": 2, "pct": 30, "qty": int(qty * 0.3), "note": "확인 후 추가"},
-            {"tranche": 3, "pct": 30, "qty": qty - int(qty * 0.4) - int(qty * 0.3), "note": "최종 진입"},
+            {"tranche": 1, "pct": POSITION_TRANCHE_1_PCT, "qty": int(qty * pct1), "note": "1차 진입"},
+            {"tranche": 2, "pct": POSITION_TRANCHE_2_PCT, "qty": int(qty * pct2), "note": "확인 후 추가"},
+            {"tranche": 3, "pct": POSITION_TRANCHE_3_PCT, "qty": qty - int(qty * pct1) - int(qty * pct2), "note": "최종 진입"},
         ]
 
         rr_ratio = TAKE_PROFIT_RR_RATIO
@@ -1716,11 +1722,11 @@ def generate_agent_chart(ticker: str, df: pd.DataFrame, composite: dict, save_pa
         if 'RSI' in display_df.columns:
             rsi = display_df['RSI']
             ax3.plot(display_df.index, rsi, color='#aec6ff', linewidth=1.0)
-            ax3.axhline(70, color=RED, linewidth=0.6, linestyle='--', alpha=0.7)
-            ax3.axhline(30, color=GREEN, linewidth=0.6, linestyle='--', alpha=0.7)
+            ax3.axhline(RSI_OVERBOUGHT, color=RED, linewidth=0.6, linestyle='--', alpha=0.7)
+            ax3.axhline(RSI_OVERSOLD, color=GREEN, linewidth=0.6, linestyle='--', alpha=0.7)
             ax3.axhline(50, color=GRID, linewidth=0.4, linestyle=':')
-            ax3.fill_between(display_df.index, rsi, 70, where=(rsi >= 70), alpha=0.15, color=RED)
-            ax3.fill_between(display_df.index, rsi, 30, where=(rsi <= 30), alpha=0.15, color=GREEN)
+            ax3.fill_between(display_df.index, rsi, RSI_OVERBOUGHT, where=(rsi >= RSI_OVERBOUGHT), alpha=0.15, color=RED)
+            ax3.fill_between(display_df.index, rsi, RSI_OVERSOLD, where=(rsi <= RSI_OVERSOLD), alpha=0.15, color=GREEN)
             ax3.set_ylim(10, 90)
         ax3.set_ylabel('RSI', color=TEXT, fontsize=9)
         ax3.tick_params(colors=TEXT, labelsize=8)

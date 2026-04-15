@@ -44,19 +44,34 @@ if _SERVICE_DIR not in sys.path:
 
 import httpx
 
-from config import (
-    OLLAMA_BASE_URL, OLLAMA_MODEL, OPENAI_API_KEY,
-    GEMINI_API_KEY, GEMINI_MODEL,
-    BUY_THRESHOLD, SELL_THRESHOLD, MIN_CONFIDENCE,
-    SCAN_INTERVAL_MINUTES, TRADING_STYLE, WATCHLIST,
-    COOLING_OFF_DAYS, ACCOUNT_SIZE, OUTPUT_DIR,
-)
+try:
+    from config import (
+        OLLAMA_BASE_URL, OLLAMA_MODEL, OPENAI_API_KEY,
+        GEMINI_API_KEY, GEMINI_MODEL,
+        BUY_THRESHOLD, SELL_THRESHOLD, MIN_CONFIDENCE,
+        SCAN_INTERVAL_MINUTES, TRADING_STYLE, WATCHLIST,
+        COOLING_OFF_DAYS, ACCOUNT_SIZE, OUTPUT_DIR,
+        AGENT_API_HOST, AGENT_API_PORT,
+    )
+except ImportError:
+    # config에서 일부 변수가 없을 경우 기본값 사용
+    from config import (
+        OLLAMA_BASE_URL, OLLAMA_MODEL, OPENAI_API_KEY,
+        GEMINI_API_KEY, GEMINI_MODEL,
+        BUY_THRESHOLD, SELL_THRESHOLD, MIN_CONFIDENCE,
+        SCAN_INTERVAL_MINUTES, TRADING_STYLE, WATCHLIST,
+        COOLING_OFF_DAYS, ACCOUNT_SIZE, OUTPUT_DIR,
+    )
+    AGENT_API_HOST = os.getenv("AGENT_API_HOST", "localhost")
+    AGENT_API_PORT = int(os.getenv("AGENT_API_PORT", "8100"))
 from data_collector import (
     fetch_ohlcv, calculate_indicators,
     fetch_fundamentals, fetch_options_pcr, fetch_insider_trades,
 )
 from analysis_tools import ChartAnalysisAgent, generate_agent_chart
-from backtest_engine import run_all_backtests
+from backtest_engine import (
+    run_all_backtests, optimize_strategy_params, backtest_walk_forward,
+)
 from ml_predictor import run_ml_prediction
 from portfolio_optimizer import (
     markowitz_optimize, risk_parity_optimize,
@@ -72,6 +87,9 @@ from db import (
     get_scan_logs, get_scan_logs_by_ticker,
     get_scan_log_latest, get_scan_log_date_range,
     get_weekly_summary, get_weekly_ticker,
+)
+from portfolio_rebalancer import (
+    execute_rebalancing, get_rebalance_history, get_rebalance_status,
 )
 
 # DB 초기화 (import 시 1회)
@@ -109,7 +127,7 @@ except ImportError as e:
 
 
 # Mac Studio API URL (HTTP fallback용)
-AGENT_API_URL = os.getenv("AGENT_API_URL", "http://100.108.11.20:8100")
+AGENT_API_URL = os.getenv("AGENT_API_URL", f"http://{AGENT_API_HOST}:{AGENT_API_PORT}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -443,13 +461,37 @@ def engine_backtest(ticker: str) -> dict:
         return {"error": str(e)}
 
 
-def engine_ml_predict(ticker: str) -> dict:
-    """ML 방향 예측"""
+def engine_ml_predict(ticker: str, ensemble: bool = True) -> dict:
+    """ML 방향 예측 (앙상블 옵션)"""
     ticker = ticker.upper()
     try:
         df = fetch_ohlcv(ticker)
         df = calculate_indicators(df)
-        return _sanitize(run_ml_prediction(ticker, df))
+        return _sanitize(run_ml_prediction(ticker, df, ensemble=ensemble))
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def engine_backtest_optimize(ticker: str, strategy: str = "rsi_reversion", n_trials: int = 50) -> dict:
+    """백테스트 파라미터 최적화 (Optuna HyperOpt)"""
+    ticker = ticker.upper()
+    try:
+        df = fetch_ohlcv(ticker)
+        df = calculate_indicators(df)
+        return _sanitize(optimize_strategy_params(ticker, df, strategy, n_trials))
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def engine_backtest_walk_forward(ticker: str, strategy: str = "rsi_reversion",
+                                  train_window: int = 252, test_window: int = 63,
+                                  n_splits: int = 5) -> dict:
+    """Walk-Forward 백테스트"""
+    ticker = ticker.upper()
+    try:
+        df = fetch_ohlcv(ticker)
+        df = calculate_indicators(df)
+        return _sanitize(backtest_walk_forward(ticker, df, strategy, train_window, test_window, n_splits))
     except Exception as e:
         return {"error": str(e)}
 
@@ -496,11 +538,18 @@ def engine_paper_status() -> dict:
 
 
 def engine_paper_order(ticker: str, action: str, qty: int,
-                       price: float, reason: str = "") -> dict:
-    """페이퍼 트레이딩 수동 주문"""
+                       price: float, reason: str = "",
+                       trailing_stop_pct: float = 0.0,
+                       time_stop_days: int = 0,
+                       stop_loss_price: float = 0.0,
+                       take_profit_price: float = 0.0) -> dict:
+    """페이퍼 트레이딩 수동 주문 (Trailing Stop / 시간 기반 청산 지원)"""
     try:
         return _sanitize(
-            execute_paper_order(ticker.upper(), action.upper(), qty, price, reason)
+            execute_paper_order(
+                ticker.upper(), action.upper(), qty, price, reason,
+                trailing_stop_pct, time_stop_days, stop_loss_price, take_profit_price
+            )
         )
     except Exception as e:
         return {"error": str(e)}
@@ -865,6 +914,84 @@ def engine_interpret_full_report(ticker: str, provider: str = "auto") -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  V2.0 멀티에이전트 시스템
+# ═══════════════════════════════════════════════════════════════
+
+_orchestrator = None
+
+def engine_multi_agent_analyze(ticker: str) -> dict:
+    """
+    멀티에이전트 분석 (V2.0)
+    - 6개 전문 에이전트 병렬 실행
+    - Decision Maker가 의견 종합 및 충돌 해결
+    """
+    global _orchestrator
+
+    ticker = ticker.upper()
+
+    try:
+        # Orchestrator 초기화 (최초 1회)
+        if _orchestrator is None:
+            from multi_agent import MultiAgentOrchestrator
+            _orchestrator = MultiAgentOrchestrator()
+
+        # 멀티에이전트 분석 실행
+        result = _orchestrator.analyze(ticker)
+        return _sanitize(result)
+
+    except Exception as e:
+        return {
+            "error": str(e),
+            "ticker": ticker,
+            "multi_agent_mode": True,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  V2.0 포트폴리오 자동 리밸런싱 (Week 4)
+# ═══════════════════════════════════════════════════════════════
+
+def engine_portfolio_rebalance(
+    method: str = "markowitz",
+    interval_days: int = 7,
+    drift_threshold: float = 0.05,
+    dry_run: bool = False
+) -> dict:
+    """
+    포트폴리오 자동 리밸런싱
+
+    Args:
+        method: "markowitz" or "risk_parity"
+        interval_days: 리밸런싱 주기 (일)
+        drift_threshold: Drift 임계값 (0.05 = 5%)
+        dry_run: True면 실제 주문 없이 시뮬레이션
+
+    Returns:
+        리밸런싱 결과
+    """
+    try:
+        return _sanitize(execute_rebalancing(method, interval_days, drift_threshold, dry_run))
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def engine_rebalance_status() -> dict:
+    """리밸런싱 상태 조회"""
+    try:
+        return _sanitize(get_rebalance_status())
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def engine_rebalance_history(limit: int = 10) -> dict:
+    """리밸런싱 히스토리"""
+    try:
+        return _sanitize(get_rebalance_history(limit))
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════
 #  디스패처 — webui.py의 api_get/api_post 호환 레이어
 # ═══════════════════════════════════════════════════════════════
 
@@ -888,12 +1015,51 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
                 except ValueError:
                     pass
             return engine_get_history(limit)
+        elif path.startswith("/backtest/optimize/"):
+            ticker = path.split("/backtest/optimize/")[1].split("?")[0]
+            strategy = "rsi_reversion"
+            n_trials = 50
+            if "strategy=" in path:
+                strategy = path.split("strategy=")[1].split("&")[0]
+            if "n_trials=" in path:
+                try:
+                    n_trials = int(path.split("n_trials=")[1].split("&")[0])
+                except ValueError:
+                    pass
+            return engine_backtest_optimize(ticker, strategy, n_trials)
+        elif path.startswith("/backtest/walk-forward/"):
+            ticker = path.split("/backtest/walk-forward/")[1].split("?")[0]
+            strategy = "rsi_reversion"
+            train_window = 252
+            test_window = 63
+            n_splits = 5
+            if "strategy=" in path:
+                strategy = path.split("strategy=")[1].split("&")[0]
+            if "train_window=" in path:
+                try:
+                    train_window = int(path.split("train_window=")[1].split("&")[0])
+                except ValueError:
+                    pass
+            if "test_window=" in path:
+                try:
+                    test_window = int(path.split("test_window=")[1].split("&")[0])
+                except ValueError:
+                    pass
+            if "n_splits=" in path:
+                try:
+                    n_splits = int(path.split("n_splits=")[1].split("&")[0])
+                except ValueError:
+                    pass
+            return engine_backtest_walk_forward(ticker, strategy, train_window, test_window, n_splits)
         elif path.startswith("/backtest/"):
             ticker = path.split("/backtest/")[1].split("?")[0]
             return engine_backtest(ticker)
         elif path.startswith("/ml/"):
             ticker = path.split("/ml/")[1].split("?")[0]
-            return engine_ml_predict(ticker)
+            ensemble = True
+            if "ensemble=" in path:
+                ensemble = path.split("ensemble=")[1].split("&")[0].lower() in ("true", "1", "yes")
+            return engine_ml_predict(ticker, ensemble)
         elif path.startswith("/portfolio/optimize"):
             method = "markowitz"
             if "method=" in path:
@@ -970,6 +1136,41 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
                 except ValueError:
                     pass
             return get_weekly_summary(weeks_ago)
+        # ── V2.0 multi-agent 엔드포인트 ──
+        elif path.startswith("/multi-agent/"):
+            ticker = path.split("/multi-agent/")[1].split("?")[0]
+            return engine_multi_agent_analyze(ticker)
+        # ── V2.0 rebalancing 엔드포인트 ──
+        elif path == "/portfolio/rebalance/status":
+            return engine_rebalance_status()
+        elif path.startswith("/portfolio/rebalance/history"):
+            limit = 10
+            if "limit=" in path:
+                try:
+                    limit = int(path.split("limit=")[1].split("&")[0])
+                except ValueError:
+                    pass
+            return engine_rebalance_history(limit)
+        elif path.startswith("/portfolio/rebalance"):
+            method = "markowitz"
+            interval = 7
+            drift = 0.05
+            dry_run = False
+            if "method=" in path:
+                method = path.split("method=")[1].split("&")[0]
+            if "interval=" in path:
+                try:
+                    interval = int(path.split("interval=")[1].split("&")[0])
+                except ValueError:
+                    pass
+            if "drift=" in path:
+                try:
+                    drift = float(path.split("drift=")[1].split("&")[0])
+                except ValueError:
+                    pass
+            if "dry_run=true" in path.lower():
+                dry_run = True
+            return engine_portfolio_rebalance(method, interval, drift, dry_run)
     except Exception as e:
         print(f"[dispatch_get 오류] {path}: {e}")
         return {"error": str(e)}

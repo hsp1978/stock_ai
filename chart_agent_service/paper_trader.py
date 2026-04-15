@@ -2,11 +2,13 @@
 페이퍼 트레이딩(모의매매) 시뮬레이터
 - 에이전트 시그널 기반 자동 모의매매
 - 포지션 추적, P&L 계산, 히스토리 관리
+- Trailing Stop (NautilusTrader/Freqtrade 스타일)
+- 시간 기반 청산 (Time-based Exit)
 - 실제 주문 집행 없음 (시뮬레이션 전용)
 """
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from config import ACCOUNT_SIZE, OUTPUT_DIR
@@ -89,7 +91,19 @@ def get_portfolio_status() -> dict:
 
 
 def execute_paper_order(ticker: str, action: str, qty: int,
-                        price: float, reason: str = "") -> dict:
+                        price: float, reason: str = "",
+                        trailing_stop_pct: float = 0.0,
+                        time_stop_days: int = 0,
+                        stop_loss_price: float = 0.0,
+                        take_profit_price: float = 0.0) -> dict:
+    """페이퍼 트레이딩 주문 실행
+
+    Args:
+        trailing_stop_pct: Trailing stop 비율 (0~1, 예: 0.05 = 5%)
+        time_stop_days: 시간 기반 청산 일수 (0 = 비활성)
+        stop_loss_price: 고정 손절가 (0 = 비활성)
+        take_profit_price: 고정 익절가 (0 = 비활성)
+    """
     state = _load_state()
     positions = state.get("positions", {})
     cash = state.get("cash", ACCOUNT_SIZE)
@@ -126,14 +140,24 @@ def execute_paper_order(ticker: str, action: str, qty: int,
                 "qty": total_qty,
                 "entry_price": round(avg_price, 4),
                 "current_price": price,
+                "peak_price": max(existing.get("peak_price", price), price),
                 "entry_date": existing.get("entry_date", datetime.now().isoformat()),
+                "trailing_stop_pct": trailing_stop_pct or existing.get("trailing_stop_pct", 0.0),
+                "time_stop_days": time_stop_days or existing.get("time_stop_days", 0),
+                "stop_loss_price": stop_loss_price or existing.get("stop_loss_price", 0.0),
+                "take_profit_price": take_profit_price or existing.get("take_profit_price", 0.0),
             }
         else:
             positions[ticker] = {
                 "qty": qty,
                 "entry_price": price,
                 "current_price": price,
+                "peak_price": price,
                 "entry_date": datetime.now().isoformat(),
+                "trailing_stop_pct": trailing_stop_pct,
+                "time_stop_days": time_stop_days,
+                "stop_loss_price": stop_loss_price,
+                "take_profit_price": take_profit_price,
             }
 
         state["cash"] = cash - cost
@@ -223,17 +247,84 @@ def process_agent_signal(ticker: str, result: dict, current_price: float) -> Opt
     return None
 
 
-def update_position_prices(prices: dict[str, float]):
+def update_position_prices(prices: dict[str, float]) -> list[dict]:
+    """포지션 가격 업데이트 + Trailing Stop/시간 기반 자동 청산
+
+    Returns:
+        자동 청산된 주문 목록
+    """
     state = _load_state()
     positions = state.get("positions", {})
-    changed = False
+    auto_closed = []
+
     for ticker, price in prices.items():
-        if ticker in positions:
-            positions[ticker]["current_price"] = price
-            changed = True
-    if changed:
-        state["positions"] = positions
-        _save_state(state)
+        if ticker not in positions:
+            continue
+
+        pos = positions[ticker]
+        pos["current_price"] = price
+
+        # Peak price 업데이트 (trailing stop 기준)
+        peak = pos.get("peak_price", pos.get("entry_price", price))
+        if price > peak:
+            pos["peak_price"] = price
+            peak = price
+
+        # 1. Trailing Stop 체크
+        trailing_pct = pos.get("trailing_stop_pct", 0.0)
+        if trailing_pct > 0:
+            trailing_stop_price = peak * (1 - trailing_pct)
+            if price <= trailing_stop_price:
+                result = execute_paper_order(
+                    ticker, "SELL", pos["qty"], price,
+                    reason=f"Trailing Stop: {trailing_pct:.1%} 이탈 (고점 ${peak:.2f} → ${price:.2f})"
+                )
+                auto_closed.append(result)
+                continue  # 다음 종목으로
+
+        # 2. 고정 손절가 체크
+        stop_loss = pos.get("stop_loss_price", 0.0)
+        if stop_loss > 0 and price <= stop_loss:
+            result = execute_paper_order(
+                ticker, "SELL", pos["qty"], price,
+                reason=f"Stop Loss: ${stop_loss:.2f}"
+            )
+            auto_closed.append(result)
+            continue
+
+        # 3. 고정 익절가 체크
+        take_profit = pos.get("take_profit_price", 0.0)
+        if take_profit > 0 and price >= take_profit:
+            result = execute_paper_order(
+                ticker, "SELL", pos["qty"], price,
+                reason=f"Take Profit: ${take_profit:.2f}"
+            )
+            auto_closed.append(result)
+            continue
+
+        # 4. 시간 기반 청산 체크
+        time_stop_days = pos.get("time_stop_days", 0)
+        if time_stop_days > 0:
+            entry_date_str = pos.get("entry_date", "")
+            if entry_date_str:
+                try:
+                    entry_date = datetime.fromisoformat(entry_date_str.replace("Z", "+00:00"))
+                    days_held = (datetime.now() - entry_date).days
+                    if days_held >= time_stop_days:
+                        result = execute_paper_order(
+                            ticker, "SELL", pos["qty"], price,
+                            reason=f"Time Stop: {days_held}일 경과 (설정: {time_stop_days}일)"
+                        )
+                        auto_closed.append(result)
+                        continue
+                except Exception:
+                    pass
+
+    # 상태 저장
+    state["positions"] = positions
+    _save_state(state)
+
+    return auto_closed
 
 
 def reset_paper_trading() -> dict:

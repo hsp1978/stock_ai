@@ -163,23 +163,27 @@ stock_analyzer/                            chart_agent_service/
 
 ### 4-1. local_engine.py가 노출하는 함수 (WebUI -> Engine)
 
+**V1.0 핵심 함수 (26개)**
+
 | 함수 | 인자 | 반환 | 용도 |
 |------|------|------|------|
 | `engine_health()` | 없음 | dict | 시스템 상태 |
 | `engine_info()` | 없음 | dict | 설정 정보 |
-| `engine_scan_ticker(ticker, ai_mode)` | str, str | dict | 단일 종목 분석 |
+| `engine_scan_ticker(ticker, ai_mode)` | str, str | dict | 단일 종목 분석 (16개 도구) |
 | `engine_scan_all(tickers)` | list[str] | dict | 전체 스캔 |
 | `engine_get_all_results()` | 없음 | dict | 캐시된 전체 결과 요약 |
 | `engine_get_ticker_result(ticker)` | str | dict\|None | 종목별 상세 결과 |
 | `engine_get_history(limit)` | int | dict | 스캔 히스토리 |
 | `engine_get_chart_path(ticker)` | str | str\|None | 차트 PNG 경로 |
 | `engine_backtest(ticker)` | str | dict | 백테스트 결과 |
-| `engine_ml_predict(ticker)` | str | dict | ML 예측 |
+| `engine_ml_predict(ticker, ensemble)` | str, bool | dict | ML 예측 (앙상블 옵션) ⭐ |
+| `engine_backtest_optimize(...)` ⭐ | ticker, strategy, n_trials | dict | HyperOpt 최적화 |
+| `engine_backtest_walk_forward(...)` ⭐ | ticker, strategy, train_window, test_window, n_splits | dict | Walk-Forward 검증 |
 | `engine_portfolio_optimize(method)` | str | dict | 포트폴리오 최적화 |
 | `engine_correlation_beta()` | 없음 | dict | 상관/베타 |
 | `engine_factor_ranking()` | 없음 | dict | 팩터 랭킹 |
 | `engine_paper_status()` | 없음 | dict | 모의매매 현황 |
-| `engine_paper_order(...)` | ticker, action, qty, price, reason | dict | 수동 주문 |
+| `engine_paper_order(...)` ⭐ | ticker, action, qty, price, reason, trailing_stop_pct, time_stop_days, stop_loss_price, take_profit_price | dict | 수동 주문 (Trailing Stop 지원) |
 | `engine_paper_auto()` | 없음 | dict | 자동 모의매매 |
 | `engine_paper_reset()` | 없음 | dict | 초기화 |
 | `engine_interpret_tool(ticker, tool_key, provider)` | str, str, str | str(마크다운) | 개별 도구 AI 해석 |
@@ -188,12 +192,25 @@ stock_analyzer/                            chart_agent_service/
 | `engine_chart_pattern(ticker)` | str | dict | 차트 패턴 |
 | `engine_sector_compare(ticker)` | str | dict | 섹터 비교 |
 | `engine_macro_context()` | 없음 | dict | 매크로 환경 |
+| `engine_available_llm()` | 없음 | dict | 사용 가능 LLM |
+
+**V2.0 신규 함수 (1개)**
+
+| 함수 | 인자 | 반환 | 용도 |
+|------|------|------|------|
+| `engine_multi_agent_analyze(ticker)` ⭐ | str | dict | 멀티에이전트 분석 (6개 에이전트 협업) |
+
+**watchlist 관리 함수 (5개)**
+
+| 함수 | 인자 | 반환 | 용도 |
+|------|------|------|------|
 | `engine_load_watchlist()` | 없음 | list[str] | watchlist 동적 로드 |
 | `engine_save_watchlist(tickers)` | list[str] | None | watchlist 저장 |
 | `engine_add_ticker(ticker)` | str | dict | 종목 추가 |
 | `engine_remove_ticker(ticker)` | str | dict | 종목 제거 |
 | `engine_set_watchlist(tickers)` | list[str] | dict | watchlist 전체 교체 |
-| `engine_available_llm()` | 없음 | dict | 사용 가능 LLM |
+
+**총 32개 함수**
 
 ### 4-2. Multi-LLM 해석 파이프라인
 
@@ -319,32 +336,327 @@ LLM 프롬프트에 아래 2가지가 반드시 포함되어야 합니다:
 
 ---
 
-## 9. 파일 구조 참조
+## 9. V2.0 신규 시스템 (2026-04-14)
+
+### 9-1. 멀티에이전트 시스템 — `multi_agent.py`
+
+**아키텍처:**
+```
+사용자 요청 -> MultiAgentOrchestrator
+    -> 5개 에이전트 병렬 실행 (ThreadPoolExecutor)
+       - TechnicalAnalyst (Gemini): 기술 지표 6개
+       - QuantAnalyst (Gemini): 퀀트 분석 6개
+       - RiskManager (Ollama): 리스크 관리 3개
+       - MLSpecialist (Ollama): ML 앙상블 예측
+       - EventAnalyst (Gemini): 뉴스/이벤트 1개
+    -> DecisionMaker (OpenAI GPT-4o): 의견 종합 및 충돌 해결
+    -> 최종 리포트 반환
+```
+
+**반환 구조:**
+```json
+{
+  "ticker": "NVDA",
+  "multi_agent_mode": true,
+  "agent_results": [
+    {
+      "agent": "Technical Analyst",
+      "signal": "buy",
+      "confidence": 7.5,
+      "reasoning": "판단 근거 (한국어)",
+      "llm_provider": "gemini",
+      "execution_time": 1.2,
+      "error": null
+    }
+  ],
+  "final_decision": {
+    "final_signal": "buy",
+    "final_confidence": 7.8,
+    "consensus": "4명 매수, 1명 중립",
+    "conflicts": "Risk Manager는 변동성 과다로 중립, 하지만 기술/퀀트 분석 강력하여 매수",
+    "reasoning": "종합 판단 근거",
+    "key_risks": ["변동성 스파이크", "실적 발표 임박"],
+    "agent_count": 5,
+    "signal_distribution": {"buy": 4, "sell": 0, "neutral": 1}
+  },
+  "total_execution_time": 8.5,
+  "analyzed_at": "2026-04-14T22:48:02"
+}
+```
+
+**엔진 함수:**
+- `engine_multi_agent_analyze(ticker)` → 멀티에이전트 분석 실행
+- API 경로: `GET /multi-agent/{ticker}`
+
+**규칙:**
+1. 각 에이전트는 독립적으로 판단 (타임아웃 60초)
+2. 실패한 에이전트는 neutral/0점으로 처리, 전체 실행은 계속
+3. Decision Maker는 모든 의견을 종합하고 소수 의견도 리스크로 반영
+4. 전체 실행 시간 목표: 120초 이내
+
+### 9-2. MCP 서버 — `mcp_server.py`, `mcp_server_extended.py`
+
+**Model Context Protocol**: Claude Desktop, ChatGPT 등 외부 AI에서 직접 도구 호출 가능
+
+**21개 노출 도구:**
+- **핵심 5개**: analyze_stock, predict_ml, optimize_strategy, walk_forward_test, optimize_portfolio
+- **개별 16개**: analyze_trend_ma, analyze_rsi_divergence, ... (16개 분석 도구 각각)
+- **시스템 1개**: get_system_info
+
+**설정 예시 (Claude Desktop):**
+```json
+{
+  "mcpServers": {
+    "stock-ai": {
+      "command": "python",
+      "args": ["/home/ubuntu/stock_auto/mcp_server_extended.py"]
+    }
+  }
+}
+```
+
+**규칙:**
+1. 모든 도구는 JSON 형태로 결과 반환
+2. 에러 발생 시에도 {"error": "..."} 구조 유지
+3. 각 도구는 독립 실행 가능 (상태 없음)
+
+### 9-3. ML 앙상블 강화 — `ml_predictor.py`
+
+**V2.0 추가 사항:**
+- **LightGBM, XGBoost 추가**: 기존 RF, GB에 2개 모델 추가 (총 5개)
+- **LSTM 시계열 모델**: 시계열 패턴 학습
+- **SHAP 설명력**: 각 feature의 예측 기여도 계산
+
+**반환 구조 (ensemble=True):**
+```json
+{
+  "ticker": "NVDA",
+  "ensemble": {
+    "prediction": "UP",
+    "up_probability": 0.73,
+    "model_count": 5,
+    "agreement_rate": 0.8
+  },
+  "models": {
+    "lgb_5d": {
+      "prediction": "UP",
+      "up_probability": 0.75,
+      "accuracy": 0.58,
+      "shap": {
+        "shap_available": true,
+        "feature_importance_shap": {
+          "RSI": 0.234,
+          "MACD": 0.187,
+          "Volume": 0.156
+        }
+      }
+    }
+  }
+}
+```
+
+**규칙:**
+1. SHAP는 tree 기반 모델(LightGBM, XGBoost)에서만 가능
+2. 앙상블은 가중 평균 + 다수결 조합
+3. `shap` 패키지 미설치 시 `shap_available: false`로 처리
+
+### 9-4. HyperOpt 백테스트 최적화 — `backtest_engine.py`
+
+**Optuna 기반 파라미터 탐색:**
+```python
+# 함수: optimize_strategy_params(ticker, df, strategy, n_trials)
+# 전략: rsi_reversion, sma_cross, bollinger_reversion
+```
+
+**반환 구조:**
+```json
+{
+  "ticker": "NVDA",
+  "strategy": "rsi_reversion",
+  "best_params": {"rsi_threshold": 32, "hold_days": 5},
+  "best_sharpe": 2.34,
+  "optimization_trials": 50,
+  "result": {
+    "total_return_pct": 28.5,
+    "annualized_return_pct": 32.1,
+    "sharpe_ratio": 2.34,
+    "max_drawdown_pct": -12.3,
+    "total_trades": 42,
+    "win_rate_pct": 57.1
+  }
+}
+```
+
+**엔진 함수:**
+- `engine_backtest_optimize(ticker, strategy, n_trials)` → HyperOpt 실행
+- API 경로: `GET /backtest/optimize/{ticker}?strategy=rsi_reversion&n_trials=50`
+
+### 9-5. Walk-Forward 백테스트 — `backtest_engine.py`
+
+**과적합 방지 검증:**
+```python
+# 함수: backtest_walk_forward(ticker, df, strategy, train_window, test_window, n_splits)
+# 학습 구간 → 테스트 구간을 Rolling하며 실행
+```
+
+**반환 구조:**
+```json
+{
+  "ticker": "NVDA",
+  "strategy": "rsi_reversion",
+  "walk_forward_splits": 5,
+  "avg_train_sharpe": 2.1,
+  "avg_test_sharpe": 1.8,
+  "avg_test_return_pct": 15.3,
+  "overfitting_ratio": 1.17,
+  "splits": [
+    {
+      "split": 1,
+      "train_start": "2024-01-01",
+      "train_end": "2024-08-31",
+      "test_start": "2024-09-01",
+      "test_end": "2024-10-31",
+      "best_params": {"rsi_threshold": 30},
+      "train_sharpe": 2.0,
+      "test_sharpe": 1.9,
+      "test_return_pct": 12.5,
+      "test_trades": 8
+    }
+  ]
+}
+```
+
+**규칙:**
+1. 과적합 비율 = avg_train_sharpe / avg_test_sharpe
+2. 1.0~1.5 양호, 2.0 이상 과적합 의심
+3. 각 split마다 독립적으로 파라미터 최적화
+
+### 9-6. Trailing Stop & 시간 기반 청산 — `paper_trader.py`
+
+**V2.0 추가 파라미터:**
+```python
+execute_paper_order(
+    ticker, action, qty, price, reason,
+    trailing_stop_pct=0.0,      # 고점 대비 % 하락 시 청산
+    time_stop_days=0,           # N일 경과 시 청산
+    stop_loss_price=0.0,        # 고정 손절가
+    take_profit_price=0.0       # 고정 익절가
+)
+```
+
+**Trailing Stop 작동:**
+```python
+# 매수가 $100, trailing_stop_pct=5%
+# 고점 $108 도달 → trailing stop = $102.6 (108 * 0.95)
+# 가격 $102 하락 → 자동 청산 (trailing stop 발동)
+```
+
+**규칙:**
+1. Trailing Stop은 고점 갱신 시마다 업데이트
+2. 시간 기반 청산은 진입일 + N일 경과 시 강제 청산
+3. 고정 손절/익절과 병행 사용 가능 (먼저 도달하는 조건 우선)
+
+### 9-7. 주간 트렌드 DB 분석 — `db.py`
+
+**SQLite 기반 스캔 이력 저장:**
+```python
+# 테이블: scan_log (ticker, scanned_at, signal, score, confidence, ...)
+# 함수: get_weekly_ticker(ticker, weeks_ago)
+```
+
+**반환 구조:**
+```json
+{
+  "ticker": "NVDA",
+  "week": "2026-W15",
+  "stats": {
+    "scan_count": 5,
+    "avg_score": 3.2,
+    "buy_cnt": 3,
+    "sell_cnt": 0,
+    "hold_cnt": 2
+  },
+  "latest_scan": {
+    "scanned_at": "2026-04-14T10:00:00",
+    "signal": "BUY",
+    "score": 4.5,
+    "confidence": 7
+  }
+}
+```
+
+**LLM 활용:**
+- `_gather_extra_context()`에서 주간 트렌드 수집
+- LLM 프롬프트에 "주간 추세 분석" 섹션 포함
+- WoW 변화를 해석하여 추세 반전/지속 판단
+
+**규칙 (절대 제거 금지):**
+1. `_gather_extra_context()` 내 주간 트렌드 블록 유지 (섹션 6-2)
+2. `_build_full_report_prompt()` 내 "주간 추세 분석" 섹션 유지 (섹션 6-3)
+3. DB 없이 LLM은 단일 스캔만 보므로 추세 판단 불가
+
+---
+
+## 10. 파일 구조 참조 (V2.0)
 
 ```
 stock_auto/
+  # ── 프로젝트 문서 ──
+  README.md                      # V2.0 프로젝트 소개
   AGENT_INSTRUCTION.md           # 이 파일 — 에이전트 코딩 규칙
+  DESIGN_SYSTEM.md               # 디자인 시스템 가이드
+  ROADMAP_V2_REVISED.md          # V2.0 로드맵
+  V2_PREREQUISITES.md            # V2.0 사전 준비
+  V2_IMPLEMENTATION_CHECKLIST.md # 구현 체크리스트
+  V2_EXECUTIVE_SUMMARY.md        # 경영진 요약
+
+  # ── V2.0 신규 파일 ⭐ ──
+  mcp_server.py                  # MCP 서버 기본 (6개 도구)
+  mcp_server_extended.py         # MCP 서버 확장 (21개 도구)
+  test_mcp_server.py             # MCP 테스트
+  test_multi_agent.py            # 멀티에이전트 테스트
+  test_v2_prerequisites.py       # V2.0 준비 상태 테스트
+  claude_desktop_config.json     # Claude Desktop MCP 설정
+  setup_v2.sh                    # V2.0 자동 설정 스크립트
+
+  # ── V1.0 테스트 ──
+  test_new_features.py           # ML 앙상블, Trailing Stop, HyperOpt, Walk-Forward 테스트
+
   chart_agent_service/           # 에이전트 코어 (Mac Studio 배포 단위)
     config.py                    # 전역 설정 + 스타일 프리셋
     db.py                        # SQLite 스캔 로그 DB (단일 테이블 scan_log)
     data_collector.py            # yfinance OHLCV + 지표 계산 + 펀더멘털/옵션/내부자
     analysis_tools.py            # 16개 분석 도구 + LLM 에이전트 오케스트레이션
-    backtest_engine.py           # SMA크로스/RSI역추세/복합시그널 백테스트
-    ml_predictor.py              # RandomForest/GradientBoosting 방향 예측
+    backtest_engine.py           # 백테스트 + HyperOpt + Walk-Forward ⭐
+    ml_predictor.py              # ML 앙상블 (5개 모델) + SHAP ⭐
     portfolio_optimizer.py       # 마코위츠/리스크패리티/팩터랭킹/상관베타
-    paper_trader.py              # 모의매매 시뮬레이터
+    paper_trader.py              # 모의매매 + Trailing Stop + 시간 기반 청산 ⭐
     news_analyzer.py             # 뉴스 감성 분석
     chart_pattern.py             # 차트 패턴 인식 (알고리즘 기반)
     sector_compare.py            # 섹터/산업 비교
     macro_context.py             # 매크로 경제 지표
     service.py                   # FastAPI 서버 (Mac Studio 독립 실행용)
     watchlist.txt                # 안내 파일 (종목 추가 금지 — stock_analyzer/ 참조)
+    requirements.txt             # V2.0 의존성 (shap, lightgbm, xgboost, tensorflow, optuna)
     output/                      # 분석 결과 JSON + 차트 PNG + scan_log.db
+
   stock_analyzer/                # WebUI + 로컬 엔진 (Ubuntu 서버)
-    webui.py                     # Streamlit 대시보드 (watchlist Add/Remove UI 포함)
-    local_engine.py              # 로컬 분석 엔진 (chart_agent_service 직접 import + Multi-LLM)
+    webui.py                     # Streamlit 대시보드 (7페이지 + Multi-Agent 추가 예정)
+    local_engine.py              # 브릿지 엔진 (직접 import + Multi-LLM) ⭐
+    multi_agent.py               # V2.0 멀티에이전트 시스템 (672줄) ⭐
     scanner.py                   # 백그라운드 스케줄러
-    watchlist.txt                # 관심 종목 목록 (Single Source of Truth, WebUI에서 관리)
+    watchlist.txt                # 관심 종목 목록 (Single Source of Truth)
     requirements.txt             # 통합 의존성 목록
     .streamlit/config.toml       # Streamlit 서버 설정
+    .env                         # API Keys (OPENAI, GOOGLE, FRED, FMP)
+    v2/                          # V2.0 개발 디렉토리
+
+  docs/v2/                       # V2.0 문서
+    MCP_GUIDE.md                 # MCP 서버 사용 가이드
+    WEEK1_COMPLETION_REPORT.md   # Week 1 완료 보고서
+
+  backups/                       # 프로젝트 백업
+    v1_backup_*.tar.gz           # V1.0 백업
 ```
+
+**⭐ 표시: V2.0에서 추가/강화된 파일**
