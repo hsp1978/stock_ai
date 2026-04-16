@@ -429,6 +429,7 @@ class EventAnalyst(BaseAgent):
             name="Event Analyst",
             tools=[
                 "event_driven_analysis",
+                "insider_trading_analysis",  # 내부자 거래 분석 추가
             ],
             llm_provider="ollama"  # Gemini 할당량 초과로 Ollama 사용
         )
@@ -618,7 +619,13 @@ class MultiAgentOrchestrator:
             MLSpecialist(),
             EventAnalyst(),
         ]
-        self.decision_maker = DecisionMaker()
+        # EnhancedDecisionMaker 사용
+        try:
+            from enhanced_decision_maker import EnhancedDecisionMaker
+            self.decision_maker = EnhancedDecisionMaker()
+        except ImportError:
+            # Fallback to original DecisionMaker
+            self.decision_maker = DecisionMaker()
 
     def analyze(self, ticker: str) -> Dict[str, Any]:
         """

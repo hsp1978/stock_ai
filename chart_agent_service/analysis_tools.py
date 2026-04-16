@@ -1166,6 +1166,82 @@ class AnalysisTools:
         })
         return result
 
+    def insider_trading_analysis(self) -> dict:
+        """[퀀트10] 내부자 거래 분석 - CEO/CFO 매수/매도 패턴"""
+        result = {"tool": "insider_trading_analysis", "name": "내부자 거래 분석"}
+
+        try:
+            # 내부자 거래 분석기 임포트
+            import sys
+            import os
+            sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+            from stock_analyzer.insider_trading import InsiderTradingAnalyzer
+
+            analyzer = InsiderTradingAnalyzer()
+            current_price = float(self.latest["Close"])
+            analysis = analyzer.analyze(self.ticker, current_price)
+
+            result.update(analysis)
+
+        except Exception as e:
+            # 폴백: 기본 yfinance 내부자 거래 체크
+            try:
+                t = yf.Ticker(self.ticker)
+                insider = t.insider_trades
+
+                score = 0
+                detail_parts = []
+
+                if insider is not None and not insider.empty:
+                    # 최근 3개월 거래 필터링
+                    recent_date = pd.Timestamp.now() - pd.Timedelta(days=90)
+                    recent_trades = insider[insider.index >= recent_date] if not insider.empty else pd.DataFrame()
+
+                    if not recent_trades.empty:
+                        # 매수/매도 카운트
+                        buy_trades = recent_trades[recent_trades['Shares'] > 0] if 'Shares' in recent_trades.columns else pd.DataFrame()
+                        sell_trades = recent_trades[recent_trades['Shares'] < 0] if 'Shares' in recent_trades.columns else pd.DataFrame()
+
+                        buy_count = len(buy_trades)
+                        sell_count = len(sell_trades)
+
+                        # 점수 계산
+                        if sell_count > buy_count * 2:
+                            score -= 4
+                            detail_parts.append(f"내부자 매도 압도적 ({sell_count}건)")
+                        elif sell_count > buy_count:
+                            score -= 2
+                            detail_parts.append(f"내부자 매도 우세 ({sell_count}건)")
+                        elif buy_count > sell_count * 2:
+                            score += 4
+                            detail_parts.append(f"내부자 매수 압도적 ({buy_count}건)")
+                        elif buy_count > sell_count:
+                            score += 2
+                            detail_parts.append(f"내부자 매수 우세 ({buy_count}건)")
+                        else:
+                            detail_parts.append(f"내부자 거래 중립 (매수 {buy_count}, 매도 {sell_count})")
+                    else:
+                        detail_parts.append("최근 내부자 거래 없음")
+                else:
+                    detail_parts.append("내부자 거래 데이터 없음")
+
+                signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+
+                result.update({
+                    "signal": signal,
+                    "score": round(score, 1),
+                    "detail": " / ".join(detail_parts)
+                })
+
+            except Exception as fallback_error:
+                result.update({
+                    "signal": "neutral",
+                    "score": 0,
+                    "detail": f"내부자 거래 분석 실패: {str(fallback_error)[:50]}"
+                })
+
+        return result
+
 
 # ═══════════════════════════════════════════════════════════════
 #  Tool 정의 (LLM에 제공할 스키마)
@@ -1282,6 +1358,13 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "event_driven_analysis",
             "description": "이벤트 드리븐 분석. 실적발표 일정, 52주 고저, 배당락, 변동성 스파이크, 애널리스트 컨센서스.",
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "insider_trading_analysis",
+            "description": "내부자 거래 분석. CEO/CFO/임원 매수매도 패턴, C-Suite 거래 집중도, 최근 30일 거래 동향 분석.",
         }
     },
 ]

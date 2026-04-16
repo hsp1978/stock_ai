@@ -47,6 +47,15 @@ try:
 except ImportError:
     _USE_LOCAL_ENGINE = False
 
+# ── 한국 주식 모듈 import ──
+try:
+    from korean_stocks import KoreanStockData, get_market_indices as get_kr_indices
+    from ticker_manager import TickerManager, normalize_ticker, detect_market, get_stock_info, format_price
+    _KOREAN_STOCKS_AVAILABLE = True
+except ImportError:
+    _KOREAN_STOCKS_AVAILABLE = False
+    print("[WARNING] Korean stocks module not available")
+
 AGENT_API_URL = os.getenv("AGENT_API_URL", f"http://{AGENT_API_HOST}:{AGENT_API_PORT}")
 WATCHLIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.txt")
 
@@ -714,14 +723,112 @@ def validate_ticker(ticker: str) -> tuple[bool, str]:
     종목 코드 유효성 검증
     Returns: (is_valid, error_message)
     """
-    ticker = ticker.strip().upper()
+    ticker_input = ticker.strip()
+    ticker = ticker_input.upper()
 
     # 기본 형식 검증
     if not ticker:
         return False, "종목 코드를 입력하세요"
 
+    # 한국 주식 이름 검색 (한글이 포함된 경우)
+    if any(ord(char) >= 0xAC00 and ord(char) <= 0xD7A3 for char in ticker_input):
+        try:
+            from korean_stocks import KoreanStockData
+            collector = KoreanStockData()
+
+            # 종목명으로 종목코드 검색
+            stock_code = collector.search_stock_by_name(ticker_input)
+            if stock_code:
+                # 검색된 종목코드로 유효성 검증 진행
+                ticker = stock_code
+            else:
+                return False, f"❌ '{ticker_input}'를 찾을 수 없습니다. 정확한 종목명이나 종목코드를 입력하세요."
+        except Exception as e:
+            print(f"한국 주식 이름 검색 오류: {e}")
+
     if len(ticker) > 10:  # 대부분의 티커는 10자 이내
         return False, f"종목 코드가 너무 깁니다: {ticker}"
+
+    # 한국 주식 코드 자동 감지 (6자리 숫자 또는 특수 코드 0126Z0 형식)
+    import re
+    if (ticker.isdigit() and len(ticker) == 6) or re.match(r'^[0-9]{4}[A-Z][0-9]$', ticker):
+        # KOSPI (.KS) 또는 KOSDAQ (.KQ) 자동 시도
+        import yfinance as yf
+
+        valid_markets = []
+
+        # 두 시장 모두 확인
+        for suffix in ['.KS', '.KQ']:
+            test_ticker = ticker + suffix
+            try:
+                stock = yf.Ticker(test_ticker)
+                info = stock.history(period="5d")
+
+                if not info.empty:
+                    # 종목명 가져오기
+                    try:
+                        stock_info = stock.info
+                        company_name = stock_info.get('longName', stock_info.get('shortName', ''))
+                        market = "KOSPI" if suffix == '.KS' else "KOSDAQ"
+
+                        # 유효한 이름이 있는 경우만 추가 (잘못된 데이터 필터링)
+                        if company_name and not company_name.startswith(ticker):
+                            valid_markets.append({
+                                'ticker': test_ticker,
+                                'name': company_name,
+                                'market': market
+                            })
+                        elif not company_name:
+                            # 이름이 없어도 데이터가 있으면 추가
+                            valid_markets.append({
+                                'ticker': test_ticker,
+                                'name': 'N/A',
+                                'market': market
+                            })
+                    except:
+                        # info 가져오기 실패해도 데이터는 있음
+                        market = "KOSPI" if suffix == '.KS' else "KOSDAQ"
+                        valid_markets.append({
+                            'ticker': test_ticker,
+                            'name': 'N/A',
+                            'market': market
+                        })
+            except:
+                continue
+
+        # 결과 처리
+        if len(valid_markets) == 0:
+            return False, f"❌ '{ticker}'는 유효하지 않은 한국 주식 코드입니다. KOSPI(.KS) 또는 KOSDAQ(.KQ) 모두에서 찾을 수 없습니다."
+        elif len(valid_markets) == 1:
+            m = valid_markets[0]
+            if m['name'] != 'N/A':
+                return True, f"✅ {m['ticker']} ({m['name']}, {m['market']})"
+            else:
+                return True, f"✅ {m['ticker']} ({m['market']})"
+        else:
+            # 두 시장 모두에 있는 경우
+            options = []
+            for m in valid_markets:
+                if m['name'] != 'N/A':
+                    options.append(f"{m['ticker']} ({m['name']}, {m['market']})")
+                else:
+                    options.append(f"{m['ticker']} ({m['market']})")
+
+            # KOSDAQ을 우선 선택 (일반적으로 더 많은 신규 기업)
+            kosdaq_option = next((m for m in valid_markets if m['market'] == 'KOSDAQ'), None)
+            if kosdaq_option:
+                selected = kosdaq_option
+            else:
+                selected = valid_markets[0]
+
+            msg = f"✅ {selected['ticker']}"
+            if selected['name'] != 'N/A':
+                msg += f" ({selected['name']}, {selected['market']})"
+            else:
+                msg += f" ({selected['market']})"
+            msg += f"\n⚠️ 참고: {ticker}는 두 시장에 모두 존재합니다: " + " / ".join(options)
+
+            return True, msg
 
     # Yahoo Finance에서 실제 데이터 존재 여부 확인
     try:
@@ -761,19 +868,30 @@ def add_to_watchlist(ticker: str) -> tuple[bool, str]:
     if not is_valid:
         return False, message
 
+    # 한국 주식의 경우 자동 해결된 ticker를 추출
+    resolved_ticker = ticker
+    import re
+    # 6자리 숫자 또는 특수 코드 (예: 0126Z0) 처리
+    if ((ticker.isdigit() and len(ticker) == 6) or
+        re.match(r'^[0-9]{4}[A-Z][0-9]$', ticker)) and "✅" in message:
+        # 메시지에서 실제 ticker 추출 (예: "✅ 072130.KQ (유엔젤, KOSDAQ)")
+        match = re.search(r'✅\s+(\S+)\s+\(', message)
+        if match:
+            resolved_ticker = match.group(1)
+
     # Watchlist에 추가
     current = load_watchlist()
-    if ticker in current:
-        return False, f"⚠️ {ticker}는 이미 Watchlist에 있습니다"
+    if resolved_ticker in current:
+        return False, f"⚠️ {resolved_ticker}는 이미 Watchlist에 있습니다"
 
-    current.append(ticker)
+    current.append(resolved_ticker)
     save_watchlist(current)
 
     # 성공 메시지에 회사명 포함
     if "✅" in message:
         return True, f"{message.replace('✅', '➕')} - Watchlist에 추가됨"
     else:
-        return True, f"➕ {ticker} added to Watchlist"
+        return True, f"➕ {resolved_ticker} added to Watchlist"
 
 
 def remove_from_watchlist(ticker: str) -> tuple[bool, str]:
@@ -947,6 +1065,29 @@ with st.sidebar:
 # ═══════════════════════════════════════════════════════════════
 
 def render_home():
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">Stock AI</div>
+        <div class="page-subtitle">AI-Powered Multi-Tool Stock Analysis Terminal</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # 시장 선택 탭
+    if _KOREAN_STOCKS_AVAILABLE:
+        tab1, tab2 = st.tabs(["🇺🇸 US Market", "🇰🇷 Korean Market"])
+
+        with tab1:
+            render_us_market_home()
+
+        with tab2:
+            render_korean_market_home()
+    else:
+        # 한국 주식 모듈 없으면 미국만
+        render_us_market_home()
+
+
+def render_us_market_home():
+    """미국 주식 홈 페이지"""
     render_market_ticker_bar()
 
     data = api_get("/results")
@@ -955,13 +1096,6 @@ def render_home():
     buy_count = sum(1 for r in results.values() if r.get("signal") == "BUY")
     sell_count = sum(1 for r in results.values() if r.get("signal") == "SELL")
     hold_count = sum(1 for r in results.values() if r.get("signal") == "HOLD")
-
-    st.markdown("""
-    <div class="page-header">
-        <div class="page-title">Stock AI</div>
-        <div class="page-subtitle">AI-Powered Multi-Tool Stock Analysis Terminal</div>
-    </div>
-    """, unsafe_allow_html=True)
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total", str(total))
@@ -1031,6 +1165,305 @@ def render_home():
             ),
             use_container_width=True, hide_index=True,
         )
+
+
+def render_korean_market_home():
+    """한국 주식 홈 페이지"""
+    if not _KOREAN_STOCKS_AVAILABLE:
+        st.warning("한국 주식 모듈을 사용할 수 없습니다.")
+        return
+
+    # KOSPI/KOSDAQ 지수 표시
+    try:
+        indices = get_kr_indices()
+        kospi = indices.get('kospi', {})
+        kosdaq = indices.get('kosdaq', {})
+
+        if kospi or kosdaq:
+            col1, col2 = st.columns(2)
+
+            if kospi:
+                with col1:
+                    change_pct = kospi.get('change_pct', 0)
+                    color = "🟢" if change_pct > 0 else "🔴" if change_pct < 0 else "⚪"
+                    st.metric(
+                        "KOSPI",
+                        f"{kospi.get('current', 0):,.2f}",
+                        f"{change_pct:+.2f}%",
+                        delta_color="normal" if change_pct >= 0 else "inverse"
+                    )
+
+            if kosdaq:
+                with col2:
+                    change_pct = kosdaq.get('change_pct', 0)
+                    color = "🟢" if change_pct > 0 else "🔴" if change_pct < 0 else "⚪"
+                    st.metric(
+                        "KOSDAQ",
+                        f"{kosdaq.get('current', 0):,.2f}",
+                        f"{change_pct:+.2f}%",
+                        delta_color="normal" if change_pct >= 0 else "inverse"
+                    )
+    except Exception as e:
+        st.error(f"지수 데이터 로드 실패: {e}")
+
+    st.markdown("""
+    <div class="section-header">
+        <div class="section-title">즐겨찾기</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # 즐겨찾기에서 종목 가져오기
+    try:
+        collector = KoreanStockData()
+        favorite_stocks = collector.get_favorites()
+
+        if not favorite_stocks:
+            st.info("즐겨찾기가 비어있습니다. 아래 방법으로 종목을 추가하세요:\n\n"
+                   "```python\n"
+                   "from stock_analyzer.korean_stocks import KoreanStockData\n"
+                   "collector = KoreanStockData()\n"
+                   "collector.add_favorite('종목코드', '종목명')\n"
+                   "```")
+        else:
+            # 즐겨찾기 종목을 리스트로 변환
+            favorite_list = [(code, name) for code, name in favorite_stocks.items()]
+
+            cols = st.columns(3)
+            for idx, (code, name) in enumerate(favorite_list):
+                with cols[idx % 3]:
+                    try:
+                        ticker = f"{code}.KS"
+                        stock = yf.Ticker(ticker)
+                        hist = stock.history(period='5d')
+
+                        if not hist.empty:
+                            current = hist['Close'].iloc[-1]
+                            prev = hist['Close'].iloc[-2] if len(hist) > 1 else current
+                            change = current - prev
+                            change_pct = (change / prev) * 100 if prev else 0
+
+                            st.metric(
+                                f"{name} ({code})",
+                                f"₩{current:,.0f}",
+                                f"{change_pct:+.2f}%",
+                                delta_color="normal" if change_pct >= 0 else "inverse"
+                            )
+                        else:
+                            st.metric(f"{name} ({code})", "데이터 없음", "—")
+                    except Exception as e:
+                        st.metric(f"{name} ({code})", "로드 실패", "—")
+    except Exception as e:
+        st.error(f"즐겨찾기 로드 실패: {e}")
+
+    st.markdown("""
+    <div class="section-header">
+        <div class="section-title">시스템 현황</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.info("""
+    ### 🇰🇷 한국 주식 분석 시스템 (베타)
+
+    **현재 지원 기능:**
+    - KOSPI/KOSDAQ 주요 종목 데이터 조회
+    - Yahoo Finance .KS/.KQ 티커 지원
+    - 기본 기술적 분석
+
+    **개발 예정 기능:**
+    - 외국인/기관/개인 매매 동향 분석
+    - DART 전자공시 연동
+    - 한국어 뉴스 감성 분석
+    - 테마주 연동 분석
+
+    **사용 방법:**
+    - Sidebar에서 한국 주식 코드 입력 (예: 005930)
+    - 또는 .KS 티커 형식 사용 (예: 005930.KS)
+    """)
+
+    # 종목 검색
+    st.markdown("""
+    <div class="section-header">
+        <div class="section-title">종목 검색</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    search_query = st.text_input("종목코드 또는 종목명 입력", placeholder="예: 삼성전자, 005930")
+
+    if search_query:
+        try:
+            collector = KoreanStockData()
+            results = collector.search_stock(search_query)
+
+            if results:
+                st.write(f"검색 결과: {len(results)}개")
+                for r in results:
+                    st.markdown(f"- **{r['name']}** ({r['code']}) - {r['market']}")
+            else:
+                st.warning("검색 결과가 없습니다.")
+        except Exception as e:
+            st.error(f"검색 실패: {e}")
+
+    # Phase 2: 외국인/기관 매매 동향
+    st.markdown("""
+    <div class="section-header">
+        <div class="section-title">투자자별 매매 동향 (Phase 2)</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.info("**pykrx 라이브러리를 통해 외국인/기관/개인 매매 데이터를 수집합니다.**")
+
+    # 즐겨찾기에서 종목 가져오기
+    try:
+        collector = KoreanStockData()
+        favorites = collector.get_favorites()
+
+        if not favorites:
+            st.warning("즐겨찾기가 비어있습니다. 직접 종목코드를 입력하세요.")
+            sample_ticker = st.text_input("종목코드 입력", placeholder="예: 005930", key="institutional_sample")
+        else:
+            ticker_options = [f"{code} ({name})" for code, name in favorites.items()]
+            sample_ticker = st.selectbox(
+                "종목 선택",
+                ticker_options,
+                key="institutional_sample"
+            )
+    except:
+        sample_ticker = st.text_input("종목코드 입력", placeholder="예: 005930", key="institutional_sample")
+
+    if st.button("📊 매매동향 조회", key="fetch_institutional"):
+        ticker_code = sample_ticker.split()[0]
+
+        with st.spinner(f"{ticker_code} 매매동향 조회 중..."):
+            try:
+                collector = KoreanStockData()
+                trading_data = collector.fetch_institutional_trading(ticker_code, days=5)
+
+                # Debug output
+                st.info(f"Debug: trading_data type={type(trading_data)}, has_summary={'summary' in trading_data if trading_data else False}")
+
+                if trading_data and 'summary' in trading_data:
+                    try:
+                        st.success(f"✅ 데이터 수집 완료: {trading_data.get('period', 'N/A')}")
+
+                        # 요약 데이터
+                        summary = trading_data['summary']
+
+                        col1, col2, col3 = st.columns(3)
+
+                        with col1:
+                            foreign_net = summary.get('foreign_net', 0)
+                            st.metric(
+                                "외국인 순매수",
+                                f"{foreign_net:,}주",
+                                delta_color="normal" if foreign_net >= 0 else "inverse"
+                            )
+
+                        with col2:
+                            inst_net = summary.get('institution_net', 0)
+                            st.metric(
+                                "기관 순매수",
+                                f"{inst_net:,}주",
+                                delta_color="normal" if inst_net >= 0 else "inverse"
+                            )
+
+                        with col3:
+                            indiv_net = summary.get('individual_net', 0)
+                            st.metric(
+                                "개인 순매수",
+                                f"{indiv_net:,}주",
+                                delta_color="normal" if indiv_net >= 0 else "inverse"
+                            )
+
+                        # 일별 데이터 테이블
+                        if 'daily' in trading_data and trading_data['daily']:
+                            st.markdown("**일별 매매 동향:**")
+
+                            daily_rows = []
+                            for day in trading_data['daily']:
+                                daily_rows.append({
+                                    "날짜": day['date'],
+                                    "외국인": f"{day['foreign']['net']:,}",
+                                    "기관": f"{day['institution']['net']:,}",
+                                    "개인": f"{day['individual']['net']:,}"
+                                })
+
+                            df_daily = pd.DataFrame(daily_rows)
+                            st.dataframe(df_daily, use_container_width=True, hide_index=True)
+                    except Exception as inner_e:
+                        st.error(f"데이터 표시 중 오류: {inner_e}")
+                        import traceback
+                        st.code(traceback.format_exc())
+
+                else:
+                    st.warning("매매 동향 데이터를 가져올 수 없습니다. 종목코드를 확인하거나 다른 종목을 시도해보세요.")
+
+            except Exception as e:
+                st.error(f"매매 동향 조회 실패: {e}")
+
+    # Phase 3: DART 공시
+    st.markdown("""
+    <div class="section-header">
+        <div class="section-title">최근 공시 (Phase 3 - DART API)</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    try:
+        from dart_api import DARTClient
+
+        dart_client = DARTClient()
+
+        if dart_client.is_configured():
+            st.success("✅ DART API Key 설정됨")
+
+            # 즐겨찾기에서 종목 가져오기
+            try:
+                collector = KoreanStockData()
+                favorites = collector.get_favorites()
+
+                if not favorites:
+                    st.warning("즐겨찾기가 비어있습니다. 직접 종목코드를 입력하세요.")
+                    disclosure_ticker = st.text_input("종목코드 입력", placeholder="예: 005930", key="dart_sample")
+                else:
+                    ticker_options = [f"{code} ({name})" for code, name in favorites.items()]
+                    disclosure_ticker = st.selectbox(
+                        "공시 조회 종목",
+                        ticker_options,
+                        key="dart_sample"
+                    )
+            except:
+                disclosure_ticker = st.text_input("종목코드 입력", placeholder="예: 005930", key="dart_sample")
+
+            if st.button("📄 최근 공시 조회", key="fetch_disclosures"):
+                ticker_code = disclosure_ticker.split()[0]
+
+                with st.spinner(f"{ticker_code} 공시 조회 중..."):
+                    disclosures = dart_client.fetch_recent_disclosures(ticker_code, days=30)
+
+                    if disclosures:
+                        st.write(f"최근 30일 공시: {len(disclosures)}건")
+
+                        for d in disclosures[:10]:
+                            with st.expander(f"{d['date']}: {d['title'][:60]}..."):
+                                st.markdown(f"**보고서 유형**: {d.get('report_type', 'N/A')}")
+                                st.markdown(f"**링크**: {d.get('url', 'N/A')}")
+                    else:
+                        st.warning("공시 데이터가 없습니다.")
+
+        else:
+            st.warning("⚠️ DART API Key가 설정되지 않았습니다.")
+            st.info("""
+            **DART API Key 설정 방법:**
+            1. https://opendart.fss.or.kr/ 에서 무료 회원가입
+            2. API Key 발급 (즉시 발급)
+            3. `/home/ubuntu/stock_auto/stock_analyzer/.env` 파일에 추가:
+               ```
+               DART_API_KEY=your_api_key_here
+               ```
+            4. 상세 가이드: DART_API_SETUP.md 참조
+            """)
+
+    except ImportError:
+        st.warning("DART API 모듈을 불러올 수 없습니다.")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1140,12 +1573,13 @@ def render_dashboard():
         st.markdown(f'<div class="ts-meta">{analysis_ts}</div>', unsafe_allow_html=True)
 
     rows = []
-    for ticker, r in sorted(results.items(), key=lambda x: x[1].get("score", 0), reverse=True):
+    # Fix: API returns 'composite_score', not 'score'
+    for ticker, r in sorted(results.items(), key=lambda x: x[1].get("composite_score", x[1].get("score", 0)), reverse=True):
         dist = r.get("signal_distribution", {})
         rows.append({
             "ticker": ticker,
             "signal": r.get("signal", "?"),
-            "score": r.get("score", 0),
+            "score": r.get("composite_score", r.get("score", 0)),  # Try composite_score first
             "confidence": r.get("confidence", 0),
             "buy": dist.get("buy", 0),
             "sell": dist.get("sell", 0),
@@ -2362,14 +2796,24 @@ def render_multi_agent():
             st.error(validation_message)
             return
 
-        with st.spinner(f"🤖 {ticker} 멀티에이전트 분석 중... (약 1-2분 소요)"):
+        # 한국 주식의 경우 자동 해결된 ticker 추출
+        resolved_ticker = ticker
+        import re
+        # 6자리 숫자 또는 특수 코드 (예: 0126Z0) 처리
+        if ((ticker.isdigit() and len(ticker) == 6) or
+            re.match(r'^[0-9]{4}[A-Z][0-9]$', ticker)) and "✅" in validation_message:
+            match = re.search(r'✅\s+(\S+)\s+\(', validation_message)
+            if match:
+                resolved_ticker = match.group(1)
+
+        with st.spinner(f"🤖 {resolved_ticker} 멀티에이전트 분석 중... (약 1-2분 소요)"):
             # Single LLM 분석
-            single_result = api_get(f"/results/{ticker}")
+            single_result = api_get(f"/results/{resolved_ticker}")
             if not single_result:
-                single_result = api_post(f"/scan/{ticker}")
+                single_result = api_post(f"/scan/{resolved_ticker}")
 
             # Multi-Agent 분석
-            multi_result = api_get(f"/multi-agent/{ticker}")
+            multi_result = api_get(f"/multi-agent/{resolved_ticker}")
 
             # API 실패 시 빈 딕셔너리로 설정
             if multi_result is None:
@@ -2383,7 +2827,7 @@ def render_multi_agent():
                 }
 
             st.session_state.multi_agent_result = {
-                "ticker": ticker,
+                "ticker": resolved_ticker,
                 "single": single_result if single_result else {},
                 "multi": multi_result,
                 "timestamp": datetime.now().isoformat()
