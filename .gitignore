@@ -1,4 +1,5 @@
 .env
+*.env
 __pycache__/
 *.pyc
 venv/
@@ -13,3 +14,12 @@ build/
 *.db
 stock_analyzer/data/
 chart_agent_service/data/
+# 테스트 결과 및 임시 아티팩트
+*_results.json
+*_result.json
+qwen3_migration_complete.json
+ml_quality_results.json
+test_artifacts/
+# improvements_test_<ticker>_<timestamp>.json 패턴
+improvements_test_*.json
+analysis_*.json
