@@ -1,0 +1,19 @@
+[Unit]
+Description=Stock AI Analysis System (Docker Compose)
+Documentation=file:///home/ubuntu/stock_auto/docs/PHASE_3_OPERATION.md
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/ubuntu/stock_auto
+User=ubuntu
+Group=ubuntu
+ExecStart=/usr/bin/docker compose --profile dev up -d
+ExecStop=/usr/bin/docker compose --profile dev down
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
