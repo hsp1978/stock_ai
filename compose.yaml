@@ -1,0 +1,87 @@
+name: stock-auto
+
+# ─────────────────────────────────────────────────────────────────────
+# 프로파일:
+#   dev — testdev (이 머신): webui + agent-api. 호스트 Ollama(11434) 그대로 사용
+#   mac — Mac Studio: ollama-heavy (선택). 현재는 Homebrew Ollama로 운영 중이라 미사용
+#
+# 기동:
+#   docker compose --profile dev up -d           # testdev에서
+#   docker compose --profile mac up -d           # Mac Studio에서 (Docker로 전환 시)
+# ─────────────────────────────────────────────────────────────────────
+
+services:
+  agent-api:
+    profiles: ["dev"]
+    build:
+      context: .
+      dockerfile: chart_agent_service/Dockerfile
+    image: stock-auto/agent-api:local
+    container_name: stock-auto-agent-api
+    network_mode: host          # 호스트 Ollama(11434) 직접 호출 + Tailscale 호스트네임 사용
+    env_file: .env
+    volumes:
+      - ./chart_agent_service/output:/app/chart_agent_service/output
+      - ./chart_agent_service/data:/app/chart_agent_service/data
+      - ./chart_agent_service/charts:/app/chart_agent_service/charts
+    restart: unless-stopped
+    # ML 앙상블(LSTM)에 RTX 5070 GPU 활용. 호스트 Ollama 와 VRAM 공유하므로
+    # ml_predictor.py 가 tf.config.experimental.set_memory_growth(True) 적용.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,httpx; httpx.get(f'http://localhost:{os.environ.get(\"API_PORT\",\"8100\")}/health', timeout=2).raise_for_status()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+  webui:
+    profiles: ["dev"]
+    build:
+      context: .
+      dockerfile: stock_analyzer/Dockerfile
+    image: stock-auto/webui:local
+    container_name: stock-auto-webui
+    network_mode: host
+    env_file: .env
+    volumes:
+      - ./stock_analyzer/watchlist.txt:/app/stock_analyzer/watchlist.txt
+    restart: unless-stopped
+    # webui 측 stock_analyzer/ml_pipeline_fix.py 가 ML 라이브러리 import.
+    # GPU 추론은 거의 agent-api에서 하지만 호환성 위해 동일 reservation.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      agent-api:
+        condition: service_healthy
+
+  # ─── Mac Studio 전용 (선택) ────────────────────────────────────────
+  # 현재 Mac Studio는 Homebrew Ollama로 :8080에서 운영 중. 이 서비스는
+  # Docker Desktop으로 전환할 경우의 reference. 활성화 전 Homebrew Ollama
+  # 종료 + LaunchAgent unload 필요 (포트 충돌 방지).
+  ollama-heavy:
+    profiles: ["mac"]
+    image: ollama/ollama:latest
+    container_name: stock-auto-ollama-heavy
+    ports:
+      - "8080:11434"
+    volumes:
+      - ollama-heavy-models:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-1}
+    restart: unless-stopped
+
+volumes:
+  ollama-heavy-models:

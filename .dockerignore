@@ -1,0 +1,35 @@
+.git/
+.gitignore
+archive/
+backups/
+docs/
+docs_archive/
+design/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+.venv/
+venv/
+
+# 시크릿 — 빌드 컨텍스트 제외, 런타임에 env_file로만 주입
+.env
+*.env.legacy
+**/.env
+**/.env.legacy
+
+# 서비스별 런타임 산출물
+chart_agent_service/output/
+chart_agent_service/data/
+chart_agent_service/charts/
+*.log
+
+# Phase 4까지 archive 상태인 잔존 도구
+mac_studio_setup.sh
+
+# 노트북/문서
+*.md
+!README.md
+*.ipynb
+
+# CI/CD
+.github/
