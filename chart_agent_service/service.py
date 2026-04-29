@@ -11,12 +11,14 @@
     uvicorn service:app --host 0.0.0.0 --port 8100
 """
 import json
+import os as _os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import sys
 import time
 import subprocess
 from datetime import datetime
-from typing import Optional
+from typing import Dict, List, Optional
 
 import httpx
 import uvicorn
@@ -24,10 +26,11 @@ import math
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from apscheduler.schedulers.background import BackgroundScheduler
+from pydantic import BaseModel
 
 from config import (
     API_HOST, API_PORT, SCAN_INTERVAL_MINUTES,
-    WATCHLIST, OLLAMA_MODEL,
+    WATCHLIST, OLLAMA_BASE_URL, OLLAMA_MODEL,
     BUY_THRESHOLD, SELL_THRESHOLD, MIN_CONFIDENCE,
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, OUTPUT_DIR,
     COOLING_OFF_DAYS, TRADING_STYLE,
@@ -278,38 +281,44 @@ def check_alert_condition(ticker: str, result: dict) -> Optional[dict]:
 
 
 def send_summary_alert(alerts: list):
-    """스캔 완료 후 기준치 도달 종목을 요약 1건으로 텔레그램 전송"""
+    """스캔 완료 후 기준치 도달 종목을 요약 1건으로 텔레그램 전송.
+
+    Sprint 3 업그레이드: 풍부한 포맷(telegram_bot.send_daily_digest) 사용.
+    """
     if not alerts:
         return
 
-    buy_alerts = [a for a in alerts if a["signal"] == "BUY"]
-    sell_alerts = [a for a in alerts if a["signal"] == "SELL"]
+    try:
+        from telegram_bot import send_daily_digest
 
-    msg = f"📊 <b>에이전트 스캔 알림</b> ({datetime.now().strftime('%Y-%m-%d %H:%M')})\n"
-    msg += f"기준치 도달: {len(alerts)}개 종목\n\n"
-
-    if buy_alerts:
-        msg += "🟢 <b>매수 신호</b>\n"
-        for a in sorted(buy_alerts, key=lambda x: x["score"], reverse=True):
-            top_tools = sorted(
-                a["result"].get("tool_summaries", []),
-                key=lambda x: x.get("score", 0), reverse=True
-            )[:2]
-            tools_str = ", ".join(f"{t['name']}({t['score']:+.0f})" for t in top_tools)
-            msg += f"  <b>{a['ticker']}</b>: {a['score']:+.1f}점 (신뢰도 {a['confidence']}) [{tools_str}]\n"
-        msg += "\n"
-
-    if sell_alerts:
-        msg += "🔴 <b>매도 신호</b>\n"
-        for a in sorted(sell_alerts, key=lambda x: x["score"]):
-            top_tools = sorted(
-                a["result"].get("tool_summaries", []),
-                key=lambda x: x.get("score", 0)
-            )[:2]
-            tools_str = ", ".join(f"{t['name']}({t['score']:+.0f})" for t in top_tools)
-            msg += f"  <b>{a['ticker']}</b>: {a['score']:+.1f}점 (신뢰도 {a['confidence']}) [{tools_str}]\n"
-
-    send_telegram(msg)
+        digest_rows: List[Dict] = []
+        for a in alerts:
+            r = a.get("result") or {}
+            digest_rows.append({
+                "ticker": a.get("ticker"),
+                "company_name": r.get("company_name"),
+                "signal": (a.get("signal") or "").lower(),
+                "score": a.get("score", 0),
+                "confidence": a.get("confidence", 0),
+                "entry_plan": r.get("entry_plan") or (r.get("final_decision") or {}).get("entry_plan"),
+            })
+        send_daily_digest(digest_rows, top_n=10, min_confidence=0.0)
+    except Exception:
+        # 새 모듈 실패 시 기본 포맷으로 폴백
+        buy_alerts = [a for a in alerts if a["signal"] == "BUY"]
+        sell_alerts = [a for a in alerts if a["signal"] == "SELL"]
+        msg = f"📊 <b>에이전트 스캔 알림</b> ({datetime.now().strftime('%Y-%m-%d %H:%M')})\n"
+        msg += f"기준치 도달: {len(alerts)}개 종목\n\n"
+        if buy_alerts:
+            msg += "🟢 <b>매수 신호</b>\n"
+            for a in sorted(buy_alerts, key=lambda x: x["score"], reverse=True):
+                msg += f"  <b>{a['ticker']}</b>: {a['score']:+.1f}점 (신뢰도 {a['confidence']})\n"
+            msg += "\n"
+        if sell_alerts:
+            msg += "🔴 <b>매도 신호</b>\n"
+            for a in sorted(sell_alerts, key=lambda x: x["score"]):
+                msg += f"  <b>{a['ticker']}</b>: {a['score']:+.1f}점 (신뢰도 {a['confidence']})\n"
+        send_telegram(msg)
 
     # 알림 발송 시간 기록 (중복 억제용)
     for a in alerts:
@@ -349,14 +358,32 @@ def _save_watchlist_file(tickers: list[str]):
 
 
 def run_scheduled_scan(override_tickers: "list[str] | None" = None):
-    """스케줄된 전체 종목 스캔. override_tickers가 주어지면 해당 목록만 스캔."""
-    tickers = override_tickers if override_tickers else _load_watchlist_files()
+    """
+    스케줄된 전체 종목 스캔.
 
+    속도 최적화:
+    1. 스캔 시작 전 yfinance 배치 사전 다운로드 (모든 종목 OHLCV 한 번에)
+    2. LLM 분석은 SCAN_PARALLEL_WORKERS 수 만큼 병렬 실행
+    3. 스캔 완료 후 OHLCV 캐시 초기화 (stale 방지)
+
+    SCAN_PARALLEL_WORKERS 환경변수로 병렬 수 조정 (기본 3).
+    Ollama OLLAMA_NUM_PARALLEL도 동일하게 설정 권장.
+    """
+    tickers = override_tickers if override_tickers else _load_watchlist_files()
+    max_workers = int(_os.getenv("SCAN_PARALLEL_WORKERS", "3"))
+
+    t_scan_start = time.time()
     print(f"\n{'='*60}")
     print(f"  스캔 시작: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"  종목: {len(tickers)}개 - {', '.join(tickers)}")
+    print(f"  병렬 워커: {max_workers}개")
     print(f"  임계값: 매수≥{BUY_THRESHOLD}, 매도≤{SELL_THRESHOLD}, 신뢰도≥{MIN_CONFIDENCE}")
     print(f"{'='*60}\n")
+
+    # ── 단계 1: yfinance 배치 사전 다운로드 ──────────────────
+    from data_collector import prefetch_ohlcv_batch, clear_ohlcv_cache
+    clear_ohlcv_cache()
+    prefetch_ohlcv_batch(tickers)
 
     scan_entry = {
         "timestamp": datetime.now().isoformat(),
@@ -364,33 +391,53 @@ def run_scheduled_scan(override_tickers: "list[str] | None" = None):
         "results": {},
         "alerts": [],
     }
+    pending_alerts = []
+    results_lock = __import__('threading').Lock()
 
-    pending_alerts = []  # 알림 대상 수집
-
-    for ticker in tickers:
+    # ── 단계 2: 병렬 LLM 분석 ────────────────────────────────
+    def _scan_one(ticker: str):
+        """단일 종목 스캔 — ThreadPoolExecutor 워커 함수."""
         result = analyze_ticker(ticker)
-        if result:
-            latest_results[ticker] = {
-                "result": result,
-                "timestamp": datetime.now().isoformat(),
-                "alert_sent_at": latest_results.get(ticker, {}).get("alert_sent_at"),
-            }
-            scan_entry["results"][ticker] = {
-                "signal": result.get("final_signal"),
-                "score": result.get("composite_score"),
-                "confidence": result.get("confidence"),
-            }
+        return ticker, result
 
-            # 개별 전송하지 않고 수집만
-            alert = check_alert_condition(ticker, result)
-            if alert:
-                pending_alerts.append(alert)
-                scan_entry["alerts"].append(ticker)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_scan_one, t): t for t in tickers}
+        for future in as_completed(futures):
+            ticker = futures[future]
+            try:
+                ticker, result = future.result()
+            except Exception as e:
+                print(f"  [{ticker}] 오류: {e}")
+                result = None
 
-            # DB 기록
-            insert_scan(ticker, result, alert_sent=(alert is not None))
+            if result:
+                with results_lock:
+                    latest_results[ticker] = {
+                        "result": result,
+                        "timestamp": datetime.now().isoformat(),
+                        "alert_sent_at": latest_results.get(ticker, {}).get("alert_sent_at"),
+                    }
+                    scan_entry["results"][ticker] = {
+                        "signal": result.get("final_signal"),
+                        "score": result.get("composite_score"),
+                        "confidence": result.get("confidence"),
+                    }
 
-        time.sleep(3)  # API 부하 방지
+                alert = check_alert_condition(ticker, result)
+                if alert:
+                    with results_lock:
+                        pending_alerts.append(alert)
+                        scan_entry["alerts"].append(ticker)
+
+                insert_scan(ticker, result, alert_sent=(alert is not None))
+
+    # ── 단계 3: 캐시 정리 ─────────────────────────────────────
+    clear_ohlcv_cache()
+
+    elapsed = time.time() - t_scan_start
+    avg = elapsed / len(tickers) if tickers else 0
+    print(f"\n  ✅ 스캔 완료: {len(tickers)}개 종목 / {elapsed:.1f}s "
+          f"(종목당 평균 {avg:.1f}s)")
 
     # 스캔 완료 후 기준치 도달 종목을 요약 1건으로 전송
     if pending_alerts:
@@ -548,7 +595,7 @@ def health():
     """헬스 체크"""
     ollama_ok = False
     try:
-        resp = httpx.get(f"http://localhost:11434/api/tags", timeout=3)
+        resp = httpx.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
         ollama_ok = resp.status_code == 200
     except Exception:
         pass
@@ -625,13 +672,161 @@ def get_paper_status():
 
 
 @app.post("/paper/order")
-def paper_order(ticker: str, action: str, qty: int, price: float, reason: str = ""):
-    """페이퍼 트레이딩 수동 주문"""
+def paper_order(ticker: str, action: str, qty: int, price: float, reason: str = "",
+                stop_loss_price: float = 0.0, take_profit_price: float = 0.0,
+                trailing_stop_pct: float = 0.0, time_stop_days: int = 0):
+    """페이퍼 트레이딩 수동 주문 (손절/익절/trailing 지정 가능)."""
     ticker = ticker.upper()
     action = action.upper()
     if action not in ("BUY", "SELL"):
         raise HTTPException(400, "action은 BUY 또는 SELL")
-    return execute_paper_order(ticker, action, qty, price, reason)
+    return execute_paper_order(
+        ticker, action, qty, price, reason,
+        stop_loss_price=stop_loss_price,
+        take_profit_price=take_profit_price,
+        trailing_stop_pct=trailing_stop_pct,
+        time_stop_days=time_stop_days,
+    )
+
+
+class VirtualBuyBody(BaseModel):
+    """가상 매수 요청 (수동 진입용 — 분석 결과 연동 포함)."""
+    ticker: str
+    qty: int
+    price: float                              # 사용자가 지정한 진입가
+    reason: Optional[str] = None              # 진입 근거 메모
+    stop_loss_price: Optional[float] = None   # 손절가 (선택)
+    take_profit_price: Optional[float] = None # 익절가 (선택)
+    trailing_stop_pct: Optional[float] = None # trailing stop 비율 (0~1)
+    time_stop_days: Optional[int] = None      # 시간 기반 청산 일수
+
+
+@app.post("/paper/virtual-buy")
+def api_virtual_buy(body: VirtualBuyBody):
+    """
+    수동 가상 매수 — 사용자가 정한 시점/가격/수량으로 포지션 생성.
+    Multi-Agent 분석의 entry_plan 데이터도 이 엔드포인트로 보낼 수 있음.
+    """
+    return execute_paper_order(
+        ticker=body.ticker.upper(),
+        action="BUY",
+        qty=body.qty,
+        price=body.price,
+        reason=body.reason or "수동 가상 매수",
+        stop_loss_price=body.stop_loss_price or 0.0,
+        take_profit_price=body.take_profit_price or 0.0,
+        trailing_stop_pct=body.trailing_stop_pct or 0.0,
+        time_stop_days=body.time_stop_days or 0,
+    )
+
+
+class PartialCloseBody(BaseModel):
+    ticker: str
+    close_pct: float = 100.0  # 청산 비율 (0~100)
+    price: Optional[float] = None  # None이면 현재가 자동 조회
+    reason: Optional[str] = None
+
+
+@app.post("/paper/partial-close")
+def api_partial_close(body: PartialCloseBody):
+    """
+    포지션 부분/전량 청산.
+    close_pct: 100 = 전량, 50 = 절반, 등
+    price: 미지정 시 현재가(yfinance) 자동 조회
+    """
+    ticker = body.ticker.upper()
+    state = _get_paper_state()
+    pos = state.get("positions", {}).get(ticker)
+    if not pos:
+        raise HTTPException(404, f"{ticker} 포지션 없음")
+
+    close_pct = max(0.01, min(100.0, body.close_pct))
+    close_qty = max(1, int(pos["qty"] * close_pct / 100))
+    close_qty = min(close_qty, pos["qty"])
+
+    price = body.price
+    if price is None or price <= 0:
+        try:
+            df = fetch_ohlcv(ticker, period="5d")
+            price = float(df["Close"].iloc[-1])
+        except Exception:
+            raise HTTPException(400, "현재가 조회 실패. price를 명시하세요.")
+
+    return execute_paper_order(
+        ticker=ticker, action="SELL", qty=close_qty, price=float(price),
+        reason=body.reason or f"수동 부분 청산 ({close_pct:.0f}%)",
+    )
+
+
+def _get_paper_state():
+    """paper_trader 내부 상태 참조용 (부분청산 qty 계산 필요)."""
+    from paper_trader import _load_state
+    return _load_state()
+
+
+@app.get("/paper/quote/{ticker}")
+def api_paper_quote(ticker: str):
+    """
+    현재가 + 호가단위 조회 (수동 진입 시 참고용).
+    """
+    ticker = ticker.upper()
+    try:
+        df = fetch_ohlcv(ticker, period="5d")
+        if df is None or df.empty:
+            raise HTTPException(404, f"{ticker} 데이터 없음")
+        latest = df.iloc[-1]
+        current = float(latest["Close"])
+        day_high = float(latest["High"])
+        day_low = float(latest["Low"])
+        prev_close = float(df["Close"].iloc[-2]) if len(df) >= 2 else current
+
+        from tick_size import round_to_tick, tick_size_for
+        tick = tick_size_for(ticker, current)
+
+        return {
+            "ticker": ticker,
+            "current_price": current,
+            "day_high": day_high,
+            "day_low": day_low,
+            "prev_close": prev_close,
+            "change_pct": round((current / prev_close - 1) * 100, 2) if prev_close else 0,
+            "tick_size": tick,
+            "suggested_limit_up": round_to_tick(current * 1.001, ticker, side="up"),
+            "suggested_limit_down": round_to_tick(current * 0.999, ticker, side="down"),
+            "as_of": str(df.index[-1])[:19],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"조회 실패: {str(e)[:100]}")
+
+
+@app.post("/paper/update-prices")
+def api_update_prices():
+    """
+    보유 포지션의 현재가를 일괄 갱신 + trailing/time/SL/TP 체크.
+    WebUI에서 "가격 갱신" 버튼으로 수동 호출 가능.
+    """
+    state = _get_paper_state()
+    tickers = list(state.get("positions", {}).keys())
+    if not tickers:
+        return {"updated": 0, "auto_closed": [], "positions": {}}
+
+    prices = {}
+    for t in tickers:
+        try:
+            df = fetch_ohlcv(t, period="5d")
+            if df is not None and not df.empty:
+                prices[t] = float(df["Close"].iloc[-1])
+        except Exception:
+            continue
+
+    auto_closed = update_position_prices(prices)
+    return {
+        "updated": len(prices),
+        "prices": prices,
+        "auto_closed": auto_closed,
+    }
 
 
 @app.post("/paper/auto")
@@ -827,6 +1022,426 @@ def api_weekly(weeks_ago: int = 0):
 def api_weekly_ticker(ticker: str, weeks_ago: int = 0):
     """종목별 주간 상세"""
     return get_weekly_ticker(ticker, weeks_ago)
+
+
+# ─── Phase 2.1: 주문 실행 API ──────────────────────────
+
+
+class OrderSubmitBody(BaseModel):
+    ticker: str
+    entry_plan: Optional[Dict] = None
+    position_pct: Optional[float] = None
+    source: str = "manual"
+    reason: Optional[str] = None
+
+
+@app.get("/trading/mode")
+def api_get_trading_mode():
+    """현재 TRADING_MODE 조회."""
+    from brokers import get_trading_mode
+    from brokers.safety import get_safety
+    return {
+        "mode": get_trading_mode(),
+        "safety": get_safety().get_status(),
+    }
+
+
+@app.post("/trading/mode")
+def api_set_trading_mode(mode: str):
+    """
+    런타임에 TRADING_MODE 변경.
+    유효값: paper | dry_run | approval | live
+    """
+    from brokers import get_trading_mode, VALID_MODES  # type: ignore
+    from brokers.factory import VALID_MODES as _valid
+    if mode.lower() not in _valid:
+        return {"ok": False, "error": f"invalid mode: {mode}. Must be one of {_valid}"}
+    os.environ["TRADING_MODE"] = mode.lower()
+    return {"ok": True, "mode": mode.lower()}
+
+
+@app.post("/trading/kill-switch/activate")
+def api_activate_kill_switch(reason: str = "manual"):
+    """긴급 중지 활성화."""
+    from brokers.safety import get_safety
+    safety = get_safety()
+    safety.activate_kill_switch(reason=reason)
+    return {"ok": True, "active": safety.is_kill_switch_active()}
+
+
+@app.post("/trading/kill-switch/deactivate")
+def api_deactivate_kill_switch(reason: str = "manual"):
+    """긴급 중지 해제."""
+    from brokers.safety import get_safety
+    safety = get_safety()
+    safety.deactivate_kill_switch(reason=reason)
+    return {"ok": True, "active": safety.is_kill_switch_active()}
+
+
+@app.get("/trading/broker-health")
+def api_broker_health():
+    """현재 브로커 연결 상태."""
+    from brokers import get_broker
+    broker = get_broker()
+    return {
+        "broker": broker.name,
+        "health": broker.health_check(),
+        "market_open": broker.is_market_open(),
+    }
+
+
+@app.get("/trading/broker-health/{broker_name}")
+def api_broker_health_specific(broker_name: str):
+    """특정 브로커 연결 상태 (alpaca/paper/dry_run)."""
+    bn = broker_name.lower()
+    if bn == "alpaca":
+        from brokers.alpaca_broker import AlpacaBroker
+        broker = AlpacaBroker()
+    elif bn == "paper":
+        from brokers.paper_broker import PaperBroker
+        broker = PaperBroker()
+    elif bn == "dry_run":
+        from brokers.dry_run_broker import DryRunBroker
+        broker = DryRunBroker()
+    else:
+        return {"ok": False, "error": f"unknown broker: {broker_name}"}
+    return {
+        "broker": broker.name,
+        "health": broker.health_check(),
+        "market_open": broker.is_market_open(),
+    }
+
+
+@app.get("/data-source")
+def api_data_source_status():
+    """현재 데이터 소스 상태 조회."""
+    from data_sources import get_data_source, get_data_source_name
+    source = get_data_source()
+    return {
+        "configured": get_data_source_name(),
+        "active": source.name,
+        "health": source.health_check(),
+    }
+
+
+@app.get("/trading/account")
+def api_trading_account():
+    """브로커 계좌 정보."""
+    from brokers import get_broker
+    return get_broker().get_account()
+
+
+@app.get("/trading/positions")
+def api_trading_positions():
+    """현재 포지션."""
+    from brokers import get_broker
+    return {"positions": get_broker().get_positions()}
+
+
+@app.post("/trading/orders")
+def api_submit_order(body: OrderSubmitBody):
+    """
+    주문 제출 (entry_plan 기반).
+    TRADING_MODE 따라 paper 즉시 체결 / dry_run 로깅만 / approval 큐 / live 실제 제출.
+    """
+    from execution.order_router import route_entry_plan
+
+    if not body.entry_plan:
+        return {"ok": False, "error": "entry_plan required"}
+
+    result = route_entry_plan(
+        ticker=body.ticker.upper(),
+        entry_plan=body.entry_plan,
+        position_pct=body.position_pct,
+        source=body.source,
+        reason=body.reason,
+    )
+    return {"ok": True, **result.to_dict()}
+
+
+@app.get("/trading/orders/recent")
+def api_recent_orders(limit: int = 50, ticker: Optional[str] = None):
+    """최근 주문 감사 로그."""
+    from execution import get_audit_log
+    return {"orders": get_audit_log().get_recent(limit=limit, ticker=ticker)}
+
+
+@app.get("/trading/orders/stats")
+def api_order_stats(days_back: int = 7):
+    """주문 통계."""
+    from execution import get_audit_log
+    return get_audit_log().get_stats(days_back=days_back)
+
+
+@app.get("/trading/approval/pending")
+def api_approval_pending():
+    """승인 대기 중인 주문."""
+    from execution import get_approval_queue
+    queue = get_approval_queue()
+    queue.expire_old()  # 기회에 만료 처리
+    return {"pending": queue.get_pending(), "stats": queue.stats()}
+
+
+@app.post("/trading/approval/{queue_id}/approve")
+def api_approve_order(queue_id: int):
+    """승인 큐 주문 승인 + 실제 실행."""
+    from execution.order_router import OrderRouter
+    router = OrderRouter()
+    result = router.execute_approved(queue_id)
+    return {"executed": result.success, "result": result.to_dict()}
+
+
+@app.post("/trading/approval/{queue_id}/reject")
+def api_reject_order(queue_id: int):
+    """승인 큐 주문 거절."""
+    from execution import get_approval_queue
+    ok = get_approval_queue().reject(queue_id, responder="api")
+    return {"ok": ok}
+
+
+# ─── Telegram 알림 API (Sprint 3) ──────────────────────
+@app.post("/telegram/rich-signal/{ticker}")
+def api_telegram_rich_signal(ticker: str, webui_base_url: Optional[str] = None):
+    """
+    풍부한 신호 알림 발송. 사전에 해당 ticker 분석이 완료되어 있어야 함.
+    - ticker: 종목 티커
+    - webui_base_url: deep link 용 (선택)
+    """
+    from telegram_bot import send_rich_signal_alert
+    from signal_tracker import get_accuracy_stats
+
+    ticker = ticker.upper()
+    cached = latest_results.get(ticker)
+    if not cached:
+        return {"sent": False, "error": "해당 종목의 분석 결과가 없습니다. 먼저 /scan/{ticker} 호출 필요."}
+
+    result = cached.get("result") or {}
+    # Multi-Agent 결과라면 final_decision 포함
+    final_decision = result.get("final_decision") or {
+        "final_signal": result.get("final_signal"),
+        "final_confidence": result.get("confidence"),
+        "consensus": f"점수 {result.get('composite_score', 0):+.2f}",
+        "reasoning": (result.get("llm_conclusion") or "")[:300],
+        "key_risks": [],
+        "entry_plan": result.get("entry_plan"),
+    }
+
+    try:
+        acc = get_accuracy_stats(horizon=7, days_back=180)
+    except Exception:
+        acc = None
+
+    sent = send_rich_signal_alert(
+        ticker=ticker,
+        final_decision=final_decision,
+        company_name=result.get("company_name"),
+        accuracy_stats=acc,
+        webui_base_url=webui_base_url,
+    )
+    return {"sent": sent, "ticker": ticker}
+
+
+@app.post("/telegram/daily-digest")
+def api_telegram_daily_digest(top_n: int = 5, min_confidence: float = 6.0):
+    """
+    latest_results의 현재 스캔 요약을 일일 다이제스트 형식으로 발송.
+    """
+    from telegram_bot import send_daily_digest
+
+    scan_rows: List[Dict] = []
+    for ticker, entry in (latest_results or {}).items():
+        r = entry.get("result") or {}
+        if not r:
+            continue
+        # Multi-Agent or Single LLM 정규화
+        if r.get("final_decision"):
+            fd = r["final_decision"]
+            scan_rows.append({
+                "ticker": ticker,
+                "company_name": r.get("company_name"),
+                "signal": (fd.get("final_signal") or "").lower(),
+                "score": r.get("composite_score") or 0,
+                "confidence": fd.get("final_confidence") or 0,
+                "entry_plan": fd.get("entry_plan"),
+            })
+        else:
+            scan_rows.append({
+                "ticker": ticker,
+                "signal": (r.get("final_signal") or "").lower(),
+                "score": r.get("composite_score") or 0,
+                "confidence": r.get("confidence") or 0,
+                "entry_plan": r.get("entry_plan"),
+            })
+
+    sent = send_daily_digest(scan_rows, top_n=top_n, min_confidence=min_confidence)
+    return {"sent": sent, "total_scans": len(scan_rows)}
+
+
+@app.post("/telegram/process-callbacks")
+def api_telegram_process_callbacks():
+    """
+    보류 중인 인라인 버튼 콜백(워치리스트 추가/무시) 처리.
+    스케줄러가 주기적으로 호출하거나 수동 실행.
+    """
+    from telegram_bot import process_callback_updates
+
+    def _watch_handler(ticker: str) -> str:
+        # watchlist.txt에 티커 추가 (stock_analyzer 쪽)
+        try:
+            wl_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "stock_analyzer", "watchlist.txt"
+            )
+            existing = set()
+            if os.path.exists(wl_path):
+                with open(wl_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            existing.add(line.upper())
+            t = ticker.upper().strip()
+            if t in existing:
+                return f"{t} 이미 워치리스트에 있음"
+            existing.add(t)
+            header = (
+                "# 관심 종목 리스트 (SSOT: WebUI/백엔드/배치 스크립트 공용)\n"
+                "# 한 줄에 하나, #은 주석, 빈 줄은 무시됨\n\n"
+            )
+            with open(wl_path, "w", encoding="utf-8") as f:
+                f.write(header)
+                for t2 in sorted(existing):
+                    f.write(t2 + "\n")
+            return f"✅ {t} 워치리스트 추가됨"
+        except Exception:
+            return "워치리스트 업데이트 실패"
+
+    def _mute_handler(ticker: str) -> str:
+        # 간단히 쿨다운 테이블에 mark (이미 cooling_off 있음)
+        try:
+            cooling_off_state[ticker.upper()] = {
+                "signal": "MUTED",
+                "triggered_at": datetime.now().isoformat(),
+            }
+            return f"🚫 {ticker} 당분간 무시됨"
+        except Exception:
+            return "설정 실패"
+
+    def _approve_handler(queue_id_str: str) -> str:
+        """Phase 2.1: 주문 승인 콜백."""
+        try:
+            from execution.order_router import OrderRouter
+            queue_id = int(queue_id_str)
+            router = OrderRouter()
+            result = router.execute_approved(queue_id)
+            if result.success:
+                return f"✅ 주문 {queue_id} 실행됨 ({result.status})"
+            return f"❌ 실행 실패: {result.error_message or result.status}"
+        except Exception as e:
+            return f"승인 처리 실패: {str(e)[:50]}"
+
+    def _reject_handler(queue_id_str: str) -> str:
+        """Phase 2.1: 주문 거절 콜백."""
+        try:
+            from execution import get_approval_queue
+            queue_id = int(queue_id_str)
+            ok = get_approval_queue().reject(queue_id, responder="telegram")
+            return f"❌ 주문 {queue_id} 거절됨" if ok else "이미 처리됨"
+        except Exception as e:
+            return f"거절 처리 실패: {str(e)[:50]}"
+
+    handlers = {
+        "watch": _watch_handler,
+        "mute": _mute_handler,
+        "approve": _approve_handler,
+        "reject": _reject_handler,
+    }
+    return process_callback_updates(handlers)
+
+
+# ─── Screener (한국 주식 기술적 스크리너 V1) ──────────
+@app.post("/screener/run")
+def api_screener_run(min_market_cap_bn: float = 2000, top_n: int = 20):
+    """
+    한국 주식 스크리너 수동 실행.
+    - min_market_cap_bn: 최소 시총 (억원 단위, 기본 2000 = 2천억)
+    - top_n: 상위 몇 개 반환 (기본 20)
+    """
+    from screener import run_screener
+    # 억원 → 원
+    min_cap = float(min_market_cap_bn) * 1e8
+    return run_screener(min_market_cap=min_cap, top_n=int(top_n), save_db=True)
+
+
+@app.get("/screener/latest")
+def api_screener_latest(limit: int = 20):
+    """가장 최근 스크리너 실행 결과 조회 (DB)."""
+    from db import get_screener_latest
+    return get_screener_latest(limit=limit)
+
+
+@app.get("/screener/history")
+def api_screener_history(days_back: int = 30):
+    """최근 N일 스크리너 실행 이력 (run별 요약)."""
+    from db import get_screener_history
+    return get_screener_history(days_back=days_back)
+
+
+@app.post("/screener/pipeline")
+def api_screener_pipeline(
+    min_market_cap_bn: float = 2000,
+    top_n: int = 20,
+    analyze_top: int = 5,
+):
+    """
+    스크리너 → Multi-Agent 자동 파이프라인.
+
+    - min_market_cap_bn: 최소 시총 (억원, 기본 2000)
+    - top_n: 스크리너 상위 몇 개 (기본 20)
+    - analyze_top: 그 중 Multi-Agent 자동 심층 분석할 상위 개수 (기본 5)
+
+    소요: 약 5~7분 (스크리너 2분 + Multi-Agent 5개 × 1분 병렬)
+    """
+    from screener import run_screener_with_multiagent
+    min_cap = float(min_market_cap_bn) * 1e8
+    return run_screener_with_multiagent(
+        min_market_cap=min_cap,
+        top_n=int(top_n),
+        analyze_top=int(analyze_top),
+        save_db=True,
+    )
+
+
+# ─── 신호 정확도 / 칼리브레이션 (Sprint 2) ──────────────
+@app.get("/signal-accuracy")
+def api_signal_accuracy(horizon: int = 7, min_confidence: float = 0.0,
+                         signal: str = None, days_back: int = 180):
+    """
+    신호 정확도 통계 조회.
+    - horizon: 7, 14, 30 (평가 기간 일수)
+    - min_confidence: 이 값 이상만 집계 (0~10)
+    - signal: "buy"|"sell"|"neutral" (선택)
+    - days_back: 최근 N일 데이터만 대상
+    """
+    from signal_tracker import get_accuracy_stats
+    return get_accuracy_stats(
+        horizon=horizon, min_confidence=min_confidence,
+        signal=signal, days_back=days_back
+    )
+
+
+@app.post("/signal-accuracy/evaluate")
+def api_signal_evaluate(days_back: int = 45, limit: int = 500):
+    """과거 신호에 대한 실제 결과 평가를 수동 실행."""
+    from signal_tracker import run_daily_validation
+    return run_daily_validation(days_back=days_back, limit=limit)
+
+
+@app.get("/signal-accuracy/calibrator")
+def api_calibrator_status():
+    """신뢰도 칼리브레이터 현재 상태."""
+    from signal_tracker import get_calibrator
+    calib = get_calibrator()
+    return calib.status()
 
 
 @app.post("/restart")

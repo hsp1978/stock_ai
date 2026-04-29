@@ -1,7 +1,13 @@
 """
 데이터 수집 모듈 (경량화 - Mac Studio용)
-yfinance 기반 OHLCV 수집 + 기술 지표 계산
+DATA_SOURCE 환경변수로 yfinance/alpaca/... 스위칭 가능.
+
+배치 프리페치:
+  prefetch_ohlcv_batch(tickers) 를 스캔 시작 전에 한 번 호출하면
+  yfinance download() 한 번으로 전 종목 데이터를 받아 캐시.
+  이후 fetch_ohlcv()는 캐시를 우선 조회 → 종당 네트워크 왕복 제거.
 """
+import threading
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -11,9 +17,94 @@ from config import (
     ADX_PERIOD, ATR_PERIOD, MACD_FAST, MACD_SLOW, MACD_SIGNAL
 )
 
+# ─── OHLCV 인메모리 캐시 ────────────────────────────────────
+# key: (ticker.upper(), period)  value: pd.DataFrame
+_ohlcv_cache: dict = {}
+_ohlcv_cache_lock = threading.Lock()
+
+
+def prefetch_ohlcv_batch(tickers: list, period: str = DEFAULT_HISTORY_PERIOD):
+    """
+    전 종목 OHLCV를 yfinance 배치 다운로드로 한 번에 수집해 캐시.
+
+    순차 스캔에서 종목당 5~10초 절약 가능.
+    스캔 시작 직전에 호출.
+    """
+    if not tickers:
+        return
+    try:
+        print(f"  [배치] {len(tickers)}개 종목 데이터 사전 다운로드 중...")
+        raw = yf.download(
+            tickers,
+            period=period,
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+        if raw.empty:
+            return
+
+        # yf.download 결과: 단일 종목은 단순 DataFrame,
+        # 복수 종목은 MultiIndex(columns: (field, ticker))
+        if isinstance(raw.columns, pd.MultiIndex):
+            for t in tickers:
+                t_up = t.upper()
+                try:
+                    # MultiIndex 슬라이싱: level 1 = ticker
+                    df_t = raw.xs(t, level=1, axis=1).copy()
+                    if not df_t.empty:
+                        with _ohlcv_cache_lock:
+                            _ohlcv_cache[(t_up, period)] = df_t
+                except KeyError:
+                    pass
+        else:
+            # 단일 종목 배치 (tickers에 1개만 있는 경우)
+            t_up = tickers[0].upper()
+            with _ohlcv_cache_lock:
+                _ohlcv_cache[(t_up, period)] = raw.copy()
+
+        cached = len([k for k in _ohlcv_cache if k[1] == period])
+        print(f"  [배치] 완료: {cached}개 캐시 저장")
+    except Exception as e:
+        print(f"  [배치] 사전 다운로드 실패 (개별 조회로 폴백): {e}")
+
+
+def clear_ohlcv_cache():
+    """다음 스캔 시작 전 캐시 초기화 (stale 데이터 방지)."""
+    with _ohlcv_cache_lock:
+        _ohlcv_cache.clear()
+
 
 def fetch_ohlcv(ticker: str, period: str = DEFAULT_HISTORY_PERIOD) -> pd.DataFrame:
-    """OHLCV 데이터 수집"""
+    """
+    OHLCV 데이터 수집.
+
+    조회 순서:
+    1. 인메모리 배치 캐시 (prefetch_ohlcv_batch 사전 호출 시)
+    2. DataSource 추상화 (alpaca 등 DATA_SOURCE 설정 시)
+    3. yfinance 직접 호출 (기본)
+    """
+    key = (ticker.upper(), period)
+
+    # 1. 배치 캐시 우선 조회
+    with _ohlcv_cache_lock:
+        cached = _ohlcv_cache.get(key)
+    if cached is not None and not cached.empty:
+        return cached.copy()
+
+    # 2. DataSource 추상화
+    try:
+        from data_sources import get_data_source, get_data_source_name
+        source_name = get_data_source_name()
+        if source_name != "yfinance":
+            source = get_data_source()
+            df = source.get_ohlcv(ticker, period=period)
+            if df is not None and not df.empty:
+                return df
+    except Exception:
+        pass
+
+    # 3. 기본/폴백: yfinance 직접 호출
     t = yf.Ticker(ticker)
     df = t.history(period=period)
     if df.empty:

@@ -10,6 +10,7 @@ import json
 import os
 import sys
 from datetime import datetime
+from typing import Dict, Tuple
 
 import httpx
 import yfinance as yf
@@ -19,11 +20,15 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from dotenv import load_dotenv
 
-load_dotenv()
-
 # ── 프로젝트 경로 설정 ──
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_THIS_DIR)
+
+# 루트 .env를 먼저 로드 (통합 설정 SSOT), 로컬 stock_analyzer/.env로 덮어쓰기 허용
+_root_env = os.path.join(_PROJECT_ROOT, ".env")
+if os.path.exists(_root_env):
+    load_dotenv(_root_env)
+load_dotenv()
 _SERVICE_DIR = os.path.join(_PROJECT_ROOT, 'chart_agent_service')
 
 if _SERVICE_DIR not in sys.path:
@@ -563,6 +568,26 @@ def resolve_ticker(user_input: str) -> tuple[str, str]:
     if upper.isascii() and len(upper) <= 10:
         return upper, ""
 
+    # 한글이 포함된 경우 ticker_suggestion 먼저 시도 (한국 주식 우선)
+    if any(ord(char) >= 0xAC00 and ord(char) <= 0xD7A3 for char in text):
+        try:
+            from ticker_suggestion import suggest_ticker
+            result = suggest_ticker(text)
+
+            if result['found'] and result['best_match']:
+                # 95% 이상 매치로 자동 선택
+                ticker = result['best_match']
+                name = result['suggestions'][0].get('name', text) if result['suggestions'] else text
+                return ticker, f"{text} → {ticker} ({name})"
+            elif result['found'] and result['suggestions']:
+                # 첫 번째 제안 사용
+                ticker = result['suggestions'][0]['ticker']
+                name = result['suggestions'][0].get('name', text)
+                return ticker, f"{text} → {ticker} ({name})"
+        except Exception as e:
+            print(f"ticker_suggestion 오류: {e}")
+
+    # 기존 미국 주식 한글 매핑 확인
     query = text.lower()
 
     exact = _KR_LOOKUP.get(query)
@@ -579,6 +604,7 @@ def resolve_ticker(user_input: str) -> tuple[str, str]:
                 best_match = (ticker, name)
                 best_len = len(name)
 
+    # yfinance 검색 (미국 주식 위주)
     try:
         import yfinance as _yf
         results = _yf.Search(text, max_results=3)
@@ -612,11 +638,15 @@ def api_get(path: str, timeout: int = 10):
         return None
 
 
-def api_post(path: str, timeout: int = 300):
+def api_post(path: str, timeout: int = 300, json_body: dict = None):
+    """API POST. json_body가 주어지면 FastAPI body 파라미터로 전달."""
     if _USE_LOCAL_ENGINE:
         return engine_dispatch_post(path)
     try:
-        resp = httpx.post(f"{AGENT_API_URL}{path}", timeout=timeout)
+        if json_body is not None:
+            resp = httpx.post(f"{AGENT_API_URL}{path}", json=json_body, timeout=timeout)
+        else:
+            resp = httpx.post(f"{AGENT_API_URL}{path}", timeout=timeout)
         resp.raise_for_status()
         return resp.json()
     except httpx.ConnectError:
@@ -693,6 +723,306 @@ def export_comprehensive_data(ticker: str, include_multi_agent: bool = True) -> 
     return export_data
 
 
+import re as _re_market
+
+# 한국 주식 코드 패턴: 6자리 숫자 (예: 072130) 또는 4자리숫자+알파벳+숫자 (예: 0126Z0)
+_KR_CODE_PATTERN = _re_market.compile(r'^(?:\d{6}|\d{4}[A-Z]\d)$')
+
+
+def _is_korean_ticker(ticker: str) -> bool:
+    """
+    한국 주식 판별. .KS/.KQ 접미사 또는 코드 패턴 기반.
+
+    유엔젤(072130.KQ) 같은 종목을 접미사 없이 072130으로 저장해도
+    정확하게 한국 주식으로 인식합니다.
+    """
+    if not ticker:
+        return False
+    t = ticker.upper().strip()
+    if t.endswith(".KS") or t.endswith(".KQ"):
+        # 접미사 제거 후 패턴 검사 (예: 072130.KQ → 072130)
+        code = t[:-3]
+        return bool(_KR_CODE_PATTERN.match(code))
+    return bool(_KR_CODE_PATTERN.match(t))
+
+
+def _confidence_label(signal: str) -> str:
+    """
+    신호 종류에 따라 적절한 신뢰도 라벨 반환.
+
+    - BUY/SELL → "신뢰도" (방향 확신도)
+    - HOLD/NEUTRAL → "관망 확신도" (중립 확신도)
+
+    '신뢰도 5.9로 HOLD'처럼 방향 신호처럼 오해되는 ambiguity 제거.
+    """
+    s = (signal or "").upper()
+    if s in ("HOLD", "NEUTRAL"):
+        return "관망 확신도"
+    return "신뢰도"
+
+
+def _render_confidence_gap_warning(single: dict, final_decision: dict):
+    """
+    Single LLM과 Multi-Agent 신뢰도 갭이 크면 해설 배너 표시.
+
+    갭 ≥ 2.0이면 "왜 차이나는지" 사용자에게 명시.
+    """
+    if not single or not final_decision:
+        return
+
+    single_sig = (single.get("final_signal") or "").upper()
+    single_conf = float(single.get("confidence") or 0)
+    multi_sig = (final_decision.get("final_signal") or "").upper()
+    multi_conf = float(final_decision.get("final_confidence") or 0)
+
+    gap = abs(single_conf - multi_conf)
+    if gap < 2.0:
+        return
+
+    # 신호도 다른 경우 추가 강조
+    same_signal = single_sig == multi_sig or (
+        single_sig in ("HOLD", "NEUTRAL") and multi_sig in ("HOLD", "NEUTRAL")
+    )
+
+    msg_parts = []
+    msg_parts.append(
+        f"**Single LLM {single_conf:.1f}/10** vs **Multi-Agent {multi_conf:.1f}/10** "
+        f"— 신뢰도 갭 **{gap:.1f}** 감지"
+    )
+    msg_parts.append("")
+    if single_sig == multi_sig:
+        msg_parts.append(f"두 시스템 모두 **{single_sig}** 방향성에 동의하나 확신도 다름:")
+    else:
+        msg_parts.append(f"신호도 차이: Single **{single_sig}** vs Multi **{multi_sig}**")
+    msg_parts.append("")
+    msg_parts.append("**원인**")
+    msg_parts.append("- **Single LLM**: 16+개 도구 점수를 LLM이 자체 통합 → 종합 점수 기반 판단")
+    msg_parts.append("- **Multi-Agent**: 7명 전문가가 각자 분석 → Decision Maker가 합의/충돌 평가 후 종합")
+    msg_parts.append("- 전문가 의견이 엇갈릴수록 Multi-Agent 신뢰도가 낮게 나오는 구조 (보수적)")
+    msg_parts.append("")
+    msg_parts.append("**권장 해석**")
+    if not same_signal:
+        msg_parts.append("- ⚠️ 신호도 다르므로 **매매 보류 권장**")
+    elif multi_conf < 3.0:
+        msg_parts.append("- ⚠️ Multi-Agent 확신도가 매우 낮음 → **전문가 의견 불일치**, 추가 관찰 권장")
+    else:
+        msg_parts.append("- ℹ️ 방향은 일치. Single LLM 점수의 강도 참고")
+
+    st.warning("\n".join(msg_parts))
+
+
+def _market_flag(ticker: str) -> str:
+    """티커에서 시장 플래그 반환 (🇰🇷 / 🇺🇸)."""
+    return "🇰🇷" if _is_korean_ticker(ticker) else "🇺🇸"
+
+
+# 주요 한국 종목 이름 폴백 맵 (pykrx/FDR 미설치 환경에서 기본 제공)
+# yfinance는 영문명을 주거나 깨진 응답을 주는 경우가 많아 한글명 보장용
+_KR_TICKER_NAME_FALLBACK = {
+    "005930": "삼성전자", "000660": "SK하이닉스", "035420": "NAVER",
+    "035720": "카카오", "051910": "LG화학", "006400": "삼성SDI",
+    "005380": "현대차", "207940": "삼성바이오로직스", "000270": "기아",
+    "068270": "셀트리온", "136480": "하림", "003380": "하림지주",
+    "012330": "현대모비스", "066570": "LG전자", "033780": "KT&G",
+    "015760": "한국전력", "105560": "KB금융", "055550": "신한지주",
+    "086790": "하나금융지주", "096770": "SK이노베이션", "034730": "SK",
+    "032830": "삼성생명", "017670": "SK텔레콤", "030200": "KT",
+    "138040": "메리츠금융지주", "251270": "넷마블", "259960": "크래프톤",
+    "018260": "삼성에스디에스", "006800": "미래에셋증권", "028260": "삼성물산",
+    "010130": "고려아연", "011200": "HMM", "009150": "삼성전기",
+    "267250": "HD현대중공업", "010950": "S-Oil", "161890": "한국콜마",
+    "047050": "포스코인터내셔널", "028050": "삼성E&A", "036570": "엔씨소프트",
+    "352820": "하이브", "0126Z0": "삼성에피스홀딩스",
+}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_ticker_display_name(ticker: str) -> str:
+    """
+    티커 → 종목명 변환. 실패 시 티커 그대로 반환.
+
+    다중 소스 폴백:
+    1. 한국 주식: pykrx → FinanceDataReader → 내장 맵 → yfinance
+    2. 미국 주식: yfinance shortName/longName
+    3. 실패 시: 티커 원본
+
+    1시간 세션 캐시로 반복 호출 최소화.
+    """
+    if not ticker:
+        return ""
+    t = ticker.upper().strip()
+
+    # 한국 주식: 종목코드 추출
+    code = None
+    if _is_korean_ticker(t):
+        if t.endswith(".KS") or t.endswith(".KQ"):
+            code = t[:-3]
+        else:
+            code = t
+
+    # ─── 한국 주식: korean_stocks_database.json 최우선 확인 ───
+    if code:
+        try:
+            import os
+            import json
+            db_file = os.path.join(os.path.dirname(__file__), 'korean_stocks_database.json')
+            if os.path.exists(db_file):
+                with open(db_file, 'r', encoding='utf-8') as f:
+                    db_data = json.load(f)
+                    stocks = db_data.get('stocks', {})
+                    if code in stocks:
+                        return stocks[code]['name']
+        except Exception:
+            pass
+
+        # ─── 한국 주식: ticker_suggestion 모듈 시도 ───
+        try:
+            from ticker_suggestion import suggest_ticker
+            result = suggest_ticker(code, max_results=1)
+            if result['found'] and result['suggestions']:
+                suggestion = result['suggestions'][0]
+                if suggestion['score'] >= 0.95:  # 95% 이상 매치만 신뢰
+                    return suggestion['name']
+        except Exception:
+            pass
+
+        # ─── 한국 주식: pykrx 시도 (빠르고 정확) ───
+        try:
+            from pykrx import stock as _krx
+            name = _krx.get_market_ticker_name(code)
+            if name and name.strip() and name != code:
+                return name.strip()
+        except Exception:
+            pass
+
+        # ─── 한국 주식: FinanceDataReader ───
+        try:
+            import FinanceDataReader as _fdr
+            krx_list = _fdr.StockListing('KRX')
+            # Symbol 또는 Code 컬럼
+            sym_col = 'Symbol' if 'Symbol' in krx_list.columns else (
+                'Code' if 'Code' in krx_list.columns else None
+            )
+            if sym_col:
+                match = krx_list[krx_list[sym_col].astype(str) == code]
+                name_col = None
+                for col in ('Name', '종목명', 'CompanyName'):
+                    if col in krx_list.columns:
+                        name_col = col
+                        break
+                if not match.empty and name_col:
+                    name = str(match.iloc[0][name_col]).strip()
+                    if name and name != code:
+                        return name
+        except Exception:
+            pass
+
+        # ─── 한국 주식: 내장 fallback 맵 (pykrx/FDR 미설치 환경 대비) ───
+        if code in _KR_TICKER_NAME_FALLBACK:
+            return _KR_TICKER_NAME_FALLBACK[code]
+
+        # ─── 한국 주식: korean_stocks 모듈 시도 ───
+        if _KOREAN_STOCKS_AVAILABLE:
+            try:
+                collector = KoreanStockData()
+                name = collector.get_stock_name(t)
+                # yfinance가 깨진 응답을 줄 수 있음 — 티커 포함이면 거부
+                if name and name != code and not _looks_broken_name(name, t, code):
+                    return name
+            except Exception:
+                pass
+
+    # ─── 미국 주식 / 폴백: yfinance ───
+    try:
+        import yfinance as yf
+        info = yf.Ticker(t).info or {}
+        # shortName이 longName보다 더 짧고 깔끔한 경우가 많음
+        for key in ('shortName', 'longName'):
+            name = info.get(key)
+            if name and not _looks_broken_name(str(name), t, code):
+                return str(name).strip()
+    except Exception:
+        pass
+
+    # 모두 실패: 티커 그대로
+    return t
+
+
+def _looks_broken_name(name: str, ticker: str, code: str = None) -> bool:
+    """yfinance가 돌려주는 깨진 응답 감지.
+
+    예: "136480.KS,0P0000T1HA,516440" 같은 ticker/ID 나열 형태.
+    """
+    if not name:
+        return True
+    name_s = name.strip()
+    # 티커나 코드가 이름에 포함되면 깨진 응답 의심
+    if ticker and ticker in name_s:
+        return True
+    if code and code in name_s:
+        return True
+    # 콤마로 구분된 3개 이상 토큰이면 ID 나열일 가능성 농후
+    if name_s.count(',') >= 2:
+        return True
+    return False
+
+
+def format_ticker_label(ticker: str, style: str = "name_with_code") -> str:
+    """
+    표시용 라벨 생성.
+
+    style:
+      "name_with_code" (기본) - "하림 (136480.KS)"
+      "name_only"             - "하림"
+      "code_only"             - "136480.KS"
+      "compact"               - "하림 · 136480.KS"
+      "flag_name"             - "🇰🇷 하림"
+      "flag_name_code"        - "🇰🇷 하библi(136480.KS)"
+    """
+    if not ticker:
+        return ""
+    name = get_ticker_display_name(ticker)
+    flag = _market_flag(ticker)
+
+    # 이름 조회 실패 시 티커만
+    if not name or name == ticker:
+        if style.startswith("flag_"):
+            return f"{flag} {ticker}"
+        return ticker
+
+    if style == "name_only":
+        return name
+    if style == "code_only":
+        return ticker
+    if style == "compact":
+        return f"{name} · {ticker}"
+    if style == "flag_name":
+        return f"{flag} {name}"
+    if style == "flag_name_code":
+        return f"{flag} {name} ({ticker})"
+    # default: name_with_code
+    return f"{name} ({ticker})"
+
+
+def _market_code(ticker: str) -> str:
+    """
+    티커에서 시장 코드 반환 (KOSPI / KOSDAQ / KR / US).
+
+    - `.KS` → KOSPI
+    - `.KQ` → KOSDAQ
+    - 접미사 없는 한국 6자리 코드 → 'KR' (KOSPI/KOSDAQ 확정 불가)
+    - 그 외 → US
+    """
+    t = (ticker or "").upper().strip()
+    if t.endswith(".KS"):
+        return "KOSPI"
+    if t.endswith(".KQ"):
+        return "KOSDAQ"
+    if _is_korean_ticker(t):
+        return "KR"
+    return "US"
+
+
 def load_watchlist() -> list[str]:
     if not os.path.exists(WATCHLIST_PATH):
         return []
@@ -711,20 +1041,46 @@ def load_watchlist() -> list[str]:
 
 
 def save_watchlist(tickers: list[str]):
-    header = "# 관심 종목 리스트 (한 줄에 하나, #은 주석)\n# 빈 줄과 주석은 무시됨\n\n"
+    header = (
+        "# 관심 종목 리스트 (SSOT: WebUI/백엔드/배치 스크립트 공용)\n"
+        "# 한 줄에 하나, #은 주석, 빈 줄은 무시됨\n"
+        "# 편집 권장 방법: WebUI 사이드바 → 관심 종목 관리\n"
+        "# 직접 편집 시 WebUI 재시작 또는 새로고침 필요\n\n"
+    )
     with open(WATCHLIST_PATH, "w", encoding="utf-8") as f:
         f.write(header)
         for t in sorted(tickers):  # 알파벳 순으로 정렬하여 저장
             f.write(f"{t}\n")
 
 
-def validate_ticker(ticker: str) -> tuple[bool, str]:
+_TICKER_VALIDATION_CACHE: Dict[str, Tuple[bool, str]] = {}
+
+
+def validate_ticker_webui(ticker: str) -> tuple[bool, str]:
     """
-    종목 코드 유효성 검증
-    Returns: (is_valid, error_message)
+    [WebUI 전용] 종목 코드 유효성 검증 - yfinance 실시간 조회 + 한글 이름 검색 포함.
+
+    참고: 백엔드 포맷 검증은 `stock_analyzer.ticker_validator.validate_ticker()`를 사용하세요.
+    이 함수는 UI 표시용 메시지를 함께 반환하기 위해 별도로 유지됩니다.
+    같은 입력에 대해서는 세션 캐시를 사용해 반복 yfinance 호출을 피합니다.
+    Returns: (is_valid, message)
     """
     ticker_input = ticker.strip()
     ticker = ticker_input.upper()
+
+    # 캐시 조회 (세션 내 반복 검증 시 UI 블로킹 방지)
+    cache_key = ticker_input
+    if cache_key in _TICKER_VALIDATION_CACHE:
+        return _TICKER_VALIDATION_CACHE[cache_key]
+
+    result = _validate_ticker_webui_impl(ticker_input, ticker)
+    # 긍정 결과만 캐싱 (부정 결과는 일시적 네트워크 장애일 수 있음)
+    if result[0]:
+        _TICKER_VALIDATION_CACHE[cache_key] = result
+    return result
+
+
+def _validate_ticker_webui_impl(ticker_input: str, ticker: str) -> tuple[bool, str]:
 
     # 기본 형식 검증
     if not ticker:
@@ -733,14 +1089,19 @@ def validate_ticker(ticker: str) -> tuple[bool, str]:
     # 한국 주식 이름 검색 (한글이 포함된 경우)
     if any(ord(char) >= 0xAC00 and ord(char) <= 0xD7A3 for char in ticker_input):
         try:
-            from korean_stocks import KoreanStockData
-            collector = KoreanStockData()
+            from ticker_suggestion import suggest_ticker
 
-            # 종목명으로 종목코드 검색
-            stock_code = collector.search_stock_by_name(ticker_input)
-            if stock_code:
-                # 검색된 종목코드로 유효성 검증 진행
-                ticker = stock_code
+            # 개선된 ticker_suggestion 사용
+            result = suggest_ticker(ticker_input)
+
+            if result['found'] and result['best_match']:
+                # 95% 이상 매치로 자동 선택된 경우
+                ticker = result['best_match']
+                print(f"✅ 종목 자동 선택: {result['suggestions'][0]['name']} ({ticker})")
+            elif result['found'] and result['suggestions']:
+                # 여러 제안이 있는 경우 첫번째 사용 (또는 UI에서 선택하게 할 수 있음)
+                ticker = result['suggestions'][0]['ticker']
+                print(f"✅ 종목 선택: {result['suggestions'][0]['name']} ({ticker})")
             else:
                 return False, f"❌ '{ticker_input}'를 찾을 수 없습니다. 정확한 종목명이나 종목코드를 입력하세요."
         except Exception as e:
@@ -762,7 +1123,8 @@ def validate_ticker(ticker: str) -> tuple[bool, str]:
             test_ticker = ticker + suffix
             try:
                 stock = yf.Ticker(test_ticker)
-                info = stock.history(period="5d")
+                # UI 블로킹 최소화를 위해 2일만 조회 (존재 여부만 확인하면 충분)
+                info = stock.history(period="2d")
 
                 if not info.empty:
                     # 종목명 가져오기
@@ -864,7 +1226,7 @@ def add_to_watchlist(ticker: str) -> tuple[bool, str]:
         return False, f"❌ 잘못된 형식: '{ticker}'"
 
     # 실제 종목 유효성 검증
-    is_valid, message = validate_ticker(ticker)
+    is_valid, message = validate_ticker_webui(ticker)
     if not is_valid:
         return False, message
 
@@ -994,17 +1356,34 @@ with st.sidebar:
 
     st.divider()
 
-    st.markdown('<div class="sidebar-section-label">Watchlist</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-section-label">Watchlist · 통합</div>', unsafe_allow_html=True)
     watchlist = load_watchlist()
 
     if watchlist:
-        wl_chips = " ".join(f'<span class="wl-chip">{t}</span>' for t in watchlist)
+        # 시장 플래그 + 종목명 (캐시됨) + 티커
+        def _wl_chip(t):
+            name = get_ticker_display_name(t)
+            flag = _market_flag(t)
+            if name and name != t:
+                return f'<span class="wl-chip" title="{t}">{flag} {name}</span>'
+            return f'<span class="wl-chip">{flag} {t}</span>'
+        wl_chips = " ".join(_wl_chip(t) for t in watchlist)
         st.markdown(f'<div style="margin-bottom:8px; line-height:2;">{wl_chips}</div>', unsafe_allow_html=True)
-        st.caption(f"{len(watchlist)} tickers")
+        kr_count = sum(1 for t in watchlist if _is_korean_ticker(t))
+        us_count = len(watchlist) - kr_count
+        st.caption(f"{len(watchlist)} tickers — 🇺🇸 {us_count} · 🇰🇷 {kr_count}")
     else:
         st.caption("No tickers in watchlist")
 
-    add_ticker = st.text_input("Add ticker", placeholder="TSLA or 테슬라", label_visibility="collapsed", key="wl_add")
+    # 카운터 기반 동적 key — Add 성공 시 key를 변경하여 입력창을 초기화
+    if "wl_add_counter" not in st.session_state:
+        st.session_state.wl_add_counter = 0
+    add_ticker = st.text_input(
+        "Add ticker",
+        placeholder="AAPL · 005930.KS · 삼성전자 — 미국/한국 구분 없이",
+        label_visibility="collapsed",
+        key=f"wl_add_{st.session_state.wl_add_counter}",
+    )
     wl_col1, wl_col2 = st.columns(2)
     if wl_col1.button("Add", use_container_width=True, key="wl_add_btn"):
         if add_ticker:
@@ -1015,6 +1394,8 @@ with st.sidebar:
                 ok, msg = add_to_watchlist(resolved)
                 if ok:
                     st.success(msg)
+                    # 새 key로 widget 재생성 → 입력창 비워짐
+                    st.session_state.wl_add_counter += 1
                     st.rerun()
                 else:
                     st.warning(msg)
@@ -1032,11 +1413,22 @@ with st.sidebar:
     if st.button("Scan All", use_container_width=True, key="scan_all_btn"):
         wl = load_watchlist()
         if wl:
+            import os as _os_scan
+            workers = int(_os_scan.getenv("SCAN_PARALLEL_WORKERS", "3"))
+            import math as _math_scan
+            est_rounds = _math_scan.ceil(len(wl) / workers)
+            # 배치 다운로드 ~15s + 병렬 LLM 라운드 × 65s 예상
+            est_sec = 15 + est_rounds * 65
+            est_min, est_s = divmod(int(est_sec), 60)
+            est_str = f"{est_min}분 {est_s}초" if est_min else f"{est_s}초"
+
             tickers_param = ",".join(wl)
-            with st.spinner(f"Scanning {len(wl)} tickers..."):
-                result = api_post(f"/scan?tickers={tickers_param}", timeout=600)
+            with st.spinner(
+                f"🔄 {len(wl)}개 종목 병렬 스캔 중 (워커 {workers}개, 예상 {est_str})..."
+            ):
+                result = api_post(f"/scan?tickers={tickers_param}", timeout=900)
                 if result:
-                    st.success(f"Done! {len(wl)} tickers scanned.")
+                    st.success(f"✅ 완료! {len(wl)}개 종목 스캔")
             st.rerun()
         else:
             st.warning("Watchlist is empty")
@@ -1057,39 +1449,27 @@ with st.sidebar:
 
     st.divider()
 
-    page = st.radio("Navigation", ["Home", "Dashboard", "Detail", "Multi-Agent", "Scan Log", "Backtest", "ML Predict", "Portfolio", "Ranking", "Paper Trade", "History"], label_visibility="collapsed")
+    page = st.radio("Navigation", ["Home", "Dashboard", "Detail", "Multi-Agent", "Scan Log", "Signal Accuracy", "Screener", "Trading", "Virtual Trade", "Backtest", "ML Predict", "Portfolio", "Ranking", "Paper Trade", "History"], label_visibility="collapsed")
 
 
 # ═══════════════════════════════════════════════════════════════
 #  홈 페이지
 # ═══════════════════════════════════════════════════════════════
 
+
 def render_home():
+    """통합 홈 페이지 — 미국/한국 시장 구분 없이 한 화면에서 관리."""
     st.markdown("""
     <div class="page-header">
         <div class="page-title">Stock AI</div>
-        <div class="page-subtitle">AI-Powered Multi-Tool Stock Analysis Terminal</div>
+        <div class="page-subtitle">AI-Powered Multi-Tool Stock Analysis Terminal · 미국/한국 통합</div>
     </div>
     """, unsafe_allow_html=True)
 
-    # 시장 선택 탭
-    if _KOREAN_STOCKS_AVAILABLE:
-        tab1, tab2 = st.tabs(["🇺🇸 US Market", "🇰🇷 Korean Market"])
-
-        with tab1:
-            render_us_market_home()
-
-        with tab2:
-            render_korean_market_home()
-    else:
-        # 한국 주식 모듈 없으면 미국만
-        render_us_market_home()
-
-
-def render_us_market_home():
-    """미국 주식 홈 페이지"""
+    # ── 1. 시장 지수 바 (S&P/NASDAQ/DOW/KOSPI/KOSDAQ/원달러/상품) ──
     render_market_ticker_bar()
 
+    # ── 2. 분석 요약 (시장 구분 없이 전체) ──
     data = api_get("/results")
     results = data.get("results", {}) if data else {}
     total = len(results)
@@ -1097,12 +1477,19 @@ def render_us_market_home():
     sell_count = sum(1 for r in results.values() if r.get("signal") == "SELL")
     hold_count = sum(1 for r in results.values() if r.get("signal") == "HOLD")
 
-    m1, m2, m3, m4 = st.columns(4)
+    # 시장별 세부 카운트
+    us_results = {k: v for k, v in results.items() if not _is_korean_ticker(k)}
+    kr_results = {k: v for k, v in results.items() if _is_korean_ticker(k)}
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Total", str(total))
     m2.metric("Buy", str(buy_count))
     m3.metric("Sell", str(sell_count))
     m4.metric("Hold", str(hold_count))
+    m5.metric("🇺🇸 US", str(len(us_results)))
+    m6.metric("🇰🇷 KR", str(len(kr_results)))
 
+    # ── 3. 시스템 상태 ──
     health = api_get("/health")
     info = api_get("/")
     watchlist = load_watchlist()
@@ -1129,51 +1516,140 @@ def render_us_market_home():
     else:
         s4.metric("Model", "—")
 
+    # ── 4. 통합 Watchlist (시장 플래그 포함) ──
     st.markdown("""
     <div class="section-header">
-        <div class="section-title">Watchlist</div>
+        <div class="section-title">Watchlist · 통합</div>
     </div>
     """, unsafe_allow_html=True)
 
     if watchlist:
-        wl_chips = " ".join(f'<span class="wl-chip">{t}</span>' for t in watchlist)
-        st.markdown(f'<div style="line-height:2.2;">{wl_chips}</div>', unsafe_allow_html=True)
-    else:
-        st.caption("No tickers in watchlist. Add tickers from the sidebar.")
+        # 필터: 전체 / 🇺🇸 US / 🇰🇷 KR
+        filter_col, add_col = st.columns([1, 2])
+        with filter_col:
+            market_filter = st.radio(
+                "시장 필터",
+                ["전체", "🇺🇸 US", "🇰🇷 KR"],
+                horizontal=True,
+                label_visibility="collapsed",
+                key="home_market_filter",
+            )
+        with add_col:
+            # 동적 key로 추가 성공 시 입력창 비우기
+            if "home_quick_add_counter" not in st.session_state:
+                st.session_state.home_quick_add_counter = 0
+            new_tk = st.text_input(
+                "빠른 종목 추가",
+                placeholder="AAPL, 005930.KS, 삼성전자 — 미국/한국 구분 없이 입력",
+                key=f"home_quick_add_{st.session_state.home_quick_add_counter}",
+                label_visibility="collapsed",
+            )
+            if new_tk and st.button("➕ Watchlist 추가", key="home_add_btn"):
+                ok, msg = add_to_watchlist(new_tk)
+                if ok:
+                    st.success(msg)
+                    # 새 key로 widget 재생성 → 입력창 초기화
+                    st.session_state.home_quick_add_counter += 1
+                    st.rerun()
+                else:
+                    st.error(msg)
 
+        # watchlist 필터링
+        if market_filter == "🇺🇸 US":
+            filtered = [t for t in watchlist if not _is_korean_ticker(t)]
+        elif market_filter == "🇰🇷 KR":
+            filtered = [t for t in watchlist if _is_korean_ticker(t)]
+        else:
+            filtered = watchlist
+
+        if filtered:
+            def _home_chip(t):
+                name = get_ticker_display_name(t)
+                flag = _market_flag(t)
+                if name and name != t:
+                    # tooltip으로 티커 노출
+                    return f'<span class="wl-chip" title="{t}">{flag} {name}</span>'
+                return f'<span class="wl-chip">{flag} {t}</span>'
+            wl_chips = " ".join(_home_chip(t) for t in filtered)
+            st.markdown(f'<div style="line-height:2.2;">{wl_chips}</div>', unsafe_allow_html=True)
+            st.caption(f"표시 {len(filtered)}개 / 전체 {len(watchlist)}개")
+        else:
+            st.caption(f"'{market_filter}' 필터에 해당하는 종목 없음")
+    else:
+        st.caption("No tickers in watchlist. Add tickers from the sidebar or above.")
+
+    # ── 5. 최신 신호 (시장 통합 테이블) ──
     if results:
         st.markdown("""
         <div class="section-header">
-            <div class="section-title">Latest Signals</div>
+            <div class="section-title">Latest Signals · 통합</div>
         </div>
         """, unsafe_allow_html=True)
 
+        # 시장 필터 옵션
+        sig_filter = st.radio(
+            "신호 필터",
+            ["전체", "🇺🇸 US", "🇰🇷 KR", "BUY만", "SELL만"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="home_sig_filter",
+        )
+
         rows = []
         for ticker, r in sorted(results.items(), key=lambda x: abs(x[1].get("score", 0)), reverse=True):
+            flag = _market_flag(ticker)
+            market_code = _market_code(ticker)
+            signal = r.get("signal", "?")
+
+            # 필터 적용
+            if sig_filter == "🇺🇸 US" and flag != "🇺🇸":
+                continue
+            if sig_filter == "🇰🇷 KR" and flag != "🇰🇷":
+                continue
+            if sig_filter == "BUY만" and signal != "BUY":
+                continue
+            if sig_filter == "SELL만" and signal != "SELL":
+                continue
+
+            # 종목명 조회 (캐시됨)
+            display_name = get_ticker_display_name(ticker)
+            name_cell = display_name if display_name and display_name != ticker else "—"
+
             rows.append({
+                "Market": f"{flag} {market_code}",
+                "Name": name_cell,
                 "Ticker": ticker,
-                "Signal": r.get("signal", "?"),
+                "Signal": signal,
                 "Score": r.get("score", 0),
                 "Confidence": r.get("confidence", 0),
                 "Time": str(r.get("analyzed_at", ""))[:16],
             })
-        df = pd.DataFrame(rows)
-        st.dataframe(
-            df.style.map(
-                lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
-                subset=["Signal"],
-            ),
-            use_container_width=True, hide_index=True,
-        )
+
+        if rows:
+            df = pd.DataFrame(rows)
+            st.dataframe(
+                df.style.map(
+                    lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+                    subset=["Signal"],
+                ),
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.caption(f"'{sig_filter}'에 해당하는 신호 없음")
+
+    # ── 6. 한국 시장 고유 기능 (접이식) ──
+    if _KOREAN_STOCKS_AVAILABLE:
+        with st.expander("🇰🇷 한국 주식 심화 도구 (매매동향 · DART 공시 · 즐겨찾기)", expanded=False):
+            render_korean_tools_panel()
 
 
-def render_korean_market_home():
-    """한국 주식 홈 페이지"""
+def render_korean_tools_panel():
+    """한국 주식 전용 도구 (통합 홈의 접이식 섹션)."""
     if not _KOREAN_STOCKS_AVAILABLE:
         st.warning("한국 주식 모듈을 사용할 수 없습니다.")
         return
 
-    # KOSPI/KOSDAQ 지수 표시
+    # KOSPI/KOSDAQ 지수
     try:
         indices = get_kr_indices()
         kospi = indices.get('kospi', {})
@@ -1181,289 +1657,143 @@ def render_korean_market_home():
 
         if kospi or kosdaq:
             col1, col2 = st.columns(2)
-
             if kospi:
                 with col1:
                     change_pct = kospi.get('change_pct', 0)
-                    color = "🟢" if change_pct > 0 else "🔴" if change_pct < 0 else "⚪"
                     st.metric(
                         "KOSPI",
                         f"{kospi.get('current', 0):,.2f}",
                         f"{change_pct:+.2f}%",
-                        delta_color="normal" if change_pct >= 0 else "inverse"
+                        delta_color="normal" if change_pct >= 0 else "inverse",
                     )
-
             if kosdaq:
                 with col2:
                     change_pct = kosdaq.get('change_pct', 0)
-                    color = "🟢" if change_pct > 0 else "🔴" if change_pct < 0 else "⚪"
                     st.metric(
                         "KOSDAQ",
                         f"{kosdaq.get('current', 0):,.2f}",
                         f"{change_pct:+.2f}%",
-                        delta_color="normal" if change_pct >= 0 else "inverse"
+                        delta_color="normal" if change_pct >= 0 else "inverse",
                     )
     except Exception as e:
-        st.error(f"지수 데이터 로드 실패: {e}")
+        st.caption(f"지수 로드 실패: {e}")
 
-    st.markdown("""
-    <div class="section-header">
-        <div class="section-title">즐겨찾기</div>
-    </div>
-    """, unsafe_allow_html=True)
+    # Watchlist의 한국 종목만 사용 (SSOT) — 별도 즐겨찾기 파일 사용하지 않음
+    watchlist = load_watchlist()
+    kr_tickers = [t for t in watchlist if _is_korean_ticker(t)]
 
-    # 즐겨찾기에서 종목 가져오기
-    try:
-        collector = KoreanStockData()
-        favorite_stocks = collector.get_favorites()
+    if not kr_tickers:
+        st.info(
+            "📭 Watchlist에 한국 종목이 없습니다.\n\n"
+            "사이드바 또는 홈 페이지의 Watchlist에 한국 종목 추가 시 여기에 자동 표시됩니다.\n\n"
+            "입력 예시: `136480.KS` (하림), `005930.KS` (삼성전자), `하림` (한글명)"
+        )
+        return
 
-        if not favorite_stocks:
-            st.info("즐겨찾기가 비어있습니다. 아래 방법으로 종목을 추가하세요:\n\n"
-                   "```python\n"
-                   "from stock_analyzer.korean_stocks import KoreanStockData\n"
-                   "collector = KoreanStockData()\n"
-                   "collector.add_favorite('종목코드', '종목명')\n"
-                   "```")
+    # ticker → (code, name) 변환 헬퍼
+    def _to_code_name(ticker):
+        """Watchlist 티커에서 (순수코드, 종목명) 반환."""
+        t = ticker.upper()
+        if t.endswith('.KS') or t.endswith('.KQ'):
+            code = t[:-3]
         else:
-            # 즐겨찾기 종목을 리스트로 변환
-            favorite_list = [(code, name) for code, name in favorite_stocks.items()]
+            code = t
+        name = get_ticker_display_name(ticker)
+        if not name or name == ticker:
+            name = code
+        return code, name
 
-            cols = st.columns(3)
-            for idx, (code, name) in enumerate(favorite_list):
-                with cols[idx % 3]:
-                    try:
-                        ticker = f"{code}.KS"
-                        stock = yf.Ticker(ticker)
-                        hist = stock.history(period='5d')
+    # 한국 종목 (code, name, ticker) 리스트
+    kr_items = [(_to_code_name(t), t) for t in kr_tickers]
+    # kr_items = [((code, name), full_ticker), ...]
 
-                        if not hist.empty:
-                            current = hist['Close'].iloc[-1]
-                            prev = hist['Close'].iloc[-2] if len(hist) > 1 else current
-                            change = current - prev
-                            change_pct = (change / prev) * 100 if prev else 0
-
-                            st.metric(
-                                f"{name} ({code})",
-                                f"₩{current:,.0f}",
-                                f"{change_pct:+.2f}%",
-                                delta_color="normal" if change_pct >= 0 else "inverse"
-                            )
-                        else:
-                            st.metric(f"{name} ({code})", "데이터 없음", "—")
-                    except Exception as e:
-                        st.metric(f"{name} ({code})", "로드 실패", "—")
-    except Exception as e:
-        st.error(f"즐겨찾기 로드 실패: {e}")
-
-    st.markdown("""
-    <div class="section-header">
-        <div class="section-title">시스템 현황</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.info("""
-    ### 🇰🇷 한국 주식 분석 시스템 (베타)
-
-    **현재 지원 기능:**
-    - KOSPI/KOSDAQ 주요 종목 데이터 조회
-    - Yahoo Finance .KS/.KQ 티커 지원
-    - 기본 기술적 분석
-
-    **개발 예정 기능:**
-    - 외국인/기관/개인 매매 동향 분석
-    - DART 전자공시 연동
-    - 한국어 뉴스 감성 분석
-    - 테마주 연동 분석
-
-    **사용 방법:**
-    - Sidebar에서 한국 주식 코드 입력 (예: 005930)
-    - 또는 .KS 티커 형식 사용 (예: 005930.KS)
-    """)
-
-    # 종목 검색
-    st.markdown("""
-    <div class="section-header">
-        <div class="section-title">종목 검색</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    search_query = st.text_input("종목코드 또는 종목명 입력", placeholder="예: 삼성전자, 005930")
-
-    if search_query:
-        try:
-            collector = KoreanStockData()
-            results = collector.search_stock(search_query)
-
-            if results:
-                st.write(f"검색 결과: {len(results)}개")
-                for r in results:
-                    st.markdown(f"- **{r['name']}** ({r['code']}) - {r['market']}")
-            else:
-                st.warning("검색 결과가 없습니다.")
-        except Exception as e:
-            st.error(f"검색 실패: {e}")
-
-    # Phase 2: 외국인/기관 매매 동향
-    st.markdown("""
-    <div class="section-header">
-        <div class="section-title">투자자별 매매 동향 (Phase 2)</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.info("**pykrx 라이브러리를 통해 외국인/기관/개인 매매 데이터를 수집합니다.**")
-
-    # 즐겨찾기에서 종목 가져오기
-    try:
-        collector = KoreanStockData()
-        favorites = collector.get_favorites()
-
-        if not favorites:
-            st.warning("즐겨찾기가 비어있습니다. 직접 종목코드를 입력하세요.")
-            sample_ticker = st.text_input("종목코드 입력", placeholder="예: 005930", key="institutional_sample")
-        else:
-            ticker_options = [f"{code} ({name})" for code, name in favorites.items()]
-            sample_ticker = st.selectbox(
-                "종목 선택",
-                ticker_options,
-                key="institutional_sample"
-            )
-    except:
-        sample_ticker = st.text_input("종목코드 입력", placeholder="예: 005930", key="institutional_sample")
-
-    if st.button("📊 매매동향 조회", key="fetch_institutional"):
-        ticker_code = sample_ticker.split()[0]
-
-        with st.spinner(f"{ticker_code} 매매동향 조회 중..."):
+    # ── Watchlist 한국 종목 현재가 카드 ──
+    st.markdown(f"**📌 Watchlist 한국 종목** ({len(kr_tickers)}개)")
+    cols = st.columns(3)
+    for idx, ((code, name), ticker) in enumerate(kr_items):
+        with cols[idx % 3]:
             try:
-                collector = KoreanStockData()
-                trading_data = collector.fetch_institutional_trading(ticker_code, days=5)
-
-                # Debug output
-                st.info(f"Debug: trading_data type={type(trading_data)}, has_summary={'summary' in trading_data if trading_data else False}")
-
-                if trading_data and 'summary' in trading_data:
-                    try:
-                        st.success(f"✅ 데이터 수집 완료: {trading_data.get('period', 'N/A')}")
-
-                        # 요약 데이터
-                        summary = trading_data['summary']
-
-                        col1, col2, col3 = st.columns(3)
-
-                        with col1:
-                            foreign_net = summary.get('foreign_net', 0)
-                            st.metric(
-                                "외국인 순매수",
-                                f"{foreign_net:,}주",
-                                delta_color="normal" if foreign_net >= 0 else "inverse"
-                            )
-
-                        with col2:
-                            inst_net = summary.get('institution_net', 0)
-                            st.metric(
-                                "기관 순매수",
-                                f"{inst_net:,}주",
-                                delta_color="normal" if inst_net >= 0 else "inverse"
-                            )
-
-                        with col3:
-                            indiv_net = summary.get('individual_net', 0)
-                            st.metric(
-                                "개인 순매수",
-                                f"{indiv_net:,}주",
-                                delta_color="normal" if indiv_net >= 0 else "inverse"
-                            )
-
-                        # 일별 데이터 테이블
-                        if 'daily' in trading_data and trading_data['daily']:
-                            st.markdown("**일별 매매 동향:**")
-
-                            daily_rows = []
-                            for day in trading_data['daily']:
-                                daily_rows.append({
-                                    "날짜": day['date'],
-                                    "외국인": f"{day['foreign']['net']:,}",
-                                    "기관": f"{day['institution']['net']:,}",
-                                    "개인": f"{day['individual']['net']:,}"
-                                })
-
-                            df_daily = pd.DataFrame(daily_rows)
-                            st.dataframe(df_daily, use_container_width=True, hide_index=True)
-                    except Exception as inner_e:
-                        st.error(f"데이터 표시 중 오류: {inner_e}")
-                        import traceback
-                        st.code(traceback.format_exc())
-
+                stock = yf.Ticker(ticker)
+                hist = stock.history(period='5d')
+                if not hist.empty:
+                    current = hist['Close'].iloc[-1]
+                    prev = hist['Close'].iloc[-2] if len(hist) > 1 else current
+                    change_pct = ((current / prev) - 1) * 100 if prev else 0
+                    st.metric(
+                        f"{name} ({code})",
+                        f"₩{current:,.0f}",
+                        f"{change_pct:+.2f}%",
+                        delta_color="normal" if change_pct >= 0 else "inverse",
+                    )
                 else:
-                    st.warning("매매 동향 데이터를 가져올 수 없습니다. 종목코드를 확인하거나 다른 종목을 시도해보세요.")
+                    st.metric(f"{name} ({code})", "데이터 없음", "—")
+            except Exception:
+                st.metric(f"{name} ({code})", "로드 실패", "—")
 
-            except Exception as e:
-                st.error(f"매매 동향 조회 실패: {e}")
+    # ── 투자자별 매매 동향 — Watchlist 한국 종목에서만 선택 ──
+    st.markdown("**📊 투자자별 매매 동향** (외국인 · 기관 · 개인)")
+    try:
+        ticker_options = [f"{code} ({name})" for (code, name), _ in kr_items]
+        sample_ticker = st.selectbox(
+            "종목 선택 (Watchlist의 한국 종목)",
+            ticker_options,
+            key="home_kr_inst_select",
+        )
 
-    # Phase 3: DART 공시
-    st.markdown("""
-    <div class="section-header">
-        <div class="section-title">최근 공시 (Phase 3 - DART API)</div>
-    </div>
-    """, unsafe_allow_html=True)
+        if st.button("📊 매매동향 조회", key="home_kr_inst_btn"):
+            ticker_code = sample_ticker.split()[0] if sample_ticker else ""
+            if ticker_code:
+                with st.spinner(f"{ticker_code} 매매동향 조회 중..."):
+                    collector = KoreanStockData()
+                    trading_data = collector.fetch_institutional_trading(ticker_code, days=5)
+                    if trading_data and 'summary' in trading_data:
+                        summary = trading_data['summary']
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("외국인 순매수", f"{summary.get('foreign_net', 0):,}주")
+                        c2.metric("기관 순매수", f"{summary.get('institution_net', 0):,}주")
+                        c3.metric("개인 순매수", f"{summary.get('individual_net', 0):,}주")
+                    else:
+                        st.caption("데이터 없음")
+    except Exception as e:
+        st.caption(f"매매동향 조회 실패: {e}")
 
+    # ── DART 공시 — Watchlist 한국 종목에서만 선택 ──
+    st.markdown("**📄 DART 공시**")
     try:
         from dart_api import DARTClient
-
         dart_client = DARTClient()
-
         if dart_client.is_configured():
-            st.success("✅ DART API Key 설정됨")
-
-            # 즐겨찾기에서 종목 가져오기
-            try:
-                collector = KoreanStockData()
-                favorites = collector.get_favorites()
-
-                if not favorites:
-                    st.warning("즐겨찾기가 비어있습니다. 직접 종목코드를 입력하세요.")
-                    disclosure_ticker = st.text_input("종목코드 입력", placeholder="예: 005930", key="dart_sample")
-                else:
-                    ticker_options = [f"{code} ({name})" for code, name in favorites.items()]
-                    disclosure_ticker = st.selectbox(
-                        "공시 조회 종목",
-                        ticker_options,
-                        key="dart_sample"
-                    )
-            except:
-                disclosure_ticker = st.text_input("종목코드 입력", placeholder="예: 005930", key="dart_sample")
-
-            if st.button("📄 최근 공시 조회", key="fetch_disclosures"):
-                ticker_code = disclosure_ticker.split()[0]
-
+            ticker_options = [f"{code} ({name})" for (code, name), _ in kr_items]
+            disclosure_ticker = st.selectbox(
+                "공시 조회 종목 (Watchlist의 한국 종목)",
+                ticker_options,
+                key="home_kr_dart_select",
+            )
+            if st.button("📄 최근 공시 조회", key="home_kr_dart_btn"):
+                ticker_code = disclosure_ticker.split()[0] if disclosure_ticker else ""
                 with st.spinner(f"{ticker_code} 공시 조회 중..."):
                     disclosures = dart_client.fetch_recent_disclosures(ticker_code, days=30)
-
                     if disclosures:
                         st.write(f"최근 30일 공시: {len(disclosures)}건")
-
                         for d in disclosures[:10]:
                             with st.expander(f"{d['date']}: {d['title'][:60]}..."):
                                 st.markdown(f"**보고서 유형**: {d.get('report_type', 'N/A')}")
                                 st.markdown(f"**링크**: {d.get('url', 'N/A')}")
                     else:
-                        st.warning("공시 데이터가 없습니다.")
-
+                        st.caption("공시 데이터 없음")
         else:
-            st.warning("⚠️ DART API Key가 설정되지 않았습니다.")
-            st.info("""
-            **DART API Key 설정 방법:**
-            1. https://opendart.fss.or.kr/ 에서 무료 회원가입
-            2. API Key 발급 (즉시 발급)
-            3. `/home/ubuntu/stock_auto/stock_analyzer/.env` 파일에 추가:
-               ```
-               DART_API_KEY=your_api_key_here
-               ```
-            4. 상세 가이드: DART_API_SETUP.md 참조
-            """)
-
+            st.caption("⚠️ DART_API_KEY 미설정 — opendart.fss.or.kr에서 무료 발급")
     except ImportError:
-        st.warning("DART API 모듈을 불러올 수 없습니다.")
+        st.caption("DART API 모듈 로드 실패")
+
+
+def _deprecated_render_korean_market_home():
+    """[Deprecated] 통합 홈과 render_korean_tools_panel()로 대체됨.
+
+    내부 코드는 한국 전용 즐겨찾기 파일을 직접 참조해 SSOT(Watchlist) 원칙을
+    위반했기 때문에 제거됨. 라우팅에서 호출되지 않으며 호환성을 위해 이름만 유지.
+    """
+    pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1572,11 +1902,33 @@ def render_dashboard():
     if analysis_ts:
         st.markdown(f'<div class="ts-meta">{analysis_ts}</div>', unsafe_allow_html=True)
 
+    # 통합 시장 필터 (미국/한국 구분 없이 한 테이블에 표시하되 필터로 선택 가능)
+    dashboard_filter = st.radio(
+        "시장 필터",
+        ["전체", "🇺🇸 US", "🇰🇷 KR"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="dashboard_market_filter",
+    )
+
     rows = []
     # Fix: API returns 'composite_score', not 'score'
     for ticker, r in sorted(results.items(), key=lambda x: x[1].get("composite_score", x[1].get("score", 0)), reverse=True):
+        flag = _market_flag(ticker)
+        market_code = _market_code(ticker)
+
+        # 시장 필터 적용
+        if dashboard_filter == "🇺🇸 US" and flag != "🇺🇸":
+            continue
+        if dashboard_filter == "🇰🇷 KR" and flag != "🇰🇷":
+            continue
+
         dist = r.get("signal_distribution", {})
+        display_name = get_ticker_display_name(ticker)
+        name_cell = display_name if display_name and display_name != ticker else "—"
         rows.append({
+            "market": f"{flag} {market_code}",
+            "name": name_cell,
             "ticker": ticker,
             "signal": r.get("signal", "?"),
             "score": r.get("composite_score", r.get("score", 0)),  # Try composite_score first
@@ -1831,7 +2183,35 @@ def _fmt_num(v, decimals=2):
     return f"{v:,.{decimals}f}"
 
 
-def _render_tool_detail_card(td: dict):
+def _is_korean_stock(ticker: str) -> bool:
+    """한국 주식 여부 판단 (.KS/.KQ 또는 6자리 숫자 코드)"""
+    if not ticker:
+        return False
+    ticker_upper = ticker.upper()
+    return ticker_upper.endswith(('.KS', '.KQ')) or (ticker_upper.isdigit() and len(ticker_upper) == 6)
+
+
+def _get_currency_symbol(ticker: str) -> str:
+    """티커에 맞는 통화 기호 반환 (₩ 또는 $)"""
+    return "₩" if _is_korean_stock(ticker) else "$"
+
+
+def _fmt_price(price, ticker: str, decimals: int = None) -> str:
+    """가격을 통화 기호와 함께 포맷 (한국: ₩, 미국: $)"""
+    if price is None:
+        return "—"
+    if isinstance(price, str):
+        return price
+
+    currency = _get_currency_symbol(ticker)
+    # 한국 주식은 소수점 없이, 미국 주식은 소수점 2자리
+    if decimals is None:
+        decimals = 0 if _is_korean_stock(ticker) else 2
+
+    return f"{currency}{price:,.{decimals}f}"
+
+
+def _render_tool_detail_card(td: dict, ticker: str = ""):
     tool_name = td.get("tool", "")
     name = td.get("name", tool_name)
     sig = td.get("signal", "neutral")
@@ -1902,18 +2282,18 @@ def _render_tool_detail_card(td: dict):
     elif tool_name == "fibonacci_retracement_analysis":
         levels = td.get("levels", {})
         if levels:
-            level_data = {f"Fib {k}": f"${_fmt_num(v)}" for k, v in levels.items()}
+            level_data = {f"Fib {k}": _fmt_price(v, ticker) for k, v in levels.items()}
             cols = st.columns(min(len(level_data), 4))
             for col, (label, val) in zip(cols, list(level_data.items())[:4]):
                 col.metric(label, val)
         c1, c2, c3 = st.columns(3)
         c1.metric("Retracement", _fmt_num(td.get("current_retracement"), 1))
-        c2.metric("Nearest Support", f"${_fmt_num(td.get('nearest_support'))}")
-        c3.metric("Nearest Resistance", f"${_fmt_num(td.get('nearest_resistance'))}")
+        c2.metric("Nearest Support", _fmt_price(td.get('nearest_support'), ticker))
+        c3.metric("Nearest Resistance", _fmt_price(td.get('nearest_resistance'), ticker))
 
     elif tool_name == "volatility_regime_analysis":
         c1, c2, c3 = st.columns(3)
-        c1.metric("ATR", f"${_fmt_num(td.get('current_atr'))}")
+        c1.metric("ATR", _fmt_price(td.get('current_atr'), ticker))
         c2.metric("ATR %", f"{_fmt_num(td.get('atr_pct'), 1)}%")
         c3.metric("Regime", str(td.get("regime", "—")).title())
         c4, c5 = st.columns(2)
@@ -1943,7 +2323,7 @@ def _render_tool_detail_card(td: dict):
 
     elif tool_name == "support_resistance_analysis":
         c1, c2, c3 = st.columns(3)
-        c1.metric("Pivot", f"${_fmt_num(td.get('pivot'))}")
+        c1.metric("Pivot", _fmt_price(td.get('pivot'), ticker))
         c2.metric("Upside %", f"{_fmt_num(td.get('upside_pct'), 1)}%")
         c3.metric("Downside %", f"{_fmt_num(td.get('downside_pct'), 1)}%")
         resistance = td.get("resistance", {})
@@ -1951,11 +2331,11 @@ def _render_tool_detail_card(td: dict):
         if resistance:
             cols = st.columns(len(resistance))
             for col, (level, val) in zip(cols, resistance.items()):
-                col.metric(f"R{level}", f"${_fmt_num(val)}")
+                col.metric(f"R{level}", _fmt_price(val, ticker))
         if support:
             cols = st.columns(len(support))
             for col, (level, val) in zip(cols, support.items()):
-                col.metric(f"S{level}", f"${_fmt_num(val)}")
+                col.metric(f"S{level}", _fmt_price(val, ticker))
         rr = td.get("risk_reward_ratio")
         if rr is not None:
             st.metric("Risk/Reward Ratio", _fmt_num(rr))
@@ -2084,7 +2464,7 @@ def render_detail():
 
         for td in tool_details:
             with st.expander(f"**{td.get('name', td.get('tool', '?'))}** — {td.get('signal', '?').upper()} ({td.get('score', 0):+.1f})", expanded=False):
-                _render_tool_detail_card(td)
+                _render_tool_detail_card(td, selected)
 
     st.markdown("""
     <div class="section-header">
@@ -2427,9 +2807,14 @@ def render_ml_predict():
         st.info("No tickers available.")
         return
 
-    ticker = st.selectbox("Select Ticker", tickers, key="ml_ticker")
+    # 티커 선택 드롭다운 (종목명 표시)
+    ticker_options = {ticker: f"{get_ticker_display_name(ticker)} ({ticker})" for ticker in tickers}
+    selected_display = st.selectbox("Select Ticker", list(ticker_options.values()), key="ml_ticker")
+    ticker = [k for k, v in ticker_options.items() if v == selected_display][0]
+
     if st.button("Run ML Prediction", type="primary"):
-        with st.spinner(f"Training model for {ticker}..."):
+        ticker_name = get_ticker_display_name(ticker)
+        with st.spinner(f"Training model for {ticker_name}..."):
             ml = api_get(f"/ml/{ticker}", timeout=120)
         if not ml:
             st.error("ML prediction failed")
@@ -2437,7 +2822,7 @@ def render_ml_predict():
 
         st.markdown(f"""
         <div class="section-header">
-            <div class="section-title">{ticker} — {ml.get('best_prediction', '?')}</div>
+            <div class="section-title">{ticker_name} ({ticker}) — {ml.get('best_prediction', '?')}</div>
             <div class="section-subtitle">Best model: {ml.get('best_model', '?').upper()}, Accuracy: {ml.get('best_accuracy', 0):.1%}</div>
         </div>
         """, unsafe_allow_html=True)
@@ -2672,9 +3057,9 @@ def render_paper_trade():
             pos_rows.append({
                 "Ticker": t,
                 "Qty": p.get("qty", 0),
-                "Entry": f"${p.get('entry_price', 0):.2f}",
-                "Current": f"${p.get('current_price', 0):.2f}",
-                "P&L": f"${p.get('pnl', 0):+.2f}",
+                "Entry": _fmt_price(p.get('entry_price', 0), t),
+                "Current": _fmt_price(p.get('current_price', 0), t),
+                "P&L": _fmt_price(p.get('pnl', 0), t),
                 "P&L %": f"{p.get('pnl_pct', 0):+.2f}%",
                 "Entry Date": str(p.get("entry_date", ""))[:10],
             })
@@ -2685,12 +3070,13 @@ def render_paper_trade():
         st.markdown("**Recent Closed Trades**")
         trade_rows = []
         for t in reversed(recent):
+            ticker = t.get("ticker", "?")
             trade_rows.append({
-                "Ticker": t.get("ticker", "?"),
-                "Entry": f"${t.get('entry_price', 0):.2f}",
-                "Exit": f"${t.get('exit_price', 0):.2f}",
+                "Ticker": ticker,
+                "Entry": _fmt_price(t.get('entry_price', 0), ticker),
+                "Exit": _fmt_price(t.get('exit_price', 0), ticker),
                 "Qty": t.get("qty", 0),
-                "P&L": f"${t.get('pnl', 0):+.2f}",
+                "P&L": _fmt_price(t.get('pnl', 0), ticker),
                 "Return %": f"{t.get('pnl_pct', 0):+.2f}%",
                 "Reason": t.get("reason", ""),
             })
@@ -2749,7 +3135,7 @@ def render_multi_agent():
     st.markdown("""
     <div class="page-header">
         <div class="page-title">🤖 Multi-Agent Analysis</div>
-        <div class="page-subtitle">6개 전문 AI 에이전트 협업 분석 (V2.0)</div>
+        <div class="page-subtitle">8개 전문 AI 에이전트 협업 분석 (V2.0 Enhanced)</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -2770,11 +3156,24 @@ def render_multi_agent():
         if input_method == "Watchlist에서 선택":
             if not watchlist:
                 st.warning("Watchlist가 비어있습니다. 직접 입력을 선택하거나 사이드바에서 종목을 추가하세요.")
-                ticker = st.text_input("종목 코드 입력", placeholder="예: AAPL, TSLA, MSFT", label_visibility="collapsed")
+                ticker = st.text_input(
+                    "종목 코드 입력",
+                    placeholder="예: AAPL, 삼성전자, 005930.KS, 네이버",
+                    label_visibility="collapsed",
+                )
             else:
-                ticker = st.selectbox("분석할 종목 선택", watchlist, label_visibility="collapsed")
+                # 종목명과 함께 표시
+                ticker_options = {t: f"{get_ticker_display_name(t)} ({t})" for t in watchlist}
+                selected_display = st.selectbox("분석할 종목 선택", list(ticker_options.values()), label_visibility="collapsed")
+                ticker = [k for k, v in ticker_options.items() if v == selected_display][0]
         else:
-            ticker = st.text_input("종목 코드 입력", placeholder="예: AAPL, TSLA, MSFT", label_visibility="collapsed").upper()
+            # 한글 종목명 입력을 지원하기 위해 .upper()는 영문/숫자 입력일 때만 적용
+            ticker_raw = st.text_input(
+                "종목 코드 입력",
+                placeholder="예: AAPL, 삼성전자, 005930.KS, 네이버",
+                label_visibility="collapsed",
+            )
+            ticker = ticker_raw.upper() if ticker_raw and ticker_raw.isascii() else ticker_raw
 
     with col2:
         analyze_btn = st.button("🤖 Multi-Agent 분석", use_container_width=True, type="primary", disabled=not ticker)
@@ -2791,9 +3190,29 @@ def render_multi_agent():
     # 분석 실행
     if analyze_btn:
         # 종목 코드 유효성 검증
-        is_valid, validation_message = validate_ticker(ticker)
+        is_valid, validation_message = validate_ticker_webui(ticker)
         if not is_valid:
             st.error(validation_message)
+            # 검증 실패 시 유사 종목 자동 추천 (UX 개선)
+            try:
+                from stock_analyzer.ticker_suggestion import suggest_ticker as _suggest
+                sug = _suggest(ticker, max_results=8)
+                if sug.get('found') and sug.get('suggestions'):
+                    # WebUI는 편의성 우선: 0.80 이상이면 자동 교정 제안
+                    top = sug['suggestions'][0]
+                    if top['score'] >= 0.80:
+                        st.info(
+                            f"💡 혹시 이 종목을 찾으시나요? **{top['name']} ({top['ticker']})** "
+                            f"(매치율 {top['score']*100:.0f}%)"
+                        )
+                    with st.expander(f"🔍 유사 종목 {len(sug['suggestions'])}개 추천", expanded=True):
+                        for s in sug['suggestions']:
+                            score = int(s['score'] * 100)
+                            st.markdown(
+                                f"- **{s['name']}** (`{s['ticker']}`) · {s.get('exchange','')} · 매치율 {score}%"
+                            )
+            except Exception:
+                pass  # 추천 모듈이 실패해도 원래 에러 메시지는 유지
             return
 
         # 한국 주식의 경우 자동 해결된 ticker 추출
@@ -2806,25 +3225,38 @@ def render_multi_agent():
             if match:
                 resolved_ticker = match.group(1)
 
-        with st.spinner(f"🤖 {resolved_ticker} 멀티에이전트 분석 중... (약 1-2분 소요)"):
+        # 사용자 입력과 분석 대상이 다르면 명시적으로 안내 (UX: 정정된 티커 투명성)
+        if resolved_ticker != ticker:
+            resolved_label = format_ticker_label(resolved_ticker, style="name_with_code")
+            st.info(f"📝 입력: **{ticker}** → 분석 대상: **{resolved_label}**")
+
+        # 분석 헤더에도 종목명 포함
+        analysis_label = format_ticker_label(resolved_ticker, style="name_with_code")
+        with st.status(f"🤖 {analysis_label} 멀티에이전트 분석 (약 1-2분)", expanded=True) as status:
             # Single LLM 분석
+            st.write("📊 1/3 · 단일 LLM 분석 (V1.0) 진행 중...")
             single_result = api_get(f"/results/{resolved_ticker}")
             if not single_result:
                 single_result = api_post(f"/scan/{resolved_ticker}")
 
-            # Multi-Agent 분석
+            # Multi-Agent 분석 (백엔드가 8개 에이전트 병렬 실행)
+            st.write("🤖 2/3 · 8개 에이전트 병렬 분석 중 (Technical · Quant · Risk · ML · Event · Geopolitical · Value · Decision)...")
             multi_result = api_get(f"/multi-agent/{resolved_ticker}")
 
-            # API 실패 시 빈 딕셔너리로 설정
+            # API 실패 시 사용자 친화적 안내
             if multi_result is None:
+                st.write("⚠️ Multi-Agent API 서버에 연결할 수 없어 단일 LLM 결과만 표시합니다.")
                 multi_result = {
-                    "error": "Multi-Agent API not available",
+                    "error": "멀티에이전트 API에 연결할 수 없습니다. chart_agent_service가 실행 중인지 확인하세요.",
                     "final_decision": {
                         "final_signal": "N/A",
                         "final_confidence": 0,
-                        "consensus": "API Error"
+                        "consensus": "API 서버 미응답"
                     }
                 }
+            else:
+                st.write("✅ 3/3 · 결과 수집 완료, 렌더링 중...")
+            status.update(label=f"✅ {analysis_label} 분석 완료", state="complete", expanded=False)
 
             st.session_state.multi_agent_result = {
                 "ticker": resolved_ticker,
@@ -2837,11 +3269,12 @@ def render_multi_agent():
     if "multi_agent_result" in st.session_state:
         result = st.session_state.multi_agent_result
         ticker = result["ticker"]
+        ticker_name = get_ticker_display_name(ticker)
         single = result.get("single", {})
         multi = result.get("multi", {})
 
         # === 비교 카드 ===
-        st.markdown("### 📊 Single LLM vs Multi-Agent 비교")
+        st.markdown(f"### 📊 {ticker_name} ({ticker}) — Single LLM vs Multi-Agent 비교")
 
         col1, col2 = st.columns(2)
 
@@ -2853,17 +3286,19 @@ def render_multi_agent():
                     {}
                 </div>
                 <div style="font-size:0.8rem; color:var(--on-surface-variant);">
-                    점수: <span style="color:{};">{:+.2f}</span> / 신뢰도: {}/10
+                    점수: <span style="color:{};">{:+.2f}</span> / {}: {}/10
                 </div>
                 <div style="margin-top:12px; font-size:0.7rem; opacity:0.6;">
-                    16개 도구 분석 → 단일 LLM 판단
+                    {}개 도구 분석 → 단일 LLM 판단
                 </div>
             </div>
             """.format(
                 single.get("final_signal", "?"),
                 "var(--buy)" if single.get("composite_score", 0) > 0 else "var(--sell)" if single.get("composite_score", 0) < 0 else "var(--outline)",
                 single.get("composite_score", 0),
-                single.get("confidence", 0)
+                _confidence_label((single.get("final_signal") or "").upper()),
+                single.get("confidence", 0),
+                len(single.get("tool_summaries") or []) or 17,
             ), unsafe_allow_html=True)
 
         with col2:
@@ -2890,6 +3325,19 @@ def render_multi_agent():
                 </div>
                 """, unsafe_allow_html=True)
             else:
+                # 에이전트 개수 자동 감지 (하드코딩 대신 실제 데이터 기반)
+                agent_count_actual = len(multi.get("agent_results", []))
+                valid_count = final_decision.get("valid_agent_count", agent_count_actual)
+                excluded_count = final_decision.get("excluded_failed_count", 0)
+                agent_detail = f"{agent_count_actual}개 에이전트"
+                if excluded_count:
+                    agent_detail += f" (유효 {valid_count}, 실패 {excluded_count} 제외)"
+
+                # 신호 라벨 (HOLD/neutral일 경우 '관망 확신도' 표기)
+                multi_sig = (final_decision.get("final_signal") or "").upper()
+                multi_conf = final_decision.get("final_confidence", 0)
+                conf_label = _confidence_label(multi_sig)
+
                 st.markdown("""
                 <div class="summary-card" style="border:2px solid var(--primary-ctr);">
                     <div style="font-size:0.7rem; color:var(--primary); margin-bottom:8px;">Multi-Agent (V2.0) ⭐</div>
@@ -2897,17 +3345,23 @@ def render_multi_agent():
                         {}
                     </div>
                     <div style="font-size:0.8rem; color:var(--on-surface-variant);">
-                        신뢰도: {:.1f}/10 | 의견: {}
+                        {}: {:.1f}/10 | 의견: {}
                     </div>
                     <div style="margin-top:12px; font-size:0.7rem; opacity:0.6;">
-                        5개 에이전트 병렬 분석 → Decision Maker 종합
+                        {} 병렬 분석 → Decision Maker 종합
                     </div>
                 </div>
                 """.format(
                     final_decision.get("final_signal", "?"),
-                    final_decision.get("final_confidence", 0),
-                    final_decision.get("consensus", "?")
+                    conf_label,
+                    multi_conf,
+                    final_decision.get("consensus", "?"),
+                    agent_detail,
                 ), unsafe_allow_html=True)
+
+        # === 신뢰도 갭 경고 (개선 #1) ===
+        if not multi.get("error"):
+            _render_confidence_gap_warning(single, final_decision)
 
         # === 에이전트 의견 ===
         st.markdown("### 👥 에이전트 의견")
@@ -2962,7 +3416,8 @@ def render_multi_agent():
             st.metric("최종 신호", f"{color} {signal}")
         with col2:
             confidence = final_decision.get('final_confidence', 0)
-            st.metric("신뢰도", f"{confidence:.1f}/10")
+            # HOLD/NEUTRAL일 때 "관망 확신도"로 라벨 분리
+            st.metric(_confidence_label(signal), f"{confidence:.1f}/10")
         with col3:
             st.metric("의견 분포", final_decision.get('consensus', 'N/A'))
 
@@ -2985,14 +3440,124 @@ def render_multi_agent():
         else:
             st.write("• 리스크 정보 없음")
 
+        # === 진입 계획 (매매 시점/분할/손절익절) ===
+        entry_plan = final_decision.get("entry_plan")
+        if entry_plan:
+            st.markdown("### 📋 실전 진입 계획")
+
+            # 진입 보류 케이스
+            if entry_plan.get("entry_timing") == "wait":
+                st.warning("⏸ **진입 보류 권장**")
+                for note in entry_plan.get("notes", []):
+                    st.write(f"• {note}")
+            else:
+                # 주요 레벨 요약
+                is_kr = ticker.upper().endswith(".KS") or ticker.upper().endswith(".KQ")
+                currency = "₩" if is_kr else "$"
+                fmt = (lambda v: f"{currency}{v:,.0f}") if is_kr else (lambda v: f"{currency}{v:,.2f}")
+
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    order_type_kr = {"market": "시장가", "limit": "지정가", "wait": "대기"}.get(
+                        entry_plan.get("order_type"), entry_plan.get("order_type", "?")
+                    )
+                    timing_kr = {"immediate": "즉시", "pullback": "풀백 대기",
+                                 "breakout_confirm": "돌파 확인", "wait": "대기"}.get(
+                        entry_plan.get("entry_timing"), entry_plan.get("entry_timing", "?")
+                    )
+                    st.metric("주문 유형", f"{order_type_kr}", delta=timing_kr, delta_color="off")
+                with col2:
+                    lp = entry_plan.get("limit_price")
+                    st.metric("진입가", fmt(lp) if lp else "—")
+                with col3:
+                    sl = entry_plan.get("stop_loss")
+                    st.metric("🛑 손절", fmt(sl) if sl else "—")
+                with col4:
+                    tp = entry_plan.get("take_profit")
+                    st.metric("🎯 익절", fmt(tp) if tp else "—")
+
+                # 분할 진입 표
+                splits = entry_plan.get("split_entry") or []
+                if splits:
+                    st.markdown("**📊 분할 진입 전략**")
+                    split_rows = []
+                    for i, s in enumerate(splits, 1):
+                        price_str = fmt(s["price"]) if s.get("price") else "—"
+                        split_rows.append({
+                            "차수": f"{i}차",
+                            "비중": f"{s.get('pct', 0)}%",
+                            "진입가": price_str,
+                            "트리거": s.get("trigger", ""),
+                        })
+                    st.dataframe(split_rows, use_container_width=True, hide_index=True)
+
+                # 기타 정보
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    days = entry_plan.get("expected_holding_days")
+                    if days:
+                        st.info(f"⏱ **예상 보유 기간**: {days}일")
+                with col_b:
+                    inv = entry_plan.get("invalidation_price")
+                    if inv:
+                        st.error(f"🚨 **무효화 가격**: {fmt(inv)} (이 가격 이하면 분석 무효)")
+
+                # 참고 사항
+                if entry_plan.get("notes"):
+                    with st.expander("📝 참고 사항", expanded=False):
+                        for note in entry_plan["notes"]:
+                            st.write(f"• {note}")
+
+                # === 가상 매수 연동 (Virtual Trade 페이지로 프리필) ===
+                st.markdown("---")
+                vt_col1, vt_col2 = st.columns([2, 1])
+                with vt_col1:
+                    st.caption(
+                        "💡 이 진입 계획으로 가상 거래를 추적하시려면 아래 버튼을 누르세요. "
+                        "Virtual Trade 페이지에서 수량을 조정하고 최종 확인 후 체결됩니다."
+                    )
+                with vt_col2:
+                    final_signal = (final_decision.get("final_signal") or "").upper()
+                    disabled = final_signal != "BUY" or entry_plan.get("entry_timing") == "wait"
+                    if st.button(
+                        "📝 이 계획대로 가상 매수",
+                        use_container_width=True, type="primary",
+                        disabled=disabled,
+                        help="Virtual Trade 페이지로 이동 (가격/손절/익절 자동 입력됨)"
+                        if not disabled
+                        else "매수 신호가 아니거나 진입 보류 상태입니다",
+                    ):
+                        # 세션에 프리필 저장
+                        st.session_state.vt_prefill = {
+                            "ticker": ticker,
+                            "price": entry_plan.get("limit_price"),
+                            "stop_loss": entry_plan.get("stop_loss"),
+                            "take_profit": entry_plan.get("take_profit"),
+                            "reason": (
+                                f"Multi-Agent {final_signal} "
+                                f"신뢰도 {final_decision.get('final_confidence', 0):.1f}/10"
+                            ),
+                        }
+                        st.success("✅ Virtual Trade 페이지로 이동하세요 (좌측 네비게이션)")
+                        st.info("💡 사이드바 → Virtual Trade 를 클릭")
+
         # === 실행 통계 ===
         st.markdown("### 📈 실행 통계")
 
+        # 에이전트 수 자동 감지 (응답에서 추출)
+        total_agents = final_decision.get("agent_count") or len(multi.get("agent_results") or [])
+        valid_agents = final_decision.get("valid_agent_count", total_agents)
+        excluded = final_decision.get("excluded_failed_count", 0)
+        dist = final_decision.get("signal_distribution", {})
+
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("에이전트 수", final_decision.get("agent_count", 0))
+            if excluded:
+                st.metric("에이전트", f"{valid_agents}/{total_agents}",
+                          delta=f"실패 {excluded}명 제외", delta_color="off")
+            else:
+                st.metric("에이전트 수", total_agents)
         with col2:
-            dist = final_decision.get("signal_distribution", {})
             st.metric("BUY 의견", dist.get("buy", 0))
         with col3:
             st.metric("SELL 의견", dist.get("sell", 0))
@@ -3073,12 +3638,13 @@ def render_multi_agent():
 ### Single LLM Analysis (V1.0)
 - **최종 신호**: {single.get("final_signal", "N/A")}
 - **종합 점수**: {single.get("composite_score", 0):+.2f}
-- **신뢰도**: {single.get("confidence", 0)}/10
+- **{_confidence_label((single.get("final_signal") or "").upper())}**: {single.get("confidence", 0)}/10
 
 ### Multi-Agent Analysis (V2.0)
 - **최종 신호**: {final_decision.get('final_signal', 'N/A')}
-- **신뢰도**: {final_decision.get('final_confidence', 0)}/10
+- **{_confidence_label((final_decision.get('final_signal') or '').upper())}**: {final_decision.get('final_confidence', 0)}/10
 - **의견 분포**: Buy({dist.get("buy", 0)}), Sell({dist.get("sell", 0)}), Neutral({dist.get("neutral", 0)})
+- **에이전트**: 총 {total_agents}명 (유효 {valid_agents}, 실패 제외 {excluded})
 
 ## 📊 에이전트별 분석 결과
 """
@@ -3113,6 +3679,1102 @@ def render_multi_agent():
                 mime="text/markdown",
                 use_container_width=True
             )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  신호 정확도 페이지 (Sprint 2)
+# ═══════════════════════════════════════════════════════════════
+
+def render_signal_accuracy():
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">📈 Signal Accuracy</div>
+        <div class="page-subtitle">신호별 사후 적중률 · 신뢰도 칼리브레이션 상태</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── 컨트롤 ─────────────────────────────────────
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+    with col1:
+        horizon = st.selectbox("평가 기간", [7, 14, 30], index=0, help="신호 후 N일 수익률 기준")
+    with col2:
+        min_conf = st.slider("최소 신뢰도", 0.0, 10.0, 0.0, step=0.5)
+    with col3:
+        signal_filter = st.selectbox("신호 필터", ["전체", "buy", "sell", "neutral"], index=0)
+    with col4:
+        days_back = st.selectbox("조회 기간", [30, 90, 180, 365], index=2,
+                                  format_func=lambda x: f"최근 {x}일")
+
+    sig_param = None if signal_filter == "전체" else signal_filter
+
+    # 수동 평가 실행 버튼
+    col_refresh, col_eval = st.columns([1, 1])
+    with col_refresh:
+        if st.button("🔄 새로고침", use_container_width=True):
+            st.cache_data.clear() if hasattr(st, "cache_data") else None
+            st.rerun()
+    with col_eval:
+        if st.button("⚡ 과거 신호 재평가 실행", use_container_width=True,
+                     help="아직 평가 안 된 과거 스캔의 결과를 지금 계산"):
+            with st.spinner("평가 중..."):
+                eval_result = api_post("/signal-accuracy/evaluate?days_back=45&limit=500")
+                if eval_result and isinstance(eval_result, dict):
+                    ev = eval_result.get("evaluation", {})
+                    st.success(
+                        f"✓ 처리: {ev.get('processed', 0)}건, "
+                        f"업데이트: {ev.get('updated', 0)}건, "
+                        f"엔트리 없음: {ev.get('skipped_no_entry', 0)}건"
+                    )
+                    calib = eval_result.get("calibrator")
+                    if calib:
+                        st.info(
+                            f"칼리브레이터 — active: {calib.get('active')}, "
+                            f"표본: {calib.get('total_samples')}건"
+                        )
+                else:
+                    st.error("평가 실행 실패 — API 서버 확인")
+
+    st.divider()
+
+    # ── 통계 조회 ──────────────────────────────────
+    url = (
+        f"/signal-accuracy?horizon={horizon}&min_confidence={min_conf}"
+        f"&days_back={days_back}"
+    )
+    if sig_param:
+        url += f"&signal={sig_param}"
+    data = api_get(url)
+
+    if not data or data.get("total_evaluated", 0) == 0:
+        st.markdown("""
+        <div class="empty-state">
+            <div class="es-icon">📊</div>
+            <div class="es-text">평가된 신호가 아직 없습니다.<br>
+            최소 7일 경과한 스캔 데이터가 있어야 합니다.<br>
+            '과거 신호 재평가 실행' 버튼으로 수동 실행할 수 있습니다.</div>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    # ── 핵심 지표 카드 ───────────────────────────
+    total = data.get("total_evaluated", 0)
+    win_rate = data.get("win_rate_pct", 0)
+    avg_return = data.get("avg_return_pct", 0)
+    wins = data.get("win_count", 0)
+    losses = data.get("loss_count", 0)
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("평가 건수", f"{total:,}")
+    with c2:
+        delta = "" if wins == 0 else f"{wins}승 / {losses}패"
+        st.metric("적중률", f"{win_rate:.1f}%", delta=delta, delta_color="off")
+    with c3:
+        color = "normal" if avg_return >= 0 else "inverse"
+        st.metric("평균 수익", f"{avg_return:+.2f}%")
+    with c4:
+        # 간단한 baseline 비교: 랜덤(33%)보다 얼마나 나은지
+        edge = win_rate - 33.3
+        st.metric("랜덤 대비 엣지", f"{edge:+.1f}%p",
+                  delta="우수" if edge > 10 else ("보통" if edge > 0 else "부진"),
+                  delta_color="normal" if edge > 0 else "inverse")
+
+    # ── 신호별 분포 ─────────────────────────────
+    st.markdown("### 신호별 적중률")
+    by_signal = data.get("by_signal", {})
+    sig_cols = st.columns(3)
+    for i, sig in enumerate(["buy", "sell", "neutral"]):
+        s = by_signal.get(sig, {})
+        with sig_cols[i]:
+            n = s.get("total", 0)
+            wr = s.get("win_rate_pct", 0)
+            avg_r = s.get("avg_return_pct", 0)
+            icon = {"buy": "🟢", "sell": "🔴", "neutral": "⚪"}.get(sig, "")
+            if n > 0:
+                st.markdown(f"""
+                <div class="summary-card">
+                    <div style="font-size:0.7rem; color:var(--on-surface-variant);">{icon} {sig.upper()}</div>
+                    <div style="font-size:1.8rem; font-weight:700;">{wr:.1f}%</div>
+                    <div style="font-size:0.8rem; color:var(--on-surface-variant);">
+                        n={n} · 평균수익 {avg_r:+.2f}%
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class="summary-card" style="opacity:0.5;">
+                    <div style="font-size:0.7rem;">{icon} {sig.upper()}</div>
+                    <div style="font-size:1rem;">데이터 없음</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+    # ── 신뢰도 구간별 ───────────────────────────
+    st.markdown("### 신뢰도 구간별 적중률")
+    bands = data.get("by_confidence_band", [])
+    if bands:
+        band_table = []
+        for b in bands:
+            if b["total"] > 0:
+                band_table.append({
+                    "구간": b["band"],
+                    "건수": b["total"],
+                    "적중": b["wins"],
+                    "적중률": f"{b['win_rate_pct']:.1f}%",
+                    "평균 수익": f"{b['avg_return_pct']:+.2f}%",
+                })
+        if band_table:
+            st.dataframe(band_table, use_container_width=True, hide_index=True)
+
+            # 차트: bar chart - 신뢰도별 적중률
+            try:
+                import plotly.graph_objects as _go
+                x = [b["band"] for b in bands if b["total"] > 0]
+                y = [b["win_rate_pct"] for b in bands if b["total"] > 0]
+                ns = [b["total"] for b in bands if b["total"] > 0]
+                fig = _go.Figure()
+                fig.add_trace(_go.Bar(
+                    x=x, y=y,
+                    text=[f"{v:.1f}%<br>n={n}" for v, n in zip(y, ns)],
+                    textposition="outside",
+                    marker_color=["#ef4444" if v < 50 else "#eab308" if v < 60 else "#10b981" for v in y],
+                ))
+                fig.add_hline(y=50, line_dash="dash", line_color="gray",
+                              annotation_text="랜덤 기준선 (50%)")
+                fig.update_layout(
+                    title=f"{horizon}일 horizon · 신뢰도 구간별 적중률",
+                    xaxis_title="신뢰도 구간",
+                    yaxis_title="적중률 (%)",
+                    yaxis=dict(range=[0, 100]),
+                    height=400,
+                    margin=dict(l=40, r=20, t=50, b=40),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception:
+                pass
+        else:
+            st.info("구간별 데이터가 아직 부족합니다.")
+    else:
+        st.info("신뢰도 구간별 데이터 없음")
+
+    # ── 칼리브레이터 상태 ───────────────────────
+    st.markdown("### 🎯 신뢰도 칼리브레이터 상태")
+    calib_data = api_get("/signal-accuracy/calibrator")
+    if calib_data:
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            active = calib_data.get("active", False)
+            st.metric("활성화 여부",
+                      "✅ ON" if active else "⏸ OFF",
+                      delta="자동 보정 중" if active else "표본 축적 중",
+                      delta_color="off")
+        with cc2:
+            samples = calib_data.get("total_samples", 0)
+            min_req = calib_data.get("min_required", 50)
+            st.metric("누적 표본", f"{samples}",
+                      delta=f"최소 {min_req}건 필요" if samples < min_req else "충족")
+        with cc3:
+            last = calib_data.get("last_refit")
+            last_str = last[:19] if last else "미실행"
+            st.metric("마지막 학습", last_str)
+
+        cal_signals = calib_data.get("signals_calibrated", [])
+        if cal_signals:
+            st.success(f"보정 적용 신호: {', '.join(cal_signals)}")
+        else:
+            st.warning("아직 칼리브레이션 학습 전 (raw confidence 사용 중)")
+    else:
+        st.warning("API 서버에 연결할 수 없습니다")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Screener 페이지 (V1 — 한국 주식 기술적 스크리너)
+# ═══════════════════════════════════════════════════════════════
+
+def render_screener():
+    """
+    매일 장 마감 후 한국 시총 2,000억+ 종목에서 기술적 점수 상위 20개 발굴.
+
+    설계 원칙:
+    - Watchlist 자동 등록 안 함 (사용자 명시 선택 시에만)
+    - Multi-Agent 분석과 독립 (스크리너 = 후보 발굴, Multi-Agent = 심층 분석)
+    - 결과는 screener_results 테이블에만 저장 (scan_log 오염 방지)
+    """
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">📡 Screener · 한국 주식</div>
+        <div class="page-subtitle">기술적 신호 기반 매수 후보 발굴 (시총 2,000억+ · 상위 20개)</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── 상단 컨트롤 ─────────────────────────────
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
+    with c1:
+        min_cap_bn = st.number_input(
+            "최소 시총 (억원)",
+            min_value=100, max_value=100_000, value=2000, step=100,
+            help="이 값 이상의 종목만 분석 대상"
+        )
+    with c2:
+        top_n = st.number_input(
+            "상위 N개",
+            min_value=5, max_value=100, value=20, step=5,
+        )
+    with c3:
+        analyze_top = st.number_input(
+            "자동 심층",
+            min_value=0, max_value=20, value=5, step=1,
+            help="상위 N개 중 Multi-Agent 자동 분석할 개수 (0=안 함)"
+        )
+    with c4:
+        run_now = st.button(
+            "▶ 스크리너만" if analyze_top == 0 else f"🚀 스크리너 + Multi-Agent {analyze_top}개",
+            type="primary", use_container_width=True,
+        )
+
+    # ── 실행 (스크리너 단독 or 파이프라인) ─────────
+    if run_now:
+        est_total = 120 + (analyze_top * 60) if analyze_top > 0 else 120
+        est_min = est_total // 60
+        est_s = est_total % 60
+        est_str = f"{est_min}분 {est_s}초" if est_min else f"{est_s}초"
+
+        if analyze_top == 0:
+            # 스크리너만
+            with st.status("한국 주식 스크리너 실행 중...", expanded=True) as status:
+                st.write(f"🔍 시총 {min_cap_bn:,}억원+ 종목 로딩...")
+                result = api_post(
+                    f"/screener/run?min_market_cap_bn={min_cap_bn}&top_n={top_n}",
+                    timeout=900,
+                )
+                if result and "error" not in result:
+                    st.write(f"✅ 유니버스 {result['universe_size']}개")
+                    st.write(f"✅ {result['analyzed_count']}개 점수 완료 ({result['elapsed_seconds']:.0f}s)")
+                    status.update(label="✅ 스크리너 완료", state="complete", expanded=False)
+                    st.session_state.screener_result = result
+                else:
+                    st.error(f"실행 실패: {(result or {}).get('error', 'API 응답 없음')}")
+        else:
+            # 파이프라인 (스크리너 + Multi-Agent)
+            with st.status(
+                f"🚀 파이프라인 실행 중 (예상 {est_str})...",
+                expanded=True,
+            ) as status:
+                st.write("📡 1/2 · 스크리너로 후보 선별 중...")
+                st.write(f"   시총 {min_cap_bn:,}억원+ · 상위 {top_n}개")
+                st.write(f"🤖 2/2 · 상위 {analyze_top}개 Multi-Agent 심층 분석...")
+                st.write(f"   (병렬 실행, {analyze_top}개 × 약 60s ÷ WORKERS)")
+
+                result = api_post(
+                    f"/screener/pipeline?min_market_cap_bn={min_cap_bn}"
+                    f"&top_n={top_n}&analyze_top={analyze_top}",
+                    timeout=1800,
+                )
+                if result and "error" not in result:
+                    st.write(f"✅ 스크리너 {result['elapsed_seconds']:.0f}s")
+                    st.write(f"✅ Multi-Agent {result.get('multi_agent_elapsed_seconds', 0):.0f}s")
+                    st.write(f"✅ 총 소요 {result.get('total_elapsed_seconds', 0):.0f}s")
+                    status.update(label="✅ 파이프라인 완료", state="complete", expanded=False)
+                    st.session_state.screener_result = result
+                    st.session_state.screener_has_pipeline = True
+                else:
+                    st.error(f"파이프라인 실패: {(result or {}).get('error', 'API 응답 없음')}")
+
+    # ── 최신 결과 로드 (실행 안 했으면 DB에서) ──
+    data = None
+    if "screener_result" in st.session_state:
+        data = st.session_state.screener_result
+        st.caption(f"세션 실행 결과: {data.get('run_id', '?')}")
+    else:
+        data = api_get("/screener/latest?limit=100")
+        if data and data.get("count", 0) > 0:
+            st.caption(f"DB 최근 실행: {data.get('scanned_at', '')[:19]} (run_id: {data.get('run_id')})")
+        else:
+            st.info("📭 스크리너 실행 기록 없음. 위 '▶ 지금 실행' 버튼으로 시작하세요.")
+            st.markdown("""
+            **매일 자동 실행**: 평일 15:35 KST (장 마감 후)
+            **분석 기준**: MACD · 이동평균 · RSI · 거래량 · 20일선 지지 (총 100점)
+            **감점 항목**: 데드크로스 · 과매수 · 거래량↓ · 장기 역행
+            **주의**: 스크리너 결과는 **매수 제안**일 뿐, Multi-Agent 심층 분석을 거쳐 최종 판단하세요.
+            """)
+            return
+
+    results = data.get("results", [])
+    if not results:
+        st.warning("결과 없음")
+        return
+
+    # ── 요약 통계 ─────────────────────────────
+    st.markdown("### 📊 결과 요약")
+    s_count = sum(1 for r in results if r.get("grade") == "S")
+    a_count = sum(1 for r in results if r.get("grade") == "A")
+    b_count = sum(1 for r in results if r.get("grade") == "B")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("총 후보", len(results))
+    m2.metric("S 등급", s_count)
+    m3.metric("A 등급", a_count)
+    m4.metric("B 등급", b_count)
+
+    if s_count == 0 and a_count == 0:
+        st.warning("⚠️ S/A 등급 없음 — 현재 시장이 약세이거나 조건 완화 필요")
+
+    # ── 결과 테이블 ───────────────────────────
+    st.markdown("### 🏆 상위 종목 리스트")
+    rows = []
+    for r in results:
+        cap_bn = (r.get("market_cap") or 0) / 1e8
+        grade_emoji = {"S": "⭐⭐", "A": "⭐", "B": "•", "C": "·", "D": ""}.get(r.get("grade"), "")
+        ticker = r.get("ticker", "")
+        rows.append({
+            "순위": r.get("rank", 0),
+            "등급": f"{grade_emoji} {r.get('grade', '?')}",
+            "종목": r.get("name", "?"),
+            "티커": ticker,
+            "시장": r.get("market", ""),
+            "점수": r.get("score", 0),
+            "시총(억)": f"{cap_bn:,.0f}",
+            "현재가": _fmt_price(r.get('current_price', 0), ticker),
+        })
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # ── 파이프라인 뷰 (스크리너 + Multi-Agent 합의도) ──
+    combined = data.get("combined_view")
+    if combined:
+        st.markdown("### 🔗 스크리너 × Multi-Agent 합의도 분석")
+        st.caption(
+            f"상위 {data.get('analyzed_top', 0)}개 Multi-Agent 심층 분석 완료. "
+            f"Multi-Agent 소요 {data.get('multi_agent_elapsed_seconds', 0):.0f}s"
+        )
+
+        # 합의도 통계 카드
+        stats = data.get("agreement_stats", {})
+        ag_cols = st.columns(5)
+        labels = {
+            "strong_match":    ("🟢🟢 강한 일치", "스크리너↑ + MA 매수"),
+            "partial_match":   ("🟢 부분 일치", "스크리너↑ + MA 보수적"),
+            "conflict":        ("⚠️ 신호 충돌", "스크리너↑ vs MA 매도"),
+            "unexpected_buy":  ("🟡 이례적 매수", "스크리너↓ + MA 매수"),
+            "aligned_weak":    ("⚪ 동반 약세", "둘 다 약한 후보"),
+        }
+        for i, (key, (label, desc)) in enumerate(labels.items()):
+            count = stats.get(key, 0)
+            with ag_cols[i]:
+                st.metric(label, count, help=desc)
+
+        # 파이프라인 상세 테이블
+        pipe_rows = []
+        for e in combined:
+            agreement = e.get("agreement") or {}
+            if not e.get("multi_agent_analyzed") and agreement.get("level") == "pending":
+                # 미분석 항목은 회색으로
+                pipe_rows.append({
+                    "순위": e["rank"],
+                    "합의": agreement.get("emoji", "⏳"),
+                    "종목": e.get("name", "?"),
+                    "스크리너": f"{e['screener_score']}점 ({e['screener_grade']})",
+                    "MA 신호": "—",
+                    "MA 확신": "—",
+                    "Entry": "—",
+                })
+            else:
+                ma_sig = (e.get("multi_agent_signal") or "?").upper()
+                ma_conf = e.get("multi_agent_confidence", 0)
+                entry = e.get("entry_plan") or {}
+                entry_str = "—"
+                if entry and entry.get("limit_price"):
+                    entry_str = f"₩{entry['limit_price']:,.0f}"
+                pipe_rows.append({
+                    "순위": e["rank"],
+                    "합의": f"{agreement.get('emoji', '')} {agreement.get('label', '')}",
+                    "종목": e.get("name", "?"),
+                    "스크리너": f"{e['screener_score']}점 ({e['screener_grade']})",
+                    "MA 신호": ma_sig,
+                    "MA 확신": f"{ma_conf:.1f}/10",
+                    "Entry": entry_str,
+                })
+
+        st.dataframe(pipe_rows, use_container_width=True, hide_index=True)
+
+        # 🟢🟢 강한 일치만 별도 하이라이트
+        strong = [e for e in combined if (e.get("agreement") or {}).get("level") == "strong_match"]
+        if strong:
+            st.markdown("#### 🎯 최우선 관심 종목 (강한 일치)")
+            for e in strong:
+                ag = e.get("agreement", {})
+                entry_plan = e.get("entry_plan") or {}
+                with st.expander(
+                    f"{ag.get('emoji','')} **{e.get('name')}** ({e['ticker']}) — "
+                    f"스크리너 {e['screener_score']}점 {e['screener_grade']}등급 / "
+                    f"MA {(e.get('multi_agent_signal') or '').upper()} "
+                    f"{e.get('multi_agent_confidence', 0):.1f}/10",
+                    expanded=True,
+                ):
+                    st.info(ag.get("description", ""))
+                    if e.get("multi_agent_reasoning"):
+                        st.markdown(f"**Multi-Agent 판단 근거**: {e['multi_agent_reasoning']}")
+                    if entry_plan:
+                        ep_cols = st.columns(4)
+                        lp = entry_plan.get("limit_price")
+                        sl = entry_plan.get("stop_loss")
+                        tp = entry_plan.get("take_profit")
+                        ep_cols[0].metric("진입가", f"₩{lp:,.0f}" if lp else "—")
+                        ep_cols[1].metric("손절", f"₩{sl:,.0f}" if sl else "—")
+                        ep_cols[2].metric("익절", f"₩{tp:,.0f}" if tp else "—")
+                        ep_cols[3].metric("보유일", f"{entry_plan.get('expected_holding_days', '?')}일")
+
+    # ── 개별 종목 상세 (점수 분해) ──────────────
+    st.markdown("### 🔎 종목별 점수 분해")
+    options = [f"{i+1}. {r['name']} ({r['ticker']}) — {r['score']}점" for i, r in enumerate(results)]
+    selected_idx = st.selectbox("상세 보기 종목 선택", range(len(options)), format_func=lambda i: options[i])
+
+    sel = results[selected_idx]
+    breakdown = sel.get("breakdown") or {}
+    penalties = sel.get("penalties") or []
+
+    # breakdown은 JSON 문자열일 수 있음 (DB에서 조회된 경우)
+    if isinstance(breakdown, str):
+        import json as _json
+        try:
+            breakdown = _json.loads(breakdown)
+        except Exception:
+            breakdown = {}
+    if isinstance(penalties, str):
+        import json as _json
+        try:
+            penalties = _json.loads(penalties)
+        except Exception:
+            penalties = []
+
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        st.markdown("**✅ 득점 항목**")
+        if breakdown:
+            for k, v in breakdown.items():
+                if isinstance(v, dict):
+                    pts = v.get("points", 0)
+                    reason = v.get("reason", "")
+                    st.write(f"  +{pts:.1f}점 · {k}: {reason}")
+        else:
+            st.caption("득점 항목 없음")
+
+    with sc2:
+        st.markdown("**❌ 감점 항목**")
+        if penalties:
+            for p in penalties:
+                if isinstance(p, dict):
+                    pts = p.get("points", 0)
+                    reason = p.get("reason", "")
+                    st.write(f"  {pts:.1f}점 · {p.get('name','?')}: {reason}")
+        else:
+            st.caption("감점 항목 없음")
+
+    # ── 액션 버튼 (SSOT 정책 준수: 사용자 명시 선택 시에만) ──
+    st.markdown("### 🎯 다음 단계")
+    ac1, ac2, ac3 = st.columns(3)
+    with ac1:
+        if st.button("📋 선택 종목 Watchlist 추가", use_container_width=True, key="screener_add_wl"):
+            ok, msg = add_to_watchlist(sel.get("ticker", ""))
+            if ok:
+                st.success(msg)
+            else:
+                st.warning(msg)
+    with ac2:
+        if st.button("🤖 Multi-Agent 심층 분석", use_container_width=True, key="screener_ma"):
+            ticker = sel.get("ticker", "")
+            with st.spinner(f"{ticker} 심층 분석 중..."):
+                r = api_post(f"/scan/{ticker}", timeout=300)
+                if r:
+                    st.success(f"완료! {ticker} → {r.get('final_signal')} ({r.get('composite_score', 0):+.1f})")
+    with ac3:
+        if st.button("📝 Virtual Trade 프리필", use_container_width=True, key="screener_vt"):
+            # Virtual Trade 페이지의 프리필 세션 변수에 저장
+            st.session_state.vt_prefill = {
+                "ticker": sel.get("ticker", ""),
+                "price": sel.get("current_price"),
+                "stop_loss": None,
+                "take_profit": None,
+                "reason": f"Screener 순위 {sel.get('rank')}위 (점수 {sel.get('score')}, {sel.get('grade')}등급)",
+            }
+            st.success("✅ Virtual Trade 페이지로 이동하세요 (사이드바에서 선택)")
+
+    # ── 주의 배너 ─────────────────────────────
+    st.divider()
+    st.caption(
+        "⚠️ 스크리너 결과는 **기술적 신호 기반 후보 발굴**입니다. "
+        "매수 결정 전 반드시 Multi-Agent 심층 분석 + 본인 판단을 거치세요. "
+        "자동 매매 권고가 아닙니다."
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Trading 페이지 (Phase 2.1)
+# ═══════════════════════════════════════════════════════════════
+
+def render_trading():
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">🛡️ Trading Center</div>
+        <div class="page-subtitle">주문 모드 · 안전장치 · 승인 큐 · 감사 로그</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── 상단: 현재 모드 + 안전 상태 ───────────────
+    mode_data = api_get("/trading/mode")
+    if not mode_data:
+        st.error("API 서버에 연결할 수 없습니다. chart_agent_service가 실행 중인지 확인하세요.")
+        return
+
+    current_mode = mode_data.get("mode", "paper")
+    safety = mode_data.get("safety", {})
+    kill_active = safety.get("kill_switch_active", False)
+
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        mode_desc = {
+            "paper": "🟢 PAPER — 시뮬레이션 (안전)",
+            "dry_run": "🟡 DRY RUN — 주문 생성·로그만",
+            "approval": "🟠 APPROVAL — 승인 후 실행",
+            "live": "🔴 LIVE — 실제 자금 이동",
+        }
+        st.metric("현재 모드", mode_desc.get(current_mode, current_mode))
+    with col2:
+        st.metric("Kill Switch", "🚨 활성" if kill_active else "✅ 정상")
+    with col3:
+        broker_health = api_get("/trading/broker-health")
+        if broker_health:
+            h = broker_health.get("health", {})
+            st.metric("브로커", f"{'✅' if h.get('ok') else '❌'} {broker_health.get('broker', '?')}")
+
+    # ── Alpaca 연결 + 데이터 소스 상태 (Phase 2.2) ─
+    with st.expander("🔌 증권사 · 데이터 소스 연결 상태", expanded=False):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**Alpaca 증권사**")
+            alpaca_h = api_get("/trading/broker-health/alpaca")
+            if alpaca_h:
+                h = alpaca_h.get("health", {})
+                if h.get("ok"):
+                    st.success(f"✅ {h.get('message', '정상')} ({h.get('latency_ms', 0)}ms)")
+                else:
+                    st.warning(f"⚠️ {h.get('message', '미연결')}")
+            else:
+                st.caption("연결 정보 없음")
+        with col_b:
+            st.markdown("**데이터 소스**")
+            ds = api_get("/data-source")
+            if ds:
+                configured = ds.get("configured", "?")
+                active = ds.get("active", "?")
+                h = ds.get("health", {})
+                if configured != active:
+                    st.info(f"설정: **{configured}** → 폴백: **{active}**")
+                else:
+                    st.markdown(f"활성: **{active}**")
+                if h.get("ok"):
+                    st.success(f"✅ {h.get('message', '정상')} ({h.get('latency_ms', 0)}ms)")
+                else:
+                    st.warning(f"⚠️ {h.get('message', '응답 없음')}")
+
+    # ── 모드 변경 ──────────────────────────────
+    with st.expander("⚙️ 모드 변경 (주의)", expanded=False):
+        new_mode = st.selectbox(
+            "TRADING_MODE",
+            ["paper", "dry_run", "approval", "live"],
+            index=["paper", "dry_run", "approval", "live"].index(current_mode),
+        )
+        if st.button("모드 적용", type="secondary"):
+            resp = api_post(f"/trading/mode?mode={new_mode}")
+            if resp and resp.get("ok"):
+                st.success(f"모드 변경: {resp.get('mode')}")
+                st.rerun()
+            else:
+                st.error(f"변경 실패: {resp}")
+
+    # ── Kill Switch 제어 ───────────────────────
+    col_ks1, col_ks2 = st.columns(2)
+    with col_ks1:
+        if not kill_active:
+            if st.button("🚨 긴급 중지 활성화", type="primary", use_container_width=True):
+                resp = api_post("/trading/kill-switch/activate?reason=manual_webui")
+                if resp and resp.get("ok"):
+                    st.warning("Kill Switch 활성화됨 — 모든 신규 주문 차단")
+                    st.rerun()
+    with col_ks2:
+        if kill_active:
+            if st.button("✅ 긴급 중지 해제", use_container_width=True):
+                resp = api_post("/trading/kill-switch/deactivate?reason=manual_webui")
+                if resp and resp.get("ok"):
+                    st.success("Kill Switch 해제됨")
+                    st.rerun()
+
+    st.divider()
+
+    # ── 일일 한도 사용량 ────────────────────────
+    st.markdown("### 💰 일일 주문 한도 사용량")
+    limits = safety.get("daily_limits", {})
+    col_us, col_kr = st.columns(2)
+    for col, market in [(col_us, "US"), (col_kr, "KR")]:
+        with col:
+            m = limits.get(market, {})
+            spent = m.get("spent", 0)
+            limit = m.get("limit", 1)
+            pct = min(100, (spent / limit * 100) if limit > 0 else 0)
+            currency = "₩" if market == "KR" else "$"
+            st.markdown(f"**{market}** — 주문 {m.get('count', 0)}건")
+            st.progress(pct / 100)
+            st.caption(f"{currency}{spent:,.0f} / {currency}{limit:,.0f} ({pct:.1f}%)")
+
+    st.divider()
+
+    # ── 계좌 및 포지션 ────────────────────────
+    st.markdown("### 📊 계좌 상태")
+    account = api_get("/trading/account")
+    if account:
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            st.metric("총 자산", f"${account.get('total_equity', 0):,.2f}")
+        with a2:
+            st.metric("현금", f"${account.get('cash', 0):,.2f}")
+        with a3:
+            pnl = account.get('total_pnl_pct', 0)
+            st.metric("수익률", f"{pnl:+.2f}%", delta_color="normal" if pnl >= 0 else "inverse")
+        with a4:
+            st.metric("포지션", f"{account.get('open_positions', 0)}개")
+
+    positions_data = api_get("/trading/positions")
+    if positions_data and positions_data.get("positions"):
+        st.markdown("#### 보유 포지션")
+        rows = []
+        for p in positions_data["positions"]:
+            ticker = p.get("ticker", "")
+            rows.append({
+                "Ticker": ticker,
+                "Qty": p.get("qty"),
+                "Entry": _fmt_price(p.get("avg_entry_price"), ticker),
+                "Current": _fmt_price(p.get("current_price"), ticker),
+                "P&L": _fmt_price(p.get("unrealized_pnl"), ticker),
+                "P&L %": f"{p.get('unrealized_pnl_pct', 0):+.2f}%",
+            })
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── 승인 대기 큐 (APPROVAL 모드용) ────────
+    st.markdown("### 🔔 승인 대기 주문")
+    pending_data = api_get("/trading/approval/pending")
+    if pending_data:
+        pending = pending_data.get("pending", [])
+        if pending:
+            st.info(f"**{len(pending)}건** 승인 대기 중")
+            for p in pending:
+                queue_id = p.get("id")
+                ticker = p.get("ticker", "?")
+                side = p.get("side", "?").upper()
+                qty = p.get("qty", 0)
+                price = p.get("limit_price")
+                price_str = f"@ {_fmt_price(price, ticker)}" if price else "@ 시장가"
+
+                cols = st.columns([4, 1, 1])
+                with cols[0]:
+                    st.markdown(f"**#{queue_id}** · `{ticker}` {side} {qty}주 {price_str}")
+                    st.caption(f"요청: {p.get('requested_at', '')[:19]}")
+                with cols[1]:
+                    if st.button("✅ 승인", key=f"approve_{queue_id}"):
+                        result = api_post(f"/trading/approval/{queue_id}/approve")
+                        if result and result.get("executed"):
+                            st.success(f"주문 #{queue_id} 실행됨")
+                            st.rerun()
+                        else:
+                            st.error(f"실행 실패: {result}")
+                with cols[2]:
+                    if st.button("❌ 거절", key=f"reject_{queue_id}"):
+                        result = api_post(f"/trading/approval/{queue_id}/reject")
+                        if result and result.get("ok"):
+                            st.info(f"주문 #{queue_id} 거절됨")
+                            st.rerun()
+        else:
+            st.caption("대기 중인 주문 없음")
+
+    st.divider()
+
+    # ── 최근 주문 감사 로그 ───────────────────
+    st.markdown("### 📝 최근 주문 (감사 로그)")
+    recent = api_get("/trading/orders/recent?limit=20")
+    if recent and recent.get("orders"):
+        rows = []
+        for o in recent["orders"]:
+            status_icon = "✅" if o.get("result_success") else ("🚫" if not o.get("safety_check_passed") else "⚠️")
+            ticker = o.get("ticker", "")
+            limit_price = o.get("limit_price")
+            rows.append({
+                "시각": (o.get("created_at") or "")[:19],
+                "모드": o.get("trading_mode", ""),
+                "Ticker": ticker,
+                "Side": o.get("side", "").upper(),
+                "Qty": o.get("qty", 0),
+                "가격": _fmt_price(limit_price, ticker) if limit_price else "—",
+                "결과": f"{status_icon} {o.get('result_status') or o.get('safety_reason', '?')}",
+            })
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    # 통계
+    stats = api_get("/trading/orders/stats?days_back=7")
+    if stats:
+        st.markdown("#### 7일 통계")
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            st.metric("총 시도", stats.get("total_orders", 0))
+        with s2:
+            st.metric("안전장치 차단", stats.get("blocked_by_safety", 0))
+        with s3:
+            by_mode = stats.get("by_trading_mode", {})
+            st.caption(f"모드별: {by_mode}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Virtual Trade 페이지 — 수동 가상 거래 추적
+# ═══════════════════════════════════════════════════════════════
+
+def render_virtual_trade():
+    """
+    사용자가 결정한 시점·가격·수량으로 가상 매수, 지속 추적.
+
+    흐름:
+    1) 종목 입력/선택 → 현재가 자동 조회
+    2) 수량/가격/손절/익절/메모 지정 → "가상 매수" 버튼
+    3) 포지션 모니터링: 현재가/목표까지 거리/경과일
+    4) 부분/전량 청산 또는 자동 청산(trailing/SL/TP)
+    """
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">📝 Virtual Trade</div>
+        <div class="page-subtitle">내가 정한 타이밍으로 가상 매수 · 자동 추적</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── 1. 상단 요약 카드 ─────────────────────
+    status = api_get("/paper")
+    if not status:
+        st.error("API 서버 연결 실패 — chart_agent_service 실행 상태 확인")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    total_equity = status.get("total_equity", 0)
+    total_pnl = status.get("total_pnl", 0)
+    total_pnl_pct = status.get("total_pnl_pct", 0)
+    positions_map = status.get("positions", {})
+
+    c1.metric("총 자산", f"${total_equity:,.2f}")
+    c2.metric("현금", f"${status.get('cash', 0):,.2f}")
+    c3.metric("손익", f"${total_pnl:+,.2f}",
+              delta=f"{total_pnl_pct:+.2f}%",
+              delta_color="normal" if total_pnl >= 0 else "inverse")
+    c4.metric("열린 포지션", f"{len(positions_map)}개")
+
+    st.divider()
+
+    # ── 2. 가상 매수 폼 ─────────────────────
+    st.markdown("### 🛒 가상 매수")
+
+    # 세션 상태 관리
+    if "vt_ticker" not in st.session_state:
+        st.session_state.vt_ticker = ""
+    if "vt_quote" not in st.session_state:
+        st.session_state.vt_quote = None
+
+    # 분석 결과에서 프리필된 값이 있는지 확인 (Multi-Agent 페이지에서 넘어온 경우)
+    prefill = st.session_state.get("vt_prefill")
+    if prefill:
+        st.info(
+            f"📊 **Multi-Agent 분석 프리필**: "
+            f"`{prefill.get('ticker')}` @ ${prefill.get('price', 0):.2f} "
+            f"· 손절 ${prefill.get('stop_loss', 0):.2f} · 익절 ${prefill.get('take_profit', 0):.2f}"
+        )
+
+    col_buy_a, col_buy_b, col_buy_c = st.columns([2, 1, 1])
+    with col_buy_a:
+        ticker_input = st.text_input(
+            "종목 코드",
+            value=(prefill.get("ticker", "") if prefill else st.session_state.vt_ticker),
+            placeholder="예: AAPL, 005930.KS",
+            key="vt_ticker_input",
+        ).strip().upper()
+    with col_buy_b:
+        if st.button("📡 현재가 조회", use_container_width=True, disabled=not ticker_input):
+            quote = api_get(f"/paper/quote/{ticker_input}")
+            if quote:
+                st.session_state.vt_quote = quote
+                st.session_state.vt_ticker = ticker_input
+                st.rerun()
+            else:
+                st.error("현재가 조회 실패")
+    with col_buy_c:
+        if st.button("🔄 폼 초기화", use_container_width=True):
+            st.session_state.vt_quote = None
+            st.session_state.vt_ticker = ""
+            st.session_state.pop("vt_prefill", None)
+            st.rerun()
+
+    quote = st.session_state.vt_quote
+    if quote:
+        # 현재가 정보 표시
+        is_kr = ticker_input.endswith((".KS", ".KQ"))
+        currency = "₩" if is_kr else "$"
+        qa, qb, qc, qd = st.columns(4)
+        qa.metric("현재가", f"{currency}{quote.get('current_price', 0):,.2f}",
+                  delta=f"{quote.get('change_pct', 0):+.2f}%")
+        qb.metric("당일 고가", f"{currency}{quote.get('day_high', 0):,.2f}")
+        qc.metric("당일 저가", f"{currency}{quote.get('day_low', 0):,.2f}")
+        qd.metric("호가단위", f"{currency}{quote.get('tick_size', 0):,}")
+        st.caption(f"기준 시각: {quote.get('as_of', '')}")
+
+    # 매수 파라미터
+    if ticker_input:
+        default_price = (
+            (prefill.get("price") if prefill else None)
+            or (quote.get("current_price") if quote else None)
+            or 100.0
+        )
+        default_sl = (prefill.get("stop_loss") if prefill else 0.0) or 0.0
+        default_tp = (prefill.get("take_profit") if prefill else 0.0) or 0.0
+
+        pc1, pc2, pc3 = st.columns(3)
+        with pc1:
+            buy_qty = st.number_input("수량", min_value=1, value=10, step=1, key="vt_qty")
+        with pc2:
+            buy_price = st.number_input(
+                "진입가 (내가 사려는 가격)",
+                min_value=0.001, value=float(default_price), step=0.01, format="%.4f",
+                key="vt_price",
+            )
+        with pc3:
+            total_cost = buy_qty * buy_price
+            st.metric("총 투자금", f"${total_cost:,.2f}")
+
+        # 손절/익절/trailing 설정 (접이식)
+        with st.expander("🛡️ 손절·익절·자동 청산 설정 (선택)", expanded=bool(prefill)):
+            sl_col, tp_col, ts_col, td_col = st.columns(4)
+            with sl_col:
+                stop_loss = st.number_input(
+                    "손절가", min_value=0.0, value=float(default_sl),
+                    step=0.01, format="%.4f",
+                    help="0이면 미설정. 도달 시 자동 청산.",
+                )
+            with tp_col:
+                take_profit = st.number_input(
+                    "익절가", min_value=0.0, value=float(default_tp),
+                    step=0.01, format="%.4f",
+                    help="0이면 미설정. 도달 시 자동 청산.",
+                )
+            with ts_col:
+                trailing_pct = st.number_input(
+                    "Trailing Stop %",
+                    min_value=0.0, max_value=50.0, value=0.0, step=0.5,
+                    help="고점 대비 N% 하락 시 자동 청산. 0이면 미사용.",
+                )
+            with td_col:
+                time_stop = st.number_input(
+                    "시간 청산 (일)", min_value=0, max_value=365, value=0, step=1,
+                    help="N일 경과 시 자동 청산. 0이면 미사용.",
+                )
+
+            # 손절/익절 R/R 표시
+            if stop_loss > 0 and buy_price > stop_loss:
+                risk = buy_price - stop_loss
+                risk_pct = risk / buy_price * 100
+                st.caption(f"🛑 손절 거리: **{risk_pct:.2f}%** (${risk:.2f}/주)")
+            if take_profit > 0 and take_profit > buy_price:
+                reward = take_profit - buy_price
+                reward_pct = reward / buy_price * 100
+                st.caption(f"🎯 익절 거리: **{reward_pct:.2f}%** (${reward:.2f}/주)")
+            if stop_loss > 0 and take_profit > buy_price > stop_loss:
+                rr = (take_profit - buy_price) / (buy_price - stop_loss)
+                st.caption(f"📐 R/R 비율: **{rr:.2f}** (익절/손절)")
+
+        reason = st.text_input(
+            "진입 근거 메모 (선택)",
+            value=(prefill.get("reason", "") if prefill else ""),
+            placeholder="예: Multi-Agent 신호 buy 7.5/10, RSI 반등",
+        )
+
+        # 매수 실행
+        if st.button("🛒 **가상 매수 실행**", type="primary", use_container_width=True):
+            body = {
+                "ticker": ticker_input,
+                "qty": int(buy_qty),
+                "price": float(buy_price),
+                "reason": reason or "수동 가상 매수",
+                "stop_loss_price": float(stop_loss) if stop_loss > 0 else None,
+                "take_profit_price": float(take_profit) if take_profit > 0 else None,
+                "trailing_stop_pct": float(trailing_pct / 100) if trailing_pct > 0 else None,
+                "time_stop_days": int(time_stop) if time_stop > 0 else None,
+            }
+            result = api_post("/paper/virtual-buy", json_body=body)
+            if result and result.get("status") == "filled":
+                st.success(
+                    f"✅ **{ticker_input}** {buy_qty}주 @ {currency if quote else '$'}{buy_price:,.2f} 체결됨 "
+                    f"(총 ${total_cost:,.2f})"
+                )
+                # 프리필 제거
+                st.session_state.pop("vt_prefill", None)
+                st.session_state.vt_quote = None
+                st.balloons()
+            else:
+                reject = (result or {}).get("reject_reason") or "알 수 없는 오류"
+                st.error(f"체결 실패: {reject}")
+
+    st.divider()
+
+    # ── 3. 포지션 모니터링 ─────────────────
+    st.markdown("### 📊 포지션 모니터링")
+    col_refresh, col_info = st.columns([1, 3])
+    with col_refresh:
+        if st.button("🔄 현재가 갱신", use_container_width=True):
+            with st.spinner("가격 갱신 중..."):
+                update_result = api_post("/paper/update-prices")
+            if update_result:
+                updated = update_result.get("updated", 0)
+                auto_closed = update_result.get("auto_closed", [])
+                st.success(f"✅ {updated}개 종목 갱신")
+                if auto_closed:
+                    st.warning(f"⚠️ {len(auto_closed)}개 포지션 자동 청산됨")
+                    for ac in auto_closed:
+                        st.write(f"  • {ac.get('ticker')} — {ac.get('reason', '?')}")
+            st.rerun()
+    with col_info:
+        st.caption("손절/익절/trailing/시간 조건이 충족되면 자동으로 청산됩니다.")
+
+    if not positions_map:
+        st.info("📭 보유 포지션 없음. 위 폼에서 첫 가상 매수를 시작하세요.")
+    else:
+        # 포지션을 카드로 표시
+        for ticker, p in positions_map.items():
+            entry = p.get("entry_price", 0)
+            current = p.get("current_price", entry)
+            qty = p.get("qty", 0)
+            pnl = p.get("pnl", 0)
+            pnl_pct = p.get("pnl_pct", 0)
+            is_kr = ticker.endswith((".KS", ".KQ"))
+            cur = "₩" if is_kr else "$"
+
+            pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+            # 포지션 헤더에 종목명 포함
+            pos_label = format_ticker_label(ticker, style="name_with_code")
+            with st.expander(
+                f"{pnl_emoji} **{pos_label}** · {qty}주 @ {cur}{entry:,.2f} "
+                f"→ {cur}{current:,.2f} ({pnl_pct:+.2f}%)",
+                expanded=True,
+            ):
+                cc1, cc2, cc3, cc4 = st.columns(4)
+                cc1.metric("수량", f"{qty}주")
+                cc2.metric("진입가", f"{cur}{entry:,.2f}")
+                cc3.metric("현재가", f"{cur}{current:,.2f}",
+                           delta=f"{pnl_pct:+.2f}%",
+                           delta_color="normal" if pnl_pct >= 0 else "inverse")
+                cc4.metric("손익", f"{cur}{pnl:+,.2f}")
+
+                # 진입일/경과일
+                entry_date = p.get("entry_date", "")
+                if entry_date:
+                    try:
+                        ed = datetime.fromisoformat(entry_date.split(".")[0] if "." in entry_date else entry_date)
+                        elapsed = (datetime.now() - ed).days
+                        st.caption(f"📅 진입: {entry_date[:10]} · 경과 **{elapsed}일**")
+                    except Exception:
+                        st.caption(f"📅 진입: {entry_date[:19]}")
+
+                # 부분/전량 청산
+                st.markdown("**청산 실행**")
+                cls1, cls2, cls3, cls4, cls5 = st.columns([1, 1, 1, 1, 1])
+
+                def _close(pct: int):
+                    body = {"ticker": ticker, "close_pct": float(pct),
+                            "reason": f"수동 {pct}% 청산"}
+                    r = api_post("/paper/partial-close", json_body=body)
+                    if r and r.get("status") == "filled":
+                        realized = r.get("pnl", 0)
+                        st.success(
+                            f"✅ {pct}% 청산됨 — {r.get('qty')}주 @ {cur}{r.get('price', 0):,.2f} · 실현 손익 {cur}{realized:+,.2f}"
+                        )
+                        st.rerun()
+                    else:
+                        st.error(f"청산 실패: {(r or {}).get('reject_reason', '?')}")
+
+                if cls1.button("25%", key=f"close25_{ticker}", use_container_width=True):
+                    _close(25)
+                if cls2.button("50%", key=f"close50_{ticker}", use_container_width=True):
+                    _close(50)
+                if cls3.button("75%", key=f"close75_{ticker}", use_container_width=True):
+                    _close(75)
+                if cls4.button("100%", key=f"close100_{ticker}",
+                               type="primary", use_container_width=True):
+                    _close(100)
+                with cls5:
+                    custom_price = st.number_input(
+                        "지정가 청산", min_value=0.0, value=0.0, step=0.01,
+                        key=f"cp_{ticker}", label_visibility="collapsed",
+                        placeholder="지정가"
+                    )
+                    if st.button("매도", key=f"custom_{ticker}", use_container_width=True):
+                        if custom_price > 0:
+                            body = {"ticker": ticker, "close_pct": 100.0,
+                                    "price": float(custom_price),
+                                    "reason": f"수동 지정가 {custom_price} 청산"}
+                            r = api_post("/paper/partial-close", json_body=body)
+                            if r and r.get("status") == "filled":
+                                st.success(f"✅ 지정가 {cur}{custom_price:,.2f} 청산")
+                                st.rerun()
+
+                # 손절/익절 표시 (있으면)
+                sl = p.get("stop_loss_price", 0)
+                tp = p.get("take_profit_price", 0)
+                ts = p.get("trailing_stop_pct", 0)
+                tsd = p.get("time_stop_days", 0)
+                if sl or tp or ts or tsd:
+                    st.markdown("**자동 청산 조건**")
+                    lines = []
+                    if sl:
+                        dist = (current - sl) / current * 100
+                        lines.append(f"🛑 손절 {cur}{sl:,.2f} (현재가 대비 {dist:+.2f}%)")
+                    if tp:
+                        dist = (tp - current) / current * 100
+                        lines.append(f"🎯 익절 {cur}{tp:,.2f} (현재가 대비 {dist:+.2f}%)")
+                    if ts:
+                        peak = p.get("peak_price", current)
+                        trail_price = peak * (1 - ts)
+                        lines.append(f"📉 Trailing {ts*100:.1f}% · 고점 {cur}{peak:,.2f} → 트리거 {cur}{trail_price:,.2f}")
+                    if tsd:
+                        lines.append(f"⏱ 시간 청산 {tsd}일")
+                    for line in lines:
+                        st.caption(line)
+
+    st.divider()
+
+    # ── 4. 최근 청산 이력 ─────────────────
+    st.markdown("### 📋 최근 청산 이력")
+    recent = status.get("recent_trades", [])
+    if recent:
+        rows = []
+        for t in reversed(recent[-20:]):
+            is_win = t.get("pnl", 0) > 0
+            tkr = t.get("ticker", "?")
+            name = get_ticker_display_name(tkr)
+            rows.append({
+                "종목명": name if name and name != tkr else "—",
+                "티커": tkr,
+                "수량": t.get("qty", 0),
+                "진입가": f"${t.get('entry_price', 0):.2f}",
+                "청산가": f"${t.get('exit_price', 0):.2f}",
+                "손익": f"${t.get('pnl', 0):+.2f}",
+                "수익률": f"{t.get('pnl_pct', 0):+.2f}%",
+                "결과": "🟢 WIN" if is_win else "🔴 LOSS",
+                "사유": t.get("reason", "")[:40],
+                "청산일": (t.get("exit_date", "") or "")[:10],
+            })
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+    else:
+        st.caption("아직 청산된 거래 없음")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -3448,6 +5110,14 @@ elif page == "Multi-Agent":
     render_multi_agent()
 elif page == "Scan Log":
     render_scan_log()
+elif page == "Signal Accuracy":
+    render_signal_accuracy()
+elif page == "Screener":
+    render_screener()
+elif page == "Trading":
+    render_trading()
+elif page == "Virtual Trade":
+    render_virtual_trade()
 elif page == "Backtest":
     render_backtest()
 elif page == "ML Predict":

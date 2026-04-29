@@ -5,6 +5,9 @@
 streamlit>=1.30.0
 plotly>=5.18.0
 yfinance>=0.2.31
+finance-datareader>=0.9.0  # Korean stock investor trading data (fallback)
+pykrx>=1.0.0  # Korean stock market data
+beautifulsoup4>=4.11.0  # HTML parsing for Naver Finance
 
 # ── 데이터/수학 ──
 pandas>=2.0.0
@@ -19,10 +22,14 @@ matplotlib>=3.7.0
 
 # ── HTTP / 설정 ──
 httpx>=0.25.0
+requests>=2.31.0
+pytz>=2024.1
 python-dotenv>=1.0.0
 
 # ── LLM ──
 google-generativeai>=0.3.0
+openai>=1.0.0
 
 # ── 스케줄러 (scanner.py) ──
 apscheduler>=3.10.0
+pydantic-settings>=2.0

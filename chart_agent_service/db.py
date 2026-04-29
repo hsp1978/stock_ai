@@ -23,13 +23,65 @@ CREATE TABLE IF NOT EXISTS scan_log (
     sell_count  INTEGER DEFAULT 0,
     neutral_count INTEGER DEFAULT 0,
     alert_sent  INTEGER DEFAULT 0,
-    scanned_at  TEXT    NOT NULL
+    scanned_at  TEXT    NOT NULL,
+    entry_price REAL
+);
+"""
+
+# 신호 사후 평가 테이블 — 스캔 로그의 신호가 실제로 얼마나 적중했는지 추적
+_CREATE_OUTCOMES_TABLE = """
+CREATE TABLE IF NOT EXISTS signal_outcomes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_log_id   INTEGER NOT NULL,
+    ticker        TEXT    NOT NULL,
+    signal        TEXT,
+    score         REAL,
+    confidence    REAL,
+    scanned_at    TEXT    NOT NULL,
+    entry_price   REAL,
+    -- 미래 N일 후 실제 가격과 수익률
+    price_7d      REAL,
+    return_7d_pct REAL,
+    outcome_7d    TEXT,       -- "win" | "loss" | "neutral"
+    price_14d     REAL,
+    return_14d_pct REAL,
+    outcome_14d   TEXT,
+    price_30d     REAL,
+    return_30d_pct REAL,
+    outcome_30d   TEXT,
+    evaluated_at  TEXT,
+    UNIQUE(scan_log_id)
 );
 """
 
 _CREATE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_scan_log_ticker  ON scan_log(ticker);
 CREATE INDEX IF NOT EXISTS idx_scan_log_date    ON scan_log(scanned_at);
+CREATE INDEX IF NOT EXISTS idx_outcomes_ticker  ON signal_outcomes(ticker);
+CREATE INDEX IF NOT EXISTS idx_outcomes_signal  ON signal_outcomes(signal);
+CREATE INDEX IF NOT EXISTS idx_outcomes_date    ON signal_outcomes(scanned_at);
+CREATE INDEX IF NOT EXISTS idx_screener_run    ON screener_results(run_id);
+CREATE INDEX IF NOT EXISTS idx_screener_ticker ON screener_results(ticker);
+"""
+
+# 스크리너 결과 테이블 — 기존 scan_log와 완전 분리 (SSOT, 스키마 오염 방지)
+_CREATE_SCREENER_TABLE = """
+CREATE TABLE IF NOT EXISTS screener_results (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id         TEXT    NOT NULL,         -- 같은 실행 묶음 (YYYYMMDD_HHMM)
+    rank           INTEGER NOT NULL,         -- 1~20
+    ticker         TEXT    NOT NULL,
+    name           TEXT,                      -- 종목명 (한글)
+    market         TEXT,                      -- KOSPI | KOSDAQ
+    market_cap     REAL,                      -- 시총 (원)
+    current_price  REAL,                      -- 실행 시점 종가
+    score          REAL    NOT NULL,         -- 0~100
+    grade          TEXT,                      -- S | A | B | C | D
+    breakdown      TEXT,                      -- JSON: {macd: 30, ma: 20, ...}
+    penalties      TEXT,                      -- JSON: [{"name": "deadcross", "points": -20}]
+    market_regime  TEXT,                      -- 실행 시점 시장 국면 (참고용, V3에서 채움)
+    scanned_at     TEXT    NOT NULL
+);
 """
 
 
@@ -44,6 +96,13 @@ def init_db():
     """테이블 생성 (서비스 시작 시 1회 호출)"""
     conn = _get_conn()
     conn.execute(_CREATE_TABLE)
+    conn.execute(_CREATE_OUTCOMES_TABLE)
+    conn.execute(_CREATE_SCREENER_TABLE)
+    # entry_price 컬럼 마이그레이션 (기존 DB 호환)
+    try:
+        conn.execute("ALTER TABLE scan_log ADD COLUMN entry_price REAL")
+    except sqlite3.OperationalError:
+        pass  # 이미 존재
     conn.executescript(_CREATE_INDEX)
     conn.commit()
     conn.close()
@@ -55,13 +114,20 @@ def init_db():
 def insert_scan(ticker: str, result: dict, alert_sent: bool = False):
     """스캔 결과 1건 DB 기록"""
     dist = result.get("signal_distribution", {})
+    # entry_price 추출 우선순위: 직접 필드 → entry_plan → current_price
+    entry_price = (
+        result.get("entry_price")
+        or (result.get("entry_plan") or {}).get("limit_price")
+        or result.get("current_price")
+        or result.get("price")
+    )
     conn = _get_conn()
     conn.execute(
         """INSERT INTO scan_log
            (ticker, signal, score, confidence,
             buy_count, sell_count, neutral_count,
-            alert_sent, scanned_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            alert_sent, scanned_at, entry_price)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             ticker.upper(),
             result.get("final_signal"),
@@ -72,6 +138,7 @@ def insert_scan(ticker: str, result: dict, alert_sent: bool = False):
             dist.get("neutral", 0),
             1 if alert_sent else 0,
             datetime.now().isoformat(),
+            entry_price,
         ),
     )
     conn.commit()
@@ -292,3 +359,86 @@ def get_weekly_ticker(ticker: str, weeks_ago: int = 0) -> dict:
         "daily_trend": [dict(r) for r in daily_trend],
         "logs": [dict(r) for r in logs],
     }
+
+
+# ─── 스크리너 결과 저장/조회 ────────────────────────────────────
+
+def insert_screener_results(run_id: str, results: list):
+    """
+    스크리너 실행 결과 저장 (상위 N개 한 번에).
+
+    results: [{rank, ticker, name, market, market_cap, current_price,
+               score, grade, breakdown(dict), penalties(list)}, ...]
+    """
+    import json
+    if not results:
+        return
+    conn = _get_conn()
+    rows = []
+    scanned_at = datetime.now().isoformat()
+    for r in results:
+        rows.append((
+            run_id,
+            r.get("rank", 0),
+            r.get("ticker", ""),
+            r.get("name"),
+            r.get("market"),
+            r.get("market_cap"),
+            r.get("current_price"),
+            r.get("score", 0.0),
+            r.get("grade"),
+            json.dumps(r.get("breakdown", {}), ensure_ascii=False),
+            json.dumps(r.get("penalties", []), ensure_ascii=False),
+            r.get("market_regime"),
+            scanned_at,
+        ))
+    conn.executemany(
+        """INSERT INTO screener_results
+           (run_id, rank, ticker, name, market, market_cap, current_price,
+            score, grade, breakdown, penalties, market_regime, scanned_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_screener_latest(limit: int = 20) -> dict:
+    """가장 최근 스크리너 실행 결과."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT run_id, scanned_at FROM screener_results ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        conn.close()
+        return {"run_id": None, "scanned_at": None, "count": 0, "results": []}
+
+    run_id = row["run_id"]
+    results = conn.execute(
+        "SELECT * FROM screener_results WHERE run_id = ? ORDER BY rank ASC LIMIT ?",
+        (run_id, limit),
+    ).fetchall()
+    conn.close()
+    return {
+        "run_id": run_id,
+        "scanned_at": row["scanned_at"],
+        "count": len(results),
+        "results": [dict(r) for r in results],
+    }
+
+
+def get_screener_history(days_back: int = 30) -> dict:
+    """최근 N일 스크리너 실행 이력 (run_id별 요약)."""
+    cutoff = (datetime.now() - timedelta(days=days_back)).isoformat()
+    conn = _get_conn()
+    runs = conn.execute(
+        """SELECT run_id, scanned_at, COUNT(*) as count,
+                  ROUND(AVG(score), 1) as avg_score,
+                  SUM(CASE WHEN grade IN ('S','A') THEN 1 ELSE 0 END) as top_grades
+           FROM screener_results
+           WHERE scanned_at >= ?
+           GROUP BY run_id ORDER BY scanned_at DESC""",
+        (cutoff,),
+    ).fetchall()
+    conn.close()
+    return {"runs": [dict(r) for r in runs]}

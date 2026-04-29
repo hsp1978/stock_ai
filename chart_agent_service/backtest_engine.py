@@ -16,6 +16,8 @@ from config import (
     BOLLINGER_PERIOD, BOLLINGER_STD,
     RSI_OVERSOLD, RSI_OVERBOUGHT,
 )
+from trading_costs import TradingCosts
+from tick_size import round_to_tick
 
 
 @dataclass
@@ -32,9 +34,10 @@ class BacktestResult:
     avg_holding_days: float = 0.0
     trades: list = field(default_factory=list)
     equity_curve: list = field(default_factory=list)
+    trading_costs: Optional[dict] = None  # 거래비용 정보 (slippage/commission/tax)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "strategy": self.strategy,
             "ticker": self.ticker,
             "total_return_pct": round(self.total_return_pct, 2),
@@ -47,6 +50,9 @@ class BacktestResult:
             "avg_holding_days": round(self.avg_holding_days, 1),
             "equity_curve_len": len(self.equity_curve),
         }
+        if self.trading_costs:
+            d["trading_costs"] = self.trading_costs
+        return d
 
 
 def _compute_stats(equity: pd.Series, trades: list, strategy: str, ticker: str) -> BacktestResult:
@@ -88,11 +94,14 @@ def _compute_stats(equity: pd.Series, trades: list, strategy: str, ticker: str) 
 
 
 def backtest_sma_cross(ticker: str, df: pd.DataFrame,
-                       fast_period: int = None, slow_period: int = None) -> BacktestResult:
+                       fast_period: int = None, slow_period: int = None,
+                       costs: Optional[TradingCosts] = None) -> BacktestResult:
     if fast_period is None:
         fast_period = SMA_PERIODS[0] if len(SMA_PERIODS) >= 2 else 20
     if slow_period is None:
         slow_period = SMA_PERIODS[1] if len(SMA_PERIODS) >= 2 else 50
+    if costs is None:
+        costs = TradingCosts.for_ticker(ticker)
 
     df = df.copy()
     sma_f = f"SMA_{fast_period}"
@@ -122,28 +131,32 @@ def backtest_sma_cross(ticker: str, df: pd.DataFrame,
         date = df.index[i]
 
         if prev_fast <= prev_slow and curr_fast > curr_slow and position == 0:
+            # 실제 진입가: 호가단위 반올림 후 거래비용 적용
+            fill_price = round_to_tick(costs.apply_entry(price), ticker, side="up")
             risk_amt = cash * (RISK_PER_TRADE_PCT / 100)
             atr_val = float(df["ATR"].iloc[i]) if "ATR" in df.columns and not pd.isna(df["ATR"].iloc[i]) else price * 0.02
             stop_dist = atr_val * ATR_STOP_MULTIPLIER
             qty = int(risk_amt / stop_dist) if stop_dist > 0 else 0
-            if qty > 0 and qty * price <= cash:
+            if qty > 0 and qty * fill_price <= cash:
                 position = qty
-                entry_price = price
+                entry_price = fill_price
                 entry_date = date
-                cash -= qty * price
+                cash -= qty * fill_price
 
         elif prev_fast >= prev_slow and curr_fast < curr_slow and position > 0:
-            pnl = (price - entry_price) * position
-            cash += position * price
+            # 실제 청산가: 호가단위 반올림 후 거래비용 차감
+            fill_price = round_to_tick(costs.apply_exit(price), ticker, side="down")
+            pnl = (fill_price - entry_price) * position
+            cash += position * fill_price
             holding = (date - entry_date).days if entry_date else 0
             trades.append({
                 "entry_date": str(entry_date)[:10],
                 "exit_date": str(date)[:10],
-                "entry_price": round(entry_price, 2),
-                "exit_price": round(price, 2),
+                "entry_price": round(entry_price, 4),
+                "exit_price": round(fill_price, 4),
                 "qty": position,
                 "pnl": round(pnl, 2),
-                "return_pct": round((price / entry_price - 1) * 100, 2),
+                "return_pct": round((fill_price / entry_price - 1) * 100, 2),
                 "holding_days": holding,
             })
             position = 0
@@ -152,15 +165,20 @@ def backtest_sma_cross(ticker: str, df: pd.DataFrame,
         equity.append(port_value)
 
     equity_series = pd.Series(equity, index=df.index[1:len(equity) + 1])
-    return _compute_stats(equity_series, trades, f"SMA_Cross_{fast_period}_{slow_period}", ticker)
+    result = _compute_stats(equity_series, trades, f"SMA_Cross_{fast_period}_{slow_period}", ticker)
+    result.trading_costs = costs.to_dict()
+    return result
 
 
 def backtest_rsi_reversion(ticker: str, df: pd.DataFrame,
-                           oversold: int = None, overbought: int = None) -> BacktestResult:
+                           oversold: int = None, overbought: int = None,
+                           costs: Optional[TradingCosts] = None) -> BacktestResult:
     if oversold is None:
         oversold = RSI_OVERSOLD
     if overbought is None:
         overbought = RSI_OVERBOUGHT
+    if costs is None:
+        costs = TradingCosts.for_ticker(ticker)
     df = df.copy()
     if "RSI" not in df.columns:
         return BacktestResult(strategy=f"RSI_Reversion_{oversold}_{overbought}", ticker=ticker)
@@ -182,28 +200,30 @@ def backtest_rsi_reversion(ticker: str, df: pd.DataFrame,
         date = df.index[i]
 
         if rsi < oversold and position == 0:
+            fill_price = round_to_tick(costs.apply_entry(price), ticker, side="up")
             risk_amt = cash * (RISK_PER_TRADE_PCT / 100)
             atr_val = float(df["ATR"].iloc[i]) if "ATR" in df.columns and not pd.isna(df["ATR"].iloc[i]) else price * 0.02
             stop_dist = atr_val * ATR_STOP_MULTIPLIER
             qty = int(risk_amt / stop_dist) if stop_dist > 0 else 0
-            if qty > 0 and qty * price <= cash:
+            if qty > 0 and qty * fill_price <= cash:
                 position = qty
-                entry_price = price
+                entry_price = fill_price
                 entry_date = date
-                cash -= qty * price
+                cash -= qty * fill_price
 
         elif rsi > overbought and position > 0:
-            pnl = (price - entry_price) * position
-            cash += position * price
+            fill_price = round_to_tick(costs.apply_exit(price), ticker, side="down")
+            pnl = (fill_price - entry_price) * position
+            cash += position * fill_price
             holding = (date - entry_date).days if entry_date else 0
             trades.append({
                 "entry_date": str(entry_date)[:10],
                 "exit_date": str(date)[:10],
-                "entry_price": round(entry_price, 2),
-                "exit_price": round(price, 2),
+                "entry_price": round(entry_price, 4),
+                "exit_price": round(fill_price, 4),
                 "qty": position,
                 "pnl": round(pnl, 2),
-                "return_pct": round((price / entry_price - 1) * 100, 2),
+                "return_pct": round((fill_price / entry_price - 1) * 100, 2),
                 "holding_days": holding,
             })
             position = 0
@@ -212,10 +232,15 @@ def backtest_rsi_reversion(ticker: str, df: pd.DataFrame,
         equity.append(port_value)
 
     equity_series = pd.Series(equity, index=df.index[1:len(equity) + 1])
-    return _compute_stats(equity_series, trades, f"RSI_Reversion_{oversold}_{overbought}", ticker)
+    result = _compute_stats(equity_series, trades, f"RSI_Reversion_{oversold}_{overbought}", ticker)
+    result.trading_costs = costs.to_dict()
+    return result
 
 
-def backtest_composite_signal(ticker: str, df: pd.DataFrame, tool_results: list) -> BacktestResult:
+def backtest_composite_signal(ticker: str, df: pd.DataFrame, tool_results: list,
+                              costs: Optional[TradingCosts] = None) -> BacktestResult:
+    if costs is None:
+        costs = TradingCosts.for_ticker(ticker)
     df = df.copy().dropna(subset=["Close"])
     if df.empty or not tool_results:
         return BacktestResult(strategy="Composite_Signal", ticker=ticker)
@@ -242,28 +267,30 @@ def backtest_composite_signal(ticker: str, df: pd.DataFrame, tool_results: list)
         sim_score = avg_score * (0.8 + 0.4 * np.random.random())
 
         if sim_score > 2 and position == 0:
+            fill_price = round_to_tick(costs.apply_entry(price), ticker, side="up")
             risk_amt = cash * (RISK_PER_TRADE_PCT / 100)
             atr_val = float(sim_df["ATR"].iloc[i]) if "ATR" in sim_df.columns and not pd.isna(sim_df["ATR"].iloc[i]) else price * 0.02
             stop_dist = atr_val * ATR_STOP_MULTIPLIER
             qty = int(risk_amt / stop_dist) if stop_dist > 0 else 0
-            if qty > 0 and qty * price <= cash:
+            if qty > 0 and qty * fill_price <= cash:
                 position = qty
-                entry_price = price
+                entry_price = fill_price
                 entry_date = date
-                cash -= qty * price
+                cash -= qty * fill_price
 
         elif (sim_score < -2 or (position > 0 and price < entry_price * (1 - ATR_STOP_MULTIPLIER * 0.02))) and position > 0:
-            pnl = (price - entry_price) * position
-            cash += position * price
+            fill_price = round_to_tick(costs.apply_exit(price), ticker, side="down")
+            pnl = (fill_price - entry_price) * position
+            cash += position * fill_price
             holding = (date - entry_date).days if entry_date else 0
             trades.append({
                 "entry_date": str(entry_date)[:10],
                 "exit_date": str(date)[:10],
-                "entry_price": round(entry_price, 2),
-                "exit_price": round(price, 2),
+                "entry_price": round(entry_price, 4),
+                "exit_price": round(fill_price, 4),
                 "qty": position,
                 "pnl": round(pnl, 2),
-                "return_pct": round((price / entry_price - 1) * 100, 2),
+                "return_pct": round((fill_price / entry_price - 1) * 100, 2),
                 "holding_days": holding,
             })
             position = 0
@@ -272,16 +299,21 @@ def backtest_composite_signal(ticker: str, df: pd.DataFrame, tool_results: list)
         equity.append(port_value)
 
     equity_series = pd.Series(equity, index=sim_df.index[1:len(equity) + 1])
-    return _compute_stats(equity_series, trades, "Composite_Signal", ticker)
+    result = _compute_stats(equity_series, trades, "Composite_Signal", ticker)
+    result.trading_costs = costs.to_dict()
+    return result
 
 
 def backtest_bollinger_reversion(ticker: str, df: pd.DataFrame,
-                                  bb_period: int = None, bb_std: float = None) -> BacktestResult:
+                                  bb_period: int = None, bb_std: float = None,
+                                  costs: Optional[TradingCosts] = None) -> BacktestResult:
     """볼린저밴드 반전 전략: 하단 돌파 매수 → 상단 근접 매도"""
     if bb_period is None:
         bb_period = BOLLINGER_PERIOD
     if bb_std is None:
         bb_std = BOLLINGER_STD
+    if costs is None:
+        costs = TradingCosts.for_ticker(ticker)
 
     df = df.copy()
     bbu_col = f"BBU_{bb_period}_{bb_std}"
@@ -314,31 +346,33 @@ def backtest_bollinger_reversion(ticker: str, df: pd.DataFrame,
 
         # 진입: 가격이 하단 밴드 아래로 떨어졌을 때
         if price < bbl and position == 0:
+            fill_price = round_to_tick(costs.apply_entry(price), ticker, side="up")
             risk_amt = cash * (RISK_PER_TRADE_PCT / 100)
             atr_val = float(df["ATR"].iloc[i]) if "ATR" in df.columns and not pd.isna(df["ATR"].iloc[i]) else price * 0.02
             stop_dist = atr_val * ATR_STOP_MULTIPLIER
             qty = int(risk_amt / stop_dist) if stop_dist > 0 else 0
-            if qty > 0 and qty * price <= cash:
+            if qty > 0 and qty * fill_price <= cash:
                 position = qty
-                entry_price = price
+                entry_price = fill_price
                 entry_date = date
-                cash -= qty * price
+                cash -= qty * fill_price
 
         # 청산: 가격이 상단 밴드 근처(80% 이상)에 도달했을 때
         elif position > 0:
             bb_position = (price - bbl) / (bbu - bbl) if bbu != bbl else 0.5
             if bb_position > 0.8:
-                pnl = (price - entry_price) * position
-                cash += position * price
+                fill_price = round_to_tick(costs.apply_exit(price), ticker, side="down")
+                pnl = (fill_price - entry_price) * position
+                cash += position * fill_price
                 holding = (date - entry_date).days if entry_date else 0
                 trades.append({
                     "entry_date": str(entry_date)[:10],
                     "exit_date": str(date)[:10],
-                    "entry_price": round(entry_price, 2),
-                    "exit_price": round(price, 2),
+                    "entry_price": round(entry_price, 4),
+                    "exit_price": round(fill_price, 4),
                     "qty": position,
                     "pnl": round(pnl, 2),
-                    "return_pct": round((price / entry_price - 1) * 100, 2),
+                    "return_pct": round((fill_price / entry_price - 1) * 100, 2),
                     "holding_days": holding,
                 })
                 position = 0
@@ -347,7 +381,9 @@ def backtest_bollinger_reversion(ticker: str, df: pd.DataFrame,
         equity.append(port_value)
 
     equity_series = pd.Series(equity, index=df.index[1:len(equity) + 1])
-    return _compute_stats(equity_series, trades, f"Bollinger_Reversion_{bb_period}_{bb_std}", ticker)
+    result = _compute_stats(equity_series, trades, f"Bollinger_Reversion_{bb_period}_{bb_std}", ticker)
+    result.trading_costs = costs.to_dict()
+    return result
 
 
 def optimize_strategy_params(ticker: str, df: pd.DataFrame, strategy: str = "rsi_reversion",

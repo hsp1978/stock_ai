@@ -12,6 +12,31 @@ from typing import Optional, Tuple
 from config import RSI_PERIOD, BOLLINGER_PERIOD, BOLLINGER_STD, ADX_PERIOD
 
 
+_tf_gpu_initialized = False
+
+def _ensure_tf_gpu_growth() -> None:
+    """TF GPU 동적 메모리 할당 — 한 번만 호출.
+
+    Why: 같은 RTX 5070을 호스트 Ollama(qwen3:14b ~9GB)와 공유하므로 TF가
+    기본값으로 전체 VRAM을 미리 잡으면 Ollama가 OOM. memory_growth=True 면
+    실제 사용량만큼만 점진적으로 alloc.
+    """
+    global _tf_gpu_initialized
+    if _tf_gpu_initialized:
+        return
+    try:
+        import tensorflow as tf
+        gpus = tf.config.list_physical_devices("GPU")
+        for gpu in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            except RuntimeError:
+                pass  # 이미 다른 호출에서 init 됐을 수도
+        _tf_gpu_initialized = True
+    except ImportError:
+        pass
+
+
 def _build_features(df: pd.DataFrame) -> pd.DataFrame:
     feat = pd.DataFrame(index=df.index)
 
@@ -357,6 +382,7 @@ def train_predict_xgb(ticker: str, df: pd.DataFrame, horizon: int = 5) -> dict:
 
 def train_predict_lstm(ticker: str, df: pd.DataFrame, horizon: int = 5, lookback: int = 20) -> dict:
     """LSTM 시계열 예측 (Qlib 스타일)"""
+    _ensure_tf_gpu_growth()
     try:
         import tensorflow as tf
         from tensorflow import keras

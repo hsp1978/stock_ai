@@ -5,6 +5,7 @@
 - Trailing Stop (NautilusTrader/Freqtrade 스타일)
 - 시간 기반 청산 (Time-based Exit)
 - 실제 주문 집행 없음 (시뮬레이션 전용)
+- 한국 주식 원화(₩) 표시 지원
 """
 import json
 import os
@@ -12,6 +13,12 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from config import ACCOUNT_SIZE, OUTPUT_DIR
+from currency_utils import (
+    is_korean_stock,
+    get_currency_symbol,
+    format_price,
+    format_amount
+)
 
 
 PAPER_STATE_FILE = os.path.join(OUTPUT_DIR, "paper_trading_state.json")
@@ -83,6 +90,12 @@ def get_portfolio_status() -> dict:
                 "pnl": round((p.get("current_price", p["entry_price"]) - p["entry_price"]) * p["qty"], 2),
                 "pnl_pct": round((p.get("current_price", p["entry_price"]) / p["entry_price"] - 1) * 100, 2),
                 "entry_date": p.get("entry_date", ""),
+                # 자동 청산 조건 및 trailing 추적 (Virtual Trade 페이지용)
+                "stop_loss_price": p.get("stop_loss_price", 0),
+                "take_profit_price": p.get("take_profit_price", 0),
+                "trailing_stop_pct": p.get("trailing_stop_pct", 0),
+                "time_stop_days": p.get("time_stop_days", 0),
+                "peak_price": p.get("peak_price", p["entry_price"]),
             }
             for ticker, p in positions.items()
         },
@@ -124,7 +137,9 @@ def execute_paper_order(ticker: str, action: str, qty: int,
             max_qty = int(cash / price)
             if max_qty <= 0:
                 order["status"] = "rejected"
-                order["reject_reason"] = f"잔고 부족 (필요: ${cost:,.0f}, 보유: ${cash:,.0f})"
+                # 한국 주식 여부에 따라 통화 표시 변경
+                currency = get_currency_symbol(ticker)
+                order["reject_reason"] = f"잔고 부족 (필요: {currency}{cost:,.0f}, 보유: {currency}{cash:,.0f})"
                 state["order_history"].append(order)
                 _save_state(state)
                 return order
@@ -275,9 +290,10 @@ def update_position_prices(prices: dict[str, float]) -> list[dict]:
         if trailing_pct > 0:
             trailing_stop_price = peak * (1 - trailing_pct)
             if price <= trailing_stop_price:
+                # 한국 주식용 통화 표시
                 result = execute_paper_order(
                     ticker, "SELL", pos["qty"], price,
-                    reason=f"Trailing Stop: {trailing_pct:.1%} 이탈 (고점 ${peak:.2f} → ${price:.2f})"
+                    reason=f"Trailing Stop: {trailing_pct:.1%} 이탈 (고점 {format_price(peak, ticker)} → {format_price(price, ticker)})"
                 )
                 auto_closed.append(result)
                 continue  # 다음 종목으로
@@ -287,7 +303,7 @@ def update_position_prices(prices: dict[str, float]) -> list[dict]:
         if stop_loss > 0 and price <= stop_loss:
             result = execute_paper_order(
                 ticker, "SELL", pos["qty"], price,
-                reason=f"Stop Loss: ${stop_loss:.2f}"
+                reason=f"Stop Loss: {format_price(stop_loss, ticker)}"
             )
             auto_closed.append(result)
             continue
@@ -297,7 +313,7 @@ def update_position_prices(prices: dict[str, float]) -> list[dict]:
         if take_profit > 0 and price >= take_profit:
             result = execute_paper_order(
                 ticker, "SELL", pos["qty"], price,
-                reason=f"Take Profit: ${take_profit:.2f}"
+                reason=f"Take Profit: {format_price(take_profit, ticker)}"
             )
             auto_closed.append(result)
             continue

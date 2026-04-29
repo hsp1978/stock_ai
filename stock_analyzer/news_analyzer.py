@@ -52,20 +52,39 @@ class NewsAnalyzer:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         })
 
-        # Financial sentiment keywords
+        # Financial sentiment keywords (영문 + 한글)
         self.positive_keywords = [
+            # 영문
             'beat', 'exceed', 'upgrade', 'raise', 'strong', 'growth', 'profit',
             'bullish', 'outperform', 'breakthrough', 'surge', 'rally', 'gain',
             'record', 'expand', 'innovative', 'partner', 'deal', 'acquire',
-            'revenue up', 'earnings beat', 'guidance raised', 'buy rating'
+            'revenue up', 'earnings beat', 'guidance raised', 'buy rating',
+            # 한글
+            '상승', '강세', '호실적', '돌파', '신고가', '매수', '목표가 상향',
+            '실적 개선', '흑자 전환', '수주', '계약', '신제품', '확대', '성장',
+            '컨센서스 상회', '어닝 서프라이즈',
         ]
 
         self.negative_keywords = [
+            # 영문
             'miss', 'downgrade', 'cut', 'weak', 'loss', 'decline', 'bearish',
             'underperform', 'concern', 'risk', 'fall', 'drop', 'plunge',
             'layoff', 'lawsuit', 'investigation', 'recall', 'warning',
-            'revenue down', 'earnings miss', 'guidance cut', 'sell rating'
+            'revenue down', 'earnings miss', 'guidance cut', 'sell rating',
+            # 한글
+            '하락', '약세', '부진', '신저가', '매도', '목표가 하향',
+            '실적 악화', '적자', '소송', '리콜', '경고', '우려', '리스크',
+            '컨센서스 하회', '어닝 쇼크', '감산', '구조조정',
         ]
+
+        # 부정 수식어 (긍정 키워드 앞에 있으면 부정으로 반전)
+        # 예: "급등 우려" → 긍정 키워드 "급등"이 부정으로 반전
+        self.negation_modifiers = [
+            'no ', 'not ', 'without ', 'lack of ', 'fail to ', 'failed to ',
+            '아님', '아니다', '실패', '없음', '부재', '못하',
+        ]
+        # 강도 약화 수식어 (긍정/부정 강도 줄임)
+        self.weakening_modifiers = ['우려', '불확실', '예상', '가능성', '전망', '기대']
 
         # Source credibility weights
         self.source_weights = {
@@ -281,9 +300,38 @@ class NewsAnalyzer:
         text = f"{item.title} {item.summary or ''}"
         text_lower = text.lower()
 
-        # Count positive and negative keywords
-        positive_count = sum(1 for keyword in self.positive_keywords if keyword in text_lower)
-        negative_count = sum(1 for keyword in self.negative_keywords if keyword in text_lower)
+        # 부정 수식어 인접 검사: 키워드 앞 30자 이내에 부정 수식어 있으면 반전
+        def _is_negated(kw: str, hay: str) -> bool:
+            idx = hay.find(kw)
+            if idx < 0:
+                return False
+            window = hay[max(0, idx - 30):idx]
+            return any(neg in window for neg in self.negation_modifiers)
+
+        # 약화 수식어 인접 검사: 키워드 주변에 "우려/예상" 등 있으면 강도 낮춤
+        def _is_weakened(kw: str, hay: str) -> bool:
+            idx = hay.find(kw)
+            if idx < 0:
+                return False
+            window = hay[max(0, idx - 15):min(len(hay), idx + len(kw) + 15)]
+            return any(mod in window for mod in self.weakening_modifiers)
+
+        positive_count = 0.0
+        negative_count = 0.0
+        for kw in self.positive_keywords:
+            if kw in text_lower:
+                weight = 0.5 if _is_weakened(kw, text_lower) else 1.0
+                if _is_negated(kw, text_lower):
+                    negative_count += weight
+                else:
+                    positive_count += weight
+        for kw in self.negative_keywords:
+            if kw in text_lower:
+                weight = 0.5 if _is_weakened(kw, text_lower) else 1.0
+                if _is_negated(kw, text_lower):
+                    positive_count += weight
+                else:
+                    negative_count += weight
 
         # Basic sentiment calculation
         if positive_count + negative_count == 0:
@@ -291,10 +339,12 @@ class NewsAnalyzer:
         else:
             base_sentiment = (positive_count - negative_count) / (positive_count + negative_count)
 
-        # Adjust for strong signals
-        if 'upgrade' in text_lower or 'beat' in text_lower:
+        # Adjust for strong signals (단, 부정/약화 수식어 없을 때만)
+        if ('upgrade' in text_lower or 'beat' in text_lower) and \
+           not _is_negated('upgrade', text_lower) and not _is_negated('beat', text_lower):
             base_sentiment = max(base_sentiment, 0.6)
-        elif 'downgrade' in text_lower or 'miss' in text_lower:
+        elif ('downgrade' in text_lower or 'miss' in text_lower) and \
+             not _is_negated('downgrade', text_lower) and not _is_negated('miss', text_lower):
             base_sentiment = min(base_sentiment, -0.6)
 
         # Apply source weight

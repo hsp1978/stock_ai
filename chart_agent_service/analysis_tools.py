@@ -31,6 +31,42 @@ from config import (
 
 
 # ═══════════════════════════════════════════════════════════════
+#  공통 헬퍼: timezone-aware 시점 비교
+# ═══════════════════════════════════════════════════════════════
+def _market_now_naive(market: str = "US") -> pd.Timestamp:
+    """
+    시장 기준 현재 시각을 tz-naive Timestamp로 반환.
+    한국 시장(KS/KQ)은 KST, 그 외는 미국 동부(ET) 기준.
+
+    이렇게 하면 yfinance가 제공하는 tz-aware 일자와 비교 시 datetime 오프셋 문제를 줄일 수 있다.
+    """
+    tz_map = {"KR": "Asia/Seoul", "KS": "Asia/Seoul", "KQ": "Asia/Seoul"}
+    tz_name = tz_map.get(market.upper(), "America/New_York")
+    return pd.Timestamp.now(tz=tz_name).tz_localize(None)
+
+
+def _to_naive_ts(ts) -> Optional[pd.Timestamp]:
+    """입력값을 tz-naive pd.Timestamp로 변환 (실패 시 None)."""
+    try:
+        result = pd.Timestamp(ts)
+        if result.tzinfo is not None:
+            result = result.tz_convert(None) if hasattr(result, 'tz_convert') else result.tz_localize(None)
+        return result
+    except (ValueError, TypeError):
+        return None
+
+
+def _market_from_ticker(ticker: str) -> str:
+    """티커에서 시장 코드(KR/US) 추론."""
+    if not ticker:
+        return "US"
+    t = ticker.upper()
+    if t.endswith(".KS") or t.endswith(".KQ"):
+        return "KR"
+    return "US"
+
+
+# ═══════════════════════════════════════════════════════════════
 #  16개 분석 기법 (각각 독립 함수, tool로 LLM에 노출)
 # ═══════════════════════════════════════════════════════════════
 
@@ -46,10 +82,28 @@ class AnalysisTools:
         self.volume = df['Volume']
         self.latest = df.iloc[-1]
 
+        # [P1 개선] 진입가 검증
+        self.entry_price_warnings = []
+        current_price = float(self.latest['Close'])
+        day_high = float(self.latest['High'])
+        day_low = float(self.latest['Low'])
+
+        if current_price > day_high:
+            self.entry_price_warnings.append(f"진입가 ${current_price:.2f} > 당일 고가 ${day_high:.2f}")
+        elif current_price < day_low:
+            self.entry_price_warnings.append(f"진입가 ${current_price:.2f} < 당일 저가 ${day_low:.2f}")
+
+        # 52주 고가 대비 하락률 계산
+        if len(df) >= 252:
+            week52_high = float(df['High'].tail(252).max())
+            self.week52_decline = (week52_high - current_price) / week52_high * 100
+        else:
+            self.week52_decline = None
+
     # ── 기술적 분석 6개 ──────────────────────────────────────
 
     def trend_ma_analysis(self) -> dict:
-        """[기술1] 이동평균선 배열 분석 - 골든/데드크로스, 정배열/역배열"""
+        """[기술1] 이동평균선 배열 분석 - 골든/데드크로스, 정배열/역배열, 급등돌파"""
         result = {"tool": "trend_ma_analysis", "name": "이동평균선 배열 분석"}
         sma_vals = {}
         for p in [20, 50, 200]:
@@ -72,6 +126,42 @@ class AnalysisTools:
         is_bullish_aligned = all(sorted_vals[i] >= sorted_vals[i+1] for i in range(len(sorted_vals)-1))
         is_bearish_aligned = all(sorted_vals[i] <= sorted_vals[i+1] for i in range(len(sorted_vals)-1))
 
+        # 급등 돌파 상태 감지: 가격이 모든 MA 위에서 일정기간 유지 + 거래량 체크
+        is_breakout = False
+        breakout_type = None
+
+        if above_count == len(sma_vals):  # 모든 MA 위에 있을 때
+            # 최근 10봉 내 MA 위 유지 기간 확인
+            lookback = min(10, len(self.df))
+            recent_df = self.df.iloc[-lookback:]
+            breakout_bars = 0
+            for i in range(len(recent_df)):
+                row = recent_df.iloc[i]
+                if all(row['Close'] > row[f'SMA_{p}'] for p in sorted_periods if f'SMA_{p}' in row and not pd.isna(row[f'SMA_{p}'])):
+                    breakout_bars += 1
+
+            # [개선 #1] MA breakout + 거래량 체크 강화
+            volume_ratio = 1.0
+            volume_warning = None
+            if 'Volume_SMA_20' in self.df.columns and not pd.isna(self.latest.get('Volume_SMA_20')):
+                vol = float(self.latest['Volume'])
+                vol_avg = float(self.latest['Volume_SMA_20'])
+                volume_ratio = vol / vol_avg if vol_avg > 0 else 1.0
+
+                # 거래량 1.5배 미만 시 경고
+                if volume_ratio < 1.5:
+                    volume_warning = f"거래량 부족 {volume_ratio:.1f}x < 1.5x 기준"
+
+            # 돌파 판정: 8봉 이상 MA 위 유지 + 거래량 1.5배 이상
+            if breakout_bars >= 8:
+                if volume_ratio >= 1.5:  # 1.5배 이상 거래량 필수
+                    is_breakout = True
+                    breakout_type = "breakout_bullish"  # 거래량 동반 강한 돌파
+                else:
+                    # 거래량 부족 시 돌파 무효
+                    is_breakout = False
+                    breakout_type = None
+
         # 골든/데드크로스 (SMA20 vs SMA50)
         cross_signal = "none"
         if 20 in sma_vals and 50 in sma_vals:
@@ -85,28 +175,80 @@ class AnalysisTools:
                 elif prev_diff > 0 and curr_diff < 0:
                     cross_signal = "dead_cross"
 
-        # 점수 계산 (-10 ~ +10)
+        # 점수 계산 (-10 ~ +10) - 돌파 유형별 처리
         score = 0
-        if is_bullish_aligned:
+        if is_breakout:
+            if breakout_type == "breakout_bullish":
+                # 거래량 동반 강한 돌파
+                score += 5
+                # RSI 과열 체크
+                if 'RSI' in self.df.columns and not pd.isna(self.latest['RSI']):
+                    rsi = float(self.latest['RSI'])
+                    if rsi > 70:
+                        score -= 2  # 과열시 일부 차감
+            elif breakout_type == "breakout_weak":
+                # 거래량 미동반 약한 돌파 - 중립
+                score += 0  # 신호 없음
+        elif is_bullish_aligned:
             score += 4
         elif is_bearish_aligned:
             score -= 4
-        score += (above_count - len(sma_vals) / 2) * 2
+        else:
+            # Mixed alignment
+            score += (above_count - len(sma_vals) / 2) * 2
+
         if cross_signal == "golden_cross":
             score += 3
         elif cross_signal == "dead_cross":
             score -= 3
+
+        # 거래량 검증을 score에 반영 (거짓 강세 신호 방지)
+        # 평균 대비 거래량이 극도로 낮은 경우 신호 신뢰성 저하
+        if 'Volume_SMA_20' in self.df.columns and not pd.isna(self.latest.get('Volume_SMA_20')):
+            try:
+                vol_now = float(self.latest['Volume'])
+                vol_avg = float(self.latest['Volume_SMA_20'])
+                if vol_avg > 0:
+                    vol_ratio = vol_now / vol_avg
+                    # 거래량 극도 부족 (0.3x 미만)이면 강한 buy/sell 신호 약화
+                    if vol_ratio < 0.3 and abs(score) >= 4:
+                        score = score * 0.4  # 60% 감점
+                    elif vol_ratio < 0.5 and abs(score) >= 4:
+                        score = score * 0.6  # 40% 감점
+            except (ValueError, TypeError, KeyError):
+                pass
+
         score = max(-10, min(10, score))
 
-        signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+        # 신호 결정 - breakout_weak는 중립 처리
+        if breakout_type == "breakout_weak":
+            signal = "neutral"
+        else:
+            signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+
+        # alignment 상태 결정
+        if is_breakout:
+            alignment = breakout_type  # "breakout_bullish" or "breakout_weak"
+        elif is_bullish_aligned:
+            alignment = "bullish"
+        elif is_bearish_aligned:
+            alignment = "bearish"
+        else:
+            alignment = "mixed"
+
         result.update({
             "signal": signal,
             "score": round(score, 1),
             "sma_values": sma_vals,
             "price_vs_sma": {f"SMA_{p}": "above" if price > v else "below" for p, v in sma_vals.items()},
-            "alignment": "bullish" if is_bullish_aligned else ("bearish" if is_bearish_aligned else "mixed"),
+            "alignment": alignment,
+            "is_breakout": is_breakout,
             "cross_signal": cross_signal,
-            "detail": f"가격 ${price:.2f}, 정배열={'Yes' if is_bullish_aligned else 'No'}, 크로스={cross_signal}"
+            "volume_ratio": round(volume_ratio, 2) if 'volume_ratio' in locals() else None,
+            "volume_warning": volume_warning if 'volume_warning' in locals() else None,
+            "detail": f"가격 ${price:.2f}, 배열={alignment}, 크로스={cross_signal}" +
+                      (f", 거래량 {volume_ratio:.1f}x" if 'volume_ratio' in locals() else "") +
+                      (f" [{volume_warning}]" if 'volume_warning' in locals() and volume_warning else "")
         })
         return result
 
@@ -155,10 +297,26 @@ class AnalysisTools:
         elif price_second_half_high < price_first_half_high and rsi_second_half_high > rsi_first_half_high:
             divergence = "bearish_hidden"
 
+        # Regime-aware RSI 임계값:
+        # 강한 추세(ADX > 25)에서는 표준 30/70이 너무 빨리 신호를 발생시킴.
+        # → 추세장에서 80/20, 평이한 시장에서는 표준 70/30 사용.
+        rsi_overbought = RSI_OVERBOUGHT
+        rsi_oversold = RSI_OVERSOLD
+        regime_adjust = "standard"
+        if 'ADX' in self.df.columns and not pd.isna(self.latest.get('ADX')):
+            try:
+                adx_val = float(self.latest['ADX'])
+                if adx_val > 25:
+                    rsi_overbought = 80
+                    rsi_oversold = 20
+                    regime_adjust = "trending"
+            except (ValueError, TypeError):
+                pass
+
         score = 0
-        if current_rsi > RSI_OVERBOUGHT:
+        if current_rsi > rsi_overbought:
             score -= 3
-        elif current_rsi < RSI_OVERSOLD:
+        elif current_rsi < rsi_oversold:
             score += 3
         elif current_rsi > 60:
             score -= 1
@@ -177,9 +335,10 @@ class AnalysisTools:
             "signal": signal,
             "score": round(score, 1),
             "current_rsi": round(current_rsi, 2),
-            "rsi_zone": "overbought" if current_rsi > RSI_OVERBOUGHT else ("oversold" if current_rsi < RSI_OVERSOLD else "neutral"),
+            "rsi_zone": "overbought" if current_rsi > rsi_overbought else ("oversold" if current_rsi < rsi_oversold else "neutral"),
+            "rsi_thresholds": {"overbought": rsi_overbought, "oversold": rsi_oversold, "regime": regime_adjust},
             "divergence": divergence,
-            "detail": f"RSI={current_rsi:.1f}, 다이버전스={divergence}"
+            "detail": f"RSI={current_rsi:.1f} (임계값 {rsi_oversold}/{rsi_overbought}, {regime_adjust}), 다이버전스={divergence}"
         })
         return result
 
@@ -378,7 +537,7 @@ class AnalysisTools:
         return result
 
     def volume_profile_analysis(self) -> dict:
-        """[기술6] 거래량 프로파일 분석 - OBV, 거래량 이상, 매집/분산"""
+        """[기술6] 거래량 프로파일 분석 - OBV, 거래량 이상, 매집/분산, 급변 감지"""
         result = {"tool": "volume_profile_analysis", "name": "거래량 프로파일 분석"}
 
         if 'OBV' not in self.df.columns:
@@ -388,6 +547,29 @@ class AnalysisTools:
         vol = float(self.latest['Volume'])
         vol_sma = float(self.latest.get('Volume_SMA_20', vol))
         vol_ratio = vol / vol_sma if vol_sma > 0 else 1.0
+
+        # 거래량 급변 감지 (1시간/4시간 단위)
+        volume_change_warning = None
+        volume_change_rate = 0.0
+        if len(self.df) >= 5:
+            # 최근 5봉 거래량 비율 추이
+            recent_vol_ratios = []
+            for i in range(-5, 0):
+                v = float(self.df['Volume'].iloc[i])
+                v_sma = float(self.df.get('Volume_SMA_20', pd.Series([v])).iloc[i] if 'Volume_SMA_20' in self.df.columns else v)
+                recent_vol_ratios.append(v / v_sma if v_sma > 0 else 1.0)
+
+            # 급변 감지: 직전 봉 대비 50% 이상 변동
+            if len(recent_vol_ratios) >= 2:
+                prev_ratio = recent_vol_ratios[-2]
+                curr_ratio = vol_ratio
+                if prev_ratio > 0:
+                    volume_change_rate = abs(curr_ratio - prev_ratio) / prev_ratio
+                    if volume_change_rate > 0.5:
+                        if curr_ratio < prev_ratio:
+                            volume_change_warning = "volume_sudden_drop"
+                        else:
+                            volume_change_warning = "volume_sudden_spike"
 
         obv = self.df['OBV'].dropna()
         obv_trend = "flat"
@@ -422,17 +604,34 @@ class AnalysisTools:
         if vol_ratio > 2.0:
             score += 1 if price_change > 0 else -1
 
+        # 거래량 급변 시 점수 조정
+        if volume_change_warning == "volume_sudden_drop":
+            score -= 2  # 거래량 급감은 추세 약화 신호
+        elif volume_change_warning == "volume_sudden_spike":
+            score += 1 if price_change > 0 else -1  # 방향성에 따라
+
         score = max(-10, min(10, score))
         signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+
+        detail_text = f"거래량비={vol_ratio:.2f}x, OBV추세={obv_trend}, 매집분산={accumulation}"
+        if volume_change_warning:
+            detail_text += f", ⚠️{volume_change_warning} ({volume_change_rate:.0%} 변동)"
 
         result.update({
             "signal": signal,
             "score": round(score, 1),
             "current_volume": int(vol),
             "volume_ratio": round(vol_ratio, 2),
+            "volume_sma_period": 20,  # [개선 #6] 시간프레임 명시
+            "volume_change_lookback": 5,  # 최근 5봉 비교
+            "volume_change_warning": volume_change_warning,
+            "volume_change_rate": round(volume_change_rate, 2) if volume_change_rate else 0.0,
             "obv_trend": obv_trend,
+            "obv_trend_periods": {"short": 5, "long": 20},  # OBV 비교 기간
+            "price_volume_divergence_period": 10,  # 가격-거래량 괴리 분석 기간
             "accumulation_distribution": accumulation,
-            "detail": f"거래량비={vol_ratio:.1f}x, OBV추세={obv_trend}, 매집분산={accumulation}"
+            "timeframe": "daily",  # 일봉 기준
+            "detail": detail_text + " (일봉 기준, SMA20 대비)"  # 시간프레임 명시
         })
         return result
 
@@ -520,6 +719,27 @@ class AnalysisTools:
         price = float(self.latest['Close'])
         atr_pct = current_atr / price * 100
 
+        # 연환산 변동성 — 단일 정의: 일간 수익률 표준편차 기반 (통계적으로 더 정확)
+        # ATR 기반 변동성은 atr_pct로 별도 보고
+        returns = self.close.pct_change().dropna()
+        if len(returns) >= 20:
+            daily_vol_pct = float(returns.tail(20).std()) * 100  # %
+        else:
+            daily_vol_pct = atr_pct  # 표본 부족 시 ATR%로 폴백
+        annualized_vol = daily_vol_pct * np.sqrt(252)  # 단일 진실 값
+
+        # 변동성 라벨 (S&P 500 평균 15-20% 기준) — 위 단일 값 기준으로 결정
+        if annualized_vol > 60:
+            vol_label = "극도 고변동성"
+        elif annualized_vol > 40:
+            vol_label = "고변동성"
+        elif annualized_vol > 25:
+            vol_label = "평균 이상"
+        elif annualized_vol > 15:
+            vol_label = "정상"
+        else:
+            vol_label = "저변동성"
+
         # 히스토리컬 퍼센타일
         atr_pcts = (atr / self.close.loc[atr.index]) * 100
         percentile = float((atr_pcts < atr_pct).sum() / len(atr_pcts) * 100)
@@ -541,11 +761,6 @@ class AnalysisTools:
         atr_20 = float(atr.tail(20).mean())
         vol_trend = "expanding" if atr_5 > atr_20 * 1.1 else ("contracting" if atr_5 < atr_20 * 0.9 else "stable")
 
-        # 일간 수익률 표준편차
-        returns = self.close.pct_change().dropna()
-        daily_vol = float(returns.tail(20).std())
-        annualized_vol = daily_vol * np.sqrt(252) * 100
-
         score = 0
         if regime == "low_volatility" and vol_trend == "contracting":
             score += 2  # 저변동성 수축 = 폭발 예고
@@ -564,13 +779,14 @@ class AnalysisTools:
             "regime": regime,
             "vol_trend": vol_trend,
             "annualized_volatility": round(annualized_vol, 2),
-            "daily_volatility": round(daily_vol * 100, 4),
-            "detail": f"ATR%={atr_pct:.2f}%, 체제={regime}, 추이={vol_trend}, 연환산변동성={annualized_vol:.1f}%"
+            "daily_volatility": round(daily_vol_pct, 4),
+            "vol_label": vol_label,
+            "detail": f"ATR%={atr_pct:.2f}%, 연환산={annualized_vol:.1f}% ({vol_label}), 체제={regime}, 추이={vol_trend}"
         })
         return result
 
     def mean_reversion_analysis(self) -> dict:
-        """[퀀트3] 평균 회귀 분석 - Z-Score 기반"""
+        """[퀀트3] 평균 회귀 분석 - Z-Score 기반 (실적 후 모드 포함)"""
         result = {"tool": "mean_reversion_analysis", "name": "평균 회귀 분석"}
 
         if len(self.close) < 50:
@@ -578,6 +794,47 @@ class AnalysisTools:
             return result
 
         price = float(self.latest['Close'])
+
+        # 실적 발표 후 여부 체크
+        post_earnings_mode = False
+        mean_reversion_confidence = "normal"  # 신뢰도 수준
+        weight_multiplier = 1.0  # 점수 가중치
+
+        try:
+            # 실적 발표일 체크 (event_driven_analysis와 연동)
+            from datetime import datetime, timedelta
+            t = yf.Ticker(self.ticker)
+            cal = t.calendar
+
+            if cal is not None:
+                earnings_dates = []
+                if isinstance(cal, dict):
+                    ed = cal.get("Earnings Date")
+                    if ed:
+                        earnings_dates = [ed] if not isinstance(ed, list) else ed
+                elif hasattr(cal, 'index') and "Earnings Date" in cal.index:
+                    ed = cal.loc["Earnings Date"]
+                    earnings_dates = [d for d in ed.values if pd.notna(d)]
+
+                # 최근 3일 이내 실적 발표 확인 (시장 시간대 기준)
+                market = _market_from_ticker(self.ticker)
+                now_naive = _market_now_naive(market)
+                for ed in earnings_dates:
+                    try:
+                        ed_dt = _to_naive_ts(ed)
+                        if ed_dt is None:
+                            continue
+                        days_since = (now_naive - ed_dt).days
+                        if 0 <= days_since <= 3:
+                            post_earnings_mode = True
+                            mean_reversion_confidence = "low"
+                            # 실적 후 점수 가중치 감소 (임계값 조정 대신)
+                            weight_multiplier = 0.5
+                            break
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:
+            pass  # 실적 정보 없으면 기본 모드
 
         # 다중 기간 Z-Score
         z_scores = {}
@@ -598,20 +855,32 @@ class AnalysisTools:
         reversion_prob = 1 - scipy_stats.norm.cdf(abs(avg_z))
         reversion_prob *= 2  # 양측
 
+        # 고정 임계값 사용 (조정 없음)
+        high_threshold = 2.0
+        mid_threshold = 1.5
+
         score = 0
-        if avg_z > 2:
+        if avg_z > high_threshold:
             score -= 5  # 극단적 고평가
-        elif avg_z > 1.5:
+        elif avg_z > mid_threshold:
             score -= 3
-        elif avg_z < -2:
+        elif avg_z < -high_threshold:
             score += 5  # 극단적 저평가
-        elif avg_z < -1.5:
+        elif avg_z < -mid_threshold:
             score += 3
         elif abs(avg_z) < 0.5:
             score += 1  # 평균 근처 = 안정
 
+        # 실적 후 모드에서 점수 가중치 적용
+        if post_earnings_mode:
+            score = score * weight_multiplier
+
         score = max(-10, min(10, score))
         signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+
+        detail_text = f"평균Z={avg_z:.2f}, 회귀확률={reversion_prob:.1%}"
+        if post_earnings_mode:
+            detail_text += f" [실적후: 신뢰도 {mean_reversion_confidence}, 가중치 {weight_multiplier}]"
 
         result.update({
             "signal": signal,
@@ -619,7 +888,10 @@ class AnalysisTools:
             "z_scores": z_scores,
             "avg_z_score": round(avg_z, 3),
             "reversion_probability": round(reversion_prob, 4),
-            "detail": f"평균Z={avg_z:.2f}, 회귀확률={reversion_prob:.1%}"
+            "post_earnings_mode": post_earnings_mode,
+            "confidence_level": mean_reversion_confidence,
+            "weight_multiplier": weight_multiplier,
+            "detail": detail_text
         })
         return result
 
@@ -832,7 +1104,7 @@ class AnalysisTools:
         return result
 
     def risk_position_sizing(self) -> dict:
-        """[리스크] 포지션 사이징 및 손절/익절 산출 (ATR 기반)"""
+        """[리스크] 포지션 사이징 및 손절/익절 산출 (ATR + 지지저항 기반)"""
         result = {"tool": "risk_position_sizing", "name": "포지션 사이징 / 리스크 관리"}
 
         if 'ATR' not in self.df.columns:
@@ -840,18 +1112,101 @@ class AnalysisTools:
             return result
 
         price = float(self.latest['Close'])
-        atr = float(self.df['ATR'].dropna().iloc[-1])
+        atr_series = self.df['ATR'].dropna()
+        if atr_series.empty:
+            result.update({"signal": "neutral", "score": 0, "detail": "ATR 유효값 없음"})
+            return result
+        atr = float(atr_series.iloc[-1])
 
+        # 1. ATR 기반 R/R 계산 (호가단위 반올림)
+        from tick_size import round_to_tick
         stop_distance = atr * ATR_STOP_MULTIPLIER
-        stop_loss = round(price - stop_distance, 2)
-        take_profit = round(price + stop_distance * TAKE_PROFIT_RR_RATIO, 2)
+        # 손절은 아래로(매수 포지션), 익절은 위로 — 실제 호가단위로 정합
+        stop_loss_atr = round_to_tick(price - stop_distance, self.ticker, side="down")
+        take_profit_atr = round_to_tick(price + stop_distance * TAKE_PROFIT_RR_RATIO, self.ticker, side="up")
+        rr_ratio_atr = TAKE_PROFIT_RR_RATIO
 
+        # 2. 지지저항 기반 R/R 계산
+        # support_resistance_analysis와 유사한 로직 사용
+        lookback = min(60, len(self.df))
+        recent = self.df.tail(lookback)
+        swing_highs = []
+        swing_lows = []
+
+        for i in range(2, min(len(recent) - 2, lookback - 2)):
+            if (float(recent['High'].iloc[i]) > float(recent['High'].iloc[i-1]) and
+                float(recent['High'].iloc[i]) > float(recent['High'].iloc[i-2]) and
+                float(recent['High'].iloc[i]) > float(recent['High'].iloc[i+1]) and
+                float(recent['High'].iloc[i]) > float(recent['High'].iloc[i+2])):
+                swing_highs.append(float(recent['High'].iloc[i]))
+            if (float(recent['Low'].iloc[i]) < float(recent['Low'].iloc[i-1]) and
+                float(recent['Low'].iloc[i]) < float(recent['Low'].iloc[i-2]) and
+                float(recent['Low'].iloc[i]) < float(recent['Low'].iloc[i+1]) and
+                float(recent['Low'].iloc[i]) < float(recent['Low'].iloc[i+2])):
+                swing_lows.append(float(recent['Low'].iloc[i]))
+
+        # 피봇 포인트 계산
+        high = float(self.latest['High'])
+        low = float(self.latest['Low'])
+        pivot = (high + low + price) / 3
+        r1 = 2 * pivot - low
+        s1 = 2 * pivot - high
+
+        nearest_resistance_sr = min([h for h in swing_highs if h > price], default=r1)
+        nearest_support_sr = max([l for l in swing_lows if l < price], default=s1)
+
+        # 호가단위로 반올림하여 실제 주문 가능한 값으로 출력
+        stop_loss_sr = round_to_tick(nearest_support_sr, self.ticker, side="down")
+        take_profit_sr = round_to_tick(nearest_resistance_sr, self.ticker, side="up")
+
+        upside_pct = (nearest_resistance_sr - price) / price * 100 if price > 0 else 0
+        downside_pct = (price - nearest_support_sr) / price * 100 if price > 0 else 0
+        rr_ratio_sr = upside_pct / downside_pct if downside_pct > 0 else 0
+
+        # 최종 손절/익절 결정 (진정한 보수적 선택)
+        stop_loss_final = min(stop_loss_atr, stop_loss_sr)  # 더 가까운(보수적) 손절
+        take_profit_final = take_profit_atr  # ATR 기반 익절 사용
+
+        # [P0 개선] 켈리 기준 먼저 가져오기
+        kelly_result = self.kelly_criterion_analysis()
+        kelly_optimal_pct = kelly_result.get('optimal_position_pct', 10.0)  # 켈리 권장 비중
+
+        # 포지션 사이징 계산
+        stop_distance_final = price - stop_loss_final
         risk_amount = ACCOUNT_SIZE * (RISK_PER_TRADE_PCT / 100)
-        qty = int(risk_amount / stop_distance) if stop_distance > 0 else 0
+        qty = int(risk_amount / stop_distance_final) if stop_distance_final > 0 else 0
         position_value = qty * price
         position_pct = (position_value / ACCOUNT_SIZE * 100) if ACCOUNT_SIZE > 0 else 0
 
+        # [P0 켈리 하드캡] 켈리 권장 비중으로 제한
+        if position_pct > kelly_optimal_pct and kelly_optimal_pct > 0:
+            warnings_pre = []
+            warnings_pre.append(f"켈리 하드캡 적용: {position_pct:.1f}% → {kelly_optimal_pct:.1f}%")
+            position_pct = kelly_optimal_pct
+            position_value = ACCOUNT_SIZE * (position_pct / 100)
+            qty = int(position_value / price)
+            position_value = qty * price  # 정수 주식수로 재계산
+            position_pct = (position_value / ACCOUNT_SIZE * 100)
+
+        # [개선 #2] R/R min() 적용 및 일관성 유지
+        effective_rr = min(rr_ratio_atr, rr_ratio_sr)  # 보수적 선택
+        rr_method = "ATR" if rr_ratio_atr <= rr_ratio_sr else "S/R"
+
         warnings = []
+        # 켈리 하드캡 경고 추가
+        if 'warnings_pre' in locals():
+            warnings.extend(warnings_pre)
+
+        # R/R 단계별 경고
+        if effective_rr < 1.0:
+            warnings.append(f"R/R 불리 ({effective_rr:.2f} < 1.0): 손실이 수익보다 큼")
+            # 포지션 50% 자동 축소
+            qty = int(qty * 0.5)
+            position_value = qty * price
+            position_pct = position_value / ACCOUNT_SIZE * 100
+        elif effective_rr < 2.0:
+            warnings.append(f"R/R 미흡 ({effective_rr:.2f} < 2.0): 권장 기준 미달")
+
         if position_pct > MAX_POSITION_PCT:
             max_qty = int(ACCOUNT_SIZE * MAX_POSITION_PCT / 100 / price)
             warnings.append(f"비중 초과({position_pct:.1f}%>{MAX_POSITION_PCT}%), 최대 {max_qty}주로 제한")
@@ -863,8 +1218,8 @@ class AnalysisTools:
             qty = int(ACCOUNT_SIZE / price)
             position_value = qty * price
             position_pct = position_value / ACCOUNT_SIZE * 100
-        if stop_distance / price > 0.10:
-            warnings.append(f"손절가 이격 과다({stop_distance / price:.1%})")
+        if stop_distance_final / price > 0.10:
+            warnings.append(f"손절가 이격 과다({stop_distance_final / price:.1%})")
 
         pct1 = POSITION_TRANCHE_1_PCT / 100
         pct2 = POSITION_TRANCHE_2_PCT / 100
@@ -876,40 +1231,114 @@ class AnalysisTools:
             {"tranche": 3, "pct": POSITION_TRANCHE_3_PCT, "qty": qty - int(qty * pct1) - int(qty * pct2), "note": "최종 진입"},
         ]
 
-        rr_ratio = TAKE_PROFIT_RR_RATIO
+        # [P0 신호 중립 고정] 포지션 사이징은 방향 판단이 아닌 실행 파라미터
+        # 점수는 실행 타이밍의 적절성만 평가 (항상 중립 신호)
         score = 0
-        if rr_ratio >= 2.0 and not warnings:
-            score += 3
-        elif rr_ratio >= 1.5:
-            score += 1
+        if effective_rr >= 2.0 and not warnings:
+            score = 5  # 좋은 실행 조건
+        elif effective_rr >= 1.5:
+            score = 3  # 보통 실행 조건
+        elif effective_rr < 1.0:
+            score = -3  # 나쁜 실행 조건
         if warnings:
-            score -= len(warnings) * 2
+            score -= min(len(warnings), 3)  # 최대 -3점 차감
         score = max(-10, min(10, score))
-        signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+        signal = "neutral"  # 항상 중립 - 방향 판단 제외
 
         result.update({
             "signal": signal,
             "score": round(score, 1),
             "entry_price": price,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "stop_distance": round(stop_distance, 2),
-            "stop_pct": round(stop_distance / price * 100, 2),
+            # ATR 기반 레벨
+            "atr_based": {
+                "stop_loss": stop_loss_atr,
+                "take_profit": take_profit_atr,
+                "risk_reward_ratio": round(rr_ratio_atr, 2),
+                "stop_distance": round(stop_distance, 2),
+                "stop_pct": round(stop_distance / price * 100, 2),
+            },
+            # 지지저항 기반 레벨
+            "sr_based": {
+                "stop_loss": stop_loss_sr,
+                "take_profit": take_profit_sr,
+                "risk_reward_ratio": round(rr_ratio_sr, 2),
+                "upside_pct": round(upside_pct, 2),
+                "downside_pct": round(downside_pct, 2),
+            },
+            # 최종 권장값
+            "final_levels": {
+                "stop_loss": stop_loss_final,
+                "take_profit": take_profit_final,
+                "effective_rr": round(effective_rr, 2),  # min(ATR_RR, SR_RR)
+                "rr_method": rr_method,  # 적용된 방법
+                "method": "conservative",  # 보수적 선택
+            },
             "atr": round(atr, 2),
             "atr_multiplier": ATR_STOP_MULTIPLIER,
-            "risk_reward_ratio": rr_ratio,
             "account_size": ACCOUNT_SIZE,
             "risk_per_trade_pct": RISK_PER_TRADE_PCT,
             "risk_amount": round(risk_amount, 2),
             "recommended_qty": qty,
             "position_value": round(position_value, 2),
             "position_pct": round(position_pct, 2),
+            "kelly_optimal_pct": round(kelly_optimal_pct, 2),  # 켈리 권장 비중
             "split_entry": split_entry,
             "trading_style": TRADING_STYLE,
             "warnings": warnings,
-            "detail": f"진입=${price:.2f}, 손절=${stop_loss:.2f}(-{stop_distance/price:.1%}), "
-                       f"익절=${take_profit:.2f}(+{stop_distance*TAKE_PROFIT_RR_RATIO/price:.1%}), "
+            "detail": f"진입=${price:.2f}, ATR손절=${stop_loss_atr:.2f}(RR {rr_ratio_atr:.1f}), "
+                       f"SR손절=${stop_loss_sr:.2f}(RR {rr_ratio_sr:.1f}), "
                        f"수량={qty}주(${position_value:,.0f}, {position_pct:.1f}%)"
+        })
+        return result
+
+    def entry_plan_analysis(self, signal: str = "buy", confidence: float = 7.0,
+                            other_results: Optional[list] = None) -> dict:
+        """
+        [실전] 진입 계획 생성 — 매매 시점/분할진입/손절익절/보유기간.
+
+        다른 도구들의 결과를 종합하여 "언제/얼마에/몇 번에 나눠 매수할지" 결정.
+        사용법: 다른 도구들을 먼저 실행한 후 results 리스트를 전달.
+
+        Args:
+            signal: 현재 종합 신호 (buy/sell/neutral)
+            confidence: 0-10 신뢰도
+            other_results: 다른 도구 실행 결과 리스트. None이면 risk_position_sizing만 재실행.
+        """
+        from entry_plan import build_entry_plan, format_entry_plan_text
+
+        result = {"tool": "entry_plan_analysis", "name": "진입 계획 (매매 시점/분할/손절익절)"}
+
+        current_price = float(self.latest['Close'])
+        tool_results = other_results or []
+
+        # 최소 필수: risk_position_sizing이 결과에 없으면 직접 실행
+        if not any(r.get("tool") == "risk_position_sizing" for r in tool_results):
+            tool_results = list(tool_results) + [self.risk_position_sizing()]
+        # volatility_regime도 ATR 풀백 계산에 유용하므로 없으면 실행
+        if not any(r.get("tool") == "volatility_regime_analysis" for r in tool_results):
+            try:
+                tool_results.append(self.volatility_regime_analysis())
+            except Exception:
+                pass
+
+        plan = build_entry_plan(
+            ticker=self.ticker,
+            signal=signal,
+            confidence=confidence,
+            current_price=current_price,
+            tool_results=tool_results,
+            trading_style=TRADING_STYLE,
+        )
+
+        currency = "₩" if self.ticker.upper().endswith(".KS") or self.ticker.upper().endswith(".KQ") else "$"
+        result.update({
+            "signal": "neutral",  # 이 도구는 방향성 판단이 아님
+            "score": 0,
+            "entry_plan": plan,
+            "formatted": format_entry_plan_text(plan, currency=currency),
+            "detail": f"{plan['entry_timing']} · {plan['order_type']}"
+                     + (f" @ {currency}{plan['limit_price']:,.2f}" if plan.get('limit_price') else "")
+                     + f" · 보유 {plan['expected_holding_days']}일"
         })
         return result
 
@@ -938,10 +1367,36 @@ class AnalysisTools:
         kelly_half = kelly_full / 2
         kelly_quarter = kelly_full / 4
 
-        sharpe = float(returns.mean() / returns.std() * np.sqrt(252)) if returns.std() > 0 else 0
-        kelly_from_sharpe = sharpe / np.sqrt(252) if sharpe > 0 else 0
+        # Sharpe Ratio (무위험 수익률 옵션 적용 - 항목 #9 참조)
+        # ANNUAL_RISK_FREE_RATE 환경변수로 조정 가능 (기본 0 = naive Sharpe)
+        rf_annual = float(os.getenv("ANNUAL_RISK_FREE_RATE", "0.0"))
+        rf_daily = rf_annual / 252
+        excess_returns = returns - rf_daily
+        sharpe = float(excess_returns.mean() / returns.std() * np.sqrt(252)) if returns.std() > 0 else 0
 
-        optimal_pct = max(0, min(kelly_half * 100, MAX_POSITION_PCT))
+        # [개선 #3] 켈리 50% 이내 규칙 엄격 적용
+        kelly_half = kelly_full / 2  # 켈리의 50%
+        kelly_cap = MAX_POSITION_PCT / 2  # MAX_POSITION_PCT의 50% (10%)
+
+        # 켈리 50% 규칙과 절대 상한 적용
+        optimal_pct_raw = kelly_half * 100
+        optimal_pct = min(optimal_pct_raw, kelly_cap)  # 10% 상한
+
+        # 경고 메시지들
+        warnings = []
+        no_trade_warning = None
+
+        # 켈리가 극단적으로 낮을 때
+        if kelly_half < 0.01:  # 1% 미만
+            no_trade_warning = f"켈리 < 1% ({kelly_half*100:.2f}%): 엣지 부족, 진입 비권장"
+            optimal_pct = 0  # 포지션 없음
+            signal_override = "no_trade"
+        # 켈리가 상한을 초과할 때
+        elif optimal_pct_raw > kelly_cap:
+            warnings.append(f"Kelly {optimal_pct_raw:.1f}% → {kelly_cap:.1f}% 상한 적용")
+            signal_override = None
+        else:
+            signal_override = None
 
         score = 0
         if kelly_full > 0.15:
@@ -958,8 +1413,21 @@ class AnalysisTools:
         elif win_rate < 0.40:
             score -= 1
 
+        # Sharpe ratio 점수 반영 (이전엔 계산만 하고 미사용)
+        if sharpe > 1.5:
+            score += 2  # 우수한 위험조정 수익
+        elif sharpe > 0.8:
+            score += 1
+        elif sharpe < -0.5:
+            score -= 2  # 열악한 위험조정 수익
+
         score = max(-10, min(10, score))
-        signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+
+        # 신호 결정 (no_trade 우선)
+        if signal_override == "no_trade":
+            signal = "neutral"  # no_trade를 neutral로 매핑
+        else:
+            signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
 
         result.update({
             "signal": signal,
@@ -971,10 +1439,16 @@ class AnalysisTools:
             "kelly_full_pct": round(kelly_full * 100, 2),
             "kelly_half_pct": round(kelly_half * 100, 2),
             "kelly_quarter_pct": round(kelly_quarter * 100, 2),
+            "kelly_raw_pct": round(optimal_pct_raw, 2),  # 상한 적용 전 값
             "optimal_position_pct": round(optimal_pct, 2),
+            "kelly_cap_pct": round(kelly_cap, 2),  # 적용된 상한
             "sharpe_ratio": round(sharpe, 3),
+            "no_trade_warning": no_trade_warning,
+            "warnings": warnings if warnings else None,
             "detail": f"승률={win_rate:.1%}, W/L비={win_loss_ratio:.2f}, "
-                       f"켈리={kelly_full:.1%}, 권장비중={optimal_pct:.1f}%"
+                       f"켈리={kelly_full:.1%}, 권장비중={optimal_pct:.1f}%" +
+                       (f" (상한 {kelly_cap:.1f}%)" if optimal_pct_raw > kelly_cap else "") +
+                       (f" [{no_trade_warning}]" if no_trade_warning else "")
         })
         return result
 
@@ -1093,11 +1567,14 @@ class AnalysisTools:
 
         if earnings_dates:
             events.append({"type": "earnings", "dates": earnings_dates})
-            from datetime import datetime as dt
+            market = _market_from_ticker(self.ticker)
+            now_naive = _market_now_naive(market)
             for ed_str in earnings_dates:
                 try:
-                    ed_dt = pd.Timestamp(ed_str)
-                    days_until = (ed_dt - pd.Timestamp.now()).days
+                    ed_dt = _to_naive_ts(ed_str)
+                    if ed_dt is None:
+                        continue
+                    days_until = (ed_dt - now_naive).days
                     if 0 <= days_until <= 7:
                         events.append({"type": "earnings_imminent", "days": days_until})
                         score -= 1
@@ -1120,8 +1597,12 @@ class AnalysisTools:
         ex_div_date = info.get("exDividendDate")
         if ex_div_date:
             try:
-                ex_dt = pd.Timestamp(ex_div_date, unit="s") if isinstance(ex_div_date, (int, float)) else pd.Timestamp(ex_div_date)
-                days_to_ex = (ex_dt - pd.Timestamp.now()).days
+                ex_dt_raw = pd.Timestamp(ex_div_date, unit="s") if isinstance(ex_div_date, (int, float)) else pd.Timestamp(ex_div_date)
+                ex_dt = _to_naive_ts(ex_dt_raw)
+                if ex_dt is None:
+                    raise ValueError("invalid ex_div_date")
+                market = _market_from_ticker(self.ticker)
+                days_to_ex = (ex_dt - _market_now_naive(market)).days
                 if 0 < days_to_ex <= 14:
                     events.append({"type": "ex_dividend_soon", "date": str(ex_dt.date()), "days": days_to_ex})
                     div_yield = info.get("dividendYield", 0) or 0
@@ -1404,6 +1885,7 @@ class ChartAnalysisAgent:
             "kelly_criterion_analysis": self.tools.kelly_criterion_analysis,
             "beta_correlation_analysis": self.tools.beta_correlation_analysis,
             "event_driven_analysis": self.tools.event_driven_analysis,
+            "entry_plan_analysis": self.tools.entry_plan_analysis,
         }
 
     def _execute_tool(self, name: str) -> dict:
@@ -1414,13 +1896,42 @@ class ChartAnalysisAgent:
         return {"tool": name, "error": f"Unknown tool: {name}"}
 
     def run_all_tools(self) -> list:
-        """전체 16개 tool 실행 (LLM 없이 전수 분석)"""
+        """전체 tool 실행 (LLM 없이 전수 분석).
+
+        entry_plan_analysis는 다른 도구 결과를 입력으로 받기 때문에 마지막에 실행.
+        """
         results = []
         for name, fn in self._tool_map.items():
+            if name == "entry_plan_analysis":
+                continue  # 마지막 단계에서 별도 실행
             try:
                 results.append(fn())
             except Exception as e:
                 results.append({"tool": name, "error": str(e), "signal": "neutral", "score": 0})
+
+        # 종합 score 기반으로 임시 signal/confidence를 산출하여 entry_plan에 전달
+        avg_score = 0
+        valid_scores = [r.get("score", 0) for r in results if isinstance(r.get("score"), (int, float))]
+        if valid_scores:
+            avg_score = sum(valid_scores) / len(valid_scores)
+        composite_signal = "buy" if avg_score > 2 else ("sell" if avg_score < -2 else "neutral")
+        composite_confidence = min(10.0, abs(avg_score) + 3.0) if valid_scores else 5.0
+
+        try:
+            entry_result = self.tools.entry_plan_analysis(
+                signal=composite_signal,
+                confidence=composite_confidence,
+                other_results=results,
+            )
+            results.append(entry_result)
+        except Exception as e:
+            results.append({
+                "tool": "entry_plan_analysis",
+                "error": str(e),
+                "signal": "neutral",
+                "score": 0,
+            })
+
         self.tool_results = results
         return results
 

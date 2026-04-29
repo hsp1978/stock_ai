@@ -13,6 +13,8 @@ import sys
 import json
 import math
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
 
@@ -365,13 +367,30 @@ def engine_scan_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
 
 
 def engine_scan_all(tickers: Optional[list] = None) -> dict:
-    """전체 watchlist 스캔"""
-    tickers = tickers or _load_watchlist_files()
+    """
+    전체 watchlist 스캔 (병렬 최적화 버전).
 
+    SCAN_PARALLEL_WORKERS 환경변수로 병렬 수 조정 (기본 3).
+    배치 OHLCV 사전 다운로드로 데이터 수집 시간 단축.
+    """
+    tickers = tickers or _load_watchlist_files()
+    max_workers = int(os.getenv("SCAN_PARALLEL_WORKERS", "3"))
+
+    t_start = time.time()
     print(f"\n{'='*60}")
     print(f"  스캔 시작: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"  종목: {len(tickers)}개 — {', '.join(tickers)}")
+    print(f"  병렬 워커: {max_workers}개")
     print(f"{'='*60}\n")
+
+    # OHLCV 배치 사전 다운로드
+    try:
+        sys.path.insert(0, _SERVICE_DIR)
+        from data_collector import prefetch_ohlcv_batch, clear_ohlcv_cache
+        clear_ohlcv_cache()
+        prefetch_ohlcv_batch(tickers)
+    except Exception as e:
+        print(f"  [배치] 사전 다운로드 실패, 개별 조회: {e}")
 
     scan_entry = {
         "timestamp": datetime.now().isoformat(),
@@ -379,22 +398,41 @@ def engine_scan_all(tickers: Optional[list] = None) -> dict:
         "results": {},
         "alerts": [],
     }
+    lock = threading.Lock()
 
-    for ticker in tickers:
-        result = engine_scan_ticker(ticker)
-        if result and not result.get("error"):
-            scan_entry["results"][ticker] = {
-                "signal": result.get("final_signal"),
-                "score": result.get("composite_score"),
-                "confidence": result.get("confidence"),
-            }
-        time.sleep(3)  # API 부하 방지
+    def _scan_one(ticker):
+        return ticker, engine_scan_ticker(ticker)
 
-    scan_history.append(scan_entry)
-    if len(scan_history) > 100:
-        scan_history.pop(0)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_scan_one, t): t for t in tickers}
+        for future in as_completed(futures):
+            try:
+                ticker, result = future.result()
+            except Exception as e:
+                print(f"  [{futures[future]}] 오류: {e}")
+                continue
+            if result and not result.get("error"):
+                with lock:
+                    scan_entry["results"][ticker] = {
+                        "signal": result.get("final_signal"),
+                        "score": result.get("composite_score"),
+                        "confidence": result.get("confidence"),
+                    }
 
-    print(f"\n  스캔 완료: {datetime.now().strftime('%H:%M')}")
+    # 캐시 정리
+    try:
+        clear_ohlcv_cache()
+    except Exception:
+        pass
+
+    with threading.Lock():
+        scan_history.append(scan_entry)
+        if len(scan_history) > 100:
+            scan_history.pop(0)
+
+    elapsed = time.time() - t_start
+    print(f"\n  ✅ 스캔 완료: {len(tickers)}개 / {elapsed:.1f}s "
+          f"(종목당 평균 {elapsed/len(tickers):.1f}s)")
     return {"status": "completed", "results": engine_get_all_results()}
 
 
@@ -1180,7 +1218,18 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
 def engine_dispatch_post(path: str) -> Optional[dict]:
     """POST 요청 경로를 로컬 엔진 함수로 라우팅"""
     try:
-        if path.startswith("/scan/"):
+        if path.startswith("/screener/"):
+            # Screener 관련 요청은 HTTP API로 전달 (chart_agent_service는 포트 8100에서 실행)
+            import httpx
+            url = f"http://localhost:8100{path}"
+            try:
+                resp = httpx.post(url, timeout=900)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                print(f"[local_engine] screener API 호출 실패: {e}")
+                return {"error": str(e)}
+        elif path.startswith("/scan/"):
             ticker = path.split("/scan/")[1].split("?")[0]
             return engine_scan_ticker(ticker)
         elif path.startswith("/scan"):
