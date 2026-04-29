@@ -1704,10 +1704,13 @@ class MultiAgentOrchestrator:
                 }
 
                 # 완료된 작업 수집
-                for future in as_completed(futures, timeout=180):  # 타임아웃 연장
+                # MULTI_AGENT_TIMEOUT 으로 조정 가능 (.env). 워커 < 에이전트 수면
+                # 직렬 가깝게 처리되므로 보수적 기본 300초.
+                _ma_timeout = int(os.getenv("MULTI_AGENT_TIMEOUT", "300"))
+                for future in as_completed(futures, timeout=_ma_timeout):
                     agent = futures[future]
                     try:
-                        result = future.result(timeout=90)  # 개별 타임아웃도 연장
+                        result = future.result(timeout=120)
                         agent_results.append(result)
 
                         # 진행 상황 출력
