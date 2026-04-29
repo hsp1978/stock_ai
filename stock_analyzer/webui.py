@@ -625,7 +625,9 @@ def resolve_ticker(user_input: str) -> tuple[str, str]:
 
 
 def api_get(path: str, timeout: int = 10):
-    if _USE_LOCAL_ENGINE:
+    # /ml/* 는 LSTM(TF) 풀스택이 webui 컨테이너에 없으므로 agent-api(GPU TF)로
+    # 강제 HTTP. 다른 path 는 in-process 우선(_USE_LOCAL_ENGINE).
+    if _USE_LOCAL_ENGINE and not path.startswith("/ml/"):
         return engine_dispatch_get(path)
     try:
         resp = httpx.get(f"{AGENT_API_URL}{path}", timeout=timeout)
