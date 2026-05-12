@@ -695,7 +695,8 @@ def export_comprehensive_data(ticker: str, include_multi_agent: bool = True) -> 
 
     # 2. Multi-Agent 분석 결과 (옵션)
     if include_multi_agent:
-        multi_result = api_get(f"/multi-agent/{ticker}")
+        # 8개 에이전트 병렬 LLM 호출. 백엔드 MULTI_AGENT_TIMEOUT(기본 600s)보다 약간 더 길게.
+        multi_result = api_get(f"/multi-agent/{ticker}", timeout=660)
         if multi_result and not multi_result.get("error"):
             export_data["multi_agent_analysis"] = {
                 "ticker": multi_result.get("ticker"),
@@ -3243,7 +3244,8 @@ def render_multi_agent():
 
             # Multi-Agent 분석 (백엔드가 8개 에이전트 병렬 실행)
             st.write("🤖 2/3 · 8개 에이전트 병렬 분석 중 (Technical · Quant · Risk · ML · Event · Geopolitical · Value · Decision)...")
-            multi_result = api_get(f"/multi-agent/{resolved_ticker}")
+            # 8개 에이전트 병렬 LLM 호출. 백엔드 MULTI_AGENT_TIMEOUT(기본 600s)보다 약간 더 길게.
+            multi_result = api_get(f"/multi-agent/{resolved_ticker}", timeout=660)
 
             # API 실패 시 사용자 친화적 안내
             if multi_result is None:

@@ -229,7 +229,7 @@ class BaseAgent:
                 return '{"signal": "neutral", "confidence": 0, "reasoning": "Gemini API key not found"}'
 
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel('gemini-2.0-flash')
+            model = genai.GenerativeModel(os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'))
 
             response = model.generate_content(prompt)
             return response.text
@@ -280,13 +280,19 @@ class BaseAgent:
                             "model": llm_config['model'],
                             "prompt": prompt,
                             "stream": False,
+                            "think": False,  # qwen3 thinking 모드 비활성화 — 미지원 모델은 무시
                             "options": {
                                 "temperature": 0.0,
-                                "num_gpu": 1,  # GPU 1개만 사용
+                                # Ollama API 의 num_gpu 는 "GPU 에 올릴 레이어 수" 이며,
+                                # 1 로 두면 99% 의 레이어를 CPU 로 오프로드해 추론이 10x 이상
+                                # 느려진다. 옵션을 빼서 Ollama 자동 결정에 맡긴다.
                                 "num_thread": 4  # CPU 스레드 제한
                             }
                         },
-                        timeout=90  # 타임아웃 연장
+                        # Mac Studio(32GB)는 32B 모델을 OLLAMA_NUM_PARALLEL=1 로
+                        # 직렬 처리하므로 4개 에이전트가 큐잉될 때 마지막 에이전트
+                        # 대기 시간을 고려해 240s 기본. .env: MULTI_AGENT_LLM_TIMEOUT
+                        timeout=int(os.getenv("MULTI_AGENT_LLM_TIMEOUT", "240"))
                     )
 
                     if response.status_code == 200:
@@ -317,9 +323,10 @@ class BaseAgent:
                         "model": fallback['model'],
                         "prompt": prompt,
                         "stream": False,
+                        "think": False,  # qwen3 thinking 모드 비활성화
                         "options": {
                             "temperature": 0.0,
-                            "num_gpu": 1,
+                            # num_gpu 제거 — Ollama 자동 결정 (위와 동일 이유)
                             "num_thread": 4
                         }
                     },
@@ -1205,13 +1212,16 @@ class DecisionMaker:
                             "model": llm_config['model'],
                             "prompt": prompt,
                             "stream": False,
+                            "think": False,  # qwen3 thinking 모드 비활성화 — 미지원 모델은 무시
                             "options": {
                                 "temperature": 0.0,
-                                "num_gpu": 1,
+                                # num_gpu 제거 — Ollama 자동 결정
                                 "num_thread": 4
                             }
                         },
-                        timeout=150  # Decision Maker는 더 긴 시간 필요
+                        # Decision Maker는 다른 에이전트 결과 종합이라 프롬프트가 가장 김.
+                        # MULTI_AGENT_LLM_TIMEOUT 보다 살짝 길게 잡되 동일 env로 통일.
+                        timeout=int(os.getenv("MULTI_AGENT_LLM_TIMEOUT", "240"))
                     )
 
                     if response.status_code == 200:
@@ -1241,9 +1251,10 @@ class DecisionMaker:
                         "model": fallback['model'],
                         "prompt": prompt,
                         "stream": False,
+                        "think": False,  # qwen3 thinking 모드 비활성화
                         "options": {
                             "temperature": 0.0,
-                            "num_gpu": 1,
+                            # num_gpu 제거 — Ollama 자동 결정
                             "num_thread": 4
                         }
                     },
@@ -1287,7 +1298,7 @@ class DecisionMaker:
                 }, ensure_ascii=False)
 
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel('gemini-2.0-flash')
+            model = genai.GenerativeModel(os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'))
 
             response = model.generate_content(prompt)
             return response.text
@@ -1384,16 +1395,32 @@ class MultiAgentOrchestrator:
         if llm_provider is None:
             llm_provider = os.getenv('DEFAULT_LLM_PROVIDER', 'ollama')
 
-        # Ollama 사용 시 헬스체크
-        self.ollama_healthy = True
-        if llm_provider == 'ollama':
-            self.ollama_healthy = self._check_ollama_health()
-
-        # agent_providers가 None이면 빈 딕셔너리로 초기화
+        # dual_node_config 에서 에이전트별 provider 자동 로드
+        # (agent_providers 명시 인수가 있으면 그걸 우선)
         if agent_providers is None:
             agent_providers = {}
+        try:
+            from dual_node_config import get_llm_config as _get_cfg
+            _agent_names = [
+                "Technical Analyst", "Quant Analyst", "Risk Manager",
+                "ML Specialist", "Event Analyst", "Geopolitical Analyst",
+                "Value Investor", "Decision Maker",
+            ]
+            for _name in _agent_names:
+                if _name not in agent_providers:
+                    _p = _get_cfg(_name).get("provider", "ollama")
+                    if _p != "ollama":  # ollama 는 기존 _call_ollama 로 처리
+                        agent_providers[_name] = _p
+        except Exception:
+            pass
 
-        # 에이전트 생성 - 각 에이전트별로 provider 설정 가능
+        # Ollama 를 쓰는 에이전트가 있으면 헬스체크
+        self.ollama_healthy = True
+        _all_providers = set(agent_providers.values()) | {llm_provider}
+        if "ollama" in _all_providers:
+            self.ollama_healthy = self._check_ollama_health()
+
+        # 에이전트 생성 — 각 에이전트별 provider 는 agent_providers 로 결정
         self.agents = [
             TechnicalAnalyst(agent_providers.get("Technical Analyst", llm_provider)),
             QuantAnalyst(agent_providers.get("Quant Analyst", llm_provider)),
@@ -1404,8 +1431,7 @@ class MultiAgentOrchestrator:
             ValueInvestor(agent_providers.get("Value Investor", llm_provider)),
         ]
 
-        # 병렬 실행 워커 수 설정 (GPU 메모리 부족 방지)
-        # Mac Studio 사용 불가 시 로컬 GPU만 사용하므로 워커 수 제한
+        # 병렬 실행 워커 수 설정
         self.max_workers = int(os.getenv('MULTI_AGENT_MAX_WORKERS', '2'))
 
         # Mac Studio 연결 확인
@@ -1415,17 +1441,17 @@ class MultiAgentOrchestrator:
             self.mac_studio_available = is_mac_studio_available()
             if not self.mac_studio_available:
                 print("  ⚠️ Mac Studio 연결 불가 - 로컬 GPU 전용 모드 (병렬 제한: 2)")
-                self.max_workers = 2  # Mac Studio 없으면 병렬 실행 제한
+                self.max_workers = 2
         except Exception:
             pass
 
-        # EnhancedDecisionMaker 사용
+        # Decision Maker provider — dual_node_config 에서 읽거나 기본값 사용
+        _dm_provider = agent_providers.get("Decision Maker", llm_provider)
         try:
             from enhanced_decision_maker import EnhancedDecisionMaker
-            self.decision_maker = EnhancedDecisionMaker(llm_provider)
+            self.decision_maker = EnhancedDecisionMaker(_dm_provider)
         except ImportError:
-            # Fallback to original DecisionMaker
-            self.decision_maker = DecisionMaker(llm_provider)
+            self.decision_maker = DecisionMaker(_dm_provider)
 
     def _check_ollama_health(self) -> bool:
         """Ollama 서버 상태 체크"""
@@ -1710,7 +1736,9 @@ class MultiAgentOrchestrator:
                 for future in as_completed(futures, timeout=_ma_timeout):
                     agent = futures[future]
                     try:
-                        result = future.result(timeout=120)
+                        # future가 이미 as_completed 로 완료된 상태라 즉시 반환되지만,
+                        # 안전을 위해 LLM 호출 timeout 보다 살짝 길게 둠.
+                        result = future.result(timeout=int(os.getenv("MULTI_AGENT_LLM_TIMEOUT", "240")) + 10)
                         agent_results.append(result)
 
                         # 진행 상황 출력

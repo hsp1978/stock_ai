@@ -13,9 +13,20 @@ RUN python -m venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
 
 WORKDIR /build
-COPY chart_agent_service/requirements.txt .
+COPY chart_agent_service/requirements.txt ./req-agent.txt
+# stock_analyzer/multi_agent.py 가 동적 import 하는 의존성:
+#   google-generativeai, openai, pykrx, finance-datareader, beautifulsoup4
+# (streamlit/plotly 등 WebUI 전용 라이브러리는 제외하여 이미지 비대화 방지)
 RUN pip install --upgrade pip \
-    && pip install -r requirements.txt
+    && pip install -r req-agent.txt \
+    && pip install --no-cache-dir \
+        'google-generativeai>=0.3.0' \
+        'openai>=1.0.0' \
+        'pykrx>=1.0.0' \
+        'finance-datareader>=0.9.0' \
+        'beautifulsoup4>=4.11.0' \
+        'requests>=2.31.0' \
+        'pytz>=2024.1'
 
 # ─── Runtime ──────────────────────────────────────────────────────
 FROM python:3.12-slim
@@ -39,6 +50,10 @@ COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
 COPY chart_agent_service/ ./chart_agent_service/
+# multi_agent.py 및 그 동적 import 대상(dual_node_config, ml_pipeline_fix,
+# enhanced_decision_maker, korean_stocks, ticker_*, signal_tracker 등)을
+# 함께 포함시켜야 /multi-agent/{ticker} 가 503으로 떨어지지 않음.
+COPY stock_analyzer/ ./stock_analyzer/
 
 WORKDIR /app/chart_agent_service
 

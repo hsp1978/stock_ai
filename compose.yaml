@@ -20,20 +20,20 @@ services:
     container_name: stock-auto-agent-api
     network_mode: host          # 호스트 Ollama(11434) 직접 호출 + Tailscale 호스트네임 사용
     env_file: .env
+    environment:
+      # RTX 5070 12GB VRAM 은 Ollama(qwen3:14b ~10GB) 가 거의 다 차지해야 안정적.
+      # TF(ml_predictor LSTM) 가 GPU 를 잡으면 Ollama 가 CPU 로 오프로드되어 추론
+      # 속도가 10x+ 느려지고 멀티에이전트 호출이 줄줄이 timeout 됨.
+      # LSTM 모델은 작아 CPU 추론으로 충분. GPU 는 Ollama 전용으로 양보.
+      CUDA_VISIBLE_DEVICES: "-1"
     volumes:
       - ./chart_agent_service/output:/app/chart_agent_service/output
       - ./chart_agent_service/data:/app/chart_agent_service/data
       - ./chart_agent_service/charts:/app/chart_agent_service/charts
+      # multi_agent.py + 그 의존 모듈들. 이미지에도 COPY되어 있지만, 코드만
+      # 바뀐 경우 재빌드 없이 컨테이너 재시작만으로 반영하기 위한 read-only mount.
+      - ./stock_analyzer:/app/stock_analyzer:ro
     restart: unless-stopped
-    # ML 앙상블(LSTM)에 RTX 5070 GPU 활용. 호스트 Ollama 와 VRAM 공유하므로
-    # ml_predictor.py 가 tf.config.experimental.set_memory_growth(True) 적용.
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
     healthcheck:
       test: ["CMD", "python", "-c", "import os,httpx; httpx.get(f'http://localhost:{os.environ.get(\"API_PORT\",\"8100\")}/health', timeout=2).raise_for_status()"]
       interval: 30s

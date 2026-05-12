@@ -27,61 +27,71 @@ LLM_NODES = {
     "mac_studio": {
         # MAC_STUDIO_URL 미설정 시 Tailscale hostname으로 시도 (실패하면 폴백 로직이 RTX 5070으로 라우팅)
         "url": os.getenv("MAC_STUDIO_URL", "http://hsptest-macstudio:8080"),
+        # Mac Studio M1 Max 32GB 통합 메모리 — 32B(q4_K_M, ~19GB)가 안전 한계.
+        # 70B(~40GB)는 OOM 으로 로드 불가하므로 라우팅 매핑에서 제외.
         "models": {
-            "qwen_32b": "qwen2.5:32b",  # 실제 설치된 모델
-            "llama_70b": "llama3:70b",  # 대형 모델
-            "gpt_20b": "gpt-oss:20b",  # 중형 모델
+            "qwen_32b": "qwen2.5:32b-instruct-q4_K_M",  # 메인 고성능 모델
+            "gpt_20b": "gpt-oss:20b",                    # 중형 폴백
+            "llama_8b": "llama3.1:8b",                   # 경량 폴백
         },
         "default_model": "qwen_32b",
-        "description": "Mac Studio M1 Max - 고성능 작업"
+        "description": "Mac Studio M1 Max 32GB - 고성능 작업"
     }
 }
 
 # 에이전트별 LLM 라우팅
+# provider: "ollama" | "gemini" | "openai"
+#   - "ollama" : node/model 필드로 노드 지정
+#   - "gemini" : Gemini API 직접 호출 (node/model 무시)
+#   - "openai" : OpenAI API 직접 호출 (node/model 무시)
 AGENT_LLM_MAPPING = {
-    # 고성능 필요 (Mac Studio)
+    # ── Gemini 외부 LLM (텍스트 해석·추론 중심) ────────────────
+    "Decision Maker": {
+        "provider": "gemini",
+        "reason": "최종 컨센서스·충돌 해결 — Gemini 고품질 추론"
+    },
+    "Value Investor": {
+        "provider": "gemini",
+        "reason": "재무제표·Graham/Buffett 가치 평가 — Gemini 지식 기반"
+    },
+    "Event Analyst": {
+        "provider": "gemini",
+        "reason": "뉴스·이벤트·내부자 거래 분류 — Gemini 최신 컨텍스트"
+    },
+    "Geopolitical Analyst": {
+        "provider": "gemini",
+        "reason": "지정학·거시경제 복잡 관계 분석 — Gemini 지식 기반"
+    },
+
+    # ── Mac Studio Ollama (qwen2.5:32b, 수치·통계 분석) ────────
     "Technical Analyst": {
+        "provider": "ollama",
         "node": "mac_studio",
         "model": "qwen_32b",
         "reason": "복잡한 기술 지표 패턴 분석"
     },
     "Quant Analyst": {
+        "provider": "ollama",
         "node": "mac_studio",
         "model": "qwen_32b",
         "reason": "통계적 계산 및 확률 분석"
     },
-    "Decision Maker": {
-        "node": "mac_studio",
-        "model": "llama_70b",  # 최고 성능 모델
-        "reason": "최종 컨센서스 및 충돌 해결"
-    },
 
-    # RTX 5070 - Qwen 14B (품질 우선)
+    # ── Mac Studio Ollama (qwen2.5:32b, 수치 계산·ML 해석) ────
+    # RTX 5070 GPU 는 Ollama(qwen3:14b) 전용으로 비워 두고,
+    # Ollama 추론 작업 전부를 Mac Studio 로 집중.
     "Risk Manager": {
-        "node": "rtx_5070",
-        "model": "llama_8b",  # 단순 계산이므로 속도 우선
-        "reason": "단순 Kelly/Beta 계산"
+        "provider": "ollama",
+        "node": "mac_studio",
+        "model": "qwen_32b",
+        "reason": "Kelly/Beta 수치 계산 — Mac Studio 우선"
     },
     "ML Specialist": {
-        "node": "rtx_5070",
-        "model": "qwen3_14b",  # Qwen3 최신 - 품질 9/10
-        "reason": "ML 해석 정확도 중요 (14초 허용)"
-    },
-    "Event Analyst": {
-        "node": "rtx_5070",
-        "model": "qwen3_14b",  # Qwen3 - 내부자 거래 정확도
-        "reason": "이벤트 분류 및 내부자 거래 체크"
-    },
-    "Geopolitical Analyst": {
+        "provider": "ollama",
         "node": "mac_studio",
-        "model": "qwen_32b",  # 거시경제/지정학 분석에 고성능 모델 필요
-        "reason": "복잡한 거시경제 및 지정학적 관계 분석"
+        "model": "qwen_32b",
+        "reason": "ML 예측 해석 정확도 — Mac Studio 우선"
     },
-    "Value Investor": {
-        "node": "rtx_5070",
-        "model": "qwen3_14b",  # 재무 지표 해석
-        "reason": "재무제표 분석 및 밸류에이션 평가"
-    }
 }
 
 def get_llm_config(agent_name: str) -> Dict[str, Any]:
@@ -96,20 +106,29 @@ def get_llm_config(agent_name: str) -> Dict[str, Any]:
     """
     mapping = AGENT_LLM_MAPPING.get(agent_name)
     if not mapping:
-        # 기본값: RTX 5070
         return {
+            "provider": "ollama",
             "url": LLM_NODES["rtx_5070"]["url"],
             "model": LLM_NODES["rtx_5070"]["default_model"],
             "node": "rtx_5070"
         }
 
+    provider = mapping.get("provider", "ollama")
+
+    # Gemini / OpenAI 는 Ollama 노드 정보 불필요
+    if provider != "ollama":
+        return {
+            "provider": provider,
+            "reason": mapping.get("reason", "")
+        }
+
     node = mapping["node"]
     model_key = mapping["model"]
-
     node_config = LLM_NODES[node]
     model_name = node_config["models"].get(model_key, node_config["default_model"])
 
     return {
+        "provider": "ollama",
         "url": node_config["url"],
         "model": model_name,
         "node": node,
@@ -157,13 +176,16 @@ def get_fallback_config(agent_name: str) -> Dict[str, Any]:
     # 모든 에이전트를 RTX 5070으로 폴백
     rtx_config = LLM_NODES["rtx_5070"]
 
+    # 폴백 timeout 도 MULTI_AGENT_LLM_TIMEOUT 과 정합 (기본 240s)
+    _fallback_timeout = int(os.getenv("MULTI_AGENT_LLM_TIMEOUT", "240"))
+
     # 고성능 에이전트는 더 많은 시간 할당
     if agent_name in ["Technical Analyst", "Quant Analyst", "Decision Maker"]:
         return {
             "url": rtx_config["url"],
             "model": rtx_config["models"]["qwen_14b"],  # 더 큰 모델 사용
             "node": "rtx_5070",
-            "timeout": 120,  # 2배 타임아웃
+            "timeout": _fallback_timeout,
             "temperature": 0.3  # 더 정확한 답변
         }
 
@@ -171,7 +193,7 @@ def get_fallback_config(agent_name: str) -> Dict[str, Any]:
         "url": rtx_config["url"],
         "model": rtx_config["default_model"],
         "node": "rtx_5070",
-        "timeout": 60,
+        "timeout": _fallback_timeout,
         "temperature": 0.5
     }
 
