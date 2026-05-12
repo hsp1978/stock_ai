@@ -115,7 +115,20 @@ class TickerManager:
 
             # 6자리 숫자 (종목코드)
             if re.match(r'^\d{6}$', ticker):
-                # KOSPI 기본, 실제로는 KRX API로 확인 필요
+                # 캐시에 KOSDAQ으로 저장된 경우 우선 적용
+                cached = cls.KOREAN_STOCKS.get(ticker)
+                if cached and cached.get('market') == 'KOSDAQ':
+                    return f"{ticker}.KQ", 'KR'
+                # pykrx로 실시간 시장 확인
+                try:
+                    from pykrx import stock as _pk
+                    _today = datetime.now().strftime("%Y%m%d")
+                    _kosdaq = _pk.get_market_ticker_list(_today, market="KOSDAQ")
+                    if ticker in _kosdaq:
+                        return f"{ticker}.KQ", 'KR'
+                except Exception:
+                    pass
+                # 기본값 KOSPI
                 return f"{ticker}.KS", 'KR'
 
             # 한글 종목명으로 검색 (캐시에 있는 경우만)

@@ -39,6 +39,7 @@ def build_entry_plan(
     current_price: float,
     tool_results: List[Dict],
     trading_style: str = "swing",
+    week52_high: Optional[float] = None,
 ) -> Dict:
     """
     분석 결과에서 구체적 진입 계획 생성.
@@ -81,6 +82,10 @@ def build_entry_plan(
     plan["stop_loss"] = final_levels.get("stop_loss") or risk.get("stop_loss")
     plan["take_profit"] = final_levels.get("take_profit") or risk.get("take_profit")
     plan["invalidation_price"] = plan["stop_loss"]
+
+    # ─── 손절가 미설정 경고 ───
+    if plan["stop_loss"] is None:
+        plan["notes"].append("⚠️ 손절가 미산출 — ATR/지지선 데이터 부족, 수동 설정 필수")
 
     # ─── 주문 유형 결정 ───
     # 1) RSI 과매수(>70)면 풀백 대기
@@ -207,6 +212,23 @@ def build_entry_plan(
     elif regime == "mean_reverting":
         plan["expected_holding_days"] = min(plan["expected_holding_days"], 7)
         plan["notes"].append("평균 회귀장 — 단기 보유 (7일 이내)")
+
+    # ─── 진입가 52주 고점 초과 검증 ───
+    lp = plan.get("limit_price")
+    if lp and week52_high:
+        if lp > week52_high:
+            excess_pct = (lp / week52_high - 1) * 100
+            plan["notes"].append(
+                f"⛔ 진입가 {lp:,.0f}이 52주 고점 {week52_high:,.0f} 초과 (+{excess_pct:.1f}%) — "
+                "1년간 도달한 적 없는 가격. 진입 보류."
+            )
+            plan["order_type"] = "wait"
+            plan["entry_timing"] = "wait"
+        elif lp > current_price * 1.10:
+            gap_pct = (lp / current_price - 1) * 100
+            plan["notes"].append(
+                f"⚠️ 진입가가 현재가 대비 +{gap_pct:.1f}% 괴리 — 돌파 확인 후 재평가 권장"
+            )
 
     return plan
 

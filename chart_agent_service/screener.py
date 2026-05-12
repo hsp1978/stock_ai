@@ -56,7 +56,14 @@ PENALTY_WEIGHTS = {
     "rsi_overbought":     15,  # RSI > 78 과매수
     "volume_declining":   10,  # 5일 연속 거래량 감소
     "below_ma120":        10,  # 종가 < MA120 (장기 역행)
+    "high_volatility":    15,  # 연환산 변동성 60%+ (극고변동성)
+    "extreme_volatility": 25,  # 연환산 변동성 100%+ (비정상 변동성)
 }
+
+# 펀더멘털 필터 — 두 조건 모두 충족 시 자동 실격
+# (PBR 단독 고평가는 성장주로 허용, 적자 + 고PBR 조합만 걸러냄)
+FUNDAMENTAL_DISQUALIFY_EPS_MAX = 0        # EPS < 0 (적자)
+FUNDAMENTAL_DISQUALIFY_PBR_MIN = 5.0      # P/B > 5.0 (동종업계 평균의 5배+)
 
 
 # ─────────────────────────────────────────────────────────
@@ -351,6 +358,22 @@ def _penalty_below_ma120(df: pd.DataFrame) -> Tuple[float, Optional[str]]:
     return 0, None
 
 
+def _penalty_high_volatility(df: pd.DataFrame) -> Tuple[float, Optional[str]]:
+    """연환산 변동성 60%+ 감점 — 변동성 29% 일간은 연 ~460%에 해당하므로 단계별 처리."""
+    if len(df) < 20:
+        return 0, None
+    daily_returns = df['Close'].pct_change().dropna()
+    if len(daily_returns) < 10:
+        return 0, None
+    daily_vol = float(daily_returns.tail(20).std())
+    annual_vol = daily_vol * (252 ** 0.5) * 100  # 연환산 %
+    if annual_vol >= 100:
+        return -PENALTY_WEIGHTS["extreme_volatility"], f"연환산변동성 {annual_vol:.0f}% (비정상)"
+    if annual_vol >= 60:
+        return -PENALTY_WEIGHTS["high_volatility"], f"연환산변동성 {annual_vol:.0f}% (극고변동성)"
+    return 0, None
+
+
 # ─────────────────────────────────────────────────────────
 #  종합 점수 계산
 # ─────────────────────────────────────────────────────────
@@ -399,6 +422,7 @@ def calculate_score(df: pd.DataFrame) -> Dict:
         ("rsi_overbought",    _penalty_rsi_overbought),
         ("volume_declining",  _penalty_volume_declining),
         ("below_ma120",       _penalty_below_ma120),
+        ("high_volatility",   _penalty_high_volatility),
     ]
     for name, fn in penalty_fns:
         try:
@@ -502,7 +526,38 @@ def run_screener(
 
     clear_ohlcv_cache()
 
-    # 4. 정렬 + 상위 N
+    # 4. 펀더멘털 필터 — 상위 후보만 yfinance로 확인 (속도 고려)
+    #    EPS < 0 AND P/B > 5 조합: 적자 기업 고평가 → 점수 0으로 강제
+    _disqualified = 0
+    _top_candidates = sorted(scored, key=lambda x: x['score'], reverse=True)[:top_n * 2]
+    for item in _top_candidates:
+        try:
+            import yfinance as yf
+            _info = yf.Ticker(item['ticker']).info
+            _eps = _info.get('trailingEps') or _info.get('epsTrailingTwelveMonths')
+            _pbr = _info.get('priceToBook')
+            if (_eps is not None and _pbr is not None
+                    and _eps < FUNDAMENTAL_DISQUALIFY_EPS_MAX
+                    and _pbr > FUNDAMENTAL_DISQUALIFY_PBR_MIN):
+                item['score'] = 0.0
+                item['grade'] = 'D'
+                item['disqualified'] = True
+                item['disqualify_reason'] = (
+                    f"적자(EPS {_eps:.1f}) + 고PBR({_pbr:.1f}x) — 펀더멘털 실격"
+                )
+                item['penalties'].append({
+                    "name": "fundamental_disqualify",
+                    "points": -100,
+                    "reason": item['disqualify_reason'],
+                })
+                _disqualified += 1
+        except Exception:
+            pass
+
+    if _disqualified:
+        print(f"[screener] 펀더멘털 실격: {_disqualified}개 (적자+고PBR)")
+
+    # 5. 정렬 + 상위 N
     scored.sort(key=lambda x: x['score'], reverse=True)
     top = scored[:top_n]
     for i, item in enumerate(top, 1):
@@ -546,17 +601,23 @@ def _determine_agreement(screener_grade: str, ma_signal: str, ma_confidence: flo
     grade_tier = {"S": 3, "A": 2, "B": 1, "C": 0, "D": -1}.get(screener_grade or "D", -1)
     sig = (ma_signal or "").lower()
 
-    # 강한 일치: 스크리너 S/A + MA buy + 신뢰도 ≥ 6
-    if grade_tier >= 2 and sig == "buy" and ma_confidence >= 6:
+    # 강한 일치: 스크리너 S/A + MA buy + 신뢰도 ≥ 7 (기존 6에서 강화)
+    # neutral이 다수(> 10개)이거나 sell 신호가 있으면 partial_match로 격하
+    if grade_tier >= 2 and sig == "buy" and ma_confidence >= 7:
         return {
             "level": "strong_match", "label": "강한 일치", "emoji": "🟢🟢",
-            "description": "스크리너 상위 + Multi-Agent 매수 확증 — 1순위 후보",
+            "description": "스크리너 상위 + Multi-Agent 매수 확증(신뢰도 7+) — 1순위 후보",
         }
-    # 부분 일치: 스크리너 S/A + MA buy 낮은 신뢰도 or MA neutral
-    if grade_tier >= 2 and (sig == "buy" or sig == "neutral"):
+    # 부분 일치: 스크리너 S/A + MA buy(신뢰도 낮음) or MA neutral
+    if grade_tier >= 2 and sig == "buy":
         return {
             "level": "partial_match", "label": "부분 일치", "emoji": "🟢",
-            "description": "스크리너 강세지만 Multi-Agent는 보수적 — 추가 관찰 필요",
+            "description": "스크리너 강세 + Multi-Agent 매수(신뢰도 7 미만) — 추가 확인 필요",
+        }
+    if grade_tier >= 2 and sig == "neutral":
+        return {
+            "level": "partial_match", "label": "부분 일치", "emoji": "🟡",
+            "description": "스크리너는 상위권이나 Multi-Agent 중립 — 스크리너 단독 결과 신뢰 금지",
         }
     # 충돌: 스크리너 A/S인데 MA sell
     if grade_tier >= 2 and sig == "sell":

@@ -87,17 +87,21 @@ class AnalysisTools:
         current_price = float(self.latest['Close'])
         day_high = float(self.latest['High'])
         day_low = float(self.latest['Low'])
+        _cur = "₩" if _market_from_ticker(ticker) == "KR" else "$"
+        _pfmt = (lambda v: f"{_cur}{v:,.0f}") if _cur == "₩" else (lambda v: f"{_cur}{v:.2f}")
 
         if current_price > day_high:
-            self.entry_price_warnings.append(f"진입가 ${current_price:.2f} > 당일 고가 ${day_high:.2f}")
+            self.entry_price_warnings.append(f"진입가 {_pfmt(current_price)} > 당일 고가 {_pfmt(day_high)}")
         elif current_price < day_low:
-            self.entry_price_warnings.append(f"진입가 ${current_price:.2f} < 당일 저가 ${day_low:.2f}")
+            self.entry_price_warnings.append(f"진입가 {_pfmt(current_price)} < 당일 저가 {_pfmt(day_low)}")
 
         # 52주 고가 대비 하락률 계산
         if len(df) >= 252:
             week52_high = float(df['High'].tail(252).max())
+            self.week52_high = week52_high
             self.week52_decline = (week52_high - current_price) / week52_high * 100
         else:
+            self.week52_high = None
             self.week52_decline = None
 
     # ── 기술적 분석 6개 ──────────────────────────────────────
@@ -1245,6 +1249,12 @@ class AnalysisTools:
         score = max(-10, min(10, score))
         signal = "neutral"  # 항상 중립 - 방향 판단 제외
 
+        _d_cur = "₩" if _market_from_ticker(self.ticker) == "KR" else "$"
+        _d_fmt = (lambda v: f"{_d_cur}{v:,.0f}") if _d_cur == "₩" else (lambda v: f"{_d_cur}{v:.2f}")
+        _detail_str = (f"진입={_d_fmt(price)}, ATR손절={_d_fmt(stop_loss_atr)}(RR {rr_ratio_atr:.1f}), "
+                       f"SR손절={_d_fmt(stop_loss_sr)}(RR {rr_ratio_sr:.1f}), "
+                       f"수량={qty}주({_d_fmt(position_value)}, {position_pct:.1f}%)")
+
         result.update({
             "signal": signal,
             "score": round(score, 1),
@@ -1285,9 +1295,7 @@ class AnalysisTools:
             "split_entry": split_entry,
             "trading_style": TRADING_STYLE,
             "warnings": warnings,
-            "detail": f"진입=${price:.2f}, ATR손절=${stop_loss_atr:.2f}(RR {rr_ratio_atr:.1f}), "
-                       f"SR손절=${stop_loss_sr:.2f}(RR {rr_ratio_sr:.1f}), "
-                       f"수량={qty}주(${position_value:,.0f}, {position_pct:.1f}%)"
+            "detail": _detail_str,
         })
         return result
 
@@ -1328,16 +1336,18 @@ class AnalysisTools:
             current_price=current_price,
             tool_results=tool_results,
             trading_style=TRADING_STYLE,
+            week52_high=self.week52_high,
         )
 
-        currency = "₩" if self.ticker.upper().endswith(".KS") or self.ticker.upper().endswith(".KQ") else "$"
+        currency = "₩" if _market_from_ticker(self.ticker) == "KR" else "$"
+        _ep_fmt = (lambda v: f"{currency}{v:,.0f}") if currency == "₩" else (lambda v: f"{currency}{v:.2f}")
         result.update({
             "signal": "neutral",  # 이 도구는 방향성 판단이 아님
             "score": 0,
             "entry_plan": plan,
             "formatted": format_entry_plan_text(plan, currency=currency),
             "detail": f"{plan['entry_timing']} · {plan['order_type']}"
-                     + (f" @ {currency}{plan['limit_price']:,.2f}" if plan.get('limit_price') else "")
+                     + (f" @ {_ep_fmt(plan['limit_price'])}" if plan.get('limit_price') else "")
                      + f" · 보유 {plan['expected_holding_days']}일"
         })
         return result
