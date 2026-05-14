@@ -8,8 +8,7 @@ ATR 기반 리스크 관리 시스템
 
 import pandas as pd
 import numpy as np
-from typing import Dict, Tuple, Optional
-from datetime import datetime
+from typing import Dict, Optional
 
 
 class ATRRiskManager:
@@ -26,10 +25,9 @@ class ATRRiskManager:
         self.account_size = account_size
         self.latest = df.iloc[-1] if not df.empty else {}
 
-    def calculate_position_size(self,
-                               price: float,
-                               risk_per_trade: float = 0.01,
-                               atr_multiplier: float = 2.0) -> Dict:
+    def calculate_position_size(
+        self, price: float, risk_per_trade: float = 0.01, atr_multiplier: float = 2.0
+    ) -> Dict:
         """
         ATR 기반 동적 포지션 사이징 계산
 
@@ -44,19 +42,11 @@ class ATRRiskManager:
         # ATR 찾기
         atr_col = self._find_atr_column()
         if not atr_col:
-            return {
-                "error": "ATR 데이터 없음",
-                "shares": 0,
-                "position_value": 0
-            }
+            return {"error": "ATR 데이터 없음", "shares": 0, "position_value": 0}
 
         atr = float(self.latest.get(atr_col, 0))
         if atr == 0:
-            return {
-                "error": "ATR 값이 0",
-                "shares": 0,
-                "position_value": 0
-            }
+            return {"error": "ATR 값이 0", "shares": 0, "position_value": 0}
 
         # 최대 허용 손실액
         risk_amount = self.account_size * risk_per_trade
@@ -89,13 +79,15 @@ class ATRRiskManager:
             "stop_price": round(price - stop_distance, 2),
             "atr": round(atr, 2),
             "volatility_level": self._classify_volatility(atr, price),
-            "recommendation": self._get_sizing_recommendation(position_pct, atr, price)
+            "recommendation": self._get_sizing_recommendation(position_pct, atr, price),
         }
 
-    def calculate_chandelier_exit(self,
-                                 lookback: int = 22,
-                                 atr_multiplier: float = 3.0,
-                                 position_type: str = "long") -> Dict:
+    def calculate_chandelier_exit(
+        self,
+        lookback: int = 22,
+        atr_multiplier: float = 3.0,
+        position_type: str = "long",
+    ) -> Dict:
         """
         샹들리에 청산가격 계산
 
@@ -121,10 +113,10 @@ class ATRRiskManager:
 
         if position_type == "long":
             # 롱 포지션: 최고가 - (ATR * 승수)
-            highest = float(recent_data['High'].max())
+            highest = float(recent_data["High"].max())
             exit_price = highest - (atr * atr_multiplier)
 
-            current_price = float(self.latest['Close'])
+            current_price = float(self.latest["Close"])
             distance_pct = ((current_price - exit_price) / current_price) * 100
 
             return {
@@ -135,15 +127,15 @@ class ATRRiskManager:
                 "atr": round(atr, 2),
                 "atr_multiplier": atr_multiplier,
                 "status": "safe" if current_price > exit_price * 1.05 else "caution",
-                "recommendation": self._get_exit_recommendation(distance_pct, "long")
+                "recommendation": self._get_exit_recommendation(distance_pct, "long"),
             }
 
         else:  # short position
             # 숏 포지션: 최저가 + (ATR * 승수)
-            lowest = float(recent_data['Low'].min())
+            lowest = float(recent_data["Low"].min())
             exit_price = lowest + (atr * atr_multiplier)
 
-            current_price = float(self.latest['Close'])
+            current_price = float(self.latest["Close"])
             distance_pct = ((exit_price - current_price) / current_price) * 100
 
             return {
@@ -154,14 +146,16 @@ class ATRRiskManager:
                 "atr": round(atr, 2),
                 "atr_multiplier": atr_multiplier,
                 "status": "safe" if current_price < exit_price * 0.95 else "caution",
-                "recommendation": self._get_exit_recommendation(distance_pct, "short")
+                "recommendation": self._get_exit_recommendation(distance_pct, "short"),
             }
 
-    def calculate_trailing_stop(self,
-                               entry_price: float,
-                               current_price: float,
-                               initial_stop_pct: float = 0.05,
-                               trailing_pct: float = 0.03) -> Dict:
+    def calculate_trailing_stop(
+        self,
+        entry_price: float,
+        current_price: float,
+        initial_stop_pct: float = 0.05,
+        trailing_pct: float = 0.03,
+    ) -> Dict:
         """
         트레일링 스톱 계산
 
@@ -213,7 +207,9 @@ class ATRRiskManager:
             "trailing_pct": round(dynamic_trailing * 100, 2),
             "stop_type": "trailing" if stop_price > initial_stop else "initial",
             "status": self._get_stop_status(profit_pct, stop_distance_pct),
-            "recommendation": self._get_stop_recommendation(profit_pct, stop_distance_pct)
+            "recommendation": self._get_stop_recommendation(
+                profit_pct, stop_distance_pct
+            ),
         }
 
     def calculate_volatility_adjusted_targets(self) -> Dict:
@@ -228,7 +224,7 @@ class ATRRiskManager:
             return {"error": "ATR 데이터 없음"}
 
         atr = float(self.latest.get(atr_col, 0))
-        current_price = float(self.latest['Close'])
+        current_price = float(self.latest["Close"])
 
         # ATR 기반 목표가 레벨
         targets = {
@@ -249,8 +245,7 @@ class ATRRiskManager:
         risk = current_price - stop_loss
 
         rr_ratios = {
-            f"{k}_rr": round((v - current_price) / risk, 2)
-            for k, v in targets.items()
+            f"{k}_rr": round((v - current_price) / risk, 2) for k, v in targets.items()
         }
 
         return {
@@ -260,13 +255,12 @@ class ATRRiskManager:
             "returns": target_returns,
             "rr_ratios": rr_ratios,
             "stop_loss": round(stop_loss, 2),
-            "recommendation": self._get_target_recommendation(rr_ratios)
+            "recommendation": self._get_target_recommendation(rr_ratios),
         }
 
-    def analyze_position_risk(self,
-                             entry_price: float,
-                             shares: int,
-                             current_price: Optional[float] = None) -> Dict:
+    def analyze_position_risk(
+        self, entry_price: float, shares: int, current_price: Optional[float] = None
+    ) -> Dict:
         """
         포지션 리스크 종합 분석
 
@@ -279,7 +273,7 @@ class ATRRiskManager:
             종합 리스크 분석
         """
         if current_price is None:
-            current_price = float(self.latest['Close'])
+            current_price = float(self.latest["Close"])
 
         # 기본 정보
         position_value = shares * current_price
@@ -295,7 +289,13 @@ class ATRRiskManager:
         if atr > 0:
             daily_risk = atr * shares  # 일일 예상 변동폭
             daily_risk_pct = (daily_risk / position_value) * 100
-            volatility_risk = "high" if daily_risk_pct > 5 else "medium" if daily_risk_pct > 2 else "low"
+            volatility_risk = (
+                "high"
+                if daily_risk_pct > 5
+                else "medium"
+                if daily_risk_pct > 2
+                else "low"
+            )
         else:
             daily_risk = 0
             daily_risk_pct = 0
@@ -325,7 +325,7 @@ class ATRRiskManager:
                 "current_price": round(current_price, 2),
                 "position_value": round(position_value, 0),
                 "profit_loss": round(profit_loss, 0),
-                "profit_loss_pct": round(profit_loss_pct, 2)
+                "profit_loss_pct": round(profit_loss_pct, 2),
             },
             "risk_metrics": {
                 "daily_risk": round(daily_risk, 0),
@@ -334,17 +334,17 @@ class ATRRiskManager:
                 "max_loss_pct": round(max_loss_pct, 2),
                 "position_pct": round(position_pct, 2),
                 "volatility_risk": volatility_risk,
-                "risk_score": risk_score
+                "risk_score": risk_score,
             },
             "recommendations": self._get_risk_recommendations(
                 risk_score, position_pct, profit_loss_pct, volatility_risk
-            )
+            ),
         }
 
     def _find_atr_column(self) -> Optional[str]:
         """ATR 컬럼 찾기"""
         for col in self.df.columns:
-            if 'ATR' in col.upper():
+            if "ATR" in col.upper():
                 return col
         return None
 
@@ -363,7 +363,9 @@ class ATRRiskManager:
         else:
             return "extreme"
 
-    def _get_sizing_recommendation(self, position_pct: float, atr: float, price: float) -> str:
+    def _get_sizing_recommendation(
+        self, position_pct: float, atr: float, price: float
+    ) -> str:
         """포지션 사이징 권고"""
         volatility = self._classify_volatility(atr, price)
 
@@ -409,7 +411,9 @@ class ATRRiskManager:
         else:
             return "normal"  # 정상
 
-    def _get_stop_recommendation(self, profit_pct: float, stop_distance_pct: float) -> str:
+    def _get_stop_recommendation(
+        self, profit_pct: float, stop_distance_pct: float
+    ) -> str:
         """스톱 권고"""
         if profit_pct > 20:
             return "높은 수익 - 일부 익절 고려"
@@ -434,8 +438,13 @@ class ATRRiskManager:
         else:
             return "우수한 R:R - 적극 진입 가능"
 
-    def _calculate_risk_score(self, position_pct: float, volatility_risk: str,
-                             profit_loss_pct: float, daily_risk_pct: float) -> int:
+    def _calculate_risk_score(
+        self,
+        position_pct: float,
+        volatility_risk: str,
+        profit_loss_pct: float,
+        daily_risk_pct: float,
+    ) -> int:
         """리스크 점수 계산 (0-100, 높을수록 위험)"""
         score = 0
 
@@ -456,7 +465,7 @@ class ATRRiskManager:
             "medium": 10,
             "low": 5,
             "very_low": 0,
-            "unknown": 15
+            "unknown": 15,
         }
         score += volatility_scores.get(volatility_risk, 15)
 
@@ -478,8 +487,13 @@ class ATRRiskManager:
 
         return min(100, score)
 
-    def _get_risk_recommendations(self, risk_score: int, position_pct: float,
-                                 profit_loss_pct: float, volatility_risk: str) -> list:
+    def _get_risk_recommendations(
+        self,
+        risk_score: int,
+        position_pct: float,
+        profit_loss_pct: float,
+        volatility_risk: str,
+    ) -> list:
         """리스크 권고사항"""
         recs = []
 
@@ -506,3 +520,128 @@ class ATRRiskManager:
             recs.append("높은 수익 - 부분 익절 고려")
 
         return recs
+
+
+# ── P2: VaR/CVaR 계산 ────────────────────────────────────────────────
+
+
+class PortfolioRiskCalculator:
+    """
+    포트폴리오 수준 Value-at-Risk / Conditional VaR 계산 (P2).
+
+    지원 방법:
+    - historical : 과거 수익률 분위수 기반 (비모수)
+    - parametric : 정규분포 가정 (분산-공분산)
+    - cornish_fisher: 왜도·첨도 보정 수정 VaR
+    """
+
+    _CONFIDENCE_LEVELS = (0.95, 0.99)
+
+    def __init__(self, returns: pd.Series, nav: float = 100_000.0) -> None:
+        """
+        Args:
+            returns: 일별 수익률 시리즈 (소수, e.g. 0.01 = 1%)
+            nav:     포트폴리오 순자산 (원화 or USD)
+        """
+        self.returns = returns.dropna()
+        self.nav = nav
+
+    # ── 내부 헬퍼 ───────────────────────────────────────────────────
+
+    def _historical_quantile(self, confidence: float) -> float:
+        """과거 수익률의 (1-confidence) 분위수."""
+        return float(np.percentile(self.returns, (1 - confidence) * 100))
+
+    def _parametric_quantile(self, confidence: float) -> float:
+        """정규분포 분위수 (z-score × σ + μ)."""
+        from scipy.stats import norm  # type: ignore[import-untyped]
+
+        mu = float(self.returns.mean())
+        sigma = float(self.returns.std())
+        z = norm.ppf(1 - confidence)
+        return mu + z * sigma
+
+    def _cornish_fisher_quantile(self, confidence: float) -> float:
+        """왜도·첨도 보정 VaR (Cornish-Fisher expansion)."""
+        from scipy.stats import norm  # type: ignore[import-untyped]
+
+        mu = float(self.returns.mean())
+        sigma = float(self.returns.std())
+        skew = float(self.returns.skew())
+        kurt = float(self.returns.kurt())  # excess kurtosis
+        z = norm.ppf(1 - confidence)
+        # Cornish-Fisher 2차 보정
+        z_cf = (
+            z
+            + (z**2 - 1) * skew / 6
+            + (z**3 - 3 * z) * kurt / 24
+            - (2 * z**3 - 5 * z) * skew**2 / 36
+        )
+        return mu + z_cf * sigma
+
+    # ── 공개 API ────────────────────────────────────────────────────
+
+    def var(self, confidence: float = 0.95, method: str = "historical") -> float:
+        """
+        Value-at-Risk (손실 부호: 음수).
+
+        Returns: VaR as a decimal (e.g. -0.025 = -2.5%)
+        """
+        if method == "parametric":
+            return self._parametric_quantile(confidence)
+        if method == "cornish_fisher":
+            return self._cornish_fisher_quantile(confidence)
+        return self._historical_quantile(confidence)
+
+    def cvar(self, confidence: float = 0.95, method: str = "historical") -> float:
+        """
+        Conditional VaR / Expected Shortfall.
+
+        Returns: CVaR as a decimal (e.g. -0.04 = -4%)
+        """
+        var_threshold = self.var(confidence, method)
+        tail = self.returns[self.returns <= var_threshold]
+        return float(tail.mean()) if len(tail) > 0 else var_threshold
+
+    def compute_all(self, method: str = "historical") -> dict:
+        """
+        VaR / CVaR를 두 신뢰 수준(95%, 99%)에서 계산한다.
+
+        Returns:
+            {
+              "var_95": float,  # –% decimal
+              "var_99": float,
+              "cvar_95": float,
+              "cvar_99": float,
+              "var_95_amount": float,  # NAV × |VaR|
+              "var_99_amount": float,
+              "cvar_95_amount": float,
+              "cvar_99_amount": float,
+              "method": str,
+              "n_days": int,
+              "annualized_vol": float,
+            }
+        """
+        v95 = self.var(0.95, method)
+        v99 = self.var(0.99, method)
+        cv95 = self.cvar(0.95, method)
+        cv99 = self.cvar(0.99, method)
+        ann_vol = float(self.returns.std() * np.sqrt(252))
+
+        return {
+            "var_95": round(v95, 6),
+            "var_99": round(v99, 6),
+            "cvar_95": round(cv95, 6),
+            "cvar_99": round(cv99, 6),
+            "var_95_pct": round(v95 * 100, 3),
+            "var_99_pct": round(v99 * 100, 3),
+            "cvar_95_pct": round(cv95 * 100, 3),
+            "cvar_99_pct": round(cv99 * 100, 3),
+            "var_95_amount": round(abs(v95) * self.nav, 2),
+            "var_99_amount": round(abs(v99) * self.nav, 2),
+            "cvar_95_amount": round(abs(cv95) * self.nav, 2),
+            "cvar_99_amount": round(abs(cv99) * self.nav, 2),
+            "method": method,
+            "n_days": len(self.returns),
+            "annualized_vol_pct": round(ann_vol * 100, 3),
+        }

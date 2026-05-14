@@ -732,6 +732,38 @@ def get_ml_prediction(ticker: str):
         raise HTTPException(500, f"ML 예측 실패: {e}")
 
 
+@app.get("/risk/{ticker}")
+def get_risk_metrics(ticker: str, method: str = "historical", nav: float = 100_000.0):
+    """VaR/CVaR 일별 리스크 지표 (P2). method: historical|parametric|cornish_fisher."""
+    ticker = ticker.upper()
+    try:
+        from risk_management import PortfolioRiskCalculator
+
+        df = fetch_ohlcv(ticker)
+        returns = df["Close"].pct_change().dropna()
+        if len(returns) < 20:
+            raise HTTPException(400, f"{ticker}: 수익률 데이터 부족 (최소 20일 필요)")
+
+        calc = PortfolioRiskCalculator(returns, nav=nav)
+        result = calc.compute_all(method=method)
+        result["ticker"] = ticker
+        return _sanitize(result)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"리스크 계산 실패: {exc}")
+
+
+@app.get("/ic-weights")
+def get_ic_weights(days: int = 90):
+    """소스별 IC(Information Coefficient) 가중치 현황 (P2)."""
+    try:
+        from ic_ensemble import get_ic_summary
+        return get_ic_summary(days=days)
+    except Exception as exc:
+        raise HTTPException(500, f"IC 계산 실패: {exc}")
+
+
 @app.get("/portfolio/optimize")
 def get_portfolio_optimization(method: str = "markowitz"):
     """포트폴리오 최적화 (마코위츠/리스크패리티)"""
