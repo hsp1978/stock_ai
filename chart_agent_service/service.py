@@ -23,8 +23,9 @@ from typing import Dict, List, Optional
 import httpx
 import uvicorn
 import math
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 from pydantic import BaseModel
 
@@ -487,6 +488,24 @@ app = FastAPI(
     description="16개 기법 차트 분석 에이전트 + 퀀트 시스템 API",
     version="1.0.0",
 )
+
+
+# ── GlobalKillSwitch 미들웨어 ─────────────────────────────────────────
+
+class KillSwitchMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        from safety.kill_switch import _is_kill_switch_protected, get_kill_switch
+        if _is_kill_switch_protected(request.url.path):
+            blocked, reason = get_kill_switch().is_blocked()
+            if blocked:
+                return JSONResponse(
+                    status_code=423,
+                    content={"detail": "kill_switch_active", "reason": reason},
+                )
+        return await call_next(request)
+
+
+app.add_middleware(KillSwitchMiddleware)
 
 
 @app.get("/")

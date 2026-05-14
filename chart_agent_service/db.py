@@ -64,6 +64,21 @@ CREATE INDEX IF NOT EXISTS idx_screener_run    ON screener_results(run_id);
 CREATE INDEX IF NOT EXISTS idx_screener_ticker ON screener_results(ticker);
 """
 
+_CREATE_KILL_SWITCH_TABLE = """
+CREATE TABLE IF NOT EXISTS kill_switch_events (
+    event_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    triggered_at      TIMESTAMP NOT NULL,
+    trigger_type      TEXT      NOT NULL,
+    trigger_value     REAL      NOT NULL,
+    portfolio_pnl_pct REAL,
+    action            TEXT      NOT NULL,
+    cool_down_until   TIMESTAMP,
+    metadata          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_kse_triggered_at ON kill_switch_events(triggered_at);
+CREATE INDEX IF NOT EXISTS idx_kse_action       ON kill_switch_events(action);
+"""
+
 # 스크리너 결과 테이블 — 기존 scan_log와 완전 분리 (SSOT, 스키마 오염 방지)
 _CREATE_SCREENER_TABLE = """
 CREATE TABLE IF NOT EXISTS screener_results (
@@ -98,6 +113,7 @@ def init_db():
     conn.execute(_CREATE_TABLE)
     conn.execute(_CREATE_OUTCOMES_TABLE)
     conn.execute(_CREATE_SCREENER_TABLE)
+    conn.executescript(_CREATE_KILL_SWITCH_TABLE)
     # entry_price 컬럼 마이그레이션 (기존 DB 호환)
     try:
         conn.execute("ALTER TABLE scan_log ADD COLUMN entry_price REAL")
