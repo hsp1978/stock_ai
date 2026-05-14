@@ -3,10 +3,10 @@
 - scan_log 테이블: 개별 종목 스캔 기록
 - 주간 요약 쿼리 함수 제공
 """
+
 import os
 import sqlite3
 from datetime import datetime, timedelta
-from typing import Optional
 
 from config import OUTPUT_DIR
 
@@ -28,40 +28,54 @@ CREATE TABLE IF NOT EXISTS scan_log (
 );
 """
 
-# 신호 사후 평가 테이블 — 스캔 로그의 신호가 실제로 얼마나 적중했는지 추적
+# Step 4: 신호 사후 평가 테이블 V2 (signal_id UUID, source, conviction, regime)
 _CREATE_OUTCOMES_TABLE = """
 CREATE TABLE IF NOT EXISTS signal_outcomes (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    scan_log_id   INTEGER NOT NULL,
-    ticker        TEXT    NOT NULL,
-    signal        TEXT,
-    score         REAL,
-    confidence    REAL,
-    scanned_at    TEXT    NOT NULL,
-    entry_price   REAL,
-    -- 미래 N일 후 실제 가격과 수익률
-    price_7d      REAL,
-    return_7d_pct REAL,
-    outcome_7d    TEXT,       -- "win" | "loss" | "neutral"
-    price_14d     REAL,
-    return_14d_pct REAL,
-    outcome_14d   TEXT,
-    price_30d     REAL,
-    return_30d_pct REAL,
-    outcome_30d   TEXT,
-    evaluated_at  TEXT,
-    UNIQUE(scan_log_id)
+    signal_id        TEXT PRIMARY KEY,
+    ticker           TEXT NOT NULL,
+    signal_type      TEXT NOT NULL,
+    signal_source    TEXT NOT NULL,
+    issued_at        TIMESTAMP NOT NULL,
+    conviction       REAL NOT NULL,
+    price_at_signal  REAL NOT NULL,
+    price_7d         REAL,
+    price_14d        REAL,
+    price_30d        REAL,
+    return_7d        REAL,
+    return_14d       REAL,
+    return_30d       REAL,
+    max_drawdown_30d REAL,
+    evaluated_at     TIMESTAMP,
+    market_context   TEXT,
+    regime           TEXT
 );
+"""
+
+_CREATE_SIGNAL_PERF_VIEW = """
+CREATE VIEW IF NOT EXISTS signal_performance_summary AS
+SELECT
+    signal_source,
+    signal_type,
+    regime,
+    COUNT(*) AS n,
+    AVG(CASE WHEN return_7d > 0 THEN 1.0 ELSE 0.0 END) AS hit_rate_7d,
+    AVG(return_7d)  AS expectancy_7d,
+    AVG(return_30d) AS expectancy_30d,
+    AVG(max_drawdown_30d) AS avg_max_dd
+FROM signal_outcomes
+WHERE evaluated_at IS NOT NULL
+  AND issued_at >= datetime('now', '-90 days')
+GROUP BY signal_source, signal_type, regime;
 """
 
 _CREATE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_scan_log_ticker  ON scan_log(ticker);
 CREATE INDEX IF NOT EXISTS idx_scan_log_date    ON scan_log(scanned_at);
-CREATE INDEX IF NOT EXISTS idx_outcomes_ticker  ON signal_outcomes(ticker);
-CREATE INDEX IF NOT EXISTS idx_outcomes_signal  ON signal_outcomes(signal);
-CREATE INDEX IF NOT EXISTS idx_outcomes_date    ON signal_outcomes(scanned_at);
-CREATE INDEX IF NOT EXISTS idx_screener_run    ON screener_results(run_id);
-CREATE INDEX IF NOT EXISTS idx_screener_ticker ON screener_results(ticker);
+CREATE INDEX IF NOT EXISTS idx_so_ticker_issued ON signal_outcomes(ticker, issued_at);
+CREATE INDEX IF NOT EXISTS idx_so_source_issued ON signal_outcomes(signal_source, issued_at);
+CREATE INDEX IF NOT EXISTS idx_so_regime        ON signal_outcomes(regime);
+CREATE INDEX IF NOT EXISTS idx_screener_run     ON screener_results(run_id);
+CREATE INDEX IF NOT EXISTS idx_screener_ticker  ON screener_results(ticker);
 """
 
 _CREATE_KILL_SWITCH_TABLE = """
@@ -107,11 +121,24 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
+def _migrate_signal_outcomes(conn: sqlite3.Connection) -> None:
+    """signal_outcomes 구 스키마(scan_log_id 기반) → V2(signal_id UUID) 마이그레이션."""
+    cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(signal_outcomes)").fetchall()
+    }
+    if cols and "signal_id" not in cols:
+        conn.execute("DROP TABLE IF EXISTS signal_outcomes_legacy")
+        conn.execute("ALTER TABLE signal_outcomes RENAME TO signal_outcomes_legacy")
+        print("[DB] signal_outcomes 구 스키마 → signal_outcomes_legacy 백업")
+
+
 def init_db():
     """테이블 생성 (서비스 시작 시 1회 호출)"""
     conn = _get_conn()
     conn.execute(_CREATE_TABLE)
+    _migrate_signal_outcomes(conn)
     conn.execute(_CREATE_OUTCOMES_TABLE)
+    conn.executescript(_CREATE_SIGNAL_PERF_VIEW)
     conn.execute(_CREATE_SCREENER_TABLE)
     conn.executescript(_CREATE_KILL_SWITCH_TABLE)
     # entry_price 컬럼 마이그레이션 (기존 DB 호환)
@@ -126,6 +153,7 @@ def init_db():
 
 
 # ─── 기록 ───────────────────────────────────────────────
+
 
 def insert_scan(ticker: str, result: dict, alert_sent: bool = False):
     """스캔 결과 1건 DB 기록"""
@@ -162,6 +190,7 @@ def insert_scan(ticker: str, result: dict, alert_sent: bool = False):
 
 
 # ─── 조회: scan-log ────────────────────────────────────
+
 
 def get_scan_logs(limit: int = 50, offset: int = 0) -> dict:
     """최근 스캔 로그 조회 (페이지네이션)"""
@@ -228,10 +257,16 @@ def get_scan_log_date_range(start: str, end: str) -> dict:
         (start, end),
     ).fetchall()
     conn.close()
-    return {"start": start, "end": end, "count": len(rows), "logs": [dict(r) for r in rows]}
+    return {
+        "start": start,
+        "end": end,
+        "count": len(rows),
+        "logs": [dict(r) for r in rows],
+    }
 
 
 # ─── 조회: weekly ───────────────────────────────────────
+
 
 def get_weekly_summary(weeks_ago: int = 0) -> dict:
     """주간 요약 리포트
@@ -379,6 +414,7 @@ def get_weekly_ticker(ticker: str, weeks_ago: int = 0) -> dict:
 
 # ─── 스크리너 결과 저장/조회 ────────────────────────────────────
 
+
 def insert_screener_results(run_id: str, results: list):
     """
     스크리너 실행 결과 저장 (상위 N개 한 번에).
@@ -387,27 +423,30 @@ def insert_screener_results(run_id: str, results: list):
                score, grade, breakdown(dict), penalties(list)}, ...]
     """
     import json
+
     if not results:
         return
     conn = _get_conn()
     rows = []
     scanned_at = datetime.now().isoformat()
     for r in results:
-        rows.append((
-            run_id,
-            r.get("rank", 0),
-            r.get("ticker", ""),
-            r.get("name"),
-            r.get("market"),
-            r.get("market_cap"),
-            r.get("current_price"),
-            r.get("score", 0.0),
-            r.get("grade"),
-            json.dumps(r.get("breakdown", {}), ensure_ascii=False),
-            json.dumps(r.get("penalties", []), ensure_ascii=False),
-            r.get("market_regime"),
-            scanned_at,
-        ))
+        rows.append(
+            (
+                run_id,
+                r.get("rank", 0),
+                r.get("ticker", ""),
+                r.get("name"),
+                r.get("market"),
+                r.get("market_cap"),
+                r.get("current_price"),
+                r.get("score", 0.0),
+                r.get("grade"),
+                json.dumps(r.get("breakdown", {}), ensure_ascii=False),
+                json.dumps(r.get("penalties", []), ensure_ascii=False),
+                r.get("market_regime"),
+                scanned_at,
+            )
+        )
     conn.executemany(
         """INSERT INTO screener_results
            (run_id, rank, ticker, name, market, market_cap, current_price,

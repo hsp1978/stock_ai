@@ -56,6 +56,7 @@ from macro_context import fetch_macro_context
 from db import init_db, insert_scan, get_scan_logs, get_scan_logs_by_ticker, \
     get_scan_log_latest, get_scan_log_date_range, \
     get_weekly_summary, get_weekly_ticker
+from signal_tracker import insert_signal_outcome
 
 # Multi-Agent import
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "stock_analyzer"))
@@ -64,6 +65,31 @@ try:
 except ImportError:
     MultiAgentOrchestrator = None
     print("[WARNING] Multi-Agent module not available")
+
+
+def _try_insert_signal_outcome(ticker: str, result: dict) -> None:
+    """스캔 결과로부터 signal_outcomes에 row를 생성한다 (실패 시 무시)."""
+    try:
+        signal = (result.get("final_signal") or "HOLD").upper()
+        if signal not in ("BUY", "SELL"):
+            return
+        price = float(
+            result.get("current_price")
+            or result.get("price")
+            or (result.get("entry_plan") or {}).get("limit_price")
+            or 0.0
+        )
+        if price <= 0:
+            return
+        insert_signal_outcome(
+            ticker=ticker,
+            signal_type=signal.lower(),
+            signal_source="scan_agent",
+            conviction=float(result.get("confidence") or 0.0),
+            price_at_signal=price,
+        )
+    except Exception as exc:
+        print(f"  [{ticker}] signal_outcome insert 실패: {exc}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -431,6 +457,7 @@ def run_scheduled_scan(override_tickers: "list[str] | None" = None):
                         scan_entry["alerts"].append(ticker)
 
                 insert_scan(ticker, result, alert_sent=(alert is not None))
+                _try_insert_signal_outcome(ticker, result)
 
     # ── 단계 3: 캐시 정리 ─────────────────────────────────────
     clear_ohlcv_cache()
@@ -581,6 +608,7 @@ def scan_ticker(ticker: str, ai_mode: str = "ollama"):
         send_summary_alert([alert])
         alert_sent = True
     insert_scan(ticker, result, alert_sent=alert_sent)
+    _try_insert_signal_outcome(ticker, result)
     return result
 
 
