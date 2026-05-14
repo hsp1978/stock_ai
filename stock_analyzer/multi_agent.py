@@ -208,16 +208,23 @@ class BaseAgent:
         return prompt
 
     def _call_llm(self, prompt: str) -> str:
-        """LLM 호출"""
-
-        if self.llm_provider == "gemini":
-            return self._call_gemini(prompt)
-        elif self.llm_provider == "ollama":
-            return self._call_ollama(prompt)
-        elif self.llm_provider == "openai":
-            return self._call_openai(prompt)
-        else:
-            raise ValueError(f"Unknown LLM provider: {self.llm_provider}")
+        """LLM 호출 (LiteLLM Router 경유 — Step 9)."""
+        try:
+            from llm.router import call_agent_llm, get_router
+            response = call_agent_llm(get_router(), self.name, prompt)
+            return json.dumps(
+                {
+                    "signal": response.signal,
+                    "confidence": response.confidence,
+                    "reasoning": response.reasoning,
+                    "key_evidence": response.key_evidence,
+                    "risk_flags": response.risk_flags,
+                },
+                ensure_ascii=False,
+            )
+        except Exception as exc:
+            # Router 자체 import/초기화 실패 시만 여기 진입 (call_agent_llm는 예외 미방출)
+            return self._empty_response_json(f"LLM Router 오류: {exc}")
 
     def _call_gemini(self, prompt: str) -> str:
         """Gemini API 호출"""
