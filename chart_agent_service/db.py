@@ -47,7 +47,9 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     max_drawdown_30d REAL,
     evaluated_at     TIMESTAMP,
     market_context   TEXT,
-    regime           TEXT
+    regime           TEXT,
+    signal_std       REAL,
+    agreement_level  TEXT
 );
 """
 
@@ -130,6 +132,14 @@ def _migrate_signal_outcomes(conn: sqlite3.Connection) -> None:
         conn.execute("DROP TABLE IF EXISTS signal_outcomes_legacy")
         conn.execute("ALTER TABLE signal_outcomes RENAME TO signal_outcomes_legacy")
         print("[DB] signal_outcomes 구 스키마 → signal_outcomes_legacy 백업")
+        return
+    # Step 12: signal_std, agreement_level 컬럼 추가 (기존 DB 호환)
+    for col, coltype in [("signal_std", "REAL"), ("agreement_level", "TEXT")]:
+        if col not in cols:
+            try:
+                conn.execute(f"ALTER TABLE signal_outcomes ADD COLUMN {col} {coltype}")
+            except sqlite3.OperationalError:
+                pass
 
 
 def init_db():

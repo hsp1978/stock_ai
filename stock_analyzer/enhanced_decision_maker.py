@@ -186,6 +186,21 @@ class EnhancedDecisionMaker:
         except Exception:
             pass
 
+        # 5.8. [Step 12] Variance-aware aggregation
+        signal_std: float | None = None
+        agreement_level: str | None = None
+        variance_penalty = 0.0
+        try:
+            if group_results:
+                from agent_groups import aggregate_with_variance
+                vagg = aggregate_with_variance(group_results, regime_weights)
+                signal_std = vagg["std"]
+                agreement_level = vagg["agreement"]
+                if vagg["agreement"] == "low":
+                    variance_penalty = 0.3   # conviction ×0.7
+        except Exception:
+            pass
+
         # 6. 최종 판단
         final_decision = self._make_final_decision(
             signal_counts,
@@ -220,8 +235,13 @@ class EnhancedDecisionMaker:
         if reflect_flags:
             warnings.extend(reflect_flags)
 
-        # 8. 결과 구성 (STRONG_*_CONFIRMATION 보너스 반영)
-        final_confidence = min(10.0, final_decision["confidence"] + strong_confirmation_bonus)
+        # HIGH_VARIANCE 경고 추가
+        if agreement_level == "low":
+            warnings.append("HIGH_VARIANCE_WAIT")
+
+        # 8. 결과 구성 (STRONG_*_CONFIRMATION 보너스 + variance 패널티 반영)
+        raw_confidence = final_decision["confidence"] + strong_confirmation_bonus
+        final_confidence = min(10.0, raw_confidence * (1.0 - variance_penalty))
         result = {
             "final_signal": final_decision["signal"],
             "final_confidence": final_confidence,
@@ -244,6 +264,8 @@ class EnhancedDecisionMaker:
             "regime_weighted_score": regime_weighted_score,
             "group_results": {k.value: v.to_dict() for k, v in group_results.items()},
             "reflect_flags": reflect_flags,
+            "signal_std": signal_std,
+            "agreement_level": agreement_level,
         }
 
         return result

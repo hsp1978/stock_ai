@@ -35,10 +35,13 @@ def insert_signal_outcome(
     price_at_signal: float,
     market_context: Optional[Dict] = None,
     regime: Optional[str] = None,
+    signal_std: Optional[float] = None,
+    agreement_level: Optional[str] = None,
 ) -> str:
     """
     시그널 발주 시점에 signal_outcomes에 row를 생성한다.
 
+    Step 12: signal_std, agreement_level 추가.
     Returns: 생성된 signal_id (UUID4)
     """
     signal_id = str(uuid.uuid4())
@@ -48,8 +51,8 @@ def insert_signal_outcome(
         """INSERT INTO signal_outcomes
            (signal_id, ticker, signal_type, signal_source,
             issued_at, conviction, price_at_signal,
-            market_context, regime)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            market_context, regime, signal_std, agreement_level)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             signal_id,
             ticker.upper(),
@@ -60,6 +63,8 @@ def insert_signal_outcome(
             price_at_signal,
             json.dumps(market_context) if market_context else None,
             regime,
+            signal_std,
+            agreement_level,
         ),
     )
     conn.commit()

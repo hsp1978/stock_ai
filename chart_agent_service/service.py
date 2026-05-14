@@ -80,6 +80,8 @@ def _try_insert_group_outcomes(ticker: str, result: dict) -> None:
     if price <= 0:
         return
     regime = result.get("regime")
+    signal_std = result.get("signal_std")
+    agreement_level = result.get("agreement_level")
     for group_name, gr in group_results.items():
         signal = gr.get("signal", "neutral")
         if signal not in ("buy", "sell"):
@@ -92,6 +94,8 @@ def _try_insert_group_outcomes(ticker: str, result: dict) -> None:
                 conviction=float(gr.get("confidence") or 0.0),
                 price_at_signal=price,
                 regime=regime,
+                signal_std=signal_std,
+                agreement_level=agreement_level,
             )
         except Exception as exc:
             print(f"  [{ticker}] group_outcome insert 실패({group_name}): {exc}")
