@@ -103,6 +103,15 @@ class Settings(BaseSettings):
 
     DATA_SOURCE: Literal["yfinance", "alpaca", "polygon", "kis"] = "yfinance"
 
+    # ── Step 11: 시장 캘린더 ──────────────────────────────────────────
+    DEFAULT_MARKET_KR: str = "KRX"
+    DEFAULT_MARKET_US: str = "NYSE"
+
+    # ── Step 10: 백테스트 무위험 수익률 / 거래비용 분리 ────────────────
+    ANNUAL_RISK_FREE_RATE_KR: float = Field(default=3.5, ge=0)   # KOFR 기준
+    ANNUAL_RISK_FREE_RATE_US: float = Field(default=4.5, ge=0)   # 3M T-Bill 기준
+    KRX_TRADING_TAX_PCT: float = Field(default=0.20, ge=0)       # 2026 거래세
+
     # ── OHLCV 캐시 TTL (Step 3) ────────────────────────────────────
     OHLCV_TTL_EOD_HOURS: float = Field(default=24.0, ge=0)
     OHLCV_TTL_INTRADAY_MINUTES: int = Field(default=5, ge=1)
