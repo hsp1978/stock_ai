@@ -10,20 +10,61 @@
 - 일일 cron 또는 scanner의 스케줄러에서 evaluate_past_signals() 호출
 - 매주 1회 calibrator.refit()으로 보정 함수 업데이트
 """
+
 from __future__ import annotations
 
-import os
-import sqlite3
-from datetime import datetime, timedelta
+import json
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
-from db import DB_PATH, _get_conn
+from db import _get_conn
 
 # 평가 horizon (영업일 기준 근사: 7/14/30 캘린더 일)
 HORIZONS = [7, 14, 30]
 
 # outcome 판정 threshold (±%)
 OUTCOME_THRESHOLD_PCT = 2.0
+
+
+def insert_signal_outcome(
+    ticker: str,
+    signal_type: str,
+    signal_source: str,
+    conviction: float,
+    price_at_signal: float,
+    market_context: Optional[Dict] = None,
+    regime: Optional[str] = None,
+) -> str:
+    """
+    시그널 발주 시점에 signal_outcomes에 row를 생성한다.
+
+    Returns: 생성된 signal_id (UUID4)
+    """
+    signal_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _get_conn()
+    conn.execute(
+        """INSERT INTO signal_outcomes
+           (signal_id, ticker, signal_type, signal_source,
+            issued_at, conviction, price_at_signal,
+            market_context, regime)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            signal_id,
+            ticker.upper(),
+            signal_type.lower(),
+            signal_source,
+            now,
+            conviction,
+            price_at_signal,
+            json.dumps(market_context) if market_context else None,
+            regime,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return signal_id
 
 
 def _latest_close_for(ticker: str, target_date: datetime) -> Optional[float]:
@@ -33,6 +74,7 @@ def _latest_close_for(ticker: str, target_date: datetime) -> Optional[float]:
     """
     try:
         import yfinance as yf
+
         # target_date부터 +5일 범위에서 첫 유효 데이터
         end = target_date + timedelta(days=7)
         start = target_date - timedelta(days=1)
@@ -42,7 +84,11 @@ def _latest_close_for(ticker: str, target_date: datetime) -> Optional[float]:
             return None
         # target_date와 같거나 이후의 첫 행
         for idx in hist.index:
-            idx_naive = idx.tz_localize(None) if hasattr(idx, "tz_localize") and idx.tzinfo else idx
+            idx_naive = (
+                idx.tz_localize(None)
+                if hasattr(idx, "tz_localize") and idx.tzinfo
+                else idx
+            )
             if idx_naive.to_pydatetime().date() >= target_date.date():
                 return float(hist.loc[idx, "Close"])
         # 없으면 마지막 행
@@ -175,11 +221,22 @@ def evaluate_past_signals(days_back: int = 45, limit: int = 500) -> Dict:
                   evaluated_at=excluded.evaluated_at
                 """,
                 (
-                    scan_log_id, ticker, signal, row["score"], row["confidence"],
-                    row["scanned_at"], entry_price,
-                    horizon_data[7][0], horizon_data[7][1], horizon_data[7][2],
-                    horizon_data[14][0], horizon_data[14][1], horizon_data[14][2],
-                    horizon_data[30][0], horizon_data[30][1], horizon_data[30][2],
+                    scan_log_id,
+                    ticker,
+                    signal,
+                    row["score"],
+                    row["confidence"],
+                    row["scanned_at"],
+                    entry_price,
+                    horizon_data[7][0],
+                    horizon_data[7][1],
+                    horizon_data[7][2],
+                    horizon_data[14][0],
+                    horizon_data[14][1],
+                    horizon_data[14][2],
+                    horizon_data[30][0],
+                    horizon_data[30][1],
+                    horizon_data[30][2],
                     now.isoformat(),
                 ),
             )
@@ -231,8 +288,8 @@ def get_accuracy_stats(
     # 기본 필터
     where_parts = [
         f"{out_col} IS NOT NULL",
-        f"confidence >= ?",
-        f"scanned_at >= ?",
+        "confidence >= ?",
+        "scanned_at >= ?",
     ]
     params: List = [min_confidence, cutoff]
     if signal:
@@ -303,13 +360,15 @@ def get_accuracy_stats(
         ).fetchone()
         t = r["total"] or 0
         w = r["wins"] or 0
-        bands.append({
-            "band": f"{lo:.1f}-{min(hi, 10.0):.1f}",
-            "total": t,
-            "wins": w,
-            "win_rate_pct": round((w / t * 100) if t else 0, 1),
-            "avg_return_pct": round(r["avg_return"] or 0, 3),
-        })
+        bands.append(
+            {
+                "band": f"{lo:.1f}-{min(hi, 10.0):.1f}",
+                "total": t,
+                "wins": w,
+                "win_rate_pct": round((w / t * 100) if t else 0, 1),
+                "avg_return_pct": round(r["avg_return"] or 0, 3),
+            }
+        )
 
     conn.close()
 
@@ -434,8 +493,9 @@ def get_calibrator(horizon: int = 7) -> ConfidenceCalibrator:
 # ─────────────────────────────────────────────────────────
 #  일일 cron 진입점
 # ─────────────────────────────────────────────────────────
-def run_daily_validation(days_back: int = 45, limit: int = 500,
-                         refit_calibrator: bool = True) -> Dict:
+def run_daily_validation(
+    days_back: int = 45, limit: int = 500, refit_calibrator: bool = True
+) -> Dict:
     """
     일일 실행: 과거 신호 평가 + 칼리브레이터 재학습.
 
