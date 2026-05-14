@@ -67,6 +67,36 @@ except ImportError:
     print("[WARNING] Multi-Agent module not available")
 
 
+def _try_insert_group_outcomes(ticker: str, result: dict) -> None:
+    """multi-agent 결과의 그룹별 신호를 signal_outcomes에 개별 row로 기록한다."""
+    group_results: dict = result.get("group_results") or {}
+    if not group_results:
+        return
+    price = float(
+        result.get("current_price")
+        or result.get("price")
+        or 0.0
+    )
+    if price <= 0:
+        return
+    regime = result.get("regime")
+    for group_name, gr in group_results.items():
+        signal = gr.get("signal", "neutral")
+        if signal not in ("buy", "sell"):
+            continue
+        try:
+            insert_signal_outcome(
+                ticker=ticker,
+                signal_type=signal,
+                signal_source=f"group_{group_name}",
+                conviction=float(gr.get("confidence") or 0.0),
+                price_at_signal=price,
+                regime=regime,
+            )
+        except Exception as exc:
+            print(f"  [{ticker}] group_outcome insert 실패({group_name}): {exc}")
+
+
 def _try_insert_signal_outcome(ticker: str, result: dict) -> None:
     """스캔 결과로부터 signal_outcomes에 row를 생성한다 (실패 시 무시)."""
     try:
@@ -1046,6 +1076,9 @@ def get_multi_agent_analysis(ticker: str):
         result = orchestrator.analyze(ticker)
 
         print(f"[Multi-Agent] Analysis complete for {ticker}")
+
+        # 그룹별 시그널 signal_outcomes에 기록
+        _try_insert_group_outcomes(ticker, result)
 
         # 결과 정제
         sanitized_result = _sanitize(result)

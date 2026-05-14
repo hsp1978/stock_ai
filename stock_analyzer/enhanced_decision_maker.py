@@ -148,16 +148,31 @@ class EnhancedDecisionMaker:
 
         # 5.6. [Step 7] Regime-aware 가중치 적용
         current_regime = None
+        regime_weights = None
         regime_weighted_score = None
         try:
-            from regime.detector import apply_regime_weights_to_agents, detect_market_regime, fetch_market_features
-            from regime.models import MacroContext
+            from regime.detector import detect_market_regime, fetch_market_features
+            from regime.models import MacroContext, REGIME_WEIGHTS
             import os
             vix_hint = float(os.getenv("CURRENT_VIX", "20"))
             ctx = MacroContext(vix=vix_hint)
             mkt = fetch_market_features()
             current_regime = detect_market_regime(ctx, mkt)
-            regime_weighted_score = apply_regime_weights_to_agents(agent_results, current_regime)
+            regime_weights = REGIME_WEIGHTS[current_regime]
+        except Exception:
+            pass
+
+        # 5.7. [Step 8] 4-그룹 분할 + confidence-weighted vote
+        group_results = {}
+        reflect_flags: List[str] = []
+        try:
+            from agent_groups import aggregate_by_group, reflect, group_weighted_score
+            group_results = aggregate_by_group(agent_results)
+            # regime-aware 그룹 합산
+            regime_weighted_score = group_weighted_score(
+                group_results,
+                regime_weights,
+            )
         except Exception:
             pass
 
@@ -172,6 +187,14 @@ class EnhancedDecisionMaker:
             fundamental_risks
         )
 
+        # reflect sanity check
+        try:
+            if group_results:
+                from agent_groups import reflect
+                reflect_flags = reflect(group_results, final_decision["signal"])
+        except Exception:
+            pass
+
         # 7. 경고 메시지 수집
         warnings = []
         if not is_valid and fixed_ticker:
@@ -182,6 +205,10 @@ class EnhancedDecisionMaker:
         # Fundamental 경고 추가
         if fundamental_risks['warnings']:
             warnings.extend(fundamental_risks['warnings'])
+
+        # reflect 플래그 경고 추가
+        if reflect_flags:
+            warnings.extend(reflect_flags)
 
         # 8. 결과 구성
         result = {
@@ -204,6 +231,8 @@ class EnhancedDecisionMaker:
             "warnings": warnings if warnings else None,
             "regime": current_regime.value if current_regime else None,
             "regime_weighted_score": regime_weighted_score,
+            "group_results": {k.value: v.to_dict() for k, v in group_results.items()},
+            "reflect_flags": reflect_flags,
         }
 
         return result
