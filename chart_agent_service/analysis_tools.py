@@ -1733,6 +1733,167 @@ class AnalysisTools:
 
         return result
 
+    # ── Step 5: MFI 도구 (16→18개) ──────────────────────────────
+
+    @staticmethod
+    def _compute_mfi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Money Flow Index (14-period 표준 공식)."""
+        tp = (df["High"] + df["Low"] + df["Close"]) / 3
+        rmf = tp * df["Volume"]
+        direction = np.where(
+            tp > tp.shift(1), 1, np.where(tp < tp.shift(1), -1, 0)
+        )
+        pos = pd.Series(rmf.where(direction > 0, 0), index=df.index).rolling(period).sum()
+        neg = pd.Series(rmf.where(direction < 0, 0), index=df.index).rolling(period).sum()
+        # neg=0 이면 MFI=100 (전부 양봉), neg=NaN이면 전파
+        mfi = np.where(
+            neg == 0,
+            100.0,
+            100.0 - 100.0 / (1.0 + pos / neg.replace(0, np.nan)),
+        )
+        return pd.Series(mfi, index=df.index)
+
+    @staticmethod
+    def _detect_divergence(price: pd.Series, indicator: pd.Series, lookback: int = 30) -> str:
+        """가격-지표 다이버전스 감지 (bullish/bearish/none)."""
+        n = min(lookback, len(price), len(indicator))
+        if n < 10:
+            return "none"
+        mid = n // 2
+        p = price.iloc[-n:]
+        ind = indicator.iloc[-n:]
+        p1_low, p2_low = float(p.iloc[:mid].min()), float(p.iloc[mid:].min())
+        i1_low, i2_low = float(ind.iloc[:mid].min()), float(ind.iloc[mid:].min())
+        p1_high, p2_high = float(p.iloc[:mid].max()), float(p.iloc[mid:].max())
+        i1_high, i2_high = float(ind.iloc[:mid].max()), float(ind.iloc[mid:].max())
+        if p2_low < p1_low and i2_low > i1_low:
+            return "bullish"
+        if p2_high > p1_high and i2_high < i1_high:
+            return "bearish"
+        return "none"
+
+    def money_flow_index_analysis(self) -> dict:
+        """[Step5-A] MFI 단독 도구 — 거래량 가중 과매수/과매도 (score ±3)."""
+        result = {"tool": "money_flow_index_analysis", "name": "MFI(자금흐름지수) 분석"}
+        if len(self.df) < 16:
+            result.update({"signal": "neutral", "score": 0, "detail": "데이터 부족"})
+            return result
+        mfi = self._compute_mfi(self.df)
+        last = float(mfi.iloc[-1])
+        if np.isnan(last):
+            result.update({"signal": "neutral", "score": 0, "detail": "MFI NaN"})
+            return result
+        score, flags = 0, []
+        if last > 80:
+            score = -3
+            flags.append("MFI_OVERBOUGHT")
+        elif last < 20:
+            score = 3
+            flags.append("MFI_OVERSOLD")
+        signal = "buy" if score > 0 else ("sell" if score < 0 else "neutral")
+        result.update({
+            "signal": signal, "score": score, "mfi": round(last, 2),
+            "flags": flags, "detail": f"MFI={last:.1f}, {', '.join(flags) or '중립'}",
+        })
+        return result
+
+    def rsi_mfi_combined_analysis(self) -> dict:
+        """[Step5-B] RSI+MFI 조합 — 합치 과매수/매도, 이중 다이버전스, 거짓 돌파 감지 (score ±6)."""
+        result = {"tool": "rsi_mfi_combined_analysis", "name": "RSI+MFI 조합 분석"}
+        if "RSI" not in self.df.columns or len(self.df) < 20:
+            result.update({"signal": "neutral", "score": 0, "detail": "데이터 부족"})
+            return result
+        rsi = self.df["RSI"].dropna()
+        mfi = self._compute_mfi(self.df).dropna()
+        if len(rsi) == 0 or len(mfi) == 0:
+            result.update({"signal": "neutral", "score": 0, "detail": "RSI/MFI 없음"})
+            return result
+        last_rsi, last_mfi = float(rsi.iloc[-1]), float(mfi.iloc[-1])
+        score, flags = 0, []
+        # 합치 과매수/과매도
+        if last_rsi > 70 and last_mfi > 80:
+            score = -5
+            flags.append("CONFIRMED_OVERBOUGHT")
+        elif last_rsi < 30 and last_mfi < 20:
+            score = 5
+            flags.append("CONFIRMED_OVERSOLD")
+        # 이중 다이버전스
+        close = self.close.loc[rsi.index]
+        close_m = self.close.loc[mfi.index]
+        price_div = self._detect_divergence(close, rsi, 30)
+        volume_div = self._detect_divergence(close_m, mfi, 30)
+        if price_div == "bearish" and volume_div == "bearish":
+            score -= 6
+            flags.append("DOUBLE_BEARISH_DIVERGENCE")
+        elif price_div == "bullish" and volume_div == "bullish":
+            score += 6
+            flags.append("DOUBLE_BULLISH_DIVERGENCE")
+        # 거짓 돌파
+        if last_rsi > 70 and last_mfi < 60:
+            score -= 4
+            flags.append("VOLUME_DIVERGENCE_BEARISH")
+        elif last_rsi < 30 and last_mfi > 40:
+            score += 4
+            flags.append("VOLUME_DIVERGENCE_BULLISH")
+        score = max(-10, min(10, score))
+        signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+        result.update({
+            "signal": signal, "score": round(score, 1),
+            "rsi": round(last_rsi, 2), "mfi": round(last_mfi, 2),
+            "flags": flags, "detail": f"RSI={last_rsi:.1f}, MFI={last_mfi:.1f}, flags={flags}",
+        })
+        return result
+
+    # ── Step 6: MACD+RSI cross-signal (18→19개) ──────────────────
+
+    def macd_rsi_cross_analysis(self) -> dict:
+        """[Step6] MACD 크로스 + RSI 동시 조건 — STRONG confirmation (score ±7)."""
+        result = {"tool": "macd_rsi_cross_analysis", "name": "MACD+RSI 크로스 시그널"}
+        macd_col = f"MACD_{MACD_FAST}_{MACD_SLOW}_{MACD_SIGNAL}"
+        sig_col = f"MACDs_{MACD_FAST}_{MACD_SLOW}_{MACD_SIGNAL}"
+        if macd_col not in self.df.columns or "RSI" not in self.df.columns:
+            result.update({"signal": "neutral", "score": 0, "detail": "데이터 없음"})
+            return result
+        macd_s = self.df[macd_col].dropna()
+        sig_s = self.df[sig_col].dropna()
+        rsi = self.df["RSI"].dropna()
+        if len(macd_s) < 2 or len(rsi) == 0:
+            result.update({"signal": "neutral", "score": 0, "detail": "데이터 부족"})
+            return result
+        bearish_cross = (
+            float(macd_s.iloc[-2]) > float(sig_s.iloc[-2])
+            and float(macd_s.iloc[-1]) < float(sig_s.iloc[-1])
+        )
+        bullish_cross = (
+            float(macd_s.iloc[-2]) < float(sig_s.iloc[-2])
+            and float(macd_s.iloc[-1]) > float(sig_s.iloc[-1])
+        )
+        last_rsi = float(rsi.iloc[-1])
+        score, flags = 0, []
+        if bearish_cross:
+            flags.append("MACD_BEARISH_CROSS")
+            if last_rsi > 70:
+                score = -7
+                flags.append("STRONG_BEARISH_CONFIRMATION")
+            else:
+                score = -3
+        elif bullish_cross:
+            flags.append("MACD_BULLISH_CROSS")
+            if last_rsi < 30:
+                score = 7
+                flags.append("STRONG_BULLISH_CONFIRMATION")
+            else:
+                score = 3
+        signal = "buy" if score > 0 else ("sell" if score < 0 else "neutral")
+        result.update({
+            "signal": signal, "score": score,
+            "macd": round(float(macd_s.iloc[-1]), 4),
+            "signal_line": round(float(sig_s.iloc[-1]), 4),
+            "rsi": round(last_rsi, 2),
+            "flags": flags, "detail": f"MACD cross={'bearish' if bearish_cross else 'bullish' if bullish_cross else 'none'}, RSI={last_rsi:.1f}, flags={flags}",
+        })
+        return result
+
 
 # ═══════════════════════════════════════════════════════════════
 #  Tool 정의 (LLM에 제공할 스키마)
@@ -1858,6 +2019,27 @@ TOOL_DEFINITIONS = [
             "description": "내부자 거래 분석. CEO/CFO/임원 매수매도 패턴, C-Suite 거래 집중도, 최근 30일 거래 동향 분석.",
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "money_flow_index_analysis",
+            "description": "MFI(자금흐름지수) 분석. 거래량 가중 과매수(>80)/과매도(<20) 탐지. 저유동성 거짓 돌파 보완.",
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rsi_mfi_combined_analysis",
+            "description": "RSI+MFI 조합 분석. 합치 과매수/매도, 이중 다이버전스, 거짓 돌파(거래량 확인 없는 RSI 극단) 감지.",
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "macd_rsi_cross_analysis",
+            "description": "MACD 크로스+RSI 동시 조건. MACD bearish cross ∧ RSI>70 → score=-7(STRONG_BEARISH), bullish cross ∧ RSI<30 → score=+7(STRONG_BULLISH).",
+        }
+    },
 ]
 
 # Ollama용 간소화 tool 이름 목록
@@ -1869,7 +2051,7 @@ TOOL_NAMES = [t["function"]["name"] for t in TOOL_DEFINITIONS]
 # ═══════════════════════════════════════════════════════════════
 
 class ChartAnalysisAgent:
-    """LLM이 16개 tool 중 필요한 것을 선택하여 분석을 수행하는 에이전트"""
+    """LLM이 19개 tool 중 필요한 것을 선택하여 분석을 수행하는 에이전트 (Step5+6 추가)"""
 
     MAX_ITERATIONS = 5  # tool call 최대 반복 횟수
 
@@ -1896,6 +2078,10 @@ class ChartAnalysisAgent:
             "beta_correlation_analysis": self.tools.beta_correlation_analysis,
             "event_driven_analysis": self.tools.event_driven_analysis,
             "entry_plan_analysis": self.tools.entry_plan_analysis,
+            # Step 5+6: 신규 도구
+            "money_flow_index_analysis": self.tools.money_flow_index_analysis,
+            "rsi_mfi_combined_analysis": self.tools.rsi_mfi_combined_analysis,
+            "macd_rsi_cross_analysis": self.tools.macd_rsi_cross_analysis,
         }
 
     def _execute_tool(self, name: str) -> dict:
