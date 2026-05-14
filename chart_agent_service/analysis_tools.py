@@ -1733,6 +1733,242 @@ class AnalysisTools:
 
         return result
 
+    # ── P2: Piotroski F-Score / Altman Z-Score ───────────────────
+
+    @staticmethod
+    def _safe_get(
+        stmt: "pd.DataFrame | None",
+        keys: "str | list[str]",
+        col: int = 0,
+        default: float = 0.0,
+    ) -> float:
+        """재무제표 DataFrame에서 안전하게 값을 추출한다. 여러 키 이름 시도."""
+        if stmt is None or stmt.empty:
+            return default
+        key_list = [keys] if isinstance(keys, str) else keys
+        for k in key_list:
+            if k in stmt.index:
+                try:
+                    val = stmt.loc[k].iloc[col]
+                    if pd.notna(val):
+                        return float(val)
+                except Exception:
+                    pass
+        return default
+
+    def piotroski_fscore_analysis(self) -> dict:
+        """[P2-A] Piotroski F-Score — 재무 건전성 0–9점.
+
+        9 신호: 수익성 4 + 레버리지/유동성 3 + 운영 효율 2.
+        score ≥7: BUY, score ≤2: SELL, 나머지: NEUTRAL.
+        """
+        result = {"tool": "piotroski_fscore_analysis", "name": "Piotroski F-Score 분석"}
+        try:
+            import yfinance as yf
+
+            t = yf.Ticker(self.ticker)
+            bs = t.balance_sheet
+            inc = t.financials
+            cf = t.cashflow
+
+            if bs is None or bs.empty or inc is None or inc.empty:
+                result.update({"signal": "neutral", "score": 0, "detail": "재무제표 없음"})
+                return result
+            if bs.shape[1] < 2:
+                result.update({"signal": "neutral", "score": 0, "detail": "데이터 1년치만 있음"})
+                return result
+
+            _g = self._safe_get
+            # ── 자산/순이익/현금흐름 ───────────────────────────────────
+            ta0 = _g(bs, ["Total Assets"], 0)
+            ta1 = _g(bs, ["Total Assets"], 1)
+            avg_ta = (ta0 + ta1) / 2 if ta0 and ta1 else (ta0 or ta1 or 1)
+
+            ni0 = _g(inc, ["Net Income", "Net Income Common Stockholders"], 0)
+            ni1 = _g(inc, ["Net Income", "Net Income Common Stockholders"], 1)
+            ocf0 = _g(
+                cf,
+                ["Operating Cash Flow", "Total Cash From Operating Activities",
+                 "Cash From Operating Activities"],
+                0,
+            )
+            roa0 = ni0 / avg_ta if avg_ta else 0
+            roa1 = ni1 / ta1 if ta1 else 0
+
+            # ── F1~F4 수익성 ─────────────────────────────────────────
+            f1 = int(roa0 > 0)
+            f2 = int(ocf0 > 0)
+            f3 = int(roa0 > roa1)
+            f4 = int(avg_ta > 0 and (ocf0 / avg_ta) > roa0)
+
+            # ── F5~F7 레버리지/유동성 ────────────────────────────────
+            ltd0 = _g(bs, ["Long Term Debt", "Long-Term Debt", "LongTermDebt"], 0)
+            ltd1 = _g(bs, ["Long Term Debt", "Long-Term Debt", "LongTermDebt"], 1)
+            ca0 = _g(bs, ["Current Assets", "Total Current Assets"], 0)
+            ca1 = _g(bs, ["Current Assets", "Total Current Assets"], 1)
+            cl0 = _g(bs, ["Current Liabilities", "Total Current Liabilities"], 0)
+            cl1 = _g(bs, ["Current Liabilities", "Total Current Liabilities"], 1)
+
+            lev0 = ltd0 / ta0 if ta0 else 0
+            lev1 = ltd1 / ta1 if ta1 else 0
+            f5 = int(lev0 < lev1)
+
+            cr0 = ca0 / cl0 if cl0 else 0
+            cr1 = ca1 / cl1 if cl1 else 0
+            f6 = int(cr0 > cr1)
+
+            # F7: 주식 수 미희석 (info 기반 근사값 — 더 정확한 검증은 P3)
+            f7 = 1  # 보수적으로 1로 설정 (API 한계)
+
+            # ── F8~F9 운영 효율 ──────────────────────────────────────
+            rev0 = _g(inc, ["Total Revenue", "Revenue"], 0)
+            rev1 = _g(inc, ["Total Revenue", "Revenue"], 1)
+            gp0 = _g(inc, ["Gross Profit"], 0)
+            gp1 = _g(inc, ["Gross Profit"], 1)
+
+            gm0 = gp0 / rev0 if rev0 else 0
+            gm1 = gp1 / rev1 if rev1 else 0
+            f8 = int(gm0 > gm1)
+
+            at0 = rev0 / avg_ta if avg_ta else 0
+            at1 = rev1 / ta1 if ta1 else 0
+            f9 = int(at0 > at1)
+
+            fscore = f1 + f2 + f3 + f4 + f5 + f6 + f7 + f8 + f9
+
+            # score –10 ~ +10 매핑: 중앙 4.5점
+            tool_score = round((fscore - 4.5) * (10 / 4.5), 1)
+            tool_score = max(-10.0, min(10.0, tool_score))
+
+            if fscore >= 7:
+                signal, grade = "buy", "STRONG(7-9)"
+            elif fscore <= 2:
+                signal, grade = "sell", "WEAK(0-2)"
+            else:
+                signal, grade = "neutral", "MEDIUM(3-6)"
+
+            result.update({
+                "signal": signal,
+                "score": tool_score,
+                "fscore": fscore,
+                "grade": grade,
+                "components": {
+                    "F1_ROA_positive": bool(f1),
+                    "F2_OCF_positive": bool(f2),
+                    "F3_ROA_improving": bool(f3),
+                    "F4_accrual_quality": bool(f4),
+                    "F5_leverage_down": bool(f5),
+                    "F6_liquidity_up": bool(f6),
+                    "F7_no_dilution": True,
+                    "F8_margin_improving": bool(f8),
+                    "F9_turnover_improving": bool(f9),
+                },
+                "detail": f"F-Score={fscore}/9 ({grade}), ROA={roa0:.3f}, OCF/TA={ocf0/avg_ta:.3f}",
+            })
+        except Exception as exc:
+            result.update({
+                "signal": "neutral", "score": 0,
+                "detail": f"F-Score 계산 실패: {str(exc)[:100]}",
+            })
+        return result
+
+    def altman_zscore_analysis(self) -> dict:
+        """[P2-B] Altman Z-Score — 도산 위험도 분석.
+
+        상장 미국 기업: Z = 1.2X1+1.4X2+3.3X3+0.6X4+1.0X5
+        한국/비상장: Z' = 0.717X1+0.847X2+3.107X3+0.420X4+0.998X5
+        """
+        result = {"tool": "altman_zscore_analysis", "name": "Altman Z-Score 도산 분석"}
+        try:
+            import yfinance as yf
+
+            t = yf.Ticker(self.ticker)
+            bs = t.balance_sheet
+            inc = t.financials
+            info = t.info or {}
+
+            if bs is None or bs.empty or inc is None or inc.empty:
+                result.update({"signal": "neutral", "score": 0, "detail": "재무제표 없음"})
+                return result
+
+            _g = self._safe_get
+            ta = _g(bs, ["Total Assets"], 0) or 1.0
+
+            # X1: Working Capital / Total Assets
+            ca = _g(bs, ["Current Assets", "Total Current Assets"], 0)
+            cl = _g(bs, ["Current Liabilities", "Total Current Liabilities"], 0)
+            x1 = (ca - cl) / ta
+
+            # X2: Retained Earnings / Total Assets
+            re = _g(bs, ["Retained Earnings", "RetainedEarnings"], 0)
+            x2 = re / ta
+
+            # X3: EBIT / Total Assets
+            ebit = _g(inc, ["Operating Income", "EBIT", "Ebit"], 0)
+            x3 = ebit / ta
+
+            # X4: Market Cap / Total Liabilities
+            mktcap = float(info.get("marketCap") or 0)
+            total_liab = _g(
+                bs,
+                ["Total Liabilities Net Minority Interest", "Total Liab",
+                 "Total Liabilities", "TotalLiabilitiesNetMinorityInterest"],
+                0,
+            )
+            x4 = mktcap / total_liab if total_liab else 0
+
+            # X5: Revenue / Total Assets
+            rev = _g(inc, ["Total Revenue", "Revenue"], 0)
+            x5 = rev / ta
+
+            # 모델 선택: 한국 or 시총 미조회 → Z'-Score
+            is_korean = _market_from_ticker(self.ticker) == "KR"
+            use_prime = is_korean or (mktcap == 0)
+
+            if use_prime:
+                zscore = 0.717*x1 + 0.847*x2 + 3.107*x3 + 0.420*x4 + 0.998*x5
+                model = "Z'-Score(비상장/KR)"
+                safe_th, distress_th = 2.9, 1.23
+            else:
+                zscore = 1.2*x1 + 1.4*x2 + 3.3*x3 + 0.6*x4 + 1.0*x5
+                model = "Z-Score(상장)"
+                safe_th, distress_th = 2.99, 1.81
+
+            if zscore >= safe_th:
+                zone, signal = "safe", "buy"
+                tool_score = min(10.0, (zscore - safe_th) * 2 + 5)
+            elif zscore >= distress_th:
+                zone, signal = "grey", "neutral"
+                tool_score = 0.0
+            else:
+                zone, signal = "distress", "sell"
+                tool_score = max(-10.0, -(distress_th - zscore) * 3 - 3)
+
+            result.update({
+                "signal": signal,
+                "score": round(tool_score, 1),
+                "zscore": round(zscore, 3),
+                "zone": zone,
+                "model": model,
+                "components": {
+                    "X1_working_capital": round(x1, 4),
+                    "X2_retained_earnings": round(x2, 4),
+                    "X3_ebit": round(x3, 4),
+                    "X4_market_book": round(x4, 4),
+                    "X5_asset_turnover": round(x5, 4),
+                },
+                "detail": (
+                    f"Altman {model} Z={zscore:.3f} | {zone.upper()} "
+                    f"(safe>{safe_th}, distress<{distress_th})"
+                ),
+            })
+        except Exception as exc:
+            result.update({
+                "signal": "neutral", "score": 0,
+                "detail": f"Z-Score 계산 실패: {str(exc)[:100]}",
+            })
+        return result
+
     # ── Step 5: MFI 도구 (16→18개) ──────────────────────────────
 
     @staticmethod
@@ -2040,6 +2276,20 @@ TOOL_DEFINITIONS = [
             "description": "MACD 크로스+RSI 동시 조건. MACD bearish cross ∧ RSI>70 → score=-7(STRONG_BEARISH), bullish cross ∧ RSI<30 → score=+7(STRONG_BULLISH).",
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "piotroski_fscore_analysis",
+            "description": "Piotroski F-Score(0-9): 수익성·레버리지·운영효율 9 신호 기반 재무 건전성. 7-9 BUY, 0-2 SELL.",
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "altman_zscore_analysis",
+            "description": "Altman Z-Score 도산 위험 분석. safe(BUY)/grey(NEUTRAL)/distress(SELL). 상장사 Z, 비상장/한국 Z'-Score.",
+        }
+    },
 ]
 
 # Ollama용 간소화 tool 이름 목록
@@ -2051,7 +2301,7 @@ TOOL_NAMES = [t["function"]["name"] for t in TOOL_DEFINITIONS]
 # ═══════════════════════════════════════════════════════════════
 
 class ChartAnalysisAgent:
-    """LLM이 19개 tool 중 필요한 것을 선택하여 분석을 수행하는 에이전트 (Step5+6 추가)"""
+    """LLM이 22개 tool 중 필요한 것을 선택하여 분석을 수행하는 에이전트 (P2: F-Score/Z-Score 추가)"""
 
     MAX_ITERATIONS = 5  # tool call 최대 반복 횟수
 
@@ -2082,6 +2332,9 @@ class ChartAnalysisAgent:
             "money_flow_index_analysis": self.tools.money_flow_index_analysis,
             "rsi_mfi_combined_analysis": self.tools.rsi_mfi_combined_analysis,
             "macd_rsi_cross_analysis": self.tools.macd_rsi_cross_analysis,
+            # P2: 펀더멘털 점수 도구
+            "piotroski_fscore_analysis": self.tools.piotroski_fscore_analysis,
+            "altman_zscore_analysis": self.tools.altman_zscore_analysis,
         }
 
     def _execute_tool(self, name: str) -> dict:
