@@ -1733,6 +1733,81 @@ class AnalysisTools:
 
         return result
 
+    # ── P2: 외국인/공매도 + DART 도구 ───────────────────────────────
+
+    def institutional_flow_analysis(self) -> dict:
+        """[P2-C] pykrx 외국인 보유율 + 공매도 비율 복합 분석 (한국 주식 전용)."""
+        result = {"tool": "institutional_flow_analysis", "name": "외국인/공매도 복합 분석"}
+        is_korean = _market_from_ticker(self.ticker) == "KR"
+        if not is_korean:
+            result.update({"signal": "neutral", "score": 0, "detail": "한국 주식 전용 도구"})
+            return result
+        try:
+            from data_sources.pykrx_source import PykrxSource
+            src = PykrxSource()
+            foreign = src.get_foreign_holding_info(self.ticker)
+            short = src.get_short_selling_info(self.ticker)
+
+            total_score = foreign.get("score", 0) + short.get("score", 0)
+            total_score = max(-10, min(10, total_score))
+            signal = "buy" if total_score > 1 else "sell" if total_score < -1 else "neutral"
+
+            result.update({
+                "signal": signal,
+                "score": total_score,
+                "foreign": foreign,
+                "short_selling": short,
+                "detail": (
+                    f"외국인소진율={foreign.get('exhaustion_rate')}% "
+                    f"({foreign.get('trend')}), "
+                    f"공매도비율={short.get('short_ratio')}% "
+                    f"({short.get('trend')})"
+                ),
+            })
+        except Exception as exc:
+            result.update({
+                "signal": "neutral", "score": 0,
+                "detail": f"외국인/공매도 분석 실패: {str(exc)[:80]}",
+            })
+        return result
+
+    def dart_disclosure_analysis(self) -> dict:
+        """[P2-D] DART 공시 기반 이벤트 신호 (한국 주식 전용)."""
+        result = {"tool": "dart_disclosure_analysis", "name": "DART 공시 분석"}
+        is_korean = _market_from_ticker(self.ticker) == "KR"
+        if not is_korean:
+            result.update({"signal": "neutral", "score": 0, "detail": "한국 주식 전용 도구"})
+            return result
+        try:
+            from dart_client import compute_disclosure_score, fetch_recent_disclosures
+            disclosures = fetch_recent_disclosures(self.ticker, days_back=30, max_items=10)
+            if not disclosures:
+                result.update({
+                    "signal": "neutral", "score": 0,
+                    "detail": "최근 30일 공시 없음 또는 DART_API_KEY 미설정",
+                })
+                return result
+
+            ds = compute_disclosure_score(disclosures)
+            result.update({
+                "signal": ds["signal"],
+                "score": ds["score"],
+                "positive": ds["positive"],
+                "negative": ds["negative"],
+                "total_disclosures": ds["total"],
+                "recent_titles": ds["recent_titles"],
+                "detail": (
+                    f"최근 30일 공시 {ds['total']}건: "
+                    f"호재 {ds['positive']}, 악재 {ds['negative']}, 중립 {ds['neutral']}"
+                ),
+            })
+        except Exception as exc:
+            result.update({
+                "signal": "neutral", "score": 0,
+                "detail": f"DART 공시 분석 실패: {str(exc)[:80]}",
+            })
+        return result
+
     # ── P2: Piotroski F-Score / Altman Z-Score ───────────────────
 
     @staticmethod
@@ -2290,6 +2365,20 @@ TOOL_DEFINITIONS = [
             "description": "Altman Z-Score 도산 위험 분석. safe(BUY)/grey(NEUTRAL)/distress(SELL). 상장사 Z, 비상장/한국 Z'-Score.",
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "institutional_flow_analysis",
+            "description": "pykrx 외국인 한도 소진율 + 공매도 잔고 비율 복합 분석 (한국 주식 전용). 외국인 매수 증가 + 공매도 감소 → BUY.",
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dart_disclosure_analysis",
+            "description": "DART 최근 30일 공시 분석 (한국 주식 전용). 자사주/배당/수주 공시 → 호재, 불성실공시/유상증자 → 악재.",
+        }
+    },
 ]
 
 # Ollama용 간소화 tool 이름 목록
@@ -2301,7 +2390,7 @@ TOOL_NAMES = [t["function"]["name"] for t in TOOL_DEFINITIONS]
 # ═══════════════════════════════════════════════════════════════
 
 class ChartAnalysisAgent:
-    """LLM이 22개 tool 중 필요한 것을 선택하여 분석을 수행하는 에이전트 (P2: F-Score/Z-Score 추가)"""
+    """LLM이 24개 tool 중 필요한 것을 선택하여 분석을 수행하는 에이전트 (P2: pykrx/DART 추가)"""
 
     MAX_ITERATIONS = 5  # tool call 최대 반복 횟수
 
@@ -2335,6 +2424,9 @@ class ChartAnalysisAgent:
             # P2: 펀더멘털 점수 도구
             "piotroski_fscore_analysis": self.tools.piotroski_fscore_analysis,
             "altman_zscore_analysis": self.tools.altman_zscore_analysis,
+            # P2: 한국 주식 외국인/공매도 + DART 공시
+            "institutional_flow_analysis": self.tools.institutional_flow_analysis,
+            "dart_disclosure_analysis": self.tools.dart_disclosure_analysis,
         }
 
     def _execute_tool(self, name: str) -> dict:
