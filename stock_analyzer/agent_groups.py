@@ -11,7 +11,9 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, TypedDict
+
+import numpy as np
 
 if TYPE_CHECKING:
     from multi_agent import AgentResult
@@ -164,3 +166,67 @@ def group_weighted_score(
         total += _signal_score(result.signal) * result.confidence * w
 
     return total
+
+
+# ── Step 12: Variance-aware aggregation ──────────────────────────────
+
+
+class VarianceAggResult(TypedDict):
+    mean_score: float
+    std: float
+    agreement: Literal["high", "medium", "low"]
+
+
+def aggregate_with_variance(
+    group_results: dict[AgentGroup, GroupResult],
+    regime_weights: dict[str, float] | None = None,
+) -> VarianceAggResult:
+    """
+    그룹별 점수의 가중 분산을 계산한다.
+
+    agreement 기준:
+    - std < 1.5 → "high"   (그룹 간 일치)
+    - std < 3.0 → "medium"
+    - std ≥ 3.0 → "low"    (그룹 간 충돌)
+
+    Returns:
+        mean_score : 가중 평균 신호 점수
+        std        : 가중 표준편차
+        agreement  : "high" | "medium" | "low"
+    """
+    _GROUP_CATEGORY: dict[AgentGroup, str] = {
+        AgentGroup.TECHNICAL: "momentum",
+        AgentGroup.FUNDAMENTAL: "fundamental",
+        AgentGroup.MACRO: "fundamental",
+        AgentGroup.RISK: "fundamental",
+    }
+    w_map = regime_weights or {}
+
+    scores: list[float] = []
+    weights: list[float] = []
+
+    for grp, result in group_results.items():
+        cat = _GROUP_CATEGORY.get(grp, "fundamental")
+        w = w_map.get(cat, 1.0)
+        s = _signal_score(result.signal) * result.confidence
+        scores.append(s)
+        weights.append(w)
+
+    if not scores:
+        return VarianceAggResult(mean_score=0.0, std=0.0, agreement="high")
+
+    scores_arr = np.array(scores)
+    weights_arr = np.array(weights)
+    mean_score = float(np.average(scores_arr, weights=weights_arr))
+    variance = float(np.average((scores_arr - mean_score) ** 2, weights=weights_arr))
+    std = float(np.sqrt(variance))
+
+    agreement: Literal["high", "medium", "low"]
+    if std < 1.5:
+        agreement = "high"
+    elif std < 3.0:
+        agreement = "medium"
+    else:
+        agreement = "low"
+
+    return VarianceAggResult(mean_score=mean_score, std=std, agreement=agreement)

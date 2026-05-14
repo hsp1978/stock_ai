@@ -48,7 +48,9 @@ def _init_test_db(path: str) -> None:
             max_drawdown_30d REAL,
             evaluated_at     TIMESTAMP,
             market_context   TEXT,
-            regime           TEXT
+            regime           TEXT,
+            signal_std       REAL,
+            agreement_level  TEXT
         );
         CREATE VIEW IF NOT EXISTS signal_performance_summary AS
         SELECT signal_source, signal_type, regime,
