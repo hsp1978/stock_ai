@@ -218,3 +218,64 @@ def test_build_router_without_gemini_key():
     assert "agent-llm-secondary" in model_names
     assert "agent-llm-tertiary" in model_names
     assert "agent-llm-primary" not in model_names
+
+
+# ── DecisionMakerResponse 스키마 ─────────────────────────────────────
+
+
+def test_decision_maker_response_valid():
+    """DecisionMakerResponse 정상 파싱."""
+    from llm.schemas import DecisionMakerResponse
+    import json
+
+    raw = json.dumps({
+        "final_signal": "buy",
+        "final_confidence": 7.5,
+        "consensus": "6명 매수, 1명 매도",
+        "conflicts": "ML 에이전트 의견 상충",
+        "reasoning": "기술적 지표 강세.",
+        "key_risks": ["고금리 지속"],
+    })
+    r = DecisionMakerResponse.model_validate_json(raw)
+    assert r.final_signal == "buy"
+    assert r.final_confidence == 7.5
+
+
+def test_decision_maker_response_signal_normalization():
+    """매수/bullish → buy 정규화."""
+    from llm.schemas import DecisionMakerResponse
+    r = DecisionMakerResponse(final_signal="매수", final_confidence=6.0)  # type: ignore
+    assert r.final_signal == "buy"
+
+
+def test_decision_maker_response_defaults():
+    """필드 기본값 확인 — 빈 객체 생성 가능."""
+    from llm.schemas import DecisionMakerResponse
+    r = DecisionMakerResponse()
+    assert r.final_signal == "neutral"
+    assert r.final_confidence == 0.0
+    assert r.conflicts == "None"
+
+
+def test_call_agent_llm_with_decision_maker_schema():
+    """call_agent_llm이 DecisionMakerResponse 스키마로 작동한다."""
+    from llm.router import call_agent_llm
+    from llm.schemas import DecisionMakerResponse
+    import json
+
+    mock_router = MagicMock()
+    mock_router.completion.return_value = _make_api_response(json.dumps({
+        "final_signal": "sell",
+        "final_confidence": 6.0,
+        "consensus": "매도 우세",
+        "conflicts": "없음",
+        "reasoning": "하락 추세.",
+        "key_risks": ["유동성 리스크"],
+    }))
+
+    with patch("llm.router.call_with_breaker", side_effect=lambda fn, *a, **kw: fn(*a, **kw)):
+        result = call_agent_llm(mock_router, "Decision Maker", "판단해라", DecisionMakerResponse)
+
+    assert isinstance(result, DecisionMakerResponse)
+    assert result.final_signal == "sell"
+    assert result.final_confidence == 6.0

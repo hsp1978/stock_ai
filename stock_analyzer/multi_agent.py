@@ -1175,118 +1175,35 @@ class DecisionMaker:
         return prompt
 
     def _call_llm(self, prompt: str) -> str:
-        """LLM 호출 (GPU 메모리 보호)"""
-        import time
-
-        # Provider별 분기
-        if self.llm_provider == "gemini":
-            return self._call_gemini(prompt)
-        elif self.llm_provider == "openai":
-            return self._call_openai(prompt)
-
-        # GPU 메모리 체크 (선택적)
+        """LLM 호출 (LiteLLM Router 경유 — BaseAgent와 동일하게 통일)."""
         try:
-            import subprocess
-            result = subprocess.run(
-                ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'],
-                capture_output=True, text=True, timeout=2
+            from llm.router import call_agent_llm, get_router
+            from llm.schemas import DecisionMakerResponse
+            resp = call_agent_llm(get_router(), self.name, prompt, DecisionMakerResponse)
+            return json.dumps(
+                {
+                    "final_signal": resp.final_signal,
+                    "final_confidence": resp.final_confidence,
+                    "consensus": resp.consensus,
+                    "conflicts": resp.conflicts,
+                    "reasoning": resp.reasoning,
+                    "key_risks": resp.key_risks,
+                },
+                ensure_ascii=False,
             )
-            if result.returncode == 0:
-                mem_used = int(result.stdout.strip())
-                if mem_used > 11000:  # 12GB GPU 기준 90%
-                    time.sleep(3)  # Decision Maker는 더 긴 대기
-        except Exception:
-            pass
-
-        # Ollama (듀얼 노드 지원)
-        try:
-            from dual_node_config import (
-                get_llm_config, get_fallback_config,
-                performance_monitor, get_http_session,
+        except Exception as exc:
+            # Router import/초기화 실패 시만 여기 진입 (call_agent_llm는 예외 미방출)
+            return json.dumps(
+                {
+                    "final_signal": "neutral",
+                    "final_confidence": 0.0,
+                    "consensus": "LLM Router 오류",
+                    "conflicts": "None",
+                    "reasoning": f"LLM Router 오류: {exc}",
+                    "key_risks": ["LLM_ROUTER_ERROR"],
+                },
+                ensure_ascii=False,
             )
-
-            session = get_http_session()
-            llm_config = get_llm_config(self.name)
-            start_time = datetime.now()
-
-            # 재시도 로직
-            max_retries = 2
-            for attempt in range(max_retries):
-                try:
-                    response = session.post(
-                        f"{llm_config['url']}/api/generate",
-                        json={
-                            "model": llm_config['model'],
-                            "prompt": prompt,
-                            "stream": False,
-                            "think": False,  # qwen3 thinking 모드 비활성화 — 미지원 모델은 무시
-                            "options": {
-                                "temperature": 0.0,
-                                # num_gpu 제거 — Ollama 자동 결정
-                                "num_thread": 4
-                            }
-                        },
-                        # Decision Maker는 다른 에이전트 결과 종합이라 프롬프트가 가장 김.
-                        # MULTI_AGENT_LLM_TIMEOUT 보다 살짝 길게 잡되 동일 env로 통일.
-                        timeout=int(os.getenv("MULTI_AGENT_LLM_TIMEOUT", "240"))
-                    )
-
-                    if response.status_code == 200:
-                        exec_time = (datetime.now() - start_time).total_seconds()
-                        performance_monitor.record(self.name, exec_time, llm_config['node'])
-                        text = (response.json().get('response') or '').strip()
-                        return text if text else json.dumps({
-                            "decision": "NEUTRAL",
-                            "confidence": 0.0,
-                            "reasoning": "LLM 응답 없음",
-                            "risks": ["응답 없음"],
-                            "opportunities": []
-                        }, ensure_ascii=False)
-                    elif attempt < max_retries - 1:
-                        time.sleep(3 ** attempt)  # 지수 백오프
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        raise
-                    time.sleep(3 ** attempt)
-
-            # Mac Studio 연결 실패 시 폴백 (RTX 5070)
-            if llm_config['node'] == 'mac_studio':
-                fallback = get_fallback_config(self.name)
-                response = session.post(
-                    f"{fallback['url']}/api/generate",
-                    json={
-                        "model": fallback['model'],
-                        "prompt": prompt,
-                        "stream": False,
-                        "think": False,  # qwen3 thinking 모드 비활성화
-                        "options": {
-                            "temperature": 0.0,
-                            # num_gpu 제거 — Ollama 자동 결정
-                            "num_thread": 4
-                        }
-                    },
-                    timeout=fallback.get('timeout', 150)
-                )
-
-                if response.status_code == 200:
-                    exec_time = (datetime.now() - start_time).total_seconds()
-                    performance_monitor.record(self.name, exec_time, fallback['node'])
-                    text = (response.json().get('response') or '').strip()
-                    return text if text else json.dumps({
-                        "final_signal": "neutral",
-                        "final_confidence": 0,
-                        "consensus": "LLM 응답 없음",
-                        "conflicts": "None",
-                        "reasoning": "LLM 서비스 응답 없음",
-                        "key_risks": ["LLM 응답 실패"]
-                    }, ensure_ascii=False)
-
-        except Exception:
-            # OpenAI 폴백 (마지막 수단)
-            try:
-                return self._call_openai(prompt)
-            except Exception:
-                raise ValueError("모든 LLM 제공자 호출 실패")
 
     def _call_gemini(self, prompt: str) -> str:
         """Gemini API 호출"""

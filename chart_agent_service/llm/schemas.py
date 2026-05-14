@@ -1,8 +1,9 @@
 """
-LLM 응답 Pydantic 스키마 (Step 9).
+LLM 응답 Pydantic 스키마 (Step 9 + DecisionMaker 통일).
 
-AgentLLMResponse  : 에이전트 공통 신호 출력
-NewsSentimentResponse: 뉴스 감성 분석 출력
+AgentLLMResponse      : 8개 분석 에이전트 공통 신호 출력
+DecisionMakerResponse : 최종 의사결정자 종합 판단 출력
+NewsSentimentResponse : 뉴스 감성 분석 출력
 """
 
 from __future__ import annotations
@@ -39,6 +40,38 @@ class AgentLLMResponse(BaseModel):
                 return "sell"
             return "neutral"
         return str(v)
+
+
+class DecisionMakerResponse(BaseModel):
+    """
+    DecisionMaker LLM 응답 스키마.
+
+    기존 _parse_decision() 필드명과 1:1 대응하여
+    _call_llm() 교체 후에도 하위 로직 무수정.
+    """
+
+    final_signal: Literal["buy", "sell", "neutral"] = "neutral"
+    final_confidence: Annotated[float, Field(ge=0.0, le=10.0)] = 0.0
+    consensus: str = ""
+    conflicts: str = "None"
+    reasoning: Annotated[str, Field(max_length=600)] = ""
+    key_risks: list[str] = Field(default_factory=list)
+
+    @field_validator("final_signal", mode="before")
+    @classmethod
+    def normalize_final_signal(cls, v: object) -> str:
+        if isinstance(v, str):
+            v = v.lower().strip()
+            if v in ("buy", "매수", "bullish"):
+                return "buy"
+            if v in ("sell", "매도", "bearish"):
+                return "sell"
+        return "neutral"
+
+    @field_validator("reasoning", "consensus", "conflicts", mode="before")
+    @classmethod
+    def strip_text(cls, v: object) -> str:
+        return str(v).strip() if v else ""
 
 
 class NewsSentimentResponse(BaseModel):
