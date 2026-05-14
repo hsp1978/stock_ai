@@ -9,6 +9,9 @@ DATA_SOURCE 환경변수로 스위칭:
 """
 from data_sources.base import DataSource, OHLCVBar, Quote
 from data_sources.factory import get_data_source, get_data_source_name
+from data_sources.fdr_source import FdrSource
+from data_sources.pykrx_source import PykrxSource
+from data_sources.yfinance_source import YFinanceSource
 
 __all__ = [
     "DataSource",
@@ -16,4 +19,7 @@ __all__ = [
     "Quote",
     "get_data_source",
     "get_data_source_name",
+    "YFinanceSource",
+    "FdrSource",
+    "PykrxSource",
 ]
