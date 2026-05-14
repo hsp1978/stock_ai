@@ -103,6 +103,11 @@ class Settings(BaseSettings):
 
     DATA_SOURCE: Literal["yfinance", "alpaca", "polygon", "kis"] = "yfinance"
 
+    # ── OHLCV 캐시 TTL (Step 3) ────────────────────────────────────
+    OHLCV_TTL_EOD_HOURS: float = Field(default=24.0, ge=0)
+    OHLCV_TTL_INTRADAY_MINUTES: int = Field(default=5, ge=1)
+    OHLCV_RETRY_COUNT: int = Field(default=3, ge=1, le=10)
+
     # ── GlobalKillSwitch 임계값 ─────────────────────────────────────
     DAILY_LOSS_LIMIT_ALERT_PCT: float = Field(default=2.0, ge=0)
     DAILY_LOSS_LIMIT_HARD_PCT: float = Field(default=3.0, ge=0)
