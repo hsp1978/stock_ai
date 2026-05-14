@@ -681,12 +681,25 @@ def health():
     except Exception:
         pass
 
+    # Step 11: market session 메타 추가
+    krx_session = nyse_session = "unknown"
+    try:
+        from market_cal.market_calendar import get_market_session
+        krx_session = get_market_session("KRX")
+        nyse_session = get_market_session("NYSE")
+    except Exception:
+        pass
+
     return {
         "status": "healthy",
         "ollama": "connected" if ollama_ok else "disconnected",
         "cached_results": len(latest_results),
         "scan_count": len(scan_history),
         "uptime_scans": len(scan_history),
+        "market_session": {
+            "KRX": krx_session,
+            "NYSE": nyse_session,
+        },
     }
 
 

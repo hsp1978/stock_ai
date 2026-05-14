@@ -70,7 +70,18 @@ def _compute_stats(equity: pd.Series, trades: list, strategy: str, ticker: str) 
 
     daily_ret = equity.pct_change().dropna()
     if len(daily_ret) > 1 and daily_ret.std() > 0:
-        result.sharpe_ratio = float(daily_ret.mean() / daily_ret.std() * np.sqrt(252))
+        # Step 10: rf 차감 Sharpe (is_korean 여부는 ticker 패턴으로 추론)
+        try:
+            from backtest_metrics import compute_sharpe
+            from config import settings
+            _is_kr = any(
+                str(getattr(result, "ticker", "") or "").upper().endswith(s)
+                for s in (".KS", ".KQ")
+            )
+            _rf = settings.ANNUAL_RISK_FREE_RATE_KR if _is_kr else settings.ANNUAL_RISK_FREE_RATE_US
+            result.sharpe_ratio = compute_sharpe(daily_ret, _rf)
+        except Exception:
+            result.sharpe_ratio = float(daily_ret.mean() / daily_ret.std() * np.sqrt(252))
 
     running_max = equity.cummax()
     drawdown = (equity - running_max) / running_max
