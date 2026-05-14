@@ -4492,8 +4492,8 @@ def render_virtual_trade():
     if prefill:
         st.info(
             f"📊 **Multi-Agent 분석 프리필**: "
-            f"`{prefill.get('ticker')}` @ ${prefill.get('price', 0):.2f} "
-            f"· 손절 ${prefill.get('stop_loss', 0):.2f} · 익절 ${prefill.get('take_profit', 0):.2f}"
+            f"`{prefill.get('ticker')}` @ ${prefill.get('price') or 0:.2f} "
+            f"· 손절 ${prefill.get('stop_loss') or 0:.2f} · 익절 ${prefill.get('take_profit') or 0:.2f}"
         )
 
     col_buy_a, col_buy_b, col_buy_c = st.columns([2, 1, 1])
