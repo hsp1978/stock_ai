@@ -955,6 +955,34 @@ def get_macro():
         raise HTTPException(500, f"매크로 데이터 수집 실패: {e}")
 
 
+@app.get("/regime")
+def get_regime():
+    """현재 시장 체제 감지 (VIX·ATR%·VHF·ADX·20d 모멘텀 기반)."""
+    try:
+        from regime.detector import detect_market_regime, fetch_market_features
+        from regime.models import MacroContext
+
+        macro = fetch_macro_context()
+        vix_val = (macro.get("vix") or {}).get("value") or 20.0
+        ctx = MacroContext(vix=float(vix_val))
+        mkt = fetch_market_features()
+        regime = detect_market_regime(ctx, mkt)
+
+        return {
+            "regime": regime.value,
+            "inputs": {
+                "vix": vix_val,
+                "vhf": round(mkt.vhf, 4),
+                "adx": round(mkt.adx, 2),
+                "atr_pct": round(mkt.atr_pct, 3),
+                "kospi_momentum_20d": round(mkt.kospi_momentum_20d, 4),
+                "spx_momentum_20d": round(mkt.spx_momentum_20d, 4),
+            },
+        }
+    except Exception as exc:
+        raise HTTPException(500, f"regime 감지 실패: {exc}")
+
+
 # ═══════════════════════════════════════════════════════════════
 #  Watchlist 관리 API
 # ═══════════════════════════════════════════════════════════════

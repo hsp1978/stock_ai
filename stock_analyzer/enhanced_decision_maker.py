@@ -146,6 +146,21 @@ class EnhancedDecisionMaker:
         # 5.5. [개선] Beta와 P/E 필수 체크 추가
         fundamental_risks = self._check_fundamental_risks(ticker)
 
+        # 5.6. [Step 7] Regime-aware 가중치 적용
+        current_regime = None
+        regime_weighted_score = None
+        try:
+            from regime.detector import apply_regime_weights_to_agents, detect_market_regime, fetch_market_features
+            from regime.models import MacroContext
+            import os
+            vix_hint = float(os.getenv("CURRENT_VIX", "20"))
+            ctx = MacroContext(vix=vix_hint)
+            mkt = fetch_market_features()
+            current_regime = detect_market_regime(ctx, mkt)
+            regime_weighted_score = apply_regime_weights_to_agents(agent_results, current_regime)
+        except Exception:
+            pass
+
         # 6. 최종 판단
         final_decision = self._make_final_decision(
             signal_counts,
@@ -186,7 +201,9 @@ class EnhancedDecisionMaker:
             "technical_analysis": tech_analysis,
             "quant_analysis": quant_analysis,
             "fundamental_risks": fundamental_risks,
-            "warnings": warnings if warnings else None
+            "warnings": warnings if warnings else None,
+            "regime": current_regime.value if current_regime else None,
+            "regime_weighted_score": regime_weighted_score,
         }
 
         return result

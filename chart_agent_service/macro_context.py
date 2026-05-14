@@ -3,6 +3,7 @@
 - yfinance로 VIX, 미국채 수익률, DXY, WTI 유가 등 수집
 - 시장 전반 분위기(regime) 판단
 """
+
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
@@ -12,12 +13,12 @@ import yfinance as yf
 # ── 지표 수집 ─────────────────────────────────────────────────────
 
 MACRO_TICKERS = {
-    "vix":     "^VIX",
-    "us10y":   "^TNX",
-    "dxy":     "DX-Y.NYB",
+    "vix": "^VIX",
+    "us10y": "^TNX",
+    "dxy": "DX-Y.NYB",
     "oil_wti": "CL=F",
-    "sp500":   "^GSPC",
-    "gold":    "GC=F",
+    "sp500": "^GSPC",
+    "gold": "GC=F",
 }
 
 
@@ -54,6 +55,7 @@ def _trend_label(pct: Optional[float], threshold: float = 2.0) -> str:
 
 # ── 신호 판단 ─────────────────────────────────────────────────────
 
+
 def _vix_signal(value: float, trend: str) -> str:
     if value < 15:
         return "risk_on"
@@ -72,10 +74,26 @@ def _us10y_signal(value: float, trend: str) -> str:
 
 def _dxy_signal(trend: str) -> str:
     if trend == "rising":
-        return "headwind"    # 달러 강세 → EM·원자재 불리
+        return "headwind"  # 달러 강세 → EM·원자재 불리
     if trend == "falling":
         return "tailwind"
     return "neutral"
+
+
+def compute_vhf(close, period: int = 28) -> float:  # type: ignore[annotation-unchecked]
+    """Vertical Horizontal Filter — 추세 강도 지표 (Step 7)."""
+    import numpy as np
+
+    if len(close) < period + 1:
+        return 0.35
+    rolling_max = close.rolling(period).max()
+    rolling_min = close.rolling(period).min()
+    abs_changes = close.diff().abs().rolling(period).sum()
+    numerator = float((rolling_max - rolling_min).iloc[-1])
+    denominator = float(abs_changes.iloc[-1])
+    if denominator == 0 or np.isnan(denominator):
+        return 0.35
+    return numerator / denominator
 
 
 def _oil_signal(trend: str) -> str:
@@ -104,12 +122,16 @@ def _market_regime(vix_sig: str, us10y_sig: str, sp500_tr: str) -> str:
     return "neutral"
 
 
-def _build_summary(vix_val, vix_sig, us10y_val, us10y_sig, dxy_sig, oil_sig, regime) -> str:
+def _build_summary(
+    vix_val, vix_sig, us10y_val, us10y_sig, dxy_sig, oil_sig, regime
+) -> str:
     parts = []
     if vix_val:
         parts.append(f"VIX {vix_val:.1f}({'하락' if vix_sig == 'risk_on' else '상승'})")
     if us10y_val:
-        parts.append(f"미국채10년 {us10y_val:.2f}%({'상승' if us10y_sig == 'headwind' else '안정'})")
+        parts.append(
+            f"미국채10년 {us10y_val:.2f}%({'상승' if us10y_sig == 'headwind' else '안정'})"
+        )
     if dxy_sig != "neutral":
         parts.append(f"달러({'강세' if dxy_sig == 'headwind' else '약세'})")
     if oil_sig != "neutral":
@@ -127,6 +149,7 @@ def _build_summary(vix_val, vix_sig, us10y_val, us10y_sig, dxy_sig, oil_sig, reg
 
 
 # ── 메인 함수 ────────────────────────────────────────────────────
+
 
 def fetch_macro_context() -> Dict:
     """주요 매크로 지표 수집 및 시장 분위기 판단."""
@@ -193,6 +216,8 @@ def fetch_macro_context() -> Dict:
         },
         "sp500_trend": sp500_tr,
         "market_regime": regime,
-        "summary": _build_summary(vix_val, vix_sig, us10y_val, us10y_sig, dxy_sig, oil_sig, regime),
+        "summary": _build_summary(
+            vix_val, vix_sig, us10y_val, us10y_sig, dxy_sig, oil_sig, regime
+        ),
         "updated_at": datetime.now(tz=timezone.utc).isoformat(),
     }
