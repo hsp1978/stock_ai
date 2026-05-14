@@ -103,6 +103,17 @@ class Settings(BaseSettings):
 
     DATA_SOURCE: Literal["yfinance", "alpaca", "polygon", "kis"] = "yfinance"
 
+    # ── GlobalKillSwitch 임계값 ─────────────────────────────────────
+    DAILY_LOSS_LIMIT_ALERT_PCT: float = Field(default=2.0, ge=0)
+    DAILY_LOSS_LIMIT_HARD_PCT: float = Field(default=3.0, ge=0)
+    WEEKLY_DRAWDOWN_LIMIT_PCT: float = Field(default=5.0, ge=0)
+    TRAILING_PEAK_DD_PCT: float = Field(default=10.0, ge=0)
+    CONSECUTIVE_LOSS_COUNT: int = Field(default=5, ge=1)
+    VIX_CAP: float = Field(default=30.0, ge=0)
+    VIX_SPIKE_PCT: float = Field(default=20.0, ge=0)
+    DATA_STALENESS_HALT_HOURS: float = Field(default=6.0, ge=0)
+    COOL_DOWN_HOURS: int = Field(default=24, ge=1)
+
 
 settings = Settings()
 
