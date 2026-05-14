@@ -143,6 +143,16 @@ class EnhancedDecisionMaker:
             ml_accuracies, insider_signal, insider_score
         )
 
+        # 5.4. [Step 6] STRONG_*_CONFIRMATION flag 탐지 → conviction +0.1
+        strong_confirmation_bonus = 0.0
+        _STRONG_FLAGS = {"STRONG_BULLISH_CONFIRMATION", "STRONG_BEARISH_CONFIRMATION"}
+        for result in agent_results:
+            for ev in (result.evidence or []):
+                flags = ev.get("flags") or ev.get("result", {}).get("flags") or []
+                if _STRONG_FLAGS & set(flags):
+                    strong_confirmation_bonus += 0.1
+                    break  # 에이전트당 최대 1회
+
         # 5.5. [개선] Beta와 P/E 필수 체크 추가
         fundamental_risks = self._check_fundamental_risks(ticker)
 
@@ -210,10 +220,11 @@ class EnhancedDecisionMaker:
         if reflect_flags:
             warnings.extend(reflect_flags)
 
-        # 8. 결과 구성
+        # 8. 결과 구성 (STRONG_*_CONFIRMATION 보너스 반영)
+        final_confidence = min(10.0, final_decision["confidence"] + strong_confirmation_bonus)
         result = {
             "final_signal": final_decision["signal"],
-            "final_confidence": final_decision["confidence"],
+            "final_confidence": final_confidence,
             "consensus": f"{signal_counts['buy']}명 매수, {signal_counts['sell']}명 매도, {signal_counts['neutral']}명 중립",
             "conflicts": final_decision["conflicts"],
             "reasoning": final_decision["reasoning"],
