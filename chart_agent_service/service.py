@@ -754,6 +754,26 @@ def get_risk_metrics(ticker: str, method: str = "historical", nav: float = 100_0
         raise HTTPException(500, f"리스크 계산 실패: {exc}")
 
 
+@app.get("/calibration/status")
+def get_calibration_status():
+    """LLM conviction 보정기 상태 조회 (P2)."""
+    try:
+        from llm_calibrator import get_calibrator
+        return get_calibrator().status()
+    except Exception as exc:
+        raise HTTPException(500, f"보정기 상태 조회 실패: {exc}")
+
+
+@app.post("/calibration/fit")
+def fit_calibration():
+    """LLM conviction 보정기 재학습 (P2). signal_outcomes 60일+ 누적 필요."""
+    try:
+        from llm_calibrator import get_calibrator
+        return get_calibrator().fit()
+    except Exception as exc:
+        raise HTTPException(500, f"보정기 학습 실패: {exc}")
+
+
 @app.get("/ic-weights")
 def get_ic_weights(days: int = 90):
     """소스별 IC(Information Coefficient) 가중치 현황 (P2)."""
