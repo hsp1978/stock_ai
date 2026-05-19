@@ -35,7 +35,7 @@
 
 ### 1.2 이 시스템이 하지 않는 것
 
-- ❌ **실제 자금 매매 실행** (Phase 2 계획, 현재는 페이퍼 트레이딩만)
+- ⚠️ **실제 자금 매매 실행** — 코드는 구현됨(Alpaca/KIS 어댑터), 기본값 `TRADING_MODE=paper`. 60일 페이퍼 hit-rate 검증 통과 후 live 후보 (정책: CLAUDE.md §9.6)
 - ❌ **투자 자문** (법적으로 허가되지 않음 — 연구·보조 도구)
 - ❌ **실시간 데이터** (yfinance 기준 15분 지연)
 - ❌ **100% 수익 보장** (모든 AI 분석 동일)
@@ -68,7 +68,7 @@ Stock AI System
 | 영역 | 점수 | 비고 |
 |------|-----|-----|
 | 분석 품질 | 8.5/10 | 7 에이전트 협업, 모순 검증 완료 |
-| 실행 가능성 | 2/10 | Paper Trading만, 실거래 Phase 2 |
+| 실행 가능성 | 5/10 | 브로커 어댑터 구현 완료, 기본 paper. 60일 검증 후 live 후보 |
 | 속도 | 9/10 | 7종목 48초 (기존 7분 30초에서 개선) |
 | 사용 편의성 | 8/10 | 한국/미국 통합, 수동 가상 매매 |
 | 운영 비용 | 9/10 | 월 약 ₩1,000 (전기세만) |
@@ -186,7 +186,7 @@ python scanner.py
 | 5 | **Scan Log** | 과거 스캔 이력 DB 조회 |
 | 6 | **Signal Accuracy** | 신호 적중률 + 칼리브레이터 상태 |
 | 7 | **Screener** | 한국 주식 기술적 스크리너 (신규) |
-| 8 | **Trading** | 주문 모드 + Kill Switch (Phase 2.1) |
+| 8 | **Trading** | 주문 모드 + Kill Switch (paper/dry_run/approval/live) |
 | 9 | **Virtual Trade** | 수동 가상 매매 (내가 정한 시점) |
 | 10 | **Backtest** | 전략 백테스트 (거래비용 반영) |
 | 11 | **ML Predict** | ML 앙상블 예측 |
@@ -391,7 +391,7 @@ python scanner.py
 | 🟢 **PAPER** | 내부 페이퍼 트레이더 | 기본, 안전 |
 | 🟡 **DRY_RUN** | 주문 생성·로그만 | 검증 단계 |
 | 🟠 **APPROVAL** | 텔레그램 승인 후 실행 | 안전장치 |
-| 🔴 **LIVE** | 실제 증권사 API | 자금 이동 (Phase 2.2+) |
+| 🔴 **LIVE** | 실제 증권사 API | 자금 이동 — 60일 paper 검증 후 활성화 (CLAUDE.md §9.6) |
 
 **안전 장치**:
 - 🚨 **Kill Switch** 즉시 활성화 버튼
@@ -583,8 +583,8 @@ OLLAMA_NUM_PARALLEL=1           # VRAM 기반 (12GB에서 qwen3:14b는 1)
 SCAN_PARALLEL_WORKERS=2         # 동시 분석 종목 수
 SCAN_INTERVAL_MINUTES=30        # Scheduler 주기
 
-# ── 주문 모드 (Phase 2) ──
-TRADING_MODE=paper              # paper | dry_run | approval | live
+# ── 주문 모드 ──
+TRADING_MODE=paper              # paper | dry_run | approval | live (기본 paper, 60일 검증 후 live 후보)
 DAILY_ORDER_LIMIT_USD=1000
 DAILY_ORDER_LIMIT_KRW=1000000
 SINGLE_ORDER_LIMIT_USD=200
@@ -813,10 +813,11 @@ OLLAMA_MODEL=llama3.1:8b  # 작은 모델 (속도 빠름)
 
 ### Q6. 실제 자금으로 매매 가능한가요?
 
-**현재는 불가능**. Phase 2.2+에서 증권사 API 연동 예정:
+**기술적으로는 가능, 정책상 보류**. 브로커 어댑터(Alpaca/KIS)는 구현되어 있고 `TRADING_MODE=live`로 전환하면 동작합니다. 다만 운영 정책상 60일 paper 검증 통과 후에만 live 활성화 (CLAUDE.md §9.6):
 - 미국: Alpaca (무료)
 - 한국: KIS (한국투자증권)
-- 계획서: `docs/PHASE_2_PLAN.md`
+- 활성화 절차: `chart_agent_service/brokers/factory.py` 및 `.env`의 `TRADING_MODE`, `BROKER_NAME`, `ALPACA_*`/`KIS_*` 키 설정
+- 권장 흐름: paper → dry_run → approval(텔레그램 승인) → live
 
 ### Q7. 스크리너 결과와 Multi-Agent 결과가 다를 때?
 
@@ -921,7 +922,7 @@ stock_auto/
 │   ├── telegram_bot.py           ← Telegram 알림
 │   ├── db.py                     ← SQLite DB
 │   │
-│   ├── brokers/                  ← Phase 2 브로커 어댑터
+│   ├── brokers/                  ← 브로커 어댑터 (paper/dry_run/alpaca)
 │   │   ├── base.py               ← BrokerInterface
 │   │   ├── paper_broker.py       ← 페이퍼 브로커
 │   │   ├── dry_run_broker.py     ← DryRun 브로커
@@ -986,7 +987,7 @@ stock_auto/
 - `POST /telegram/daily-digest` — 일일 다이제스트
 - `POST /telegram/process-callbacks` — 버튼 콜백 처리
 
-**Trading (Phase 2)**:
+**Trading**:
 - `GET /trading/mode` — 현재 모드
 - `POST /trading/mode` — 모드 변경
 - `POST /trading/kill-switch/activate` — 긴급 중지
