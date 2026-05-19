@@ -4,9 +4,9 @@
 
 ```
 RTX 5070 (testdev)        ←Tailscale→        Mac Studio (hsptest-macstudio)
-├ webui (Streamlit)                          └ Ollama heavy (qwen2.5:32b, llama3:70b)
+├ webui (Streamlit)                          └ Ollama heavy (qwen2.5:32b)
 ├ agent-api (FastAPI)
-└ Ollama light (qwen3:14b)
+└ Ollama light (qwen3:14b-q4_K_M)
 ```
 
 ---
@@ -32,12 +32,12 @@ open http://localhost:8501              # Streamlit WebUI
 |---|---|---|---|
 | Technical Analyst | 차트 패턴, 기술 지표 6개 | Mac Studio | qwen2.5:32b |
 | Quant Analyst | 통계 모델 6개 | Mac Studio | qwen2.5:32b |
-| Geopolitical Analyst | 거시/지정학 분석 | Mac Studio | qwen2.5:32b |
-| Risk Manager | Kelly, ATR 포지션 사이징 | RTX 5070 | llama3.1:8b |
-| ML Specialist | 5모델 앙상블 + SHAP | RTX 5070 | qwen3:14b |
-| Event Analyst | 뉴스, 내부자 거래 | RTX 5070 | qwen3:14b |
-| Value Investor | 재무제표, 밸류에이션 | RTX 5070 | qwen3:14b |
-| **Decision Maker** | 충돌 해결 + 최종 판단 | Mac Studio | llama3:70b |
+| Risk Manager | Kelly, ATR 포지션 사이징 | Mac Studio | qwen2.5:32b |
+| ML Specialist | 5모델 앙상블 + SHAP | Mac Studio | qwen2.5:32b |
+| Geopolitical Analyst | 거시/지정학 분석 | Gemini | gemini-pro |
+| Event Analyst | 뉴스, 내부자 거래 | Gemini | gemini-pro |
+| Value Investor | 재무제표, 밸류에이션 | Gemini | gemini-pro |
+| **Decision Maker** | 충돌 해결 + 최종 판단 | Gemini | gemini-pro |
 
 흐름: 7개 에이전트 병렬 실행 → 각자 buy/sell/neutral + confidence(0~10) → Decision Maker 가 충돌 해결 + 최종 리포트.
 
@@ -139,7 +139,7 @@ docker exec stock-auto-webui python -c \
 
 Tailscale MagicDNS 로 `hsptest-macstudio:8080` 직결. Mac Studio 측은 Homebrew Ollama (`OLLAMA_HOST=0.0.0.0:8080`) 또는 Docker (compose `mac` 프로파일) 둘 다 가능. 자세한 셋업: [`docs/PHASE_1_MAC_STUDIO.md`](docs/PHASE_1_MAC_STUDIO.md), 운영: [`docs/PHASE_3_OPERATION.md`](docs/PHASE_3_OPERATION.md).
 
-Mac Studio 끄면 자동으로 RTX 5070 단독 모드 (Decision Maker 도 RTX 로 폴백, 큰 모델 + 2배 timeout).
+Mac Studio 끄면 자동으로 RTX 5070 단독 모드 (Ollama 에이전트 4개가 RTX 5070 / qwen2.5:14b 로 폴백, 2배 timeout). Gemini 에이전트 4개는 Mac Studio 상태와 무관하게 동작.
 
 ---
 

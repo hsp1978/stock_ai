@@ -22,3 +22,8 @@ optuna>=3.5.0
 
 # ── Settings 검증 (Phase 2b) ──
 pydantic-settings>=2.0
+
+# ── LLM Router / 재시도 / 회로차단 ──
+litellm>=1.83.0
+tenacity>=9.0.0
+circuitbreaker>=2.1.0
