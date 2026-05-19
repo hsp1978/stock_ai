@@ -1,0 +1,40 @@
+# Ruff 설정 — CLAUDE.md §5.1 준수
+# 점진적 도입: 현재 CI는 bug-class 규칙만 게이트로 강제.
+# 스타일 cleanup (F401 unused-import 등)은 인덱스 누적 후 일괄 정리 예정.
+
+line-length = 100
+target-version = "py312"
+
+exclude = [
+    "archive",
+    "output",
+    "data",
+    "__pycache__",
+    "venv",
+    ".venv",
+    "*.ipynb",
+    "build",
+    "dist",
+]
+
+[lint]
+# 강제 (bug class): CI fail
+# - F601: 딕셔너리 중복 키 — 데이터 덮어쓰기 버그
+# - F811: 미사용 redefinition — import/함수 중복 정의
+# - F821: undefined-name — 정의되지 않은 이름 참조
+# - F823: local-var-referenced-before-assignment
+# - E9*: 구문 오류
+select = ["F601", "F811", "F821", "F823", "E9"]
+
+# 정보성 (점진적 정리 대상) — 현재 enforce 안 함:
+# - F401 unused-import (73건)
+# - F541 f-string-missing-placeholders (30건)
+# - F841 unused-variable (35건)
+# - I001 import-block-unsorted (다수)
+# 향후 별도 PR 로 cleanup 후 select 에 추가.
+
+[lint.per-file-ignores]
+# __init__.py 의 unused-import 는 re-export 패턴일 수 있음
+"__init__.py" = ["F401"]
+# 테스트는 fixture 미사용 변수가 흔함
+"tests/**/*.py" = ["F841"]

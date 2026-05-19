@@ -1737,7 +1737,7 @@ class MultiAgentOrchestrator:
                 "final_decision": final_decision,
                 "total_execution_time": total_time,
                 "analyzed_at": datetime.now().isoformat(),
-                "data_quality": {
+                "frame_summary": {
                     "total_rows": len(df),
                     "has_sufficient_data": len(df) >= 100
                 }

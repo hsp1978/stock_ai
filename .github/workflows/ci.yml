@@ -11,6 +11,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    name: Ruff lint (bug-class)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install "ruff>=0.13"
+
+      - name: Run ruff check
+        # 설정: ruff.toml — 현재 게이트는 bug-class 만 (F601/F811/F821/F823/E9).
+        # 스타일 cleanup 규칙은 향후 별도 PR 로 점진 도입.
+        run: ruff check .
+
   test:
     name: Tests + dependency smoke
     runs-on: ubuntu-latest
