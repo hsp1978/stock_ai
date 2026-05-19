@@ -35,7 +35,7 @@
 
 ### 1.2 이 시스템이 하지 않는 것
 
-- ⚠️ **실제 자금 매매 실행** — 코드는 구현됨(Alpaca/KIS 어댑터), 기본값 `TRADING_MODE=paper`. 60일 페이퍼 hit-rate 검증 통과 후 live 후보 (정책: CLAUDE.md §9.6)
+- ⚠️ **실제 자금 매매 실행** — Alpaca 어댑터 구현됨, KIS는 factory 슬롯만 존재(파일 미구현). 기본값 `TRADING_MODE=paper`. 60일 페이퍼 hit-rate 검증 통과 후 live 후보 (정책: CLAUDE.md §9.6)
 - ❌ **투자 자문** (법적으로 허가되지 않음 — 연구·보조 도구)
 - ❌ **실시간 데이터** (yfinance 기준 15분 지연)
 - ❌ **100% 수익 보장** (모든 AI 분석 동일)
@@ -813,10 +813,11 @@ OLLAMA_MODEL=llama3.1:8b  # 작은 모델 (속도 빠름)
 
 ### Q6. 실제 자금으로 매매 가능한가요?
 
-**기술적으로는 가능, 정책상 보류**. 브로커 어댑터(Alpaca/KIS)는 구현되어 있고 `TRADING_MODE=live`로 전환하면 동작합니다. 다만 운영 정책상 60일 paper 검증 통과 후에만 live 활성화 (CLAUDE.md §9.6):
-- 미국: Alpaca (무료)
-- 한국: KIS (한국투자증권)
-- 활성화 절차: `chart_agent_service/brokers/factory.py` 및 `.env`의 `TRADING_MODE`, `BROKER_NAME`, `ALPACA_*`/`KIS_*` 키 설정
+**미국은 기술적으로 가능 — 한국은 미구현, 모두 정책상 보류**.
+
+- 미국: **Alpaca 어댑터 구현 완료** (`chart_agent_service/brokers/alpaca_broker.py`). `TRADING_MODE=live` + `BROKER_NAME=alpaca` + Alpaca API 키 설정 시 동작.
+- 한국: **KIS 어댑터 미구현**. `factory.py`에 try/except optional import 슬롯만 있고 `kis_broker.py` 파일은 존재하지 않음. live 활성화 시 ImportError 발생.
+- 정책: 60일 paper 검증 통과 후에만 live 활성화 (CLAUDE.md §9.6).
 - 권장 흐름: paper → dry_run → approval(텔레그램 승인) → live
 
 ### Q7. 스크리너 결과와 Multi-Agent 결과가 다를 때?

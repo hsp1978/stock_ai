@@ -52,7 +52,7 @@ stock_auto/
 │  ├ BACKTEST_ASSUMPTIONS.md            # Slippage/수수료/rf 가정
 │  └ USER_MANUAL.md                     # WebUI 사용법
 ├ chart_agent_service/                  # FastAPI agent-api
-│  ├ service.py (19 endpoints)
+│  ├ service.py (67 endpoints)
 │  ├ config.py  (Pydantic Settings 60+ field)
 │  ├ analysis_tools.py (16 tools)
 │  ├ ml_predictor.py / backtest_engine.py
@@ -68,7 +68,7 @@ stock_auto/
 │  ├ dual_node_config.py (라우팅/폴백)
 │  ├ local_engine.py (in-proc / HTTP 분기)
 │  └ watchlist.txt
-└ tests/                                # unit/ 18 files (P2 정비 완료, CI 미구축)
+└ tests/                                # unit/ 15 test files (P2 정비 완료, CI 미구축)
 ```
 
 ---
@@ -244,7 +244,7 @@ PR 머지 시:
 | 5 | 양방향 sys.path 주입 | P2 |
 | 6 | 모델 버전 미핀 (`qwen3:14b-q4_K_M`) | P2 |
 | 7 | 매직 포트 8080 (3곳 흩어짐) | P2 |
-| 8 | CI 부재 (tests/ 18 files 존재) | P2 후속 |
+| 8 | CI 부재 (tests/ unit/ 15 test files 존재) | P2 후속 |
 | 9 | 차트 PNG 무한 누적 | 시스템 P1 |
 | 10 | README ↔ 코드 라우팅 불일치 | P2 |
 | 11 | 프롬프트 인젝션 표면 | Step 9 (structured output) |
