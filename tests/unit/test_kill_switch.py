@@ -278,3 +278,42 @@ def test_default_method_is_post_for_backward_compat():
 
     assert _is_kill_switch_protected("/scan") is True  # 기존 동작 유지
     assert _is_kill_switch_protected("/trading/orders") is True  # POST 기본값
+
+
+def test_release_halt_clears_active_block(ks):
+    """force_halt 후 release_halt 로 is_blocked() = False 가 되어야 한다."""
+    instance, db, mock_settings = ks
+    with patch("safety.kill_switch.settings", mock_settings):
+        instance.force_halt(reason="test_halt", hours=1)
+        blocked_before, _ = instance.is_blocked()
+        assert blocked_before is True
+
+        released = instance.release_halt(reason="test_release")
+        assert released >= 1
+
+        blocked_after, _ = instance.is_blocked()
+        assert blocked_after is False
+
+
+def test_release_halt_records_audit_event(ks):
+    """release_halt 는 audit 이벤트(action='alert')를 남겨야 한다."""
+    instance, db, mock_settings = ks
+    with patch("safety.kill_switch.settings", mock_settings):
+        instance.force_halt(reason="test_halt", hours=1)
+        instance.release_halt(reason="test_release")
+        events = instance.get_recent_events(limit=5)
+
+    release_events = [e for e in events if e["trigger_type"] == "manual_release"]
+    assert len(release_events) == 1
+    assert release_events[0]["action"] == "alert"
+
+
+def test_release_halt_no_active_returns_zero(ks):
+    """활성 halt 가 없으면 release_halt 는 0을 반환하지만 audit은 남긴다."""
+    instance, db, mock_settings = ks
+    with patch("safety.kill_switch.settings", mock_settings):
+        released = instance.release_halt(reason="no_op")
+        assert released == 0
+        events = instance.get_recent_events(limit=2)
+        # audit 이벤트는 여전히 기록됨
+        assert any(e["trigger_type"] == "manual_release" for e in events)

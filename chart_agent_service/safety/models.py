@@ -27,6 +27,7 @@ TriggerType = Literal[
     "vix_spike_halt",
     "data_stale_halt",
     "manual_halt",
+    "manual_release",
 ]
 
 ActionType = Literal["alert", "halt", "cool_down"]

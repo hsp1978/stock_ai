@@ -202,6 +202,40 @@ class GlobalKillSwitch:
         self._record_event(ev)
         return ev
 
+    def release_halt(self, reason: str = "manual") -> int:
+        """활성 halt/cool_down 이벤트들의 cool_down_until 을 현재로 만료시켜
+        is_blocked() = False 가 되도록 한다. 수동 해제 트랙용 audit 이벤트도 함께 기록.
+
+        Returns: 만료시킨 활성 이벤트 수.
+        """
+        now = _utcnow()
+        now_iso = _iso(now)
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                """UPDATE kill_switch_events
+                   SET cool_down_until = ?
+                   WHERE action IN ('halt', 'cool_down')
+                     AND cool_down_until > ?""",
+                (now_iso, now_iso),
+            )
+            affected = cur.rowcount or 0
+            conn.commit()
+        finally:
+            conn.close()
+
+        # audit 이벤트 1건 기록 (action='alert', cool_down 없음)
+        audit = KillSwitchEvent(
+            triggered_at=now,
+            trigger_type="manual_release",
+            trigger_value=float(affected),
+            action="alert",
+            cool_down_until=None,
+            metadata={"reason": reason, "released_count": affected},
+        )
+        self._record_event(audit)
+        return affected
+
 
 # ── 경로 보호 헬퍼 (service.py 미들웨어와 공유) ───────────────────────
 # (prefix, allowed_methods) — 해당 메서드일 때만 차단.

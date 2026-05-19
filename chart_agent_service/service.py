@@ -1239,20 +1239,46 @@ def api_set_trading_mode(mode: str):
 
 @app.post("/trading/kill-switch/activate")
 def api_activate_kill_switch(reason: str = "manual"):
-    """긴급 중지 활성화."""
+    """긴급 중지 활성화 — broker safety + GlobalKillSwitch 동시 차단.
+
+    broker safety (`.kill_switch` 파일): 브로커 주문 경로용.
+    GlobalKillSwitch (DB 이벤트): /scan, /decide, /paper/order, /trading/orders 등
+    분석·실행 전 경로 차단용 미들웨어.
+    """
     from brokers.safety import get_safety
+    from safety.kill_switch import get_kill_switch
+
     safety = get_safety()
     safety.activate_kill_switch(reason=reason)
-    return {"ok": True, "active": safety.is_kill_switch_active()}
+    global_ks = get_kill_switch()
+    ev = global_ks.force_halt(reason=f"manual_webui: {reason}")
+    blocked, blocked_reason = global_ks.is_blocked()
+    return {
+        "ok": True,
+        "broker_safety_active": safety.is_kill_switch_active(),
+        "global_ks_blocked": blocked,
+        "global_ks_reason": blocked_reason,
+        "cool_down_until": ev.cool_down_until.isoformat() if ev.cool_down_until else None,
+    }
 
 
 @app.post("/trading/kill-switch/deactivate")
 def api_deactivate_kill_switch(reason: str = "manual"):
-    """긴급 중지 해제."""
+    """긴급 중지 해제 — broker safety + GlobalKillSwitch 동시 해제."""
     from brokers.safety import get_safety
+    from safety.kill_switch import get_kill_switch
+
     safety = get_safety()
     safety.deactivate_kill_switch(reason=reason)
-    return {"ok": True, "active": safety.is_kill_switch_active()}
+    global_ks = get_kill_switch()
+    released = global_ks.release_halt(reason=f"manual_webui: {reason}")
+    blocked, _ = global_ks.is_blocked()
+    return {
+        "ok": True,
+        "broker_safety_active": safety.is_kill_switch_active(),
+        "global_ks_blocked": blocked,
+        "released_count": released,
+    }
 
 
 @app.get("/trading/broker-health")
