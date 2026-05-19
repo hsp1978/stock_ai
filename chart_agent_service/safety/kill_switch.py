@@ -204,14 +204,31 @@ class GlobalKillSwitch:
 
 
 # ── 경로 보호 헬퍼 (service.py 미들웨어와 공유) ───────────────────────
-
-_PROTECTED_PREFIXES: frozenset[str] = frozenset(
-    {"/decide", "/scan", "/paper/order", "/execute"}
+# (prefix, allowed_methods) — 해당 메서드일 때만 차단.
+# GET류 조회 경로(/trading/orders/recent 등)는 차단되지 않아 운영 가시성이 유지된다.
+# /trading/kill-switch/activate|deactivate는 의도적으로 미보호 — kill switch 활성
+# 상태에서도 토글이 가능해야 한다.
+_PROTECTED_PREFIXES: tuple[tuple[str, frozenset[str]], ...] = (
+    ("/decide", frozenset({"POST"})),
+    ("/scan", frozenset({"POST"})),
+    ("/paper/order", frozenset({"POST"})),
+    ("/paper/virtual-buy", frozenset({"POST"})),
+    ("/paper/partial-close", frozenset({"POST"})),
+    ("/execute", frozenset({"POST"})),
+    ("/trading/orders", frozenset({"POST"})),
+    ("/trading/approval", frozenset({"POST"})),
 )
 
 
-def _is_kill_switch_protected(path: str) -> bool:
-    for prefix in _PROTECTED_PREFIXES:
+def _is_kill_switch_protected(path: str, method: str = "POST") -> bool:
+    """경로/메서드가 kill switch 보호 대상인지.
+
+    `method` 기본값 "POST"는 기존 호출자(테스트 포함)의 시그니처 호환을 위함.
+    """
+    method_upper = method.upper()
+    for prefix, methods in _PROTECTED_PREFIXES:
+        if method_upper not in methods:
+            continue
         if path == prefix or path.startswith(prefix + "/"):
             return True
     return False

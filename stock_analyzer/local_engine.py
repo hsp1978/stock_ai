@@ -1215,8 +1215,14 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
     return None
 
 
-def engine_dispatch_post(path: str) -> Optional[dict]:
-    """POST 요청 경로를 로컬 엔진 함수로 라우팅"""
+def engine_dispatch_post(path: str, json_body: Optional[dict] = None) -> Optional[dict]:
+    """POST 요청 경로를 로컬 엔진 함수로 라우팅.
+
+    핸들러가 없는 경로(예: /trading/*, /paper/virtual-buy, /paper/partial-close)는
+    None을 반환하여 호출 측에서 HTTP fallback을 트리거하도록 한다.
+    json_body는 현재 로컬 핸들러에서 사용되지 않으며 HTTP fallback 경로용이다.
+    """
+    _ = json_body  # 시그니처 호환용 (현재 로컬 핸들러 미사용)
     try:
         if path.startswith("/screener/"):
             # Screener 관련 요청은 HTTP API로 전달 (chart_agent_service는 포트 8100에서 실행)

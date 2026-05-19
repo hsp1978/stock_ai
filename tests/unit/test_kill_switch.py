@@ -229,3 +229,52 @@ def test_middleware_scan_log_not_blocked(tmp_path, mock_settings):
     assert _is_kill_switch_protected("/scan-log") is False
     assert _is_kill_switch_protected("/paper/order") is True
     assert _is_kill_switch_protected("/paper/reset") is False
+
+
+def test_trading_orders_post_blocked_but_get_allowed():
+    """POST /trading/orders 는 차단, GET 조회 경로는 허용."""
+    from safety.kill_switch import _is_kill_switch_protected
+
+    # 실거래 주문 — 차단
+    assert _is_kill_switch_protected("/trading/orders", "POST") is True
+    # 조회 — 차단 금지 (운영 가시성 유지)
+    assert _is_kill_switch_protected("/trading/orders/recent", "GET") is False
+    assert _is_kill_switch_protected("/trading/orders/stats", "GET") is False
+    assert _is_kill_switch_protected("/trading/account", "GET") is False
+    assert _is_kill_switch_protected("/trading/positions", "GET") is False
+
+
+def test_trading_approval_post_blocked():
+    """POST /trading/approval/{id}/approve|reject 는 차단."""
+    from safety.kill_switch import _is_kill_switch_protected
+
+    assert _is_kill_switch_protected("/trading/approval/123/approve", "POST") is True
+    assert _is_kill_switch_protected("/trading/approval/456/reject", "POST") is True
+    # pending 조회는 GET — 차단 금지
+    assert _is_kill_switch_protected("/trading/approval/pending", "GET") is False
+
+
+def test_kill_switch_toggle_endpoints_not_blocked():
+    """/trading/kill-switch/activate|deactivate 는 차단 금지 (자기 자신 토글)."""
+    from safety.kill_switch import _is_kill_switch_protected
+
+    assert _is_kill_switch_protected("/trading/kill-switch/activate", "POST") is False
+    assert _is_kill_switch_protected("/trading/kill-switch/deactivate", "POST") is False
+
+
+def test_paper_virtual_buy_and_partial_close_blocked():
+    """페이퍼 거래의 가상 매수/부분 청산도 보호 대상."""
+    from safety.kill_switch import _is_kill_switch_protected
+
+    assert _is_kill_switch_protected("/paper/virtual-buy", "POST") is True
+    assert _is_kill_switch_protected("/paper/partial-close", "POST") is True
+    # 동일 경로 GET은 보호 아님
+    assert _is_kill_switch_protected("/paper/virtual-buy", "GET") is False
+
+
+def test_default_method_is_post_for_backward_compat():
+    """method 인자 생략 시 POST로 간주 (기존 호출자 호환)."""
+    from safety.kill_switch import _is_kill_switch_protected
+
+    assert _is_kill_switch_protected("/scan") is True  # 기존 동작 유지
+    assert _is_kill_switch_protected("/trading/orders") is True  # POST 기본값

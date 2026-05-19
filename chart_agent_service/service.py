@@ -556,7 +556,7 @@ app = FastAPI(
 class KillSwitchMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         from safety.kill_switch import _is_kill_switch_protected, get_kill_switch
-        if _is_kill_switch_protected(request.url.path):
+        if _is_kill_switch_protected(request.url.path, request.method):
             blocked, reason = get_kill_switch().is_blocked()
             if blocked:
                 return JSONResponse(

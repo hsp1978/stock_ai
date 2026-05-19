@@ -627,8 +627,11 @@ def resolve_ticker(user_input: str) -> tuple[str, str]:
 def api_get(path: str, timeout: int = 10):
     # /ml/* 는 LSTM(TF) 풀스택이 webui 컨테이너에 없으므로 agent-api(GPU TF)로
     # 강제 HTTP. 다른 path 는 in-process 우선(_USE_LOCAL_ENGINE).
+    # 로컬 엔진이 None 반환 시 (핸들러 부재 — 예: /trading/*) HTTP fallback.
     if _USE_LOCAL_ENGINE and not path.startswith("/ml/"):
-        return engine_dispatch_get(path)
+        result = engine_dispatch_get(path)
+        if result is not None:
+            return result
     try:
         resp = httpx.get(f"{AGENT_API_URL}{path}", timeout=timeout)
         resp.raise_for_status()
@@ -641,9 +644,15 @@ def api_get(path: str, timeout: int = 10):
 
 
 def api_post(path: str, timeout: int = 300, json_body: dict = None):
-    """API POST. json_body가 주어지면 FastAPI body 파라미터로 전달."""
+    """API POST. json_body가 주어지면 FastAPI body 파라미터로 전달.
+
+    로컬 엔진이 None 반환 시 (핸들러 부재 — 예: /trading/*, /paper/virtual-buy,
+    /paper/partial-close) HTTP fallback. json_body는 HTTP 경로에서 사용된다.
+    """
     if _USE_LOCAL_ENGINE:
-        return engine_dispatch_post(path)
+        result = engine_dispatch_post(path, json_body=json_body)
+        if result is not None:
+            return result
     try:
         if json_body is not None:
             resp = httpx.post(f"{AGENT_API_URL}{path}", json=json_body, timeout=timeout)
