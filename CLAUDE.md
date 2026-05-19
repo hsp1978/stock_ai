@@ -244,7 +244,7 @@ PR 머지 시:
 | 5 | 양방향 sys.path 주입 | P2 |
 | 6 | 모델 버전 미핀 (`qwen3:14b-q4_K_M`) | P2 |
 | 7 | 매직 포트 8080 (3곳 흩어짐) | P2 |
-| 8 | CI 부재 (tests/ unit/ 15 test files 존재) | P2 후속 |
+| 8 | ~~CI 부재~~ ✅ GitHub Actions 도입 (`.github/workflows/ci.yml`: test + dep smoke, 2026-05-19) | 완료 |
 | 9 | 차트 PNG 무한 누적 | 시스템 P1 |
 | 10 | README ↔ 코드 라우팅 불일치 | P2 |
 | 11 | 프롬프트 인젝션 표면 | Step 9 (structured output) |
