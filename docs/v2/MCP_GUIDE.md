@@ -19,7 +19,7 @@ python mcp_server_extended.py
 ### 핵심 도구 (5개)
 
 1. **analyze_stock**
-   - 설명: 16개 기술적 분석 도구를 사용한 종합 분석
+   - 설명: 24개 분석 도구와 진입 계획을 사용한 종합 분석
    - 파라미터: `ticker` (예: "NVDA")
    - 반환: 매수/매도/관망 신호, 점수, 신뢰도
 
@@ -43,7 +43,7 @@ python mcp_server_extended.py
    - 파라미터: `method` (markowitz/risk_parity)
    - 반환: 최적 비중, 예상 수익/리스크
 
-### 개별 분석 도구 (16개)
+### 개별 분석 도구 (24개 + 진입 계획)
 
 | 도구명 | 설명 |
 |--------|------|

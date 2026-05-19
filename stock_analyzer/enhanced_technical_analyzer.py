@@ -58,7 +58,7 @@ class EnhancedTechnicalAnalyzer:
             SignalType.VOLATILITY: 0.8
         }
 
-    def analyze(self, ticker: str, period: str = "3mo") -> Dict:
+    def analyze(self, ticker: str, period: str = "1y") -> Dict:
         """
         Complete technical analysis with conflict resolution
 
@@ -397,7 +397,12 @@ class EnhancedTechnicalAnalyzer:
 
             # Calculate bandwidth for squeeze detection
             bandwidth = (upper_band - lower_band) / middle_band
-            avg_bandwidth = ((df['BB_Upper'] - df['BB_Lower']) / df['BB_Middle']).rolling(window=50).mean().iloc[-1]
+            bandwidth_series = ((df['BB_Upper'] - df['BB_Lower']) / df['BB_Middle']).replace(
+                [np.inf, -np.inf], np.nan
+            ).dropna()
+            avg_bandwidth = bandwidth_series.tail(50).mean()
+            if pd.isna(avg_bandwidth):
+                avg_bandwidth = bandwidth
 
             # Position within bands
             position = (current_price - lower_band) / (upper_band - lower_band) if upper_band != lower_band else 0.5
@@ -831,13 +836,15 @@ class EnhancedTechnicalAnalyzer:
         # Support/Resistance risk
         current_price = df['Close'].iloc[-1]
         if context.support_levels:
-            nearest_support = min(context.support_levels, key=lambda x: abs(x - current_price))
-            if (current_price - nearest_support) / current_price < 0.03:
+            supports_below = [x for x in context.support_levels if x < current_price]
+            nearest_support = max(supports_below) if supports_below else None
+            if nearest_support and (current_price - nearest_support) / current_price < 0.03:
                 risks.append(f"Near support at ${nearest_support:.2f}")
 
         if context.resistance_levels:
-            nearest_resistance = min(context.resistance_levels, key=lambda x: abs(x - current_price) if x > current_price else float('inf'))
-            if nearest_resistance != float('inf') and (nearest_resistance - current_price) / current_price < 0.03:
+            resistances_above = [x for x in context.resistance_levels if x > current_price]
+            nearest_resistance = min(resistances_above) if resistances_above else None
+            if nearest_resistance and (nearest_resistance - current_price) / current_price < 0.03:
                 risks.append(f"Near resistance at ${nearest_resistance:.2f}")
 
         return risks

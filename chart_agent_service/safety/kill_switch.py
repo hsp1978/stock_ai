@@ -11,6 +11,8 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from starlette.responses import JSONResponse
+
 from config import settings
 from safety.models import DecisionContext, KillSwitchEvent
 
@@ -279,3 +281,27 @@ def get_kill_switch() -> GlobalKillSwitch:
     if _instance is None:
         _instance = GlobalKillSwitch()
     return _instance
+
+
+class KillSwitchASGIMiddleware:
+    """FastAPI/Starlette용 kill switch ASGI 미들웨어."""
+
+    def __init__(self, app, kill_switch: GlobalKillSwitch | None = None):
+        self.app = app
+        self.kill_switch = kill_switch
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            path = scope.get("path", "")
+            method = scope.get("method", "GET")
+            if _is_kill_switch_protected(path, method):
+                ks = self.kill_switch or get_kill_switch()
+                blocked, reason = ks.is_blocked()
+                if blocked:
+                    response = JSONResponse(
+                        status_code=423,
+                        content={"detail": "kill_switch_active", "reason": reason},
+                    )
+                    await response(scope, receive, send)
+                    return
+        await self.app(scope, receive, send)

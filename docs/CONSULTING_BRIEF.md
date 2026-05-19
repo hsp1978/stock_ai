@@ -9,7 +9,7 @@
 
 ## 0. 임원 요약 (TL;DR)
 
-`stock_auto`는 **8개 LLM 에이전트 + 16개 분석 도구 + 5모델 ML 앙상블**로 한국·미국 주식의 매수/매도/관망 신호를 생성하는 **개인용 듀얼 노드 의사결정 보조 시스템**이다.
+`stock_auto`는 **8개 LLM 에이전트 + 24개 분석 도구 + 진입 계획 + 5모델 ML 앙상블**로 한국·미국 주식의 매수/매도/관망 신호를 생성하는 **개인용 듀얼 노드 의사결정 보조 시스템**이다.
 
 | 축 | 현 상태 | 한 줄 평 |
 |---|---|---|
@@ -221,7 +221,7 @@ EnhancedDecisionMaker:
              entry_plan(split_entry/order_type), stop_loss, take_profit, qty}
 ```
 
-### 3.2 16개 분석 도구 (`chart_agent_service/analysis_tools.py`)
+### 3.2 24개 분석 도구 + 진입 계획 (`chart_agent_service/analysis_tools.py`)
 
 #### A. 기술적 (6개)
 
@@ -271,7 +271,8 @@ KOSPI+KOSDAQ 시총 ≥2,000억 원 (~280종목) 대상.
 
 | 요소 | 점수 |
 |---|---|
-| MACD 골든크로스(10봉 이내) | +30 |
+| MACD 골든크로스(10봉 이내) | +30 ~ +20 (1봉 전 30점 → 10봉 전 20점) |
+| MACD 상승 유지 | +15 |
 | MA 정배열(5>20>60) | +20 |
 | RSI>50 ∧ 상승기울기 | +20 |
 | 3일 중 2일 양봉 + 거래량↑ | +20 |
@@ -288,7 +289,7 @@ KOSPI+KOSDAQ 시총 ≥2,000억 원 (~280종목) 대상.
 | 고변동성 | -15 | annualized >60% |
 | 극고변동성 | -25 | >100% |
 
-**펀더멘털 필터** (f3b4926): `EPS<0 ∧ P/B>5.0` → 자동 실격(0점). 신뢰도 7+ 기준 상향(이전 6 → 7), 스크리너 단독 신뢰 금지 경고.
+**펀더멘털 필터** (f3b4926): `EPS<0 ∧ P/B>5.0` → 자동 실격(0점). 신뢰도 7+ 기준 상향(이전 6 → 7), 스크리너 단독 신뢰 금지 경고. API 최소 시총 파라미터는 `min_market_cap_100m`(억원)이며, 기존 `min_market_cap_bn`은 호환 alias로만 유지한다.
 
 ### 3.4 신호 정규화 (`stock_analyzer/signal_normalizer.py`)
 
@@ -436,7 +437,7 @@ objective: maximize (port_ret - rf) / port_vol     # rf=5% 기본
 
 ### 4.4 백테스트 (`chart_agent_service/backtest_engine.py`)
 
-**4 전략**: SMA Cross / RSI Reversion / Bollinger Reversion / Composite(16개 도구 합성).
+**4 전략**: SMA Cross / RSI Reversion / Bollinger Reversion / Composite(현재 도구 결과는 look-ahead 방지를 위해 과거 replay 생략).
 
 **메트릭** (`_compute_stats`):
 
@@ -591,7 +592,7 @@ SQLite + WAL.
 
 **핵심 5**: `analyze_stock`, `predict_ml`, `optimize_strategy`, `walk_forward_backtest`, `portfolio_optimize`.
 
-**개별 분석 16**: RSI, Bollinger, MACD, Stochastic, ADX, ATR, MA, momentum, volatility, P/E, PEG, ROE, 부채비율, 차트 패턴, 뉴스 감정, 펀더멘털 헬스.
+**개별 분석 도구**: RSI, Bollinger, MACD, Stochastic, ADX, ATR, MA, momentum, volatility, P/E, PEG, ROE, 부채비율, 차트 패턴, 뉴스 감정, 펀더멘털 헬스 등과 진입 계획 도구.
 
 ```json
 { "mcpServers": {
@@ -605,7 +606,7 @@ SQLite + WAL.
 
 ### 7.1 강점
 
-1. **앙상블 다층 구조** — 16 도구 + 7 에이전트 + 5 ML 모델 + Decision Maker의 다단 합의로 단일 지표 편향 완화.
+1. **앙상블 다층 구조** — 24개 분석 도구 + 진입 계획 + 7 에이전트 + 5 ML 모델 + Decision Maker의 다단 합의로 단일 지표 편향 완화.
 2. **자동 폴백** — Mac Studio 다운 시 RTX 5070으로 라우팅(2초 헬스체크).
 3. **Pydantic Settings 일원화** — 60+ 필드 enum/range 검증, 기동 시 조기 실패.
 4. **호가단위 정합** — 한/미 시장 자동 분기로 실제 체결 가능 가격 보장.
@@ -669,7 +670,7 @@ SQLite + WAL.
 | `Makefile` | 1–43 | 14 운영 타깃 |
 | `chart_agent_service/config.py` | 19–217 | Pydantic Settings + 호환 export |
 | `chart_agent_service/service.py` | 492–832 | 19 FastAPI 엔드포인트 |
-| `chart_agent_service/analysis_tools.py` | 73–1875 | 16 도구 본체 |
+| `chart_agent_service/analysis_tools.py` | 73–1875 | 24개 분석 도구 + 진입 계획 |
 | `chart_agent_service/screener.py` | 1–160+ | 한국 종목 스크리너 |
 | `chart_agent_service/backtest_engine.py` | 58–541 | 4 전략 + WF |
 | `chart_agent_service/ml_predictor.py` | 138–250 | TSCV + 모델 학습 + (미사용) SHAP 슬롯 |
@@ -755,7 +756,7 @@ calculate_indicators (SMA/EMA/RSI/BB/ATR/ADX/MACD/OBV)
    ↓
 [ Technical | Quant | Risk | ML | Event | Geo | Value ]  ── 7 에이전트 병렬
    │   │   │   │   │   │   │
-   └────────── 16 도구 호출 + LLM 해석 → AgentResult(signal, confidence, evidence) ──┐
+   └────────── 분석 도구 호출 + LLM 해석 → AgentResult(signal, confidence, evidence) ──┐
                                                                                        ↓
                           EnhancedDecisionMaker (충돌해결 + 펀더멘털 검증 + 평활화)
                                                                                        ↓

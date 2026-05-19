@@ -49,7 +49,7 @@ def build_entry_plan(
         signal: "buy" | "sell" | "neutral"
         confidence: 0-10
         current_price: 현재가
-        tool_results: 16개 도구의 분석 결과 리스트
+        tool_results: 분석 도구의 결과 리스트
         trading_style: "scalping" | "swing" | "longterm"
 
     Returns:
@@ -103,7 +103,7 @@ def build_entry_plan(
         plan["notes"].append(f"RSI {rsi_val:.1f} 과매수 — 풀백 대기 권장")
 
     bb_data = by_tool.get("bollinger_squeeze_analysis", {})
-    if bb_data.get("is_squeeze"):
+    if bb_data.get("is_squeeze", bb_data.get("squeeze", False)):
         order_type = "limit"
         entry_timing = "breakout_confirm"
         plan["notes"].append("볼린저 스퀴즈 중 — 방향성 돌파 확인 후 진입")
@@ -134,7 +134,7 @@ def build_entry_plan(
             plan["limit_price"] = round_to_tick(current_price, ticker, side="nearest")
     elif entry_timing == "breakout_confirm":
         # 볼린저 상단 돌파 확인가
-        bb_upper = bb_data.get("upper_band")
+        bb_upper = bb_data.get("upper_band", bb_data.get("bb_upper"))
         if bb_upper:
             plan["limit_price"] = round_to_tick(bb_upper * 1.005, ticker, side="up")
         else:

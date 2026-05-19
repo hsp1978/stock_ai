@@ -35,6 +35,7 @@ class BacktestResult:
     trades: list = field(default_factory=list)
     equity_curve: list = field(default_factory=list)
     trading_costs: Optional[dict] = None  # 거래비용 정보 (slippage/commission/tax)
+    notes: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = {
@@ -52,6 +53,8 @@ class BacktestResult:
         }
         if self.trading_costs:
             d["trading_costs"] = self.trading_costs
+        if self.notes:
+            d["notes"] = self.notes
         return d
 
 
@@ -256,62 +259,15 @@ def backtest_composite_signal(ticker: str, df: pd.DataFrame, tool_results: list,
     if df.empty or not tool_results:
         return BacktestResult(strategy="Composite_Signal", ticker=ticker)
 
-    scores_by_tool = {}
-    for r in tool_results:
-        scores_by_tool[r.get("tool", "")] = r.get("score", 0)
-    avg_score = np.mean(list(scores_by_tool.values()))
-
-    cash = ACCOUNT_SIZE
-    position = 0
-    entry_price = 0.0
-    entry_date = None
-    trades = []
-    equity = []
-
-    lookback = min(60, len(df))
-    sim_df = df.tail(lookback)
-
-    for i in range(1, len(sim_df)):
-        price = float(sim_df["Close"].iloc[i])
-        date = sim_df.index[i]
-
-        sim_score = avg_score * (0.8 + 0.4 * np.random.random())
-
-        if sim_score > 2 and position == 0:
-            fill_price = round_to_tick(costs.apply_entry(price), ticker, side="up")
-            risk_amt = cash * (RISK_PER_TRADE_PCT / 100)
-            atr_val = float(sim_df["ATR"].iloc[i]) if "ATR" in sim_df.columns and not pd.isna(sim_df["ATR"].iloc[i]) else price * 0.02
-            stop_dist = atr_val * ATR_STOP_MULTIPLIER
-            qty = int(risk_amt / stop_dist) if stop_dist > 0 else 0
-            if qty > 0 and qty * fill_price <= cash:
-                position = qty
-                entry_price = fill_price
-                entry_date = date
-                cash -= qty * fill_price
-
-        elif (sim_score < -2 or (position > 0 and price < entry_price * (1 - ATR_STOP_MULTIPLIER * 0.02))) and position > 0:
-            fill_price = round_to_tick(costs.apply_exit(price), ticker, side="down")
-            pnl = (fill_price - entry_price) * position
-            cash += position * fill_price
-            holding = (date - entry_date).days if entry_date else 0
-            trades.append({
-                "entry_date": str(entry_date)[:10],
-                "exit_date": str(date)[:10],
-                "entry_price": round(entry_price, 4),
-                "exit_price": round(fill_price, 4),
-                "qty": position,
-                "pnl": round(pnl, 2),
-                "return_pct": round((fill_price / entry_price - 1) * 100, 2),
-                "holding_days": holding,
-            })
-            position = 0
-
-        port_value = cash + position * price
-        equity.append(port_value)
-
-    equity_series = pd.Series(equity, index=sim_df.index[1:len(equity) + 1])
-    result = _compute_stats(equity_series, trades, "Composite_Signal", ticker)
+    # tool_results는 현재 시점 1회 실행 결과다. 이를 과거 봉마다 재사용하면
+    # 미래 정보를 과거에 주입하는 look-ahead bias가 되므로 거래 재현을 하지 않는다.
+    equity_series = pd.Series([ACCOUNT_SIZE] * len(df), index=df.index)
+    result = _compute_stats(equity_series, [], "Composite_Signal_CurrentOnly", ticker)
     result.trading_costs = costs.to_dict()
+    result.notes.append(
+        "현재 시점 tool_results만 제공되어 복합 시그널 과거 백테스트를 생략함 "
+        "(look-ahead bias 방지)."
+    )
     return result
 
 
@@ -502,7 +458,12 @@ def backtest_walk_forward(ticker: str, df: pd.DataFrame, strategy: str = "rsi_re
 
         # 테스트 구간에서 백테스트
         if strategy == "sma_cross":
-            test_result = backtest_sma_cross(ticker, test_df, best_params["fast_period"], best_params["slow_period"])
+            fast = best_params["fast_period"]
+            slow = best_params["slow_period"]
+            test_df = df.iloc[train_end_idx:test_end_idx].copy()
+            test_df[f"SMA_{fast}"] = df["Close"].rolling(fast).mean().iloc[train_end_idx:test_end_idx]
+            test_df[f"SMA_{slow}"] = df["Close"].rolling(slow).mean().iloc[train_end_idx:test_end_idx]
+            test_result = backtest_sma_cross(ticker, test_df, fast, slow)
         elif strategy == "rsi_reversion":
             test_result = backtest_rsi_reversion(ticker, test_df, best_params["oversold"], best_params["overbought"])
         elif strategy == "bollinger_reversion":

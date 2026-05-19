@@ -1,6 +1,6 @@
 """
-차트 분석 에이전트 - 16개 기법을 tool로 제공, LLM이 판단/조합
-기술적 분석 6개 + 퀀트 분석 6개 + 리스크/퀀트 확장 4개
+차트 분석 에이전트 - 24개 호출 도구와 진입 계획 도구를 제공, LLM이 판단/조합
+기술적 분석 + 퀀트 분석 + 리스크/펀더멘털/수급/공시 확장
 
 사용법:
     agent = ChartAnalysisAgent(ticker, df_indicators)
@@ -66,12 +66,28 @@ def _market_from_ticker(ticker: str) -> str:
     return "US"
 
 
+def _normalize_tool_results(results: Optional[list]) -> list:
+    """멀티에이전트 evidence wrapper를 원본 tool result dict로 정규화."""
+    normalized = []
+    for item in results or []:
+        if not isinstance(item, dict):
+            continue
+        inner = item.get("result")
+        if isinstance(inner, dict):
+            tool_result = inner.copy()
+            tool_result.setdefault("tool", item.get("tool", tool_result.get("tool", "")))
+            normalized.append(tool_result)
+        else:
+            normalized.append(item)
+    return normalized
+
+
 # ═══════════════════════════════════════════════════════════════
-#  16개 분석 기법 (각각 독립 함수, tool로 LLM에 노출)
+#  분석 기법 (각각 독립 함수, tool로 LLM에 노출)
 # ═══════════════════════════════════════════════════════════════
 
 class AnalysisTools:
-    """16개 분석 기법. 각 메서드는 dict를 반환한다."""
+    """분석 기법 모음. 각 메서드는 dict를 반환한다."""
 
     def __init__(self, ticker: str, df: pd.DataFrame):
         self.ticker = ticker
@@ -393,10 +409,13 @@ class AnalysisTools:
             "score": round(score, 1),
             "bb_upper": round(upper, 2),
             "bb_lower": round(lower, 2),
+            "upper_band": round(upper, 2),
+            "lower_band": round(lower, 2),
             "bb_width_pct": round(bb_width, 2),
             "avg_width_pct": round(avg_width, 2),
             "pct_b": round(pct_b, 3),
             "squeeze": is_squeeze,
+            "is_squeeze": is_squeeze,
             "expanding": is_expanding,
             "detail": f"밴드폭={bb_width:.1f}% (평균 {avg_width:.1f}%), %B={pct_b:.2f}, 스퀴즈={'Yes' if is_squeeze else 'No'}"
         })
@@ -918,14 +937,14 @@ class AnalysisTools:
         weights = {"1w": 0.2, "1m": 0.3, "3m": 0.5}
         weighted_return = sum(returns.get(k, 0) * w for k, w in weights.items())
 
-        # 가속도 (단기 vs 장기)
+        # 가속도 (단기 vs 장기): 1주 수익률과 3개월 주간 환산 수익률을 같은 단위로 비교
         acceleration = "neutral"
         if "1w" in returns and "3m" in returns:
-            weekly_annualized = returns["1w"] * 52
-            quarterly = returns["3m"]
-            if weekly_annualized > quarterly * 1.5:
+            weekly_return = returns["1w"]
+            quarterly_weekly_avg = returns["3m"] / 13
+            if weekly_return > quarterly_weekly_avg + 1.0:
                 acceleration = "accelerating"
-            elif weekly_annualized < quarterly * 0.5:
+            elif weekly_return < quarterly_weekly_avg - 1.0:
                 acceleration = "decelerating"
 
         score = 0
@@ -952,6 +971,8 @@ class AnalysisTools:
             "returns": returns,
             "weighted_return": round(weighted_return, 2),
             "acceleration": acceleration,
+            "weekly_return": round(returns.get("1w", 0), 2),
+            "quarterly_weekly_avg": round(returns.get("3m", 0) / 13, 2) if "3m" in returns else None,
             "detail": f"가중수익률={weighted_return:.1f}%, 가속={acceleration}"
         })
         return result
@@ -1167,8 +1188,9 @@ class AnalysisTools:
         downside_pct = (price - nearest_support_sr) / price * 100 if price > 0 else 0
         rr_ratio_sr = upside_pct / downside_pct if downside_pct > 0 else 0
 
-        # 최종 손절/익절 결정 (진정한 보수적 선택)
-        stop_loss_final = min(stop_loss_atr, stop_loss_sr)  # 더 가까운(보수적) 손절
+        # 최종 손절/익절 결정: long 기준으로 현재가 아래의 더 가까운 손절이 보호적 선택
+        stop_candidates = [v for v in (stop_loss_atr, stop_loss_sr) if v < price]
+        stop_loss_final = max(stop_candidates) if stop_candidates else min(stop_loss_atr, stop_loss_sr)
         take_profit_final = take_profit_atr  # ATR 기반 익절 사용
 
         # [P0 개선] 켈리 기준 먼저 가져오기
@@ -1192,9 +1214,11 @@ class AnalysisTools:
             position_value = qty * price  # 정수 주식수로 재계산
             position_pct = (position_value / ACCOUNT_SIZE * 100)
 
-        # [개선 #2] R/R min() 적용 및 일관성 유지
-        effective_rr = min(rr_ratio_atr, rr_ratio_sr)  # 보수적 선택
-        rr_method = "ATR" if rr_ratio_atr <= rr_ratio_sr else "S/R"
+        # 최종 레벨 기준 R/R 산출
+        final_downside_pct = (price - stop_loss_final) / price * 100 if price > 0 else 0
+        final_upside_pct = (take_profit_final - price) / price * 100 if price > 0 else 0
+        effective_rr = final_upside_pct / final_downside_pct if final_downside_pct > 0 else 0
+        rr_method = "ATR" if stop_loss_final == stop_loss_atr else "S/R"
 
         warnings = []
         # 켈리 하드캡 경고 추가
@@ -1317,7 +1341,7 @@ class AnalysisTools:
         result = {"tool": "entry_plan_analysis", "name": "진입 계획 (매매 시점/분할/손절익절)"}
 
         current_price = float(self.latest['Close'])
-        tool_results = other_results or []
+        tool_results = _normalize_tool_results(other_results)
 
         # 최소 필수: risk_position_sizing이 결과에 없으면 직접 실행
         if not any(r.get("tool") == "risk_position_sizing" for r in tool_results):
@@ -2383,6 +2407,20 @@ TOOL_DEFINITIONS = [
 
 # Ollama용 간소화 tool 이름 목록
 TOOL_NAMES = [t["function"]["name"] for t in TOOL_DEFINITIONS]
+NON_DIRECTIONAL_TOOLS = {"risk_position_sizing", "entry_plan_analysis"}
+
+
+def _is_directional_result(result: dict) -> bool:
+    """최종 방향 점수에 포함할 도구인지 판단한다."""
+    return result.get("tool") not in NON_DIRECTIONAL_TOOLS
+
+
+def _format_tool_catalog() -> str:
+    rows = []
+    for i, definition in enumerate(TOOL_DEFINITIONS, start=1):
+        fn = definition["function"]
+        rows.append(f"{i}. {fn['name']} - {fn['description']}")
+    return "\n".join(rows)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2390,7 +2428,7 @@ TOOL_NAMES = [t["function"]["name"] for t in TOOL_DEFINITIONS]
 # ═══════════════════════════════════════════════════════════════
 
 class ChartAnalysisAgent:
-    """LLM이 24개 tool 중 필요한 것을 선택하여 분석을 수행하는 에이전트 (P2: pykrx/DART 추가)"""
+    """LLM이 24개 호출 도구와 진입 계획 도구를 사용하여 분석을 수행하는 에이전트."""
 
     MAX_ITERATIONS = 5  # tool call 최대 반복 횟수
 
@@ -2452,7 +2490,11 @@ class ChartAnalysisAgent:
 
         # 종합 score 기반으로 임시 signal/confidence를 산출하여 entry_plan에 전달
         avg_score = 0
-        valid_scores = [r.get("score", 0) for r in results if isinstance(r.get("score"), (int, float))]
+        valid_scores = [
+            r.get("score", 0)
+            for r in results
+            if _is_directional_result(r) and isinstance(r.get("score"), (int, float))
+        ]
         if valid_scores:
             avg_score = sum(valid_scores) / len(valid_scores)
         composite_signal = "buy" if avg_score > 2 else ("sell" if avg_score < -2 else "neutral")
@@ -2485,11 +2527,14 @@ class ChartAnalysisAgent:
         signals = {"buy": 0, "sell": 0, "neutral": 0}
         tool_summaries = []
 
+        directional_signals = {"buy": 0, "sell": 0, "neutral": 0}
         for r in self.tool_results:
             score = r.get("score", 0)
             signal = r.get("signal", "neutral")
-            scores.append(score)
             signals[signal] = signals.get(signal, 0) + 1
+            if _is_directional_result(r):
+                scores.append(score)
+                directional_signals[signal] = directional_signals.get(signal, 0) + 1
             tool_summaries.append({
                 "tool": r.get("tool", "unknown"),
                 "name": r.get("name", ""),
@@ -2498,8 +2543,9 @@ class ChartAnalysisAgent:
                 "detail": r.get("detail", ""),
             })
 
-        avg_score = float(np.mean(scores))
+        avg_score = float(np.mean(scores)) if scores else 0.0
         total = len(self.tool_results)
+        directional_total = len(scores)
 
         if avg_score > 2:
             final_signal = "BUY"
@@ -2509,8 +2555,8 @@ class ChartAnalysisAgent:
             final_signal = "HOLD"
 
         # 신뢰도 (의견 일치도 기반)
-        max_agreement = max(signals.values())
-        confidence = round(max_agreement / total * 10, 1) if total > 0 else 0
+        max_agreement = max(directional_signals.values())
+        confidence = round(max_agreement / directional_total * 10, 1) if directional_total > 0 else 0
 
         return {
             "ticker": self.ticker,
@@ -2519,7 +2565,9 @@ class ChartAnalysisAgent:
             "composite_score": round(avg_score, 2),
             "confidence": confidence,
             "signal_distribution": signals,
+            "directional_signal_distribution": directional_signals,
             "tool_count": total,
+            "directional_tool_count": directional_total,
             "tool_summaries": tool_summaries,
             "tool_details": self.tool_results,
         }
@@ -2543,31 +2591,19 @@ class ChartAnalysisAgent:
             return self.compute_composite_score()
 
     def _build_agent_system_prompt(self) -> str:
+        tool_count = len(TOOL_DEFINITIONS)
+        tool_catalog = _format_tool_catalog()
         return f"""당신은 주식 차트 분석 전문 에이전트다.
 
 역할:
 - {self.ticker} 종목에 대해 제공된 분석 도구(tool)를 사용하여 종합 판단을 내린다.
-- 16개의 분석 도구가 있다. 상황에 따라 필요한 도구를 선택하여 호출한다.
+- {tool_count}개의 호출 가능한 분석 도구가 있다. 상황에 따라 필요한 도구를 선택하여 호출한다.
 - 최소 8개 이상의 도구를 사용해야 한다.
 - 각 도구의 결과를 종합하여 최종 매수/매도/관망 판단을 내린다.
+- risk_position_sizing과 entry_plan_analysis는 실행 계획 도구이며 방향성 판단 점수에는 포함하지 않는다.
 
 분석 도구 목록:
-1. trend_ma_analysis - 이동평균선 배열 (골든/데드크로스)
-2. rsi_divergence_analysis - RSI 다이버전스
-3. bollinger_squeeze_analysis - 볼린저밴드 스퀴즈
-4. macd_momentum_analysis - MACD 모멘텀
-5. adx_trend_strength_analysis - ADX 추세 강도
-6. volume_profile_analysis - 거래량 프로파일
-7. fibonacci_retracement_analysis - 피보나치 되돌림
-8. volatility_regime_analysis - 변동성 체제
-9. mean_reversion_analysis - 평균 회귀 (Z-Score)
-10. momentum_rank_analysis - 모멘텀 순위
-11. support_resistance_analysis - 지지/저항선
-12. correlation_regime_analysis - 수익률 자기상관
-13. risk_position_sizing - 포지션 사이징/리스크 관리 (ATR 손절, 매수 수량, 분할 진입)
-14. kelly_criterion_analysis - 켈리 기준 배팅 (승률/손익비 → 최적 비중)
-15. beta_correlation_analysis - 베타/상관관계 (SPY 대비 베타, 알파, 정보비율)
-16. event_driven_analysis - 이벤트 드리븐 (실적발표, 배당락, 52주 고저, 애널리스트)
+{tool_catalog}
 
 규칙:
 1. 먼저 기본 도구(1~6)를 실행하고, 결과를 보고 필요한 퀀트 도구(7~12)를 추가 실행한다.
@@ -2685,7 +2721,7 @@ class ChartAnalysisAgent:
             return self.compute_composite_score()
 
         # Step 1: 전체 tool 실행 (Ollama는 function calling 미지원 모델이 많으므로)
-        print("    [Step 1] 16개 분석 도구 실행...")
+        print(f"    [Step 1] {len(TOOL_DEFINITIONS)}개 분석 도구 + 진입 계획 실행...")
         self.run_all_tools()
 
         for r in self.tool_results:
@@ -2706,7 +2742,7 @@ class ChartAnalysisAgent:
 - 신호 분포: 매수 {composite['signal_distribution']['buy']}개, 매도 {composite['signal_distribution']['sell']}개, 중립 {composite['signal_distribution']['neutral']}개
 - 시스템 판단: {composite['final_signal']}
 
-위 16개 도구의 분석 결과를 종합하여 최종 판단을 한국어로 작성하라.
+위 분석 도구의 결과를 종합하여 최종 판단을 한국어로 작성하라.
 다음 형식을 따르라:
 
 ## 종합 판단

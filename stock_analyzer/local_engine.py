@@ -4,7 +4,7 @@
 
 연결 방식:
   - 직접 import: chart_agent_service/ 모듈을 sys.path로 추가하여 Python 함수 직접 호출
-    (16개 분석 도구, 백테스트, ML, 포트폴리오, 페이퍼트레이딩)
+    (24개 분석 도구 + 진입 계획, 백테스트, ML, 포트폴리오, 페이퍼트레이딩)
   - HTTP API: Mac Studio FastAPI로 뉴스/차트패턴/섹터/매크로 (직접 import 실패 시 fallback)
   - Multi-LLM: Gemini → Ollama → OpenAI fallback 파이프라인
 """
@@ -301,7 +301,7 @@ def engine_info() -> dict:
 
 
 def engine_scan_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
-    """단일 종목 에이전트 분석 (16개 기법)"""
+    """단일 종목 에이전트 분석."""
     ticker = ticker.upper()
     try:
         print(f"  [{ticker}] 데이터 수집...")
@@ -323,7 +323,7 @@ def engine_scan_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
         except Exception as e:
             print(f"  [{ticker}] 내부자거래 실패: {e}")
 
-        print(f"  [{ticker}] 16개 기법 분석...")
+        print(f"  [{ticker}] 분석 도구 실행...")
         agent = ChartAnalysisAgent(ticker, df)
         result = agent.run(mode=ai_mode)
 
@@ -825,7 +825,7 @@ def _build_full_report_prompt(ticker: str, result: dict,
 
     prompt = (
         f"# {ticker} 종합 분석 리포트\n\n"
-        f"## 에이전트 분석 결과 (16개 기법)\n"
+        f"## 에이전트 분석 결과\n"
         f"- 최종 신호: {result.get('final_signal', '?')}\n"
         f"- 종합 점수: {result.get('composite_score', 0):+.2f} / 10\n"
         f"- 신뢰도: {result.get('confidence', 0)} / 10\n"
@@ -845,7 +845,7 @@ def _build_full_report_prompt(ticker: str, result: dict,
         "\n## 분석 요청\n"
         "위 데이터를 종합하여 다음 형식으로 분석하라:\n\n"
         "### 종합 판단\n[매수/매도/관망] (신뢰도: X/10)\n\n"
-        "### 기술적 분석 요약\n[16개 도구 결과 해석]\n\n"
+        "### 기술적 분석 요약\n[분석 도구 결과 해석]\n\n"
         "### 주간 추세 분석\n[DB 누적 데이터 기반 WoW 변화 해석 — 점수/신호 추이, 반전/지속 판단]\n\n"
         "### 펀더멘털 분석\n[재무 건전성, 밸류에이션]\n\n"
         "### 리스크 관리\n[손절/익절, 포지션 크기]\n\n"
@@ -934,7 +934,7 @@ def engine_interpret_tool(ticker: str, tool_key: str,
 def engine_interpret_full_report(ticker: str, provider: str = "auto") -> str:
     """
     종합 AI 리포트 생성.
-    1. engine_get_ticker_result → 16개 도구 결과
+    1. engine_get_ticker_result → 분석 도구 결과
     2. _build_full_report_prompt → 프롬프트 조립
     3. _gather_extra_context → 뉴스+매크로+차트패턴+섹터 수집
     4. _call_llm(prompt, provider)
@@ -1225,9 +1225,9 @@ def engine_dispatch_post(path: str, json_body: Optional[dict] = None) -> Optiona
     _ = json_body  # 시그니처 호환용 (현재 로컬 핸들러 미사용)
     try:
         if path.startswith("/screener/"):
-            # Screener 관련 요청은 HTTP API로 전달 (chart_agent_service는 포트 8100에서 실행)
+            # Screener 관련 요청은 HTTP API로 전달
             import httpx
-            url = f"http://localhost:8100{path}"
+            url = f"{AGENT_API_URL.rstrip('/')}{path}"
             try:
                 resp = httpx.post(url, timeout=900)
                 resp.raise_for_status()

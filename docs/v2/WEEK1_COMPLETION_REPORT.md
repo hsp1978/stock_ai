@@ -40,13 +40,13 @@
 ### MCP 서버 도구 (21개)
 
 #### 핵심 도구 (5개)
-1. `analyze_stock` - 16개 도구 종합 분석
+1. `analyze_stock` - 24개 분석 도구 + 진입 계획 종합 분석
 2. `predict_ml` - ML 앙상블 예측
 3. `optimize_strategy` - 백테스트 최적화
 4. `walk_forward_test` - Walk-forward 검증
 5. `optimize_portfolio` - 포트폴리오 최적화
 
-#### 개별 분석 도구 (16개)
+#### 개별 분석 도구 (24개 + 진입 계획)
 - `analyze_trend_ma` - 이동평균 추세
 - `analyze_rsi_divergence` - RSI 다이버전스
 - `analyze_bollinger_squeeze` - 볼린저 스퀴즈

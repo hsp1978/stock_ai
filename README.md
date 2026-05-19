@@ -1,6 +1,6 @@
 # Stock AI Analysis System V2
 
-8개 AI 에이전트가 16개 분석 도구로 한국/미국 주식을 멀티-LLM(Gemini · GPT-4o · Ollama)으로 분석하는 듀얼 노드 플랫폼.
+8개 AI 에이전트가 24개 분석 도구와 진입 계획 도구로 한국/미국 주식을 멀티-LLM(Gemini · GPT-4o · Ollama)으로 분석하는 듀얼 노드 플랫폼.
 
 ```
 RTX 5070 (testdev)        ←Tailscale→        Mac Studio (hsptest-macstudio)
@@ -43,7 +43,7 @@ open http://localhost:8501              # Streamlit WebUI
 
 ---
 
-## 🔧 분석 도구 16개
+## 🔧 분석 도구 24개 + 진입 계획
 
 ### 기술적 (6)
 | 도구 | 신호 |
@@ -65,13 +65,30 @@ open http://localhost:8501              # Streamlit WebUI
 | support_resistance | 지지선 근처 반등 |
 | correlation_regime | Hurst > 0.5 → 추세 지속 |
 
-### 리스크/이벤트 (4)
+### 리스크/이벤트 (5)
 | 도구 | 신호 |
 |---|---|
 | risk_position_sizing | ATR 기반 최적 수량 |
 | kelly_criterion | 승률·손익비 기반 비중 |
 | beta_correlation | 시장 민감도 |
 | event_driven | 뉴스 + 매크로 종합 |
+| insider_trading | 내부자 거래 패턴 |
+
+### 확장 분석 (7)
+| 도구 | 신호 |
+|---|---|
+| money_flow_index | 거래량 가중 과매수/과매도 |
+| rsi_mfi_combined | RSI+MFI 합치/괴리 |
+| macd_rsi_cross | MACD 크로스 + RSI 조건 |
+| piotroski_fscore | 재무 건전성 |
+| altman_zscore | 도산 위험 |
+| institutional_flow | 외국인/공매도 수급 |
+| dart_disclosure | DART 공시 이벤트 |
+
+### 실행 계획 (방향 점수 제외)
+| 도구 | 신호 |
+|---|---|
+| entry_plan_analysis | 진입 시점, 분할, 손절/익절 |
 
 ---
 
@@ -85,7 +102,7 @@ open http://localhost:8501              # Streamlit WebUI
 
 ## 📊 백테스트
 
-4 전략: SMA Cross · RSI Reversion · Bollinger Reversion · Composite(16 도구 종합).
+4 전략: SMA Cross · RSI Reversion · Bollinger Reversion · Composite(현재 도구 결과는 look-ahead 방지를 위해 과거 replay 생략).
 
 ```
 HyperOpt 결과 예시:

@@ -179,14 +179,18 @@ def _calc_indicators_lite(df: pd.DataFrame) -> pd.DataFrame:
     df['MA60'] = close.rolling(60, min_periods=60).mean()
     df['MA120'] = close.rolling(120, min_periods=120).mean()
 
-    # RSI (Wilder's)
+    # RSI (Wilder's): 손실이 없는 강한 상승 구간은 RSI=100, 변동 없는 구간은 50
     delta = close.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = (-delta).where(delta < 0, 0.0)
     avg_gain = gain.ewm(alpha=1/14, min_periods=14).mean()
     avg_loss = loss.ewm(alpha=1/14, min_periods=14).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    df['RSI'] = 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100.0)
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain == 0), 50.0)
+    rsi = rsi.mask((avg_gain == 0) & (avg_loss > 0), 0.0)
+    df['RSI'] = rsi
 
     # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
@@ -225,9 +229,9 @@ def _score_macd_cross(df: pd.DataFrame) -> Tuple[float, Optional[str]]:
         idx_curr = len(macd) - i
         if idx_prev >= 0 and idx_curr >= 0:
             if macd[idx_prev] <= sig[idx_prev] and macd[idx_curr] > sig[idx_curr]:
-                # 크로스 발생 — 최근일수록 높은 점수 (30→20 선형)
-                fresh_bonus = (11 - i) / 10  # i=1일 때 1.0, i=10일 때 0.1
-                return SCORE_WEIGHTS["macd_cross"] * fresh_bonus, f"골든크로스 {i}봉 전 발생"
+                # 크로스 발생 — 최근일수록 높은 점수 (1봉 전 30점 → 10봉 전 20점)
+                freshness_score = SCORE_WEIGHTS["macd_cross"] - (i - 1) * (10 / 9)
+                return freshness_score, f"골든크로스 {i}봉 전 발생"
 
     # 유지 중인 경우
     if macd[-1] > sig[-1]:
@@ -238,7 +242,7 @@ def _score_macd_cross(df: pd.DataFrame) -> Tuple[float, Optional[str]]:
 
 def _score_ma_alignment(df: pd.DataFrame) -> Tuple[float, Optional[str]]:
     """MA5 > MA20 > MA60 정배열 확인."""
-    if len(df) < 60 or df[['MA5', 'MA20', 'MA60']].isna().any().any():
+    if len(df) < 60 or df[['MA5', 'MA20', 'MA60']].iloc[-1].isna().any():
         return 0, None
 
     last = df.iloc[-1]
@@ -476,7 +480,7 @@ def run_screener(
         {run_id, scanned_at, universe_size, results: [...상위 N], ...}
     """
     t_start = datetime.now()
-    run_id = t_start.strftime("%Y%m%d_%H%M")
+    run_id = t_start.strftime("%Y%m%d_%H%M%S_%f")
 
     print(f"[screener] 실행 {run_id} 시작")
 
@@ -492,12 +496,18 @@ def run_screener(
         }
     print(f"[screener] 유니버스: {len(universe)}개 (시총 {min_market_cap/1e8:.0f}억+)")
 
-    # 2. 배치 OHLCV 다운로드
+    # 2. OHLCV 준비
     tickers = universe['ticker'].tolist()
     from data_collector import prefetch_ohlcv_batch, clear_ohlcv_cache, fetch_ohlcv
     clear_ohlcv_cache()
-    # 스크리너는 1y (200일+) 필요 — data_collector 기본값
-    prefetch_ohlcv_batch(tickers, period="1y")
+    us_batch_tickers = [
+        t for t in tickers
+        if not str(t).upper().endswith((".KS", ".KQ"))
+    ]
+    if us_batch_tickers:
+        prefetch_ohlcv_batch(us_batch_tickers, period="1y")
+    if len(us_batch_tickers) != len(tickers):
+        print("[screener] 한국 종목 OHLCV는 pykrx/FDR 우선순위 보존을 위해 개별 조회")
 
     # 3. 각 종목 점수 계산
     scored = []

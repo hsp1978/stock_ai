@@ -1692,11 +1692,15 @@ class MultiAgentOrchestrator:
                 from analysis_tools import AnalysisTools as _AT
                 _at = _AT(ticker, df)
 
-                # agent_results에서 evidence(도구 결과)를 평면화하여 진입 계획 입력으로
+                # agent_results에서 evidence의 원본 도구 결과를 평면화하여 진입 계획 입력으로
                 flat_evidence = []
                 for ar in agent_results:
                     if ar.evidence:
-                        flat_evidence.extend(ar.evidence)
+                        for ev in ar.evidence:
+                            if isinstance(ev, dict) and isinstance(ev.get("result"), dict):
+                                flat_evidence.append(ev["result"])
+                            else:
+                                flat_evidence.append(ev)
 
                 entry_signal = final_decision.get("final_signal", "neutral")
                 entry_confidence = float(final_decision.get("final_confidence", 5.0))

@@ -45,7 +45,7 @@ flowchart LR
     cd([Claude Desktop]):::user
 
     subgraph stockAuto[Stock AI Analysis System]
-        sys[(8 에이전트<br/>16 도구<br/>5 ML 앙상블)]
+        sys[(8 에이전트<br/>24 도구 + 진입 계획<br/>5 ML 앙상블)]
     end
 
     yf[(Yahoo Finance)]:::ext
@@ -787,7 +787,7 @@ git log --oneline -- .env                          # 과거 노출 가능성
        │                                            │     ├── Gemini API
        │                                            │     └── OpenAI API (최후)
        │                                            ├── data_collector (_ohlcv_cache + yfinance/FDR)
-       │                                            ├── analysis_tools (16 도구) / screener / entry_plan
+       │                                            ├── analysis_tools (24 도구 + 진입 계획) / screener / entry_plan
        │                                            ├── ml_predictor / backtest_engine
        │                                            ├── paper_trader → brokers/safety → paper_state.json
        │                                            └── db.py SQLite WAL

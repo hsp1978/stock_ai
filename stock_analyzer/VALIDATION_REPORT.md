@@ -29,7 +29,7 @@ total_score = tech_analysis["total_score"] + quant_analysis["total_score"]
 **파일**: `chart_agent_service/analysis_tools.py:1366`
 **문제점**:
 ```python
-avg_score = float(np.mean(scores))  # 16개 도구 평균
+avg_score = float(np.mean(scores))  # 방향성 분석 도구 평균
 if avg_score > 2:
     final_signal = "BUY"
 ```

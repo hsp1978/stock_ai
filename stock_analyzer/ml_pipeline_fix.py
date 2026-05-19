@@ -225,17 +225,22 @@ def enhanced_ml_ensemble(ticker: str, df: pd.DataFrame, debug: bool = False) -> 
     features = create_robust_features(df_fixed, ticker)
 
     # 4. 타겟 생성 (5일 후 상승/하락)
-    target = (df_fixed["Close"].shift(-5) > df_fixed["Close"]).astype(int)
+    # 미래 종가가 없는 마지막 5개 행은 학습 라벨로 사용할 수 없다.
+    future_close = df_fixed["Close"].shift(-5)
+    target = (future_close > df_fixed["Close"]).astype("float64")
+    target[future_close.isna()] = np.nan
 
     # 5. 학습 데이터 준비
-    combined = pd.concat([features, target.rename("target")], axis=1).dropna()
+    combined = pd.concat([features, target.rename("target")], axis=1)
+    combined = combined.replace([np.inf, -np.inf], np.nan).dropna()
+    result["rows_used"] = len(combined)
 
     if len(combined) < 50:  # 최소 요구 사항 완화
         result["warnings"].append(f"학습 데이터 부족: {len(combined)}개")
         return result
 
     X = combined.drop("target", axis=1)
-    y = combined["target"]
+    y = combined["target"].astype(int)
 
     # 6. 학습/테스트 분할
     train_size = int(len(X) * 0.8)
@@ -398,8 +403,11 @@ def enhanced_ml_ensemble(ticker: str, df: pd.DataFrame, debug: bool = False) -> 
         # (예: up_probability=0.65인데 confidence=2 → 의미상 일관성 위해 buy를 neutral로)
         signal = "buy" if weighted_prob > 0.6 else ("sell" if weighted_prob < 0.4 else "neutral")
         if confidence < 2 and signal != "neutral":
+            weakened_signal = signal
             signal = "neutral"
-            result["warnings"].append(f"낮은 confidence({confidence:.1f})로 인해 {signal}로 강제 변경")
+            result["warnings"].append(
+                f"낮은 confidence({confidence:.1f})로 인해 {weakened_signal}→neutral로 강제 변경"
+            )
 
         result["ensemble"] = {
             "prediction": "UP" if weighted_prob > 0.5 else "DOWN",

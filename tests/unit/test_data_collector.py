@@ -198,6 +198,28 @@ def test_korean_ticker_uses_pykrx_first():
     yf_mock.get_ohlcv.assert_not_called()
 
 
+def test_korean_ticker_ignores_yfinance_batch_cache():
+    """한국 종목은 yfinance 배치 캐시가 있어도 pykrx/FDR 우선순위를 유지한다."""
+    import data_collector as dc
+
+    dc._ohlcv_cache[("005930.KS", "2y")] = _make_df()
+
+    pykrx_mock = MagicMock()
+    pykrx_mock.name = "pykrx"
+    pykrx_mock.get_ohlcv.return_value = _make_df(60)
+
+    with (
+        patch("data_collector.PykrxSource", return_value=pykrx_mock),
+        patch("data_collector.FdrSource", return_value=MagicMock()),
+        patch("data_collector.YFinanceSource", return_value=MagicMock()),
+        patch("data_collector._is_korean_ticker", return_value=True),
+    ):
+        df = dc.fetch_ohlcv("005930.KS", "2y")
+
+    assert len(df) == 60
+    pykrx_mock.get_ohlcv.assert_called_once()
+
+
 # ── TTL 미만료 → 캐시 반환 ───────────────────────────────────────────
 
 

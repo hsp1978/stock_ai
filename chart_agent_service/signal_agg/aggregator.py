@@ -53,42 +53,54 @@ class SignalAggregator:
     def _signal_to_num(signal: str) -> float:
         return {"buy": 1.0, "sell": -1.0, "neutral": 0.0}.get(signal.lower(), 0.0)
 
-    def _compute_conviction(
+    def _compute_direction(
         self,
         agent_signals: list[AgentSignal],
         ml_signals: list[MLPrediction],
         tool_outputs: dict[str, ToolResult],
     ) -> float:
-        """세 소스의 가중 합산 conviction (0–1 스케일)."""
+        """세 소스의 가중 합산 방향 (-1~1)."""
         w_a = self.weights.get("agent_ensemble", 0.4)
         w_m = self.weights.get("ml_ensemble", 0.4)
         w_t = self.weights.get("tool_score", 0.2)
 
         # 에이전트 앙상블 (신뢰도 가중 신호 방향, 0–10 → 0–1 정규화)
-        agent_conf = 0.0
+        weighted_parts: list[tuple[float, float]] = []
         if agent_signals:
             total_conf = sum(s.confidence for s in agent_signals if s.confidence > 0)
             if total_conf > 0:
                 weighted_dir = sum(
                     self._signal_to_num(s.signal) * s.confidence for s in agent_signals
                 )
-                # 방향 × 정규화 신뢰도 → 0–1
-                agent_conf = (weighted_dir / total_conf + 1) / 2  # -1~1 → 0~1
+                agent_dir = max(-1.0, min(1.0, weighted_dir / total_conf))
+                weighted_parts.append((w_a, agent_dir))
 
-        # ML 앙상블 평균 score
-        ml_conf = 0.0
+        # ML 앙상블 score는 상승 확률(0~1)로 보고 방향(-1~1)으로 변환
         if ml_signals:
-            ml_conf = sum(s.score for s in ml_signals) / len(ml_signals)
-            ml_conf = max(0.0, min(1.0, ml_conf))
+            ml_prob = sum(s.score for s in ml_signals) / len(ml_signals)
+            ml_prob = max(0.0, min(1.0, ml_prob))
+            weighted_parts.append((w_m, ml_prob * 2 - 1))
 
-        # Tool score 정규화 (–10~10 → 0~1)
-        tool_score = 0.0
+        # Tool score 정규화 (-10~10 → -1~1)
         if tool_outputs:
             raw = sum(r.score for r in tool_outputs.values()) / len(tool_outputs)
-            tool_score = (raw / 10 + 1) / 2  # –10~10 → 0~1
-            tool_score = max(0.0, min(1.0, tool_score))
+            tool_dir = max(-1.0, min(1.0, raw / 10))
+            weighted_parts.append((w_t, tool_dir))
 
-        conviction = w_a * agent_conf + w_m * ml_conf + w_t * tool_score
+        total_weight = sum(weight for weight, _ in weighted_parts)
+        if total_weight <= 0:
+            return 0.0
+        direction = sum(weight * value for weight, value in weighted_parts) / total_weight
+        return round(max(-1.0, min(1.0, direction)), 4)
+
+    def _compute_conviction(
+        self,
+        agent_signals: list[AgentSignal],
+        ml_signals: list[MLPrediction],
+        tool_outputs: dict[str, ToolResult],
+    ) -> float:
+        """세 소스의 방향 합의 강도(0~1). 매수/매도 방향은 별도 계산한다."""
+        conviction = abs(self._compute_direction(agent_signals, ml_signals, tool_outputs))
         return round(conviction, 4)
 
     def _size_position(self, conviction: float, atr: float, nav: float) -> int:
@@ -188,7 +200,8 @@ class SignalAggregator:
             currency:           통화 (노출 한도용)
             existing_conviction: 기존 포지션의 conviction (resize 판단용)
         """
-        conviction = self._compute_conviction(agent_signals, ml_signals, tool_outputs)
+        direction = self._compute_direction(agent_signals, ml_signals, tool_outputs)
+        conviction = round(abs(direction), 4)
         flags: list[str] = []
 
         # 1. 종목당 단일 active position 규칙
@@ -229,12 +242,9 @@ class SignalAggregator:
             )
 
         # 3. 신호 방향 결정
-        agent_dir = sum(
-            self._signal_to_num(s.signal) * s.confidence for s in agent_signals
-        )
-        if agent_dir > 0.1:
+        if direction > 0.1:
             action = "buy" if not flags else action  # resize 유지
-        elif agent_dir < -0.1:
+        elif direction < -0.1:
             action = "sell" if not flags else action
         else:
             return Decision(

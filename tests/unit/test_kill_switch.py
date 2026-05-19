@@ -12,6 +12,8 @@ GlobalKillSwitch 단위 테스트 (EXECUTION_PLAN Step 1)
 
 import os
 import sys
+import asyncio
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -172,10 +174,7 @@ def test_force_halt_and_blocked(ks):
 
 def test_middleware_blocks_scan_when_halted(tmp_path, mock_settings):
     """kill_switch 활성 시 /scan 호출 → 423."""
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from fastapi.responses import JSONResponse
+    from safety.kill_switch import KillSwitchASGIMiddleware
 
     db = str(tmp_path / "mw_test.db")
 
@@ -183,41 +182,46 @@ def test_middleware_blocks_scan_when_halted(tmp_path, mock_settings):
         ks_instance = GlobalKillSwitch(db_path=db)
         ks_instance.force_halt(reason="test", hours=1)
 
-    test_app = FastAPI()
+    async def downstream(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b'{"ok":true}'})
 
-    class _TestKSMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request, call_next):
-            from safety.kill_switch import _is_kill_switch_protected
+    app = KillSwitchASGIMiddleware(downstream, kill_switch=ks_instance)
 
-            if _is_kill_switch_protected(request.url.path):
-                blocked, reason = ks_instance.is_blocked()
-                if blocked:
-                    return JSONResponse(
-                        status_code=423,
-                        content={"detail": "kill_switch_active", "reason": reason},
-                    )
-            return await call_next(request)
+    async def request(path: str, method: str):
+        sent = []
 
-    test_app.add_middleware(_TestKSMiddleware)
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
 
-    @test_app.post("/scan")
-    def _scan():
-        return {"ok": True}
+        async def send(message):
+            sent.append(message)
 
-    @test_app.get("/health")
-    def _health():
-        return {"ok": True}
-
-    client = TestClient(test_app, raise_server_exceptions=False)
+        scope = {
+            "type": "http",
+            "http_version": "1.1",
+            "method": method,
+            "path": path,
+            "headers": [],
+            "query_string": b"",
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "client": ("testclient", 50000),
+        }
+        await app(scope, receive, send)
+        status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+        body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+        return status, json.loads(body.decode("utf-8"))
 
     # /scan → 423
-    resp = client.post("/scan")
-    assert resp.status_code == 423
-    assert resp.json()["detail"] == "kill_switch_active"
+    status, body = asyncio.run(request("/scan", "POST"))
+    assert status == 423
+    assert body["detail"] == "kill_switch_active"
 
     # /health → 200 (보호 대상 아님)
-    resp = client.get("/health")
-    assert resp.status_code == 200
+    status, body = asyncio.run(request("/health", "GET"))
+    assert status == 200
+    assert body["ok"] is True
 
 
 def test_middleware_scan_log_not_blocked(tmp_path, mock_settings):

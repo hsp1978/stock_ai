@@ -27,7 +27,7 @@
 
 ### 1.1 이 시스템으로 할 수 있는 것
 
-- **분석**: 개별 종목의 16개 기술 지표 + 7개 전문 AI 에이전트 종합 분석
+- **분석**: 개별 종목의 24개 분석 도구 + 진입 계획 + 7개 전문 AI 에이전트 종합 분석
 - **발굴**: 한국 시장 2,500개 중 매수 후보 상위 20개 자동 발굴 (매일 장 마감 후)
 - **가상 매매**: 사용자가 정한 시점/가격으로 가상 포지션 추적, 손익 자동 계산
 - **신호 추적**: 모든 분석 신호의 7/14/30일 후 실제 수익률 자동 평가 + 신뢰도 칼리브레이션
@@ -45,7 +45,7 @@
 ```
 Stock AI System
 ├── chart_agent_service/  ← 분석 엔진 (FastAPI)
-│   ├── 16개 기술 지표
+│   ├── 24개 분석 도구 + 진입 계획
 │   ├── Multi-Agent 7 에이전트
 │   ├── 한국 주식 스크리너
 │   └── ML 예측 + 백테스트
@@ -274,7 +274,8 @@ python scanner.py
 
 | 득점 항목 | 최대 |
 |---------|-----|
-| MACD 골든크로스 (최근 10봉) | +30 |
+| MACD 골든크로스 (최근 10봉) | +30 (1봉 전 30점 → 10봉 전 20점) |
+| MACD 상승 유지 | +15 |
 | MA5>MA20>MA60 정배열 | +20 |
 | RSI > 50 + 상승 기울기 | +20 |
 | 거래량+양봉 동반 (3일 중 2일+) | +20 |
@@ -300,8 +301,8 @@ python scanner.py
 
 | 합의 | 조건 | 설명 |
 |-----|------|-----|
-| 🟢🟢 **강한 일치** | 스크리너 S/A + MA buy + 신뢰도≥6 | 1순위 후보 |
-| 🟢 **부분 일치** | 스크리너 S/A + MA 보수적 | 추가 관찰 |
+| 🟢🟢 **강한 일치** | 스크리너 S/A + MA buy + 신뢰도≥7 | 1순위 후보 |
+| 🟢 **부분 일치** | 스크리너 S/A + MA buy(신뢰도 7 미만) 또는 neutral | 추가 관찰 |
 | ⚠️ **신호 충돌** | 스크리너 S/A + MA sell | 재검토 필요 |
 | 🟡 **이례적 매수** | 스크리너 C/D + MA buy | MA 근거 확인 |
 | ⚪ **동반 약세** | 스크리너 C/D + MA neutral/sell | 관망 |
@@ -446,7 +447,7 @@ python scanner.py
 ### 4.9 기타 페이지
 
 - **Dashboard**: 현재 분석 결과 요약 대시보드 + 시장 필터
-- **Detail**: 개별 종목 차트 + 16개 도구 결과
+- **Detail**: 개별 종목 차트 + 분석 도구 결과
 - **ML Predict**: LightGBM/XGBoost/LSTM 앙상블 예측 + SHAP
 - **Portfolio**: Markowitz / Risk Parity 최적화
 - **Ranking**: 멀티팩터 종목 순위
@@ -909,7 +910,7 @@ stock_auto/
 │
 ├── chart_agent_service/          ← 분석 엔진
 │   ├── service.py                ← FastAPI 서버
-│   ├── analysis_tools.py         ← 16개 분석 도구
+│   ├── analysis_tools.py         ← 24개 분석 도구 + 진입 계획
 │   ├── data_collector.py         ← yfinance + 지표 계산
 │   ├── screener.py               ← 한국 주식 스크리너 ⭐
 │   ├── entry_plan.py             ← 진입 계획 생성
@@ -967,8 +968,8 @@ stock_auto/
 - `GET /multi-agent/{ticker}` — Multi-Agent 분석
 
 **Screener** (신규):
-- `POST /screener/run` — 스크리너 실행
-- `POST /screener/pipeline` — 스크리너 + Multi-Agent 파이프라인
+- `POST /screener/run?min_market_cap_100m=2000&top_n=20` — 스크리너 실행
+- `POST /screener/pipeline?min_market_cap_100m=2000&top_n=20&analyze_top=5` — 스크리너 + Multi-Agent 파이프라인
 - `GET /screener/latest` — 최근 결과
 - `GET /screener/history` — 실행 이력
 
@@ -1006,7 +1007,7 @@ stock_auto/
 - `GET /weekly` — 주간 요약
 - `GET /scan-log` — 스캔 로그
 
-### 12.3 분석 도구 16개 (analysis_tools.py)
+### 12.3 분석 도구 24개 + 진입 계획 (analysis_tools.py)
 
 기술적 분석 (6):
 1. trend_ma_analysis — 이동평균 배열
@@ -1024,13 +1025,24 @@ stock_auto/
 11. support_resistance_analysis — 지지/저항
 12. correlation_regime_analysis — Hurst 체제
 
-리스크 관리 (4):
+리스크/이벤트 (5):
 13. risk_position_sizing — 포지션 사이징
 14. kelly_criterion_analysis — 켈리 기준
 15. beta_correlation_analysis — 베타
 16. event_driven_analysis — 이벤트
-+ insider_trading_analysis — 내부자 거래
-+ entry_plan_analysis — 진입 계획
+17. insider_trading_analysis — 내부자 거래
+
+확장 분석 (7):
+18. money_flow_index_analysis — 자금흐름지수
+19. rsi_mfi_combined_analysis — RSI+MFI 조합
+20. macd_rsi_cross_analysis — MACD+RSI 교차
+21. piotroski_fscore_analysis — 재무 건전성
+22. altman_zscore_analysis — 도산 위험
+23. institutional_flow_analysis — 외국인/공매도 수급
+24. dart_disclosure_analysis — DART 공시
+
+실행 계획:
++ entry_plan_analysis — 진입 계획 (방향 점수 제외)
 
 ### 12.4 7 에이전트 (Multi-Agent)
 

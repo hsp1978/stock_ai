@@ -119,7 +119,7 @@ def run_kr_screener():
         port = _os.getenv("API_PORT", "8100")
         # 장 마감 후 실행이므로 시총 기준 2천억 기본값
         r = httpx.post(
-            f"http://localhost:{port}/screener/run?min_market_cap_bn=2000&top_n=20",
+            f"http://localhost:{port}/screener/run?min_market_cap_100m=2000&top_n=20",
             timeout=600,
         )
         if r.status_code == 200:

@@ -3922,7 +3922,7 @@ def render_screener():
     # ── 상단 컨트롤 ─────────────────────────────
     c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
     with c1:
-        min_cap_bn = st.number_input(
+        min_cap_100m = st.number_input(
             "최소 시총 (억원)",
             min_value=100, max_value=100_000, value=2000, step=100,
             help="이 값 이상의 종목만 분석 대상"
@@ -3954,9 +3954,9 @@ def render_screener():
         if analyze_top == 0:
             # 스크리너만
             with st.status("한국 주식 스크리너 실행 중...", expanded=True) as status:
-                st.write(f"🔍 시총 {min_cap_bn:,}억원+ 종목 로딩...")
+                st.write(f"🔍 시총 {min_cap_100m:,}억원+ 종목 로딩...")
                 result = api_post(
-                    f"/screener/run?min_market_cap_bn={min_cap_bn}&top_n={top_n}",
+                    f"/screener/run?min_market_cap_100m={min_cap_100m}&top_n={top_n}",
                     timeout=900,
                 )
                 if result and "error" not in result:
@@ -3973,12 +3973,12 @@ def render_screener():
                 expanded=True,
             ) as status:
                 st.write("📡 1/2 · 스크리너로 후보 선별 중...")
-                st.write(f"   시총 {min_cap_bn:,}억원+ · 상위 {top_n}개")
+                st.write(f"   시총 {min_cap_100m:,}억원+ · 상위 {top_n}개")
                 st.write(f"🤖 2/2 · 상위 {analyze_top}개 Multi-Agent 심층 분석...")
                 st.write(f"   (병렬 실행, {analyze_top}개 × 약 60s ÷ WORKERS)")
 
                 result = api_post(
-                    f"/screener/pipeline?min_market_cap_bn={min_cap_bn}"
+                    f"/screener/pipeline?min_market_cap_100m={min_cap_100m}"
                     f"&top_n={top_n}&analyze_top={analyze_top}",
                     timeout=1800,
                 )

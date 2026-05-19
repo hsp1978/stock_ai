@@ -43,6 +43,7 @@ from data_collector_models import (
     CacheEntry,
     DataStaleError,
 )
+from data_sources.factory import get_data_source, get_data_source_name
 from data_sources.fdr_source import FdrSource
 from data_sources.pykrx_source import PykrxSource
 from data_sources.yfinance_source import YFinanceSource
@@ -77,6 +78,18 @@ def _get_ttl_seconds(period: str) -> float:
 def _is_fresh(entry: CacheEntry, period: str) -> bool:
     age = (datetime.now(timezone.utc) - entry.fetched_at).total_seconds()
     return age < _get_ttl_seconds(period)
+
+
+def _dedupe_sources(sources: list) -> list:
+    seen = set()
+    result = []
+    for source in sources:
+        name = getattr(source, "name", source.__class__.__name__)
+        if name in seen:
+            continue
+        seen.add(name)
+        result.append(source)
+    return result
 
 
 # ── tenacity retry 래퍼 ───────────────────────────────────────
@@ -119,10 +132,13 @@ def fetch_ohlcv_with_meta(
         return cached
 
     # 2. 소스 우선순위 결정
+    configured_source_name = get_data_source_name()
     if _is_korean_ticker(ticker):
         sources: list = [PykrxSource(), FdrSource(), YFinanceSource()]
     else:
         sources = [YFinanceSource(), FdrSource()]
+    if configured_source_name != "yfinance":
+        sources = _dedupe_sources([get_data_source(configured_source_name)] + sources)
 
     last_exc: Exception | None = None
     for source in sources:
@@ -151,7 +167,7 @@ def fetch_ohlcv(ticker: str, period: str = DEFAULT_HISTORY_PERIOD) -> pd.DataFra
     OHLCV DataFrame 반환 (backward-compatible).
 
     조회 순서:
-    1. 배치 프리페치 레거시 캐시 (prefetch_ohlcv_batch 호출 시)
+    1. 배치 프리페치 레거시 캐시 (prefetch_ohlcv_batch 호출 시, yfinance/미국 종목만)
     2. TTL-aware CacheEntry → 다중 소스 fallback
     """
     key = (ticker.upper(), period)
@@ -159,7 +175,12 @@ def fetch_ohlcv(ticker: str, period: str = DEFAULT_HISTORY_PERIOD) -> pd.DataFra
     # 1. 배치 캐시 (구형, 스캔 시 프리페치로 채워짐)
     with _ohlcv_cache_lock:
         legacy = _ohlcv_cache.get(key)
-    if legacy is not None and not legacy.empty:
+    if (
+        legacy is not None
+        and not legacy.empty
+        and get_data_source_name() == "yfinance"
+        and not _is_korean_ticker(ticker)
+    ):
         return legacy.copy()
 
     # 2. TTL 캐시 + 다중 소스 fallback
@@ -169,17 +190,32 @@ def fetch_ohlcv(ticker: str, period: str = DEFAULT_HISTORY_PERIOD) -> pd.DataFra
 
 def prefetch_ohlcv_batch(tickers: list, period: str = DEFAULT_HISTORY_PERIOD) -> None:
     """
-    전 종목 OHLCV를 yfinance 배치 다운로드로 한 번에 수집해 캐시.
+    미국 종목 OHLCV를 yfinance 배치 다운로드로 한 번에 수집해 캐시.
 
     순차 스캔에서 종목당 5~10초 절약 가능.
     스캔 시작 직전에 호출.
+    한국 종목은 pykrx/FDR 우선순위를 보존하기 위해 배치 캐시에 넣지 않는다.
     """
     if not tickers:
         return
+    if get_data_source_name() != "yfinance":
+        logger.info("[배치] DATA_SOURCE=%s 이므로 yfinance 배치 프리페치 생략", get_data_source_name())
+        return
+
+    batch_tickers = [t for t in tickers if not _is_korean_ticker(t)]
+    if not batch_tickers:
+        logger.info("[배치] yfinance 배치 대상 미국 종목 없음")
+        return
+
     try:
-        logger.info("[배치] %d개 종목 데이터 사전 다운로드 중...", len(tickers))
+        skipped = len(tickers) - len(batch_tickers)
+        logger.info(
+            "[배치] %d개 미국 종목 데이터 사전 다운로드 중... (한국 종목 %d개 제외)",
+            len(batch_tickers),
+            skipped,
+        )
         raw = yf.download(
-            tickers,
+            batch_tickers,
             period=period,
             auto_adjust=True,
             progress=False,
@@ -189,7 +225,7 @@ def prefetch_ohlcv_batch(tickers: list, period: str = DEFAULT_HISTORY_PERIOD) ->
             return
 
         if isinstance(raw.columns, pd.MultiIndex):
-            for t in tickers:
+            for t in batch_tickers:
                 t_up = t.upper()
                 try:
                     df_t = raw.xs(t, level=1, axis=1).copy()
@@ -199,7 +235,7 @@ def prefetch_ohlcv_batch(tickers: list, period: str = DEFAULT_HISTORY_PERIOD) ->
                 except KeyError:
                     pass
         else:
-            t_up = tickers[0].upper()
+            t_up = batch_tickers[0].upper()
             with _ohlcv_cache_lock:
                 _ohlcv_cache[(t_up, period)] = raw.copy()
 

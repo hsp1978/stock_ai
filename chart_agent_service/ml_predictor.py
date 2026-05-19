@@ -84,12 +84,14 @@ def _build_features(df: pd.DataFrame) -> pd.DataFrame:
         lambda x: x.weekday() if hasattr(x, "weekday") else 0
     )
 
-    return feat
+    return feat.replace([np.inf, -np.inf], np.nan)
 
 
 def _build_target(df: pd.DataFrame, horizon: int = 5) -> pd.Series:
     future_ret = df["Close"].shift(-horizon) / df["Close"] - 1
-    return (future_ret > 0).astype(int)
+    target = (future_ret > 0).astype("float64")
+    target[future_ret.isna()] = np.nan
+    return target
 
 
 def train_predict(ticker: str, df: pd.DataFrame,
@@ -110,7 +112,7 @@ def train_predict(ticker: str, df: pd.DataFrame,
         return {"error": "데이터 부족 (최소 100개 필요)", "ticker": ticker, "rows": len(combined)}
 
     X = combined.drop("target", axis=1)
-    y = combined["target"]
+    y = combined["target"].astype(int)
 
     train_size = int(len(X) * 0.8)
     X_train, X_test = X.iloc[:train_size], X.iloc[train_size:]
@@ -245,7 +247,7 @@ def train_predict_lgb(ticker: str, df: pd.DataFrame, horizon: int = 5) -> dict:
         return {"error": "데이터 부족", "ticker": ticker, "rows": len(combined)}
 
     X = combined.drop("target", axis=1)
-    y = combined["target"]
+    y = combined["target"].astype(int)
 
     train_size = int(len(X) * 0.8)
     X_train, X_test = X.iloc[:train_size], X.iloc[train_size:]
@@ -321,7 +323,7 @@ def train_predict_xgb(ticker: str, df: pd.DataFrame, horizon: int = 5) -> dict:
         return {"error": "데이터 부족", "ticker": ticker, "rows": len(combined)}
 
     X = combined.drop("target", axis=1)
-    y = combined["target"]
+    y = combined["target"].astype(int)
 
     train_size = int(len(X) * 0.8)
     X_train, X_test = X.iloc[:train_size], X.iloc[train_size:]
@@ -399,22 +401,31 @@ def train_predict_lstm(ticker: str, df: pd.DataFrame, horizon: int = 5, lookback
         return {"error": f"데이터 부족 (최소 {lookback + 50}개 필요)", "ticker": ticker}
 
     X = combined.drop("target", axis=1).values
-    y = combined["target"].values
+    y = combined["target"].astype(int).values
 
-    # 스케일링
+    train_cut = int(len(X) * 0.8)
+    if train_cut <= lookback or train_cut >= len(X):
+        return {"error": "학습/테스트 분할 불가", "ticker": ticker}
+
+    # 스케일링: 학습 구간으로만 fit하여 테스트/최신 구간 누수 방지
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    scaler.fit(X[:train_cut])
+    X_scaled = scaler.transform(X)
 
     # 시계열 윈도우 생성 (lookback 기간)
-    X_seq, y_seq = [], []
+    X_seq, y_seq, target_indices = [], [], []
     for i in range(lookback, len(X_scaled)):
         X_seq.append(X_scaled[i-lookback:i])
         y_seq.append(y[i])
+        target_indices.append(i)
     X_seq, y_seq = np.array(X_seq), np.array(y_seq)
+    target_indices = np.array(target_indices)
 
-    train_size = int(len(X_seq) * 0.8)
-    X_train, X_test = X_seq[:train_size], X_seq[train_size:]
-    y_train, y_test = y_seq[:train_size], y_seq[train_size:]
+    train_mask = target_indices < train_cut
+    X_train, X_test = X_seq[train_mask], X_seq[~train_mask]
+    y_train, y_test = y_seq[train_mask], y_seq[~train_mask]
+    if len(X_train) == 0 or len(X_test) == 0:
+        return {"error": "LSTM 학습/테스트 시퀀스 부족", "ticker": ticker}
 
     # LSTM 모델
     model = keras.Sequential([
@@ -499,16 +510,36 @@ def run_ml_prediction(ticker: str, df: pd.DataFrame, ensemble: bool = True) -> d
         except Exception as e:
             print(f"  [LSTM 오류] {e}")
 
-    # 앙상블 예측 (가중 평균)
+    # 앙상블 예측 (성능 기반 가중 평균)
     valid_models = [r for r in results.values() if not r.get("error")]
     if valid_models:
-        ensemble_up_prob = np.mean([r.get("up_probability", 0.5) for r in valid_models])
+        weights = []
+        probs = []
+        model_weights = {}
+        for r in valid_models:
+            prob = float(r.get("up_probability", 0.5))
+            acc = float(r.get("test_accuracy", 0.0) or 0.0)
+            weight = max(acc, 0.0)
+            weights.append(weight)
+            probs.append(prob)
+            model_weights[r.get("tool", "unknown")] = round(weight, 4)
+        total_weight = float(np.sum(weights))
+        if total_weight > 0:
+            ensemble_up_prob = float(np.average(probs, weights=weights))
+            ensemble_method = "accuracy_weighted"
+        else:
+            ensemble_up_prob = float(np.mean(probs))
+            ensemble_method = "simple_mean_fallback"
         ensemble_pred = "UP" if ensemble_up_prob > 0.5 else "DOWN"
         ensemble_signal = "buy" if ensemble_up_prob > 0.6 else ("sell" if ensemble_up_prob < 0.4 else "neutral")
+        avg_accuracy = float(np.mean([r.get("test_accuracy", 0.0) for r in valid_models]))
     else:
         ensemble_up_prob = 0.5
         ensemble_pred = "HOLD"
         ensemble_signal = "neutral"
+        ensemble_method = "no_valid_model"
+        model_weights = {}
+        avg_accuracy = 0.0
 
     best = max(results.values(), key=lambda x: x.get("test_accuracy", 0) if not x.get("error") else 0)
 
@@ -520,6 +551,9 @@ def run_ml_prediction(ticker: str, df: pd.DataFrame, ensemble: bool = True) -> d
             "up_probability": round(float(ensemble_up_prob), 4),
             "signal": ensemble_signal,
             "model_count": len(valid_models),
+            "method": ensemble_method,
+            "model_weights": model_weights,
+            "avg_accuracy": round(avg_accuracy, 4),
         },
         "best_model": best.get("tool", "rf_5d"),
         "best_prediction": best.get("prediction", "?"),

@@ -44,6 +44,13 @@ def _buy_signals(n: int = 4, conf: float = 8.0) -> list[AgentSignal]:
     ]
 
 
+def _sell_signals(n: int = 4, conf: float = 8.0) -> list[AgentSignal]:
+    return [
+        AgentSignal(agent_name=f"Agent{i}", signal="sell", confidence=conf)
+        for i in range(n)
+    ]
+
+
 def _ml(n: int = 2, score: float = 0.7) -> list[MLPrediction]:
     return [MLPrediction(model_name=f"Model{i}", score=score) for i in range(n)]
 
@@ -185,6 +192,23 @@ def test_conviction_mixed_signals():
     )
     # 중립 → wait
     assert decision.action == "wait" or decision.conviction <= 0.6
+
+
+def test_strong_sell_creates_sell_decision():
+    """강한 SELL 합의는 낮은 conviction이 아니라 sell action으로 이어져야 한다."""
+    decision = AGG.aggregate(
+        ticker="NVDA",
+        agent_signals=_sell_signals(4, 9.0),
+        ml_signals=_ml(2, 0.2),
+        tool_outputs=_tools(-7.0),
+        active_positions={},
+        atr=_ATR,
+        price=_PRICE,
+        nav=_NAV,
+    )
+    assert decision.action == "sell"
+    assert decision.qty > 0
+    assert decision.conviction >= 0.5
 
 
 # ── per_ticker 10% 초과 → 자동 축소 ─────────────────────────────────

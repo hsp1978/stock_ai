@@ -23,9 +23,8 @@ from typing import Dict, List, Optional
 import httpx
 import uvicorn
 import math
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 from pydantic import BaseModel
 
@@ -36,6 +35,7 @@ from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, OUTPUT_DIR,
     COOLING_OFF_DAYS, TRADING_STYLE,
 )
+from safety.kill_switch import KillSwitchASGIMiddleware
 from data_collector import fetch_ohlcv, calculate_indicators, fetch_fundamentals, fetch_options_pcr, fetch_insider_trades
 from analysis_tools import ChartAnalysisAgent, generate_agent_chart
 from backtest_engine import run_all_backtests
@@ -249,7 +249,7 @@ def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
         except Exception as e:
             print(f"  [{ticker}] 내부자 거래 수집 실패: {e}")
 
-        print(f"  [{ticker}] 16개 기법 분석...")
+        print(f"  [{ticker}] 분석 도구 실행...")
         agent = ChartAnalysisAgent(ticker, df)
         result = agent.run(mode=ai_mode)
 
@@ -546,27 +546,14 @@ def _sanitize(obj):
 
 app = FastAPI(
     title="Chart Analysis Agent",
-    description="16개 기법 차트 분석 에이전트 + 퀀트 시스템 API",
+    description="24개 분석 도구 + 진입 계획 차트 분석 에이전트 + 퀀트 시스템 API",
     version="1.0.0",
 )
 
 
 # ── GlobalKillSwitch 미들웨어 ─────────────────────────────────────────
 
-class KillSwitchMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        from safety.kill_switch import _is_kill_switch_protected, get_kill_switch
-        if _is_kill_switch_protected(request.url.path, request.method):
-            blocked, reason = get_kill_switch().is_blocked()
-            if blocked:
-                return JSONResponse(
-                    status_code=423,
-                    content={"detail": "kill_switch_active", "reason": reason},
-                )
-        return await call_next(request)
-
-
-app.add_middleware(KillSwitchMiddleware)
+app.add_middleware(KillSwitchASGIMiddleware)
 
 
 @app.get("/")
@@ -1563,15 +1550,21 @@ def api_telegram_process_callbacks():
 
 # ─── Screener (한국 주식 기술적 스크리너 V1) ──────────
 @app.post("/screener/run")
-def api_screener_run(min_market_cap_bn: float = 2000, top_n: int = 20):
+def api_screener_run(
+    min_market_cap_100m: float = 2000,
+    top_n: int = 20,
+    min_market_cap_bn: Optional[float] = None,
+):
     """
     한국 주식 스크리너 수동 실행.
-    - min_market_cap_bn: 최소 시총 (억원 단위, 기본 2000 = 2천억)
+    - min_market_cap_100m: 최소 시총 (억원 단위, 기본 2000 = 2천억)
+    - min_market_cap_bn: 기존 호환용 alias (실제 단위는 억원)
     - top_n: 상위 몇 개 반환 (기본 20)
     """
     from screener import run_screener
     # 억원 → 원
-    min_cap = float(min_market_cap_bn) * 1e8
+    min_cap_100m = min_market_cap_bn if min_market_cap_bn is not None else min_market_cap_100m
+    min_cap = float(min_cap_100m) * 1e8
     return run_screener(min_market_cap=min_cap, top_n=int(top_n), save_db=True)
 
 
@@ -1591,21 +1584,24 @@ def api_screener_history(days_back: int = 30):
 
 @app.post("/screener/pipeline")
 def api_screener_pipeline(
-    min_market_cap_bn: float = 2000,
+    min_market_cap_100m: float = 2000,
     top_n: int = 20,
     analyze_top: int = 5,
+    min_market_cap_bn: Optional[float] = None,
 ):
     """
     스크리너 → Multi-Agent 자동 파이프라인.
 
-    - min_market_cap_bn: 최소 시총 (억원, 기본 2000)
+    - min_market_cap_100m: 최소 시총 (억원, 기본 2000)
+    - min_market_cap_bn: 기존 호환용 alias (실제 단위는 억원)
     - top_n: 스크리너 상위 몇 개 (기본 20)
     - analyze_top: 그 중 Multi-Agent 자동 심층 분석할 상위 개수 (기본 5)
 
     소요: 약 5~7분 (스크리너 2분 + Multi-Agent 5개 × 1분 병렬)
     """
     from screener import run_screener_with_multiagent
-    min_cap = float(min_market_cap_bn) * 1e8
+    min_cap_100m = min_market_cap_bn if min_market_cap_bn is not None else min_market_cap_100m
+    min_cap = float(min_cap_100m) * 1e8
     return run_screener_with_multiagent(
         min_market_cap=min_cap,
         top_n=int(top_n),
