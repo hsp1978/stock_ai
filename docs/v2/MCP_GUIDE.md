@@ -10,7 +10,7 @@ Stock AI Agent를 MCP (Model Context Protocol) 서버로 실행하여 Claude Des
 # 기본 서버 (6개 도구)
 python mcp_server.py
 
-# 확장 서버 (21개 도구)
+# 확장 서버 (22개 도구)
 python mcp_server_extended.py
 ```
 

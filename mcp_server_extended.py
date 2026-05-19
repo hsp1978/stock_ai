@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Stock AI Agent MCP Server - Extended Version
-21개 도구 (5개 핵심 + 16개 개별 분석 도구) 노출
+22개 도구 (5개 핵심 + 16개 개별 분석 도구 + 1개 시스템정보) 노출
 Week 1 Day 3-4: 전체 도구 노출
 """
 
@@ -50,7 +50,7 @@ class StockAIServerExtended:
 
         @self.server.list_tools()
         async def handle_list_tools() -> list[types.Tool]:
-            """21개 도구 목록 반환"""
+            """22개 도구 목록 반환"""
             tools = []
 
             # === 5개 핵심 도구 ===

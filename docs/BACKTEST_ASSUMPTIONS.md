@@ -26,7 +26,7 @@
 
 ## Survivorship Bias
 
-- 워치리스트 13종목은 현재 시점에서 선택됨 → 명시적 한계
+- 워치리스트(현재 7종목)는 현재 시점에서 선택됨 → 명시적 한계
 - 백테스트 결과는 universe selection bias 포함
 
 ## Risk-Free Rate

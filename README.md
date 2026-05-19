@@ -34,10 +34,10 @@ open http://localhost:8501              # Streamlit WebUI
 | Quant Analyst | 통계 모델 6개 | Mac Studio | qwen2.5:32b |
 | Risk Manager | Kelly, ATR 포지션 사이징 | Mac Studio | qwen2.5:32b |
 | ML Specialist | 5모델 앙상블 + SHAP | Mac Studio | qwen2.5:32b |
-| Geopolitical Analyst | 거시/지정학 분석 | Gemini | gemini-pro |
-| Event Analyst | 뉴스, 내부자 거래 | Gemini | gemini-pro |
-| Value Investor | 재무제표, 밸류에이션 | Gemini | gemini-pro |
-| **Decision Maker** | 충돌 해결 + 최종 판단 | Gemini | gemini-pro |
+| Geopolitical Analyst | 거시/지정학 분석 | Gemini | gemini-2.0-flash |
+| Event Analyst | 뉴스, 내부자 거래 | Gemini | gemini-2.0-flash |
+| Value Investor | 재무제표, 밸류에이션 | Gemini | gemini-2.0-flash |
+| **Decision Maker** | 충돌 해결 + 최종 판단 | Gemini | gemini-2.0-flash |
 
 흐름: 7개 에이전트 병렬 실행 → 각자 buy/sell/neutral + confidence(0~10) → Decision Maker 가 충돌 해결 + 최종 리포트.
 
@@ -109,7 +109,7 @@ Walk-Forward (3 split 평균):
 }
 ```
 
-기본 6 도구 (`mcp_server.py`) 또는 확장 21 도구 (`mcp_server_extended.py`). 상세: [`docs/v2/MCP_GUIDE.md`](docs/v2/MCP_GUIDE.md).
+기본 6 도구 (`mcp_server.py`) 또는 확장 22 도구 (`mcp_server_extended.py`). 상세: [`docs/v2/MCP_GUIDE.md`](docs/v2/MCP_GUIDE.md).
 
 ---
 
@@ -168,7 +168,7 @@ archive/                  # legacy scripts/docs/setup
 - [`docs/PHASE_1_MAC_STUDIO.md`](docs/PHASE_1_MAC_STUDIO.md) — Mac Studio Tailscale 셋업
 - [`docs/PHASE_3_OPERATION.md`](docs/PHASE_3_OPERATION.md) — Compose 운영 가이드
 - [`docs/USER_MANUAL.md`](docs/USER_MANUAL.md) — WebUI 사용법
-- [`docs/v2/MCP_GUIDE.md`](docs/v2/MCP_GUIDE.md) — MCP 21 도구
+- [`docs/v2/MCP_GUIDE.md`](docs/v2/MCP_GUIDE.md) — MCP 22 도구
 
 ---
 

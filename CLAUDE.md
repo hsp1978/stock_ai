@@ -49,8 +49,8 @@ stock_auto/
 ├ docs/
 │  ├ CONSULTING_BRIEF.md                # 도메인 컨설팅 (분석/리스크/데이터)
 │  ├ ARCHITECTURE_BRIEF.md              # 시스템 아키텍처 컨설팅
-│  ├ MULTIAGENT_TECHNICAL_RECONSULTING.md  # 멀티에이전트+기술적 분석 재컨설팅
-│  └ EXECUTION_PLAN.md                  # 단계별 작업 지시서 (P0+P1)
+│  ├ BACKTEST_ASSUMPTIONS.md            # Slippage/수수료/rf 가정
+│  └ USER_MANUAL.md                     # WebUI 사용법
 ├ chart_agent_service/                  # FastAPI agent-api
 │  ├ service.py (19 endpoints)
 │  ├ config.py  (Pydantic Settings 60+ field)
@@ -68,7 +68,7 @@ stock_auto/
 │  ├ dual_node_config.py (라우팅/폴백)
 │  ├ local_engine.py (in-proc / HTTP 분기)
 │  └ watchlist.txt
-└ tests/                                # 현재 비어 있음 — 부활 대상
+└ tests/                                # unit/ 18 files (P2 정비 완료, CI 미구축)
 ```
 
 ---
@@ -145,7 +145,6 @@ make help
 
 <body>
 
-Refs: docs/EXECUTION_PLAN.md#step-N
 ```
 - type: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`, `perf`
 - scope: `kill-switch`, `signal-agg`, `cache`, `mfi`, `regime`, `agent-group`, `llm-router`, ...
@@ -169,24 +168,17 @@ Refs: docs/EXECUTION_PLAN.md#step-N
 
 ## 7. 통합 로드맵
 
-### 0–3개월 P0+P1 (현재 진행 대상)
-`docs/EXECUTION_PLAN.md`에 12 단계로 분해. 단일 개발자 5–7주 공수.
+### P0+P1+P2 — 완료 (2026-05-14)
+12 단계 EXECUTION_PLAN + P2 (F-Score/Z-Score, VaR/CVaR, DSR+PBO, LLM calibration, IC ensemble, pykrx 외국인/공매도, DART) 모두 머지. tests/ 18 files.
 
-### 3–6개월 P2
-- Piotroski F-Score / Altman Z-Score 도구
-- VaR/CVaR 일일 계산
-- DSR + PBO 백테스트 검증
-- LLM confidence calibration (ECE + isotonic)
-- IC-weighted ensemble (signal_outcomes 60일 누적 후)
-- pykrx 외국인/공매도 통합
-- DART API 통합
-
-### 6–12개월 P3 (선택)
+### P3 — 데이터 누적 후 재검토 (선택)
 - HMM regime detector
 - Contextual bandit 에이전트 가중치
 - Black-Litterman 포트폴리오 비중
 - ML 라벨 회귀화
 - CPCV 백테스트
+
+현재 단계: paper trading 운영 + signal_outcomes 누적 (60일 hit-rate 검증).
 
 ---
 
@@ -221,7 +213,7 @@ Refs: docs/EXECUTION_PLAN.md#step-N
 2. **측정 가능성 > 최적화**: signal_outcomes 없는 상태에서 ML 튜닝 금지.
 3. **명시적 가정 > 암묵적 가정**: 백테스트 슬리피지·수수료·rf 명시 후 결과 보고.
 4. **단순 fallback > 정교 합의**: 분산 합의 알고리즘 도입보다 단순 weighted majority 우선.
-5. **로컬 운영 비용 > 클라우드 정교함**: NATS/Kafka 등 메시지 브로커는 현재 규모(13종목, 1사용자)에서 보류.
+5. **로컬 운영 비용 > 클라우드 정교함**: NATS/Kafka 등 메시지 브로커는 현재 규모(7종목, 1사용자)에서 보류.
 6. **paper trading 검증 60일 > 즉시 live 전환**: 새 도구 추가 후 paper 운영 60일 hit-rate 검증 통과 시에만 live 후보.
 
 ---
@@ -230,17 +222,14 @@ Refs: docs/EXECUTION_PLAN.md#step-N
 
 새 세션 시작 시:
 1. `git pull origin main`
-2. `git checkout -b feature/<step-name>` (각 EXECUTION_PLAN 단계 = 별도 브랜치)
-3. `docs/EXECUTION_PLAN.md`의 해당 단계 섹션 열기
-4. 단계의 "변경 파일" 섹션 먼저 확인
-5. 변경 → 테스트 → 커밋 → PR
+2. `git checkout -b feature/<scope>` (변경 단위별 브랜치)
+3. 변경 → 테스트 → 커밋 → PR
 
-세션이 길어지면 `/compact`로 컨텍스트 축소. 단계 완료 후 `/clear` 권장.
+세션이 길어지면 `/compact`로 컨텍스트 축소. 작업 단위 완료 후 `/clear` 권장.
 
 PR 머지 시:
-1. `pytest` 통과 확인
+1. `pytest` 통과 확인 (CI 부재 — 수동)
 2. `docker compose --profile dev up -d` 재기동 후 `/health` 정상 확인
-3. `docs/EXECUTION_PLAN.md`의 해당 단계에 ✅ 마크 추가
 
 ---
 
@@ -255,7 +244,7 @@ PR 머지 시:
 | 5 | 양방향 sys.path 주입 | P2 |
 | 6 | 모델 버전 미핀 (`qwen3:14b-q4_K_M`) | P2 |
 | 7 | 매직 포트 8080 (3곳 흩어짐) | P2 |
-| 8 | 빈 `tests/` + CI 부재 | P2 |
+| 8 | CI 부재 (tests/ 18 files 존재) | P2 후속 |
 | 9 | 차트 PNG 무한 누적 | 시스템 P1 |
 | 10 | README ↔ 코드 라우팅 불일치 | P2 |
 | 11 | 프롬프트 인젝션 표면 | Step 9 (structured output) |
@@ -266,8 +255,9 @@ PR 머지 시:
 
 - `docs/CONSULTING_BRIEF.md` — 사용자 작성 도메인 브리프
 - `docs/ARCHITECTURE_BRIEF.md` — 사용자 작성 시스템 브리프
-- `docs/MULTIAGENT_TECHNICAL_RECONSULTING.md` — 멀티에이전트+기술적 분석 재컨설팅
-- `docs/EXECUTION_PLAN.md` — 본 CLAUDE.md의 행동 사양
+- `docs/BACKTEST_ASSUMPTIONS.md` — Slippage/수수료/rf 가정 (Step 10)
+- `docs/USER_MANUAL.md` — WebUI 사용법
+- `docs/PHASE_1_MAC_STUDIO.md` / `PHASE_3_OPERATION.md` — 듀얼 노드 셋업/운영
 
 ---
 

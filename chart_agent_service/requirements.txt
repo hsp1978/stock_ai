@@ -27,3 +27,6 @@ pydantic-settings>=2.0
 litellm>=1.83.0
 tenacity>=9.0.0
 circuitbreaker>=2.1.0
+
+# ── 거래일 캘린더 (Step 11) ──
+pandas_market_calendars>=4.4.0
