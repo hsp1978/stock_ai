@@ -999,6 +999,13 @@ stock_auto/
 - `GET /trading/orders/recent` — 최근 주문
 - `POST /trading/approval/{id}/approve` — 주문 승인
 
+**User Action Log (WebUI 행위 추적)**:
+- `POST /user-action` — 행위 1건 기록 (body: action_type, page, ticker, query, metadata, session_id)
+- `GET /user-action/recent?limit=&action_type=&ticker=` — 최근 행위 조회
+- `GET /user-action/stats?days_back=7` — 행위 타입별/종목별 집계
+
+기록되는 action_type: `page_view`, `manual_scan`, `ticker_search`, `watchlist_edit`, `export`, `other`. 자기 검색 패턴·페이지 사용 통계 확인 용도. scan_log(분석 결과)와는 독립.
+
 **기타**:
 - `GET /paper` — 페이퍼 트레이딩 상태
 - `GET /backtest/{ticker}` — 백테스트

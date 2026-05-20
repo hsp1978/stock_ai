@@ -78,6 +78,9 @@ CREATE INDEX IF NOT EXISTS idx_so_source_issued ON signal_outcomes(signal_source
 CREATE INDEX IF NOT EXISTS idx_so_regime        ON signal_outcomes(regime);
 CREATE INDEX IF NOT EXISTS idx_screener_run     ON screener_results(run_id);
 CREATE INDEX IF NOT EXISTS idx_screener_ticker  ON screener_results(ticker);
+CREATE INDEX IF NOT EXISTS idx_ual_occurred     ON user_action_log(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_ual_action_type  ON user_action_log(action_type);
+CREATE INDEX IF NOT EXISTS idx_ual_ticker       ON user_action_log(ticker);
 """
 
 _CREATE_KILL_SWITCH_TABLE = """
@@ -93,6 +96,20 @@ CREATE TABLE IF NOT EXISTS kill_switch_events (
 );
 CREATE INDEX IF NOT EXISTS idx_kse_triggered_at ON kill_switch_events(triggered_at);
 CREATE INDEX IF NOT EXISTS idx_kse_action       ON kill_switch_events(action);
+"""
+
+# 사용자 행위 로그 — WebUI 페이지 진입/수동 스캔/검색 등 (scan_log 와 별도)
+_CREATE_USER_ACTION_TABLE = """
+CREATE TABLE IF NOT EXISTS user_action_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at  TEXT    NOT NULL,
+    action_type  TEXT    NOT NULL,      -- page_view | ticker_search | manual_scan | watchlist_edit | export | other
+    page         TEXT,                   -- Streamlit 페이지 / 화면 식별자
+    ticker       TEXT,                   -- 액션 대상 종목 (있을 때)
+    query        TEXT,                   -- 검색어 / 입력 값
+    metadata     TEXT,                   -- JSON 추가 컨텍스트 (선택)
+    session_id   TEXT                    -- Streamlit session_state UUID (선택)
+);
 """
 
 # 스크리너 결과 테이블 — 기존 scan_log와 완전 분리 (SSOT, 스키마 오염 방지)
@@ -150,6 +167,7 @@ def init_db():
     conn.execute(_CREATE_OUTCOMES_TABLE)
     conn.executescript(_CREATE_SIGNAL_PERF_VIEW)
     conn.execute(_CREATE_SCREENER_TABLE)
+    conn.execute(_CREATE_USER_ACTION_TABLE)
     conn.executescript(_CREATE_KILL_SWITCH_TABLE)
     # entry_price 컬럼 마이그레이션 (기존 DB 호환)
     try:
@@ -507,3 +525,101 @@ def get_screener_history(days_back: int = 30) -> dict:
     ).fetchall()
     conn.close()
     return {"runs": [dict(r) for r in runs]}
+
+
+# ─── 사용자 행위 로그 (user_action_log) ────────────────────────────────
+
+
+def insert_user_action(
+    action_type: str,
+    page: str | None = None,
+    ticker: str | None = None,
+    query: str | None = None,
+    metadata: dict | None = None,
+    session_id: str | None = None,
+) -> int:
+    """WebUI 사용자 행위 1건 기록 (실패 시 0 반환, 호출자에 예외 전파하지 않음)."""
+    import json as _json
+
+    try:
+        conn = _get_conn()
+        cur = conn.execute(
+            """INSERT INTO user_action_log
+               (occurred_at, action_type, page, ticker, query, metadata, session_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                datetime.now().isoformat(),
+                action_type,
+                page,
+                ticker.upper() if ticker else None,
+                query,
+                _json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                session_id,
+            ),
+        )
+        new_id = cur.lastrowid or 0
+        conn.commit()
+        conn.close()
+        return int(new_id)
+    except Exception as exc:
+        print(f"[DB] user_action_log insert 실패: {exc}")
+        return 0
+
+
+def get_user_actions(
+    limit: int = 100,
+    offset: int = 0,
+    action_type: str | None = None,
+    ticker: str | None = None,
+) -> dict:
+    """사용자 행위 로그 페이지네이션 조회."""
+    where = []
+    params: list = []
+    if action_type:
+        where.append("action_type = ?")
+        params.append(action_type)
+    if ticker:
+        where.append("ticker = ?")
+        params.append(ticker.upper())
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    conn = _get_conn()
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM user_action_log {where_sql}", params
+    ).fetchone()[0]
+    rows = conn.execute(
+        f"""SELECT * FROM user_action_log {where_sql}
+            ORDER BY id DESC LIMIT ? OFFSET ?""",
+        [*params, int(limit), int(offset)],
+    ).fetchall()
+    conn.close()
+    return {"total": total, "actions": [dict(r) for r in rows]}
+
+
+def get_user_action_stats(days_back: int = 7) -> dict:
+    """최근 N일 행위 타입별 / 종목별 집계."""
+    cutoff = (datetime.now() - timedelta(days=days_back)).isoformat()
+    conn = _get_conn()
+    by_type = conn.execute(
+        """SELECT action_type, COUNT(*) AS count
+           FROM user_action_log
+           WHERE occurred_at >= ?
+           GROUP BY action_type
+           ORDER BY count DESC""",
+        (cutoff,),
+    ).fetchall()
+    by_ticker = conn.execute(
+        """SELECT ticker, COUNT(*) AS count
+           FROM user_action_log
+           WHERE occurred_at >= ? AND ticker IS NOT NULL
+           GROUP BY ticker
+           ORDER BY count DESC
+           LIMIT 20""",
+        (cutoff,),
+    ).fetchall()
+    conn.close()
+    return {
+        "days_back": days_back,
+        "by_action_type": [dict(r) for r in by_type],
+        "top_tickers": [dict(r) for r in by_ticker],
+    }

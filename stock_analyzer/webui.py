@@ -667,6 +667,43 @@ def api_post(path: str, timeout: int = 300, json_body: dict = None):
         return None
 
 
+def _get_session_id() -> str:
+    """Streamlit session 당 1회 생성되는 UUID — user_action_log 트래킹용."""
+    if "_action_log_sid" not in st.session_state:
+        import uuid as _uuid
+        st.session_state._action_log_sid = _uuid.uuid4().hex[:16]
+    return st.session_state._action_log_sid
+
+
+def log_action(
+    action_type: str,
+    page: str | None = None,
+    ticker: str | None = None,
+    query: str | None = None,
+    metadata: dict | None = None,
+) -> None:
+    """WebUI 행위 로깅 헬퍼. 실패해도 UI 흐름을 막지 않는다.
+
+    action_type 권장 값: page_view, ticker_search, manual_scan,
+    watchlist_edit, export, other.
+    """
+    try:
+        api_post(
+            "/user-action",
+            timeout=3,
+            json_body={
+                "action_type": action_type,
+                "page": page,
+                "ticker": ticker,
+                "query": query,
+                "metadata": metadata,
+                "session_id": _get_session_id(),
+            },
+        )
+    except Exception:
+        pass  # 로깅 실패가 UI를 막지 않도록
+
+
 def get_chart_url(ticker: str) -> str:
     """local_engine 모드: 파일 경로 반환 / HTTP 모드: URL 반환"""
     if _USE_LOCAL_ENGINE:
@@ -1260,6 +1297,7 @@ def add_to_watchlist(ticker: str) -> tuple[bool, str]:
 
     current.append(resolved_ticker)
     save_watchlist(current)
+    log_action("watchlist_edit", ticker=resolved_ticker, metadata={"op": "add"})
 
     # 성공 메시지에 회사명 포함
     if "✅" in message:
@@ -1275,6 +1313,7 @@ def remove_from_watchlist(ticker: str) -> tuple[bool, str]:
         return False, f"{ticker} not found"
     current.remove(ticker)
     save_watchlist(current)
+    log_action("watchlist_edit", ticker=ticker, metadata={"op": "remove"})
     return True, f"{ticker} removed"
 
 
@@ -1360,6 +1399,12 @@ with st.sidebar:
             if hint:
                 st.info(hint)
             if resolved:
+                log_action(
+                    "manual_scan",
+                    page="sidebar",
+                    ticker=resolved,
+                    query=scan_ticker,
+                )
                 with st.spinner(f"Analyzing {resolved}..."):
                     result = api_post(f"/scan/{resolved}")
                     if result:
@@ -2368,6 +2413,7 @@ def _render_tool_detail_card(td: dict, ticker: str = ""):
 
 
 def render_detail():
+    log_action("page_view", page="detail")
     st.markdown("""
     <div class="page-header">
         <div class="page-title">Detail Analysis</div>
@@ -3144,6 +3190,7 @@ def render_paper_trade():
 # ═══════════════════════════════════════════════════════════════
 
 def render_multi_agent():
+    log_action("page_view", page="multi_agent")
     st.markdown("""
     <div class="page-header">
         <div class="page-title">🤖 Multi-Agent Analysis</div>
@@ -3249,6 +3296,11 @@ def render_multi_agent():
             st.write("📊 1/3 · 단일 LLM 분석 (V1.0) 진행 중...")
             single_result = api_get(f"/results/{resolved_ticker}")
             if not single_result:
+                log_action(
+                    "manual_scan",
+                    page="multi_agent",
+                    ticker=resolved_ticker,
+                )
                 single_result = api_post(f"/scan/{resolved_ticker}")
 
             # Multi-Agent 분석 (백엔드가 8개 에이전트 병렬 실행)

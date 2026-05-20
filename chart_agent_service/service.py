@@ -1176,6 +1176,59 @@ def api_scan_log_ticker(ticker: str, limit: int = 30):
     return get_scan_logs_by_ticker(ticker, limit)
 
 
+# ─── 사용자 행위 로그 (user_action_log) ────────────────
+
+
+class UserActionBody(BaseModel):
+    action_type: str
+    page: Optional[str] = None
+    ticker: Optional[str] = None
+    query: Optional[str] = None
+    metadata: Optional[Dict] = None
+    session_id: Optional[str] = None
+
+
+@app.post("/user-action")
+def api_log_user_action(body: UserActionBody):
+    """WebUI 사용자 행위 1건 기록.
+
+    action_type 권장 값: page_view, ticker_search, manual_scan,
+    watchlist_edit, export, other.
+    실패해도 호출자에 예외 전파하지 않으며 id=0 반환.
+    """
+    from db import insert_user_action
+    new_id = insert_user_action(
+        action_type=body.action_type,
+        page=body.page,
+        ticker=body.ticker,
+        query=body.query,
+        metadata=body.metadata,
+        session_id=body.session_id,
+    )
+    return {"ok": new_id > 0, "id": new_id}
+
+
+@app.get("/user-action/recent")
+def api_user_action_recent(
+    limit: int = 100,
+    offset: int = 0,
+    action_type: Optional[str] = None,
+    ticker: Optional[str] = None,
+):
+    """최근 사용자 행위 로그 (필터 옵션: action_type, ticker)."""
+    from db import get_user_actions
+    return get_user_actions(
+        limit=limit, offset=offset, action_type=action_type, ticker=ticker
+    )
+
+
+@app.get("/user-action/stats")
+def api_user_action_stats(days_back: int = 7):
+    """최근 N일 행위 타입별 / 종목별 집계."""
+    from db import get_user_action_stats
+    return get_user_action_stats(days_back=days_back)
+
+
 @app.get("/weekly")
 def api_weekly(weeks_ago: int = 0):
     """주간 요약 리포트 (?weeks_ago=0 이번주, 1 지난주)"""
