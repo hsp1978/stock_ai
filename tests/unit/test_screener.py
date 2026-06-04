@@ -12,6 +12,7 @@ if _AGENT_DIR not in sys.path:  # noqa: E402
     sys.path.insert(0, _AGENT_DIR)
 
 import screener  # noqa: E402
+from decision_context import build_decision_context  # noqa: E402
 
 
 def _ohlcv(rows: int = 80, start: float = 100.0, step: float = 1.0) -> pd.DataFrame:
@@ -115,3 +116,62 @@ def test_korean_screener_keeps_pykrx_priority_without_yfinance_prefetch(monkeypa
     assert prefetch_calls == []
     assert result["analyzed_count"] == 1
     assert result["results"][0]["ticker"] == "005930.KS"
+    assert result["results"][0]["horizon_days"] == 7
+    assert result["results"][0]["decision_context"]["source"] == "screener"
+    assert result["results"][0]["decision_context"]["role"] == "candidate_discovery"
+
+
+def test_screener_multiagent_divergence_includes_reason_codes():
+    agreement = screener._determine_agreement(
+        "A",
+        "neutral",
+        3.0,
+        screener_score=80.0,
+        ma_decision={
+            "final_signal": "neutral",
+            "final_confidence": 3.0,
+            "agreement_level": "low",
+            "volatility_status": {"is_high": True},
+            "key_risks": ["고변동성 구간"],
+        },
+        screener_row={"penalties": [{"name": "rsi_overbought"}]},
+    )
+
+    assert agreement["status"] == "divergent"
+    assert agreement["level"] == "partial_match"
+    assert agreement["horizon_days"] == 7
+    assert agreement["primary"]["role"] == "candidate_discovery"
+    assert agreement["secondary"]["role"] == "deep_validation"
+    assert "AGENT_DISAGREEMENT" in agreement["reason_codes"]
+    assert "HIGH_VOLATILITY" in agreement["reason_codes"]
+
+
+def test_signal_aggregator_context_scales_conviction_and_wait_action():
+    context = build_decision_context(
+        source="signal_aggregator",
+        role="execution",
+        signal="wait",
+        confidence=0.8,
+        reasoning="execution decision",
+    )
+
+    assert context["signal"] == "neutral"
+    assert context["confidence"] == 8.0
+
+
+def test_screener_neutral_multiagent_sell_label_is_explicit():
+    agreement = screener._determine_agreement(
+        "D",
+        "sell",
+        8.0,
+        screener_score=30.0,
+        ma_decision={
+            "final_signal": "sell",
+            "final_confidence": 8.0,
+            "reasoning": "risk-off",
+        },
+    )
+
+    assert agreement["level"] == "aligned_weak"
+    assert agreement["label"] == "MA 매도 확인"
+    assert agreement["secondary"]["signal"] == "sell"

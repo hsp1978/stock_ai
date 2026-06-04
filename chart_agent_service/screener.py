@@ -28,6 +28,12 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from decision_context import (
+    build_multi_agent_context,
+    build_screener_context,
+    compare_decision_contexts,
+)
+
 
 # ─────────────────────────────────────────────────────────
 #  설정 (환경변수로 조정 가능)
@@ -525,12 +531,22 @@ def run_screener(
             continue
 
         result = calculate_score(df)
+        decision_context = build_screener_context(
+            score=result["score"],
+            grade=result["grade"],
+            breakdown=result.get("breakdown", {}),
+            penalties=result.get("penalties", []),
+        )
         scored.append({
             "ticker": ticker,
             "name": row['name'],
             "market": row['market'],
             "market_cap": row['market_cap'],
             "current_price": float(df['Close'].iloc[-1]),
+            "screener_signal": decision_context["signal"],
+            "screener_confidence": decision_context["confidence"],
+            "horizon_days": decision_context["horizon_days"],
+            "decision_context": decision_context,
             **result,
         })
 
@@ -601,57 +617,44 @@ def run_screener(
 # ─────────────────────────────────────────────────────────
 #  스크리너 → Multi-Agent 파이프라인
 # ─────────────────────────────────────────────────────────
-def _determine_agreement(screener_grade: str, ma_signal: str, ma_confidence: float) -> Dict:
+def _score_floor_for_grade(screener_grade: str) -> float:
+    return {"S": 90.0, "A": 80.0, "B": 70.0, "C": 55.0, "D": 30.0}.get(
+        str(screener_grade or "D").upper(),
+        30.0,
+    )
+
+
+def _determine_agreement(
+    screener_grade: str,
+    ma_signal: str,
+    ma_confidence: float,
+    screener_score: Optional[float] = None,
+    ma_decision: Optional[Dict] = None,
+    screener_row: Optional[Dict] = None,
+) -> Dict:
     """
     스크리너 등급과 Multi-Agent 결과의 일치도 판정.
 
     Returns:
         {level: str, label: str, emoji: str, description: str}
     """
-    grade_tier = {"S": 3, "A": 2, "B": 1, "C": 0, "D": -1}.get(screener_grade or "D", -1)
-    sig = (ma_signal or "").lower()
-
-    # 강한 일치: 스크리너 S/A + MA buy + 신뢰도 ≥ 7 (기존 6에서 강화)
-    # neutral이 다수(> 10개)이거나 sell 신호가 있으면 partial_match로 격하
-    if grade_tier >= 2 and sig == "buy" and ma_confidence >= 7:
-        return {
-            "level": "strong_match", "label": "강한 일치", "emoji": "🟢🟢",
-            "description": "스크리너 상위 + Multi-Agent 매수 확증(신뢰도 7+) — 1순위 후보",
-        }
-    # 부분 일치: 스크리너 S/A + MA buy(신뢰도 낮음) or MA neutral
-    if grade_tier >= 2 and sig == "buy":
-        return {
-            "level": "partial_match", "label": "부분 일치", "emoji": "🟢",
-            "description": "스크리너 강세 + Multi-Agent 매수(신뢰도 7 미만) — 추가 확인 필요",
-        }
-    if grade_tier >= 2 and sig == "neutral":
-        return {
-            "level": "partial_match", "label": "부분 일치", "emoji": "🟡",
-            "description": "스크리너는 상위권이나 Multi-Agent 중립 — 스크리너 단독 결과 신뢰 금지",
-        }
-    # 충돌: 스크리너 A/S인데 MA sell
-    if grade_tier >= 2 and sig == "sell":
-        return {
-            "level": "conflict", "label": "신호 충돌", "emoji": "⚠️",
-            "description": "스크리너는 매수 후보인데 Multi-Agent 매도 — 재검토 필요",
-        }
-    # 뜻밖의 매수: 스크리너 C/D인데 MA buy
-    if grade_tier < 1 and sig == "buy":
-        return {
-            "level": "unexpected_buy", "label": "이례적 매수", "emoji": "🟡",
-            "description": "스크리너 약한 후보인데 Multi-Agent는 매수 — Multi-Agent 근거 확인",
-        }
-    # 동반 약세
-    if grade_tier < 1 and sig in ("sell", "neutral"):
-        return {
-            "level": "aligned_weak", "label": "동반 약세", "emoji": "⚪",
-            "description": "스크리너와 Multi-Agent 모두 약한 후보 — 관망",
-        }
-    # 기본
-    return {
-        "level": "neutral", "label": "일치도 보통", "emoji": "🔵",
-        "description": "스크리너와 Multi-Agent 신호 보통 수준",
-    }
+    score = screener_score if screener_score is not None else _score_floor_for_grade(screener_grade)
+    primary = build_screener_context(
+        score=score,
+        grade=screener_grade,
+        breakdown=(screener_row or {}).get("breakdown") or (screener_row or {}).get("screener_breakdown"),
+        penalties=(screener_row or {}).get("penalties") or (screener_row or {}).get("screener_penalties"),
+    )
+    fd = dict(ma_decision or {})
+    fd.setdefault("final_signal", ma_signal)
+    fd.setdefault("final_confidence", ma_confidence)
+    secondary = build_multi_agent_context(fd, horizon_days=primary["horizon_days"])
+    return compare_decision_contexts(
+        primary,
+        secondary,
+        secondary_decision=fd,
+        screener_row=screener_row,
+    )
 
 
 def run_screener_with_multiagent(
@@ -743,6 +746,10 @@ def run_screener_with_multiagent(
             "current_price": cand.get("current_price"),
             "screener_score": cand["score"],
             "screener_grade": cand["grade"],
+            "screener_signal": cand.get("screener_signal", "neutral"),
+            "screener_confidence": cand.get("screener_confidence", 0.0),
+            "horizon_days": cand.get("horizon_days"),
+            "decision_context": cand.get("decision_context"),
             "screener_breakdown": cand.get("breakdown", {}),
             "screener_penalties": cand.get("penalties", []),
         }
@@ -752,14 +759,25 @@ def run_screener_with_multiagent(
             fd = ma.get("final_decision", {})
             ma_signal = fd.get("final_signal", "neutral")
             ma_conf = float(fd.get("final_confidence", 0))
+            ma_context = build_multi_agent_context(fd, horizon_days=entry.get("horizon_days"))
+            agreement = _determine_agreement(
+                cand["grade"],
+                ma_signal,
+                ma_conf,
+                screener_score=cand["score"],
+                ma_decision=fd,
+                screener_row=cand,
+            )
             entry.update({
                 "multi_agent_analyzed": True,
                 "multi_agent_signal": ma_signal,
                 "multi_agent_confidence": ma_conf,
+                "multi_agent_context": ma_context,
                 "multi_agent_consensus": fd.get("consensus", ""),
                 "multi_agent_reasoning": (fd.get("reasoning") or "")[:200],
                 "entry_plan": fd.get("entry_plan"),
-                "agreement": _determine_agreement(cand["grade"], ma_signal, ma_conf),
+                "agreement": agreement,
+                "decision_divergence": agreement,
             })
         elif ma and "error" in ma:
             entry.update({

@@ -53,15 +53,6 @@ services:
     volumes:
       - ./stock_analyzer/watchlist.txt:/app/stock_analyzer/watchlist.txt
     restart: unless-stopped
-    # webui 측 stock_analyzer/ml_pipeline_fix.py 가 ML 라이브러리 import.
-    # GPU 추론은 거의 agent-api에서 하지만 호환성 위해 동일 reservation.
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
     depends_on:
       agent-api:
         condition: service_healthy

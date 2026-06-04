@@ -566,6 +566,16 @@ def resolve_ticker(user_input: str) -> tuple[str, str]:
 
     upper = text.upper()
     if upper.isascii() and len(upper) <= 10:
+        is_plain_kr_code = (
+            (upper.isdigit() and len(upper) == 6)
+            or (len(upper) == 6 and upper[:4].isdigit() and upper[4].isalpha() and upper[5].isdigit())
+        )
+        if is_plain_kr_code:
+            try:
+                normalized, _market = normalize_ticker(upper, "KR")
+            except Exception:
+                normalized = f"{upper}.KS"
+            return normalized, f"{text} → {normalized}"
         return upper, ""
 
     # 한글이 포함된 경우 ticker_suggestion 먼저 시도 (한국 주식 우선)
@@ -624,23 +634,55 @@ def resolve_ticker(user_input: str) -> tuple[str, str]:
     return text, ""
 
 
+def _agent_api_candidates() -> list[str]:
+    """AGENT_API_URL이 오래된 원격 주소여도 로컬 agent-api로 폴백."""
+    candidates = [
+        AGENT_API_URL,
+        f"http://{AGENT_API_HOST}:{AGENT_API_PORT}",
+        f"http://localhost:{AGENT_API_PORT}",
+        f"http://127.0.0.1:{AGENT_API_PORT}",
+    ]
+    seen = set()
+    result = []
+    for base in candidates:
+        base = (base or "").rstrip("/")
+        if base and base not in seen:
+            result.append(base)
+            seen.add(base)
+    return result
+
+
+def _force_http_api(path: str) -> bool:
+    # Paper/Virtual Trade 상태는 agent-api의 mounted output을 단일 소스로 쓴다.
+    return path.startswith("/paper") or path.startswith("/trading/")
+
+
 def api_get(path: str, timeout: int = 10):
     # /ml/* 는 LSTM(TF) 풀스택이 webui 컨테이너에 없으므로 agent-api(GPU TF)로
     # 강제 HTTP. 다른 path 는 in-process 우선(_USE_LOCAL_ENGINE).
     # 로컬 엔진이 None 반환 시 (핸들러 부재 — 예: /trading/*) HTTP fallback.
-    if _USE_LOCAL_ENGINE and not path.startswith("/ml/"):
+    if _USE_LOCAL_ENGINE and not path.startswith("/ml/") and not _force_http_api(path):
         result = engine_dispatch_get(path)
         if result is not None:
             return result
-    try:
-        resp = httpx.get(f"{AGENT_API_URL}{path}", timeout=timeout)
-        resp.raise_for_status()
-        return resp.json()
-    except httpx.ConnectError:
-        return None
-    except Exception as e:
-        st.error(f"API Error: {e}")
-        return None
+    last_error = None
+    for base_url in _agent_api_candidates():
+        try:
+            resp = httpx.get(f"{base_url}{path}", timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.ConnectError as e:
+            last_error = e
+            continue
+        except httpx.HTTPStatusError as e:
+            last_error = e
+            break
+        except Exception as e:
+            last_error = e
+            continue
+    if last_error is not None and not isinstance(last_error, httpx.ConnectError):
+        st.error(f"API Error: {last_error}")
+    return None
 
 
 def api_post(path: str, timeout: int = 300, json_body: dict = None):
@@ -649,22 +691,31 @@ def api_post(path: str, timeout: int = 300, json_body: dict = None):
     로컬 엔진이 None 반환 시 (핸들러 부재 — 예: /trading/*, /paper/virtual-buy,
     /paper/partial-close) HTTP fallback. json_body는 HTTP 경로에서 사용된다.
     """
-    if _USE_LOCAL_ENGINE:
+    if _USE_LOCAL_ENGINE and not _force_http_api(path):
         result = engine_dispatch_post(path, json_body=json_body)
         if result is not None:
             return result
-    try:
-        if json_body is not None:
-            resp = httpx.post(f"{AGENT_API_URL}{path}", json=json_body, timeout=timeout)
-        else:
-            resp = httpx.post(f"{AGENT_API_URL}{path}", timeout=timeout)
-        resp.raise_for_status()
-        return resp.json()
-    except httpx.ConnectError:
-        return None
-    except Exception as e:
-        st.error(f"API Error: {e}")
-        return None
+    last_error = None
+    for base_url in _agent_api_candidates():
+        try:
+            if json_body is not None:
+                resp = httpx.post(f"{base_url}{path}", json=json_body, timeout=timeout)
+            else:
+                resp = httpx.post(f"{base_url}{path}", timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.ConnectError as e:
+            last_error = e
+            continue
+        except httpx.HTTPStatusError as e:
+            last_error = e
+            break
+        except Exception as e:
+            last_error = e
+            continue
+    if last_error is not None and not isinstance(last_error, httpx.ConnectError):
+        st.error(f"API Error: {last_error}")
+    return None
 
 
 def _get_session_id() -> str:
@@ -2432,7 +2483,12 @@ def render_detail():
         return
 
     tickers = sorted(data["results"].keys())
-    selected = st.selectbox("Select Ticker", tickers, label_visibility="collapsed")
+    selected = st.selectbox(
+        "Select Ticker",
+        tickers,
+        format_func=lambda ticker: format_ticker_label(ticker, "flag_name_code"),
+        label_visibility="collapsed",
+    )
     if not selected:
         return
 
@@ -3303,9 +3359,9 @@ def render_multi_agent():
                 )
                 single_result = api_post(f"/scan/{resolved_ticker}")
 
-            # Multi-Agent 분석 (백엔드가 8개 에이전트 병렬 실행)
-            st.write("🤖 2/3 · 8개 에이전트 병렬 분석 중 (Technical · Quant · Risk · ML · Event · Geopolitical · Value · Decision)...")
-            # 8개 에이전트 병렬 LLM 호출. 백엔드 MULTI_AGENT_TIMEOUT(기본 600s)보다 약간 더 길게.
+            # Multi-Agent 분석 (백엔드가 7개 분석 에이전트 실행 후 Decision Maker가 종합)
+            st.write("🤖 2/3 · 7개 분석 에이전트 병렬 분석 중 (Technical · Quant · Risk · ML · Event · Geopolitical · Value)...")
+            # 7개 분석 에이전트 병렬 LLM 호출. 백엔드 MULTI_AGENT_TIMEOUT보다 약간 더 길게.
             multi_result = api_get(f"/multi-agent/{resolved_ticker}", timeout=660)
 
             # API 실패 시 사용자 친화적 안내
@@ -4138,13 +4194,17 @@ def render_screener():
                     "합의": agreement.get("emoji", "⏳"),
                     "종목": e.get("name", "?"),
                     "스크리너": f"{e['screener_score']}점 ({e['screener_grade']})",
+                    "기간": f"{e.get('horizon_days') or agreement.get('horizon_days', 7)}일",
                     "MA 신호": "—",
                     "MA 확신": "—",
+                    "차이 사유": "미분석",
                     "Entry": "—",
                 })
             else:
                 ma_sig = (e.get("multi_agent_signal") or "?").upper()
                 ma_conf = e.get("multi_agent_confidence", 0)
+                reason_codes = agreement.get("reason_codes") or []
+                reason_label = ", ".join(reason_codes[:2]) if reason_codes else "—"
                 entry = e.get("entry_plan") or {}
                 entry_str = "—"
                 if entry and entry.get("limit_price"):
@@ -4154,8 +4214,10 @@ def render_screener():
                     "합의": f"{agreement.get('emoji', '')} {agreement.get('label', '')}",
                     "종목": e.get("name", "?"),
                     "스크리너": f"{e['screener_score']}점 ({e['screener_grade']})",
+                    "기간": f"{e.get('horizon_days') or agreement.get('horizon_days', 7)}일",
                     "MA 신호": ma_sig,
                     "MA 확신": f"{ma_conf:.1f}/10",
+                    "차이 사유": reason_label,
                     "Entry": entry_str,
                 })
 
@@ -4248,9 +4310,22 @@ def render_screener():
         if st.button("🤖 Multi-Agent 심층 분석", use_container_width=True, key="screener_ma"):
             ticker = sel.get("ticker", "")
             with st.spinner(f"{ticker} 심층 분석 중..."):
-                r = api_post(f"/scan/{ticker}", timeout=300)
-                if r:
-                    st.success(f"완료! {ticker} → {r.get('final_signal')} ({r.get('composite_score', 0):+.1f})")
+                r = api_get(f"/multi-agent/{ticker}", timeout=660)
+                if r and "error" not in r:
+                    fd = r.get("final_decision", {})
+                    sig = (fd.get("final_signal") or "?").upper()
+                    conf = float(fd.get("final_confidence") or 0)
+                    st.session_state.multi_agent_result = {
+                        "ticker": ticker,
+                        "single": {},
+                        "multi": r,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                    st.success(f"완료! {ticker} → {sig} ({conf:.1f}/10)")
+                elif r:
+                    st.error(f"Multi-Agent 분석 실패: {r.get('error', '알 수 없는 오류')}")
+                else:
+                    st.error("Multi-Agent API 응답 없음")
     with ac3:
         if st.button("📝 Virtual Trade 프리필", use_container_width=True, key="screener_vt"):
             # Virtual Trade 페이지의 프리필 세션 변수에 저장
@@ -4565,12 +4640,19 @@ def render_virtual_trade():
             placeholder="예: AAPL, 005930.KS",
             key="vt_ticker_input",
         ).strip().upper()
+        trade_ticker = ""
+        ticker_note = ""
+        if ticker_input:
+            trade_ticker, ticker_note = resolve_ticker(ticker_input)
+            trade_ticker = trade_ticker.upper()
+            if ticker_note and trade_ticker != ticker_input:
+                st.caption(f"정규화: {ticker_note}")
     with col_buy_b:
-        if st.button("📡 현재가 조회", use_container_width=True, disabled=not ticker_input):
-            quote = api_get(f"/paper/quote/{ticker_input}")
+        if st.button("📡 현재가 조회", use_container_width=True, disabled=not trade_ticker):
+            quote = api_get(f"/paper/quote/{trade_ticker}")
             if quote:
                 st.session_state.vt_quote = quote
-                st.session_state.vt_ticker = ticker_input
+                st.session_state.vt_ticker = quote.get("ticker") or trade_ticker
                 st.rerun()
             else:
                 st.error("현재가 조회 실패")
@@ -4584,18 +4666,17 @@ def render_virtual_trade():
     quote = st.session_state.vt_quote
     if quote:
         # 현재가 정보 표시
-        is_kr = ticker_input.endswith((".KS", ".KQ"))
-        currency = "₩" if is_kr else "$"
+        quote_ticker = quote.get("ticker") or trade_ticker
         qa, qb, qc, qd = st.columns(4)
-        qa.metric("현재가", f"{currency}{quote.get('current_price', 0):,.2f}",
+        qa.metric("현재가", _fmt_price(quote.get('current_price', 0), quote_ticker),
                   delta=f"{quote.get('change_pct', 0):+.2f}%")
-        qb.metric("당일 고가", f"{currency}{quote.get('day_high', 0):,.2f}")
-        qc.metric("당일 저가", f"{currency}{quote.get('day_low', 0):,.2f}")
-        qd.metric("호가단위", f"{currency}{quote.get('tick_size', 0):,}")
+        qb.metric("당일 고가", _fmt_price(quote.get('day_high', 0), quote_ticker))
+        qc.metric("당일 저가", _fmt_price(quote.get('day_low', 0), quote_ticker))
+        qd.metric("호가단위", _fmt_price(quote.get('tick_size', 0), quote_ticker))
         st.caption(f"기준 시각: {quote.get('as_of', '')}")
 
     # 매수 파라미터
-    if ticker_input:
+    if trade_ticker:
         default_price = (
             (prefill.get("price") if prefill else None)
             or (quote.get("current_price") if quote else None)
@@ -4615,7 +4696,7 @@ def render_virtual_trade():
             )
         with pc3:
             total_cost = buy_qty * buy_price
-            st.metric("총 투자금", f"${total_cost:,.2f}")
+            st.metric("총 투자금", _fmt_price(total_cost, trade_ticker))
 
         # 손절/익절/trailing 설정 (접이식)
         with st.expander("🛡️ 손절·익절·자동 청산 설정 (선택)", expanded=bool(prefill)):
@@ -4666,7 +4747,7 @@ def render_virtual_trade():
         # 매수 실행
         if st.button("🛒 **가상 매수 실행**", type="primary", use_container_width=True):
             body = {
-                "ticker": ticker_input,
+                "ticker": trade_ticker,
                 "qty": int(buy_qty),
                 "price": float(buy_price),
                 "reason": reason or "수동 가상 매수",
@@ -4678,8 +4759,8 @@ def render_virtual_trade():
             result = api_post("/paper/virtual-buy", json_body=body)
             if result and result.get("status") == "filled":
                 st.success(
-                    f"✅ **{ticker_input}** {buy_qty}주 @ {currency if quote else '$'}{buy_price:,.2f} 체결됨 "
-                    f"(총 ${total_cost:,.2f})"
+                    f"✅ **{trade_ticker}** {buy_qty}주 @ {_fmt_price(buy_price, trade_ticker)} 체결됨 "
+                    f"(총 {_fmt_price(total_cost, trade_ticker)})"
                 )
                 # 프리필 제거
                 st.session_state.pop("vt_prefill", None)

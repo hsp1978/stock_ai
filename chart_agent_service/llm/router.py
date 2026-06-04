@@ -32,17 +32,44 @@ litellm.set_verbose = False
 
 T = TypeVar("T", bound=BaseModel)
 
+
+def _setting(name: str, default: str = "") -> str:
+    """환경변수 우선, 없으면 chart_agent_service/config.py 설정값 사용."""
+    if name in os.environ:
+        return os.environ.get(name, "")
+
+    try:
+        from config import settings
+
+        configured = getattr(settings, name, default)
+        return str(configured) if configured is not None else default
+    except Exception:
+        return default
+
+
+def _int_setting(name: str, default: int) -> int:
+    try:
+        return int(_setting(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _gemini_api_key() -> str:
+    return _setting("GEMINI_API_KEY") or _setting("GOOGLE_API_KEY")
+
+
 # ── Router 생성 ──────────────────────────────────────────────────────
 
 
 def build_router() -> Router:
     """환경변수를 읽어 3-tier LiteLLM Router를 생성한다."""
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    mac_url = os.environ.get("MAC_STUDIO_URL", "http://hsptest-macstudio:8080")
-    rtx_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-    gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-    mac_model = os.environ.get("OLLAMA_MAC_MODEL", "qwen2.5:32b-instruct-q4_K_M")
-    rtx_model = os.environ.get("OLLAMA_MODEL", "qwen3:14b-q4_K_M")
+    gemini_key = _gemini_api_key()
+    mac_url = _setting("MAC_STUDIO_URL", "http://hsptest-macstudio:8080")
+    rtx_url = _setting("OLLAMA_BASE_URL", "http://localhost:11434")
+    gemini_model = _setting("GEMINI_MODEL", "gemini-2.0-flash")
+    mac_model = _setting("OLLAMA_MAC_MODEL", "qwen2.5:32b-instruct-q4_K_M")
+    rtx_model = _setting("OLLAMA_MODEL", "qwen3:14b-q4_K_M")
+    ollama_timeout = _int_setting("MULTI_AGENT_LLM_TIMEOUT", 240)
 
     model_list = []
 
@@ -65,7 +92,7 @@ def build_router() -> Router:
                 "litellm_params": {
                     "model": f"ollama/{mac_model}",
                     "api_base": mac_url,
-                    "timeout": 60,
+                    "timeout": max(60, ollama_timeout),
                 },
             },
             {
@@ -73,7 +100,7 @@ def build_router() -> Router:
                 "litellm_params": {
                     "model": f"ollama/{rtx_model}",
                     "api_base": rtx_url,
-                    "timeout": 90,
+                    "timeout": max(90, ollama_timeout),
                 },
             },
         ]
@@ -82,7 +109,8 @@ def build_router() -> Router:
     # fallback chain: primary → secondary → tertiary
     if gemini_key:
         fallbacks = [
-            {"agent-llm-primary": ["agent-llm-secondary", "agent-llm-tertiary"]}
+            {"agent-llm-primary": ["agent-llm-secondary", "agent-llm-tertiary"]},
+            {"agent-llm-secondary": ["agent-llm-tertiary"]},
         ]
     else:
         fallbacks = [{"agent-llm-secondary": ["agent-llm-tertiary"]}]
@@ -149,6 +177,7 @@ def call_agent_llm(
     agent_role: str,
     prompt: str,
     response_model: type[T] = AgentLLMResponse,  # type: ignore[assignment]
+    preferred_provider: str | None = None,
 ) -> T:
     """
     LiteLLM Router + circuit breaker를 통해 LLM을 호출하고
@@ -168,34 +197,57 @@ def call_agent_llm(
         {"role": "user", "content": prompt},
     ]
 
-    # tier 1 먼저 시도 (gemini or secondary)
-    primary = "agent-llm-primary" if _has_primary() else "agent-llm-secondary"
+    model_candidates = _model_candidates(preferred_provider)
+    last_exc: Exception | None = None
 
-    try:
-        api_response = call_with_breaker(
-            _do_router_completion,
-            router,
-            primary,
-            messages,
-            response_format={"type": "json_object"},
+    for model_name in model_candidates:
+        try:
+            api_response = call_with_breaker(
+                _do_router_completion,
+                router,
+                model_name,
+                messages,
+                breaker_name=f"agent_llm:{agent_role}:{model_name}",
+                response_format={"type": "json_object"},
+            )
+            raw = (api_response.choices[0].message.content or "").strip()
+            json_str = _extract_json(raw)
+            return response_model.model_validate_json(json_str)
+
+        except ValidationError as exc:
+            logger.warning("LLM response parse fail for %s: %s", agent_role, exc)
+            return _safe_response(
+                response_model, f"parse_error: {exc}", ["LLM_PARSE_ERROR"]
+            )
+
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "LLM call fail for %s via %s: %s", agent_role, model_name, exc
+            )
+
+    return _safe_response(
+        response_model, f"call_error: {last_exc}", ["LLM_CALL_ERROR"]
+    )
+
+
+def _model_candidates(preferred_provider: str | None = None) -> list[str]:
+    provider = (preferred_provider or "").lower().strip()
+    has_primary = _has_primary()
+
+    if provider == "gemini" and has_primary:
+        return ["agent-llm-primary", "agent-llm-secondary"]
+    if provider == "ollama":
+        return (
+            ["agent-llm-secondary", "agent-llm-primary"]
+            if has_primary
+            else ["agent-llm-secondary"]
         )
-        raw = (api_response.choices[0].message.content or "").strip()
-        json_str = _extract_json(raw)
-        return response_model.model_validate_json(json_str)
-
-    except ValidationError as exc:
-        logger.warning("LLM response parse fail for %s: %s", agent_role, exc)
-        return _safe_response(
-            response_model, f"parse_error: {exc}", ["LLM_PARSE_ERROR"]
-        )
-
-    except Exception as exc:
-        logger.warning("LLM call fail for %s: %s", agent_role, exc)
-        return _safe_response(response_model, f"call_error: {exc}", ["LLM_CALL_ERROR"])
+    return ["agent-llm-primary"] if has_primary else ["agent-llm-secondary"]
 
 
 def _has_primary() -> bool:
-    return bool(os.environ.get("GEMINI_API_KEY", ""))
+    return bool(_gemini_api_key())
 
 
 def _safe_response(model_cls: type[T], reason: str, flags: list[str]) -> T:

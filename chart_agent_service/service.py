@@ -1118,7 +1118,7 @@ def api_watchlist_set(tickers: str):
 
 @app.get("/multi-agent/{ticker}")
 def get_multi_agent_analysis(ticker: str):
-    """Multi-Agent 분석 (V2.0) - 5개 에이전트 병렬 분석"""
+    """Multi-Agent 분석 (V2.0) - 7개 분석 에이전트 + Decision Maker"""
     ticker = ticker.upper()
 
     if MultiAgentOrchestrator is None:

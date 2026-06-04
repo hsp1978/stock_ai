@@ -31,10 +31,50 @@ _SERVICE_DIR = os.path.join(_PROJECT_ROOT, 'chart_agent_service')
 if _SERVICE_DIR not in sys.path:
     sys.path.insert(0, _SERVICE_DIR)
 
-from config import DEFAULT_TEST_TICKER
+from config import (
+    DEFAULT_TEST_TICKER,
+    MULTI_AGENT_LLM_TIMEOUT,
+    MULTI_AGENT_MAX_WORKERS,
+    MULTI_AGENT_TIMEOUT,
+    OLLAMA_BASE_URL,
+)
 
 from data_collector import fetch_ohlcv, calculate_indicators
 from analysis_tools import AnalysisTools
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _str_env(name: str, default: str) -> str:
+    return os.getenv(name) or default
+
+
+def _ensure_decision_context(decision: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach the shared decision context schema when a decision lacks one."""
+    if not isinstance(decision, dict):
+        return decision
+    try:
+        from decision_context import build_multi_agent_context, default_horizon_days
+        horizon_days = int(decision.get("horizon_days") or default_horizon_days())
+        decision["horizon_days"] = horizon_days
+        if not decision.get("decision_context"):
+            ctx = build_multi_agent_context(decision, horizon_days=horizon_days)
+            decision["decision_context"] = ctx
+            decision["decision_schema_version"] = ctx["schema_version"]
+        else:
+            decision.setdefault(
+                "decision_schema_version",
+                decision["decision_context"].get("schema_version", "decision_context.v1"),
+            )
+    except Exception:
+        decision.setdefault("horizon_days", 7)
+        decision.setdefault("decision_schema_version", "decision_context.v1")
+    return decision
 
 
 @dataclass
@@ -211,7 +251,12 @@ class BaseAgent:
         """LLM 호출 (LiteLLM Router 경유 — Step 9)."""
         try:
             from llm.router import call_agent_llm, get_router
-            response = call_agent_llm(get_router(), self.name, prompt)
+            response = call_agent_llm(
+                get_router(),
+                self.name,
+                prompt,
+                preferred_provider=self.llm_provider,
+            )
             return json.dumps(
                 {
                     "signal": response.signal,
@@ -246,7 +291,10 @@ class BaseAgent:
 
     @staticmethod
     def _empty_response_json(reason: str = "LLM 응답 없음") -> str:
-        return f'{{"signal": "neutral", "confidence": 0, "reasoning": "{reason}"}}'
+        return json.dumps(
+            {"signal": "neutral", "confidence": 0, "reasoning": reason},
+            ensure_ascii=False,
+        )
 
     def _call_ollama(self, prompt: str) -> str:
         """Ollama API 호출 (듀얼 노드 지원, GPU 메모리 보호)"""
@@ -276,6 +324,8 @@ class BaseAgent:
             session = get_http_session()
             llm_config = get_llm_config(self.name)
             start_time = datetime.now()
+            request_timeout = _int_env("MULTI_AGENT_LLM_TIMEOUT", MULTI_AGENT_LLM_TIMEOUT)
+            last_status = None
 
             # 첫 번째 시도: 할당된 노드
             max_retries = 2
@@ -299,7 +349,7 @@ class BaseAgent:
                         # Mac Studio(32GB)는 32B 모델을 OLLAMA_NUM_PARALLEL=1 로
                         # 직렬 처리하므로 4개 에이전트가 큐잉될 때 마지막 에이전트
                         # 대기 시간을 고려해 240s 기본. .env: MULTI_AGENT_LLM_TIMEOUT
-                        timeout=int(os.getenv("MULTI_AGENT_LLM_TIMEOUT", "240"))
+                        timeout=request_timeout,
                     )
 
                     if response.status_code == 200:
@@ -314,8 +364,11 @@ class BaseAgent:
                             "opportunities": []
                         }, ensure_ascii=False)
                     elif attempt < max_retries - 1:
+                        last_status = response.status_code
                         # 재시도 전 대기 (지수 백오프)
                         time.sleep(2 ** attempt)
+                    else:
+                        last_status = response.status_code
                 except Exception as e:
                     if attempt == max_retries - 1:
                         raise  # 마지막 시도에서는 예외 발생
@@ -345,6 +398,11 @@ class BaseAgent:
                     performance_monitor.record(self.name, exec_time, fallback['node'])
                     text = (response.json().get('response') or '').strip()
                     return text if text else BaseAgent._empty_response_json()
+                last_status = response.status_code
+
+            if last_status is not None:
+                return self._empty_response_json(f"LLM 서비스 응답 오류: HTTP {last_status}")
+            return self._empty_response_json("LLM 서비스 응답 없음")
 
         except Exception:
             # 내부 에러 상세를 응답에 노출하지 않음 (정보 누설 방지)
@@ -1058,7 +1116,7 @@ class DecisionMaker:
             except Exception:
                 decision["calibration_applied"] = False
 
-            return decision
+            return _ensure_decision_context(decision)
 
         except Exception as e:
             # 폴백: confidence 가중 다수결
@@ -1074,7 +1132,7 @@ class DecisionMaker:
             if excluded_failed:
                 consensus_msg += f" (실패 {excluded_failed}명 제외)"
 
-            return {
+            fallback_decision = {
                 "final_signal": majority_signal,
                 "final_confidence": avg_confidence,
                 "consensus": consensus_msg,
@@ -1089,6 +1147,7 @@ class DecisionMaker:
                 "analyzed_at": datetime.now().isoformat(),
                 "error": "Decision Maker 호출 실패"  # 사용자에게는 내부 메시지 노출 안 함
             }
+            return _ensure_decision_context(fallback_decision)
 
     def _build_decision_prompt(self, ticker: str, agent_results: List[AgentResult], signals: Dict[str, int]) -> str:
         """의사결정 프롬프트 생성"""
@@ -1179,7 +1238,13 @@ class DecisionMaker:
         try:
             from llm.router import call_agent_llm, get_router
             from llm.schemas import DecisionMakerResponse
-            resp = call_agent_llm(get_router(), self.name, prompt, DecisionMakerResponse)
+            resp = call_agent_llm(
+                get_router(),
+                self.name,
+                prompt,
+                DecisionMakerResponse,
+                preferred_provider=self.llm_provider,
+            )
             return json.dumps(
                 {
                     "final_signal": resp.final_signal,
@@ -1356,7 +1421,7 @@ class MultiAgentOrchestrator:
         ]
 
         # 병렬 실행 워커 수 설정
-        self.max_workers = int(os.getenv('MULTI_AGENT_MAX_WORKERS', '2'))
+        self.max_workers = _int_env("MULTI_AGENT_MAX_WORKERS", MULTI_AGENT_MAX_WORKERS)
 
         # Mac Studio 연결 확인
         self.mac_studio_available = False
@@ -1381,7 +1446,7 @@ class MultiAgentOrchestrator:
         """Ollama 서버 상태 체크"""
         try:
             import requests
-            ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+            ollama_url = _str_env("OLLAMA_BASE_URL", OLLAMA_BASE_URL)
             response = requests.get(f"{ollama_url}/api/tags", timeout=3)
             if response.status_code == 200:
                 # 모델 목록 확인
@@ -1656,13 +1721,19 @@ class MultiAgentOrchestrator:
                 # 완료된 작업 수집
                 # MULTI_AGENT_TIMEOUT 으로 조정 가능 (.env). 워커 < 에이전트 수면
                 # 직렬 가깝게 처리되므로 보수적 기본 300초.
-                _ma_timeout = int(os.getenv("MULTI_AGENT_TIMEOUT", "300"))
+                _ma_timeout = _int_env("MULTI_AGENT_TIMEOUT", MULTI_AGENT_TIMEOUT)
                 for future in as_completed(futures, timeout=_ma_timeout):
                     agent = futures[future]
                     try:
                         # future가 이미 as_completed 로 완료된 상태라 즉시 반환되지만,
                         # 안전을 위해 LLM 호출 timeout 보다 살짝 길게 둠.
-                        result = future.result(timeout=int(os.getenv("MULTI_AGENT_LLM_TIMEOUT", "240")) + 10)
+                        result = future.result(
+                            timeout=_int_env(
+                                "MULTI_AGENT_LLM_TIMEOUT",
+                                MULTI_AGENT_LLM_TIMEOUT,
+                            )
+                            + 10
+                        )
                         agent_results.append(result)
 
                         # 진행 상황 출력
@@ -1685,6 +1756,7 @@ class MultiAgentOrchestrator:
             # 3. Decision Maker가 종합
             print(f"  [3/3] Decision Maker가 의견 종합 중...")
             final_decision = self.decision_maker.aggregate(ticker, agent_results)
+            final_decision = _ensure_decision_context(final_decision)
 
             # 4. 실전 진입 계획 생성 (매매 시점/분할/손절익절)
             try:

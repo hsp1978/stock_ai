@@ -960,7 +960,7 @@ _orchestrator = None
 def engine_multi_agent_analyze(ticker: str) -> dict:
     """
     멀티에이전트 분석 (V2.0)
-    - 6개 전문 에이전트 병렬 실행
+    - 7개 전문 에이전트 병렬 실행
     - Decision Maker가 의견 종합 및 충돌 해결
     """
     global _orchestrator

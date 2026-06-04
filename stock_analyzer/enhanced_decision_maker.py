@@ -27,6 +27,84 @@ class EnhancedDecisionMaker:
         self.previous_confidence = None  # 이전 신뢰도 추적
         self.confidence_history = []  # 신뢰도 이력 추적 (최대 5개)
 
+    def _decision_horizon_days(self) -> int:
+        try:
+            from decision_context import default_horizon_days
+            return default_horizon_days()
+        except Exception:
+            return 7
+
+    def _build_decision_context(
+        self,
+        signal: str,
+        confidence: float,
+        horizon_days: int,
+        reasoning: str,
+        metadata: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        try:
+            from decision_context import build_decision_context
+            return build_decision_context(
+                source="multi_agent",
+                role="deep_validation",
+                signal=signal,
+                confidence=confidence,
+                horizon_days=horizon_days,
+                reasoning=reasoning,
+                metadata=metadata or {},
+            )
+        except Exception:
+            return {
+                "schema_version": "decision_context.v1",
+                "source": "multi_agent",
+                "role": "deep_validation",
+                "signal": signal,
+                "confidence": confidence,
+                "horizon_days": horizon_days,
+                "reasoning": reasoning,
+                "metadata": metadata or {},
+            }
+
+    @staticmethod
+    def _signed_confidence(signal: str, confidence: float) -> float:
+        """Convert normalized signal + 0-10 confidence into signed score."""
+        direction = {"buy": 1.0, "sell": -1.0, "neutral": 0.0}.get(signal, 0.0)
+        return direction * confidence
+
+    @staticmethod
+    def _avg_signed_score(scores: List[float]) -> float:
+        return sum(scores) / len(scores) if scores else 0.0
+
+    def _apply_reflect_guard(self, final_decision: Dict, reflect_flags: List[str]) -> Dict:
+        """
+        그룹 다수가 최종 신호와 정면 충돌하면 경고만 하지 않고 관망으로 강등한다.
+        """
+        signal = (final_decision.get("signal") or "neutral").lower()
+        severe = (
+            ("REFLECT_INCONSISTENT_3_SELL_VS_FINAL_BUY" in reflect_flags and signal == "buy")
+            or ("REFLECT_INCONSISTENT_3_BUY_VS_FINAL_SELL" in reflect_flags and signal == "sell")
+        )
+        if not severe:
+            return final_decision
+
+        guarded = dict(final_decision)
+        guarded["signal"] = "neutral"
+        guarded["confidence"] = min(float(guarded.get("confidence", 0) or 0), 3.0)
+        # 최종 confidence 산출 단계에서 보너스/패널티 적용 후 cap을 재적용하기 위한 표식.
+        guarded["reflect_downgraded"] = True
+        conflict = guarded.get("conflicts")
+        reflect_msg = "그룹 다수 의견과 최종 신호 충돌"
+        guarded["conflicts"] = (
+            f"{conflict}, {reflect_msg}" if conflict and conflict != "없음" else reflect_msg
+        )
+        guarded["reasoning"] = (
+            f"{guarded.get('reasoning', '')} / 그룹 reflect 검증 실패로 관망 전환"
+        ).strip()
+        risks = list(guarded.get("risks") or [])
+        risks.extend(reflect_flags)
+        guarded["risks"] = risks
+        return guarded
+
     def aggregate(self, ticker: str, agent_results: List[Any]) -> Dict[str, Any]:
         """
         에이전트 결과 종합 및 최종 판단
@@ -50,6 +128,7 @@ class EnhancedDecisionMaker:
         market_info = get_market_info(ticker)
         currency = market_info["currency"]
         benchmark = market_info["benchmark"]
+        horizon_days = self._decision_horizon_days()
 
         # 2. 에이전트 의견 및 점수 집계 (신호 정규화 적용)
         signal_counts = {"buy": 0, "sell": 0, "neutral": 0}
@@ -64,6 +143,8 @@ class EnhancedDecisionMaker:
         ml_scores = []
         ml_accuracies = []  # ML 정확도 추적
         event_scores = []
+        fundamental_scores = []
+        macro_scores = []
         insider_signal = None  # 내부자 거래 신호
         insider_score = 0
 
@@ -72,16 +153,18 @@ class EnhancedDecisionMaker:
                 failed_agents.append(result.agent_name)
                 continue
 
+            # confidence 0.0은 LLM/데이터 실패의 안전 응답이다. 이를 neutral 표로
+            # 집계하면 유효한 buy/sell 의견이 실패 표에 희석된다.
+            if result.confidence <= 0:
+                failed_agents.append(f"{result.agent_name} (0.0 confidence)")
+                continue
+
             # 신호 정규화
             normalized_signal = normalize_signal(result.signal)
             signal_counts[normalized_signal] += 1
             confidence_sum += result.confidence
-
-            # [중요 수정] confidence 0.0인 경우도 실패로 간주
-            if result.confidence > 0:
-                valid_agents += 1
-            else:
-                failed_agents.append(f"{result.agent_name} (0.0 confidence)")
+            valid_agents += 1
+            signed_confidence = self._signed_confidence(normalized_signal, result.confidence)
 
             # 에이전트별 점수 분류
             if "Technical" in result.agent_name:
@@ -89,9 +172,9 @@ class EnhancedDecisionMaker:
             elif "Quant" in result.agent_name:
                 quant_scores.append(self._extract_scores(result))
             elif "Risk" in result.agent_name:
-                risk_scores.append(result.confidence)
+                risk_scores.append(signed_confidence)
             elif "ML" in result.agent_name:
-                ml_scores.append(result.confidence)
+                ml_scores.append(signed_confidence)
                 # ML 정확도 추출 (evidence에서)
                 for ev in result.evidence:
                     ml_result = ev.get("result", {})
@@ -102,28 +185,47 @@ class EnhancedDecisionMaker:
                             if "test_accuracy" in model_data:
                                 ml_accuracies.append(model_data["test_accuracy"])
             elif "Event" in result.agent_name:
-                event_scores.append(result.confidence)
+                event_scores.append(signed_confidence)
                 # 내부자 거래 신호 추출
                 for ev in result.evidence:
                     if ev.get("tool") == "insider_trading_analysis":
                         insider_result = ev.get("result", {})
                         insider_signal = normalize_signal(insider_result.get("signal", "neutral"))
                         insider_score = insider_result.get("score", 0)
+            elif "Value" in result.agent_name:
+                fundamental_scores.append(signed_confidence)
+            elif "Geopolitical" in result.agent_name:
+                macro_scores.append(signed_confidence)
 
         # [중요] 에이전트 전원 장애 체크
         if valid_agents == 0:
             # 모든 에이전트가 실패한 경우 - 분석 무효화
+            failure_reasoning = f"모든 에이전트 분석 실패: {', '.join(failed_agents[:3])}... 분석 신뢰 불가"
             return {
                 "final_signal": "neutral",
                 "final_confidence": 0.0,
-                "consensus": f"0명 매수, 0명 매도, {len(agent_results)}명 중립 (전원 장애)",
+                "consensus": f"유효 의견 0명 (실패 {len(failed_agents)}명 제외, 전원 장애)",
                 "conflicts": "전체 에이전트 장애",
-                "reasoning": f"모든 에이전트 분석 실패: {', '.join(failed_agents[:3])}... 분석 신뢰 불가",
+                "reasoning": failure_reasoning,
                 "key_risks": ["전체 LLM 서비스 장애", "분석 완전 무효", "시스템 점검 필요"],
                 "agent_count": len(agent_results),
                 "valid_agent_count": 0,
+                "excluded_failed_count": len(failed_agents),
                 "signal_distribution": signal_counts,
                 "analyzed_at": datetime.now().isoformat(),
+                "horizon_days": horizon_days,
+                "decision_schema_version": "decision_context.v1",
+                "decision_context": self._build_decision_context(
+                    "neutral",
+                    0.0,
+                    horizon_days,
+                    failure_reasoning,
+                    {
+                        "system_failure": True,
+                        "excluded_failed_count": len(failed_agents),
+                        "signal_distribution": signal_counts,
+                    },
+                ),
                 "currency": currency,
                 "market_info": market_info,
                 "warnings": ["⚠️ 전체 에이전트 장애로 V2 분석 무효. V1 지표만 참고하세요."],
@@ -140,7 +242,9 @@ class EnhancedDecisionMaker:
         # 5. 신호 강도 계산 (ML 정확도 및 내부자 거래 반영)
         signal_strength = self._calculate_signal_strength(
             tech_analysis, quant_analysis, risk_scores, ml_scores, event_scores,
-            ml_accuracies, insider_signal, insider_score
+            ml_accuracies, insider_signal, insider_score,
+            fundamental_scores=fundamental_scores,
+            macro_scores=macro_scores,
         )
 
         # 5.4. [Step 6] STRONG_*_CONFIRMATION flag 탐지 → conviction +0.1
@@ -217,6 +321,8 @@ class EnhancedDecisionMaker:
             if group_results:
                 from agent_groups import reflect
                 reflect_flags = reflect(group_results, final_decision["signal"])
+                if reflect_flags:
+                    final_decision = self._apply_reflect_guard(final_decision, reflect_flags)
         except Exception:
             pass
 
@@ -242,6 +348,25 @@ class EnhancedDecisionMaker:
         # 8. 결과 구성 (STRONG_*_CONFIRMATION 보너스 + variance 패널티 반영)
         raw_confidence = final_decision["confidence"] + strong_confirmation_bonus
         final_confidence = min(10.0, raw_confidence * (1.0 - variance_penalty))
+        # reflect 강등 시 보너스가 더해져도 cap(3.0)을 넘지 않도록 최종 재적용.
+        if final_decision.get("reflect_downgraded"):
+            final_confidence = min(final_confidence, 3.0)
+        decision_context = self._build_decision_context(
+            final_decision["signal"],
+            final_confidence,
+            horizon_days,
+            final_decision["reasoning"],
+            {
+                "signal_distribution": signal_counts,
+                "signal_strength_level": signal_strength.get("strength_level"),
+                "signal_total_score": signal_strength.get("total_score"),
+                "domain_contributions": signal_strength.get("domain_contributions", {}),
+                "agreement_level": agreement_level,
+                "signal_std": signal_std,
+                "valid_agent_count": valid_agents,
+                "excluded_failed_count": len(failed_agents),
+            },
+        )
         result = {
             "final_signal": final_decision["signal"],
             "final_confidence": final_confidence,
@@ -250,8 +375,13 @@ class EnhancedDecisionMaker:
             "reasoning": final_decision["reasoning"],
             "key_risks": final_decision["risks"],
             "agent_count": len(agent_results),
+            "valid_agent_count": valid_agents,
+            "excluded_failed_count": len(failed_agents),
             "signal_distribution": signal_counts,
             "analyzed_at": datetime.now().isoformat(),
+            "horizon_days": horizon_days,
+            "decision_schema_version": decision_context["schema_version"],
+            "decision_context": decision_context,
             "currency": currency,
             "market_info": market_info,
             "signal_strength": signal_strength,
@@ -511,8 +641,11 @@ class EnhancedDecisionMaker:
     def _calculate_signal_strength(self, tech_analysis, quant_analysis,
                                   risk_scores, ml_scores, event_scores,
                                   ml_accuracies=None, insider_signal=None,
-                                  insider_score=0) -> Dict:
+                                  insider_score=0, fundamental_scores=None,
+                                  macro_scores=None) -> Dict:
         """신호 강도 계산 (ML 정확도 가중치 및 내부자 거래 반영)"""
+        fundamental_scores = fundamental_scores or []
+        macro_scores = macro_scores or []
 
         # 기술적 분석 강도
         tech_strength = tech_analysis["avg_strength"]
@@ -538,32 +671,37 @@ class EnhancedDecisionMaker:
             else:  # 60% 이상
                 ml_weight = 1.0  # 정상 가중치
 
-            # 전 모델 동일 방향 시 보너스 (정확도 50% 이상인 경우만)
-            if avg_accuracy >= 0.50 and len(ml_scores) >= 4:
-                # 모든 ML 점수가 같은 방향인지 체크
-                all_buy = all(score > 5 for score in ml_scores)
-                all_sell = all(score < 5 for score in ml_scores)
-                if all_buy or all_sell:
-                    ml_weight += 0.3  # 방향 일치 보너스
+            # NOTE: 과거 '방향 일치 보너스'(ml_weight += 0.3)는 제거됨.
+            # ml_scores는 ML 에이전트당 1개(현재 ML Specialist 단일)라서
+            # all_buy/all_sell이 항상 참 → 단일 신호에 상시 가산되는 무의미한
+            # 보너스가 됐다. 앙상블 '내부 모델별' 방향을 추출할 수 있게 되면
+            # 그때 모델 간 합의 보너스로 재도입한다.
 
         # ML 점수 조정
         ml_contribution = 0
         if ml_scores:
             ml_avg = sum(ml_scores) / len(ml_scores)
-            # ML이 매도 신호일 때 가중치 적용
-            if ml_avg < 5:  # 매도 경향
-                ml_contribution = -(5 - ml_avg) * ml_weight
-            elif ml_avg > 5:  # 매수 경향
-                ml_contribution = (ml_avg - 5) * ml_weight
+            # ml_scores는 signal 방향을 반영한 signed confidence(-10~10)이다.
+            ml_contribution = (ml_avg / 2.0) * ml_weight
 
         # 내부자 거래 신호 강화 (2배 가중치)
         insider_contribution = insider_score * 2.0
 
-        # 전체 점수 (기술 + 퀀트 + ML조정 + 내부자)
+        # 도구 점수로 직접 반영되지 않던 에이전트 도메인을 별도 contribution으로 반영
+        risk_contribution = self._avg_signed_score(risk_scores) * 0.7
+        event_contribution = self._avg_signed_score(event_scores) * 0.5
+        fundamental_contribution = self._avg_signed_score(fundamental_scores) * 0.7
+        macro_contribution = self._avg_signed_score(macro_scores) * 0.5
+
+        # 전체 점수 (기술 + 퀀트 + ML조정 + 내부자 + 누락 도메인)
         total_score = (tech_analysis["total_score"] +
                       quant_analysis["total_score"] +
                       ml_contribution +
-                      insider_contribution)
+                      insider_contribution +
+                      risk_contribution +
+                      event_contribution +
+                      fundamental_contribution +
+                      macro_contribution)
 
         # 신호 강도 분류 (개선된 기준)
         # 기술 6개 + 퀀트 6개 = 12개 도구, 각 ±10점 범위
@@ -605,6 +743,12 @@ class EnhancedDecisionMaker:
                 "contribution": ml_contribution,
                 "avg_accuracy": sum(ml_accuracies) / len(ml_accuracies) if ml_accuracies else 0,
                 "note": ml_note
+            },
+            "domain_contributions": {
+                "risk": risk_contribution,
+                "event": event_contribution,
+                "fundamental": fundamental_contribution,
+                "macro": macro_contribution,
             },
             "insider": {
                 "signal": insider_signal,
@@ -770,6 +914,15 @@ class EnhancedDecisionMaker:
         # 7. 판단 근거
         reasoning_parts = []
         reasoning_parts.append(f"종합 점수: {total_score:+.1f} (기술: {tech_analysis['total_score']:+.1f}, 퀀트: {quant_analysis['total_score']:+.1f})")
+        domain = signal_strength.get("domain_contributions", {})
+        if any(abs(float(v or 0)) > 0 for v in domain.values()):
+            reasoning_parts.append(
+                "도메인 보정: "
+                f"Risk {domain.get('risk', 0):+.1f}, "
+                f"Event {domain.get('event', 0):+.1f}, "
+                f"Value {domain.get('fundamental', 0):+.1f}, "
+                f"Macro {domain.get('macro', 0):+.1f}"
+            )
         reasoning_parts.append(f"신호 강도: {strength_level}")
 
         if base_signal == "buy":

@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     DEFAULT_LLM_PROVIDER: Literal["ollama", "gemini", "openai"] = "ollama"
 
     MULTI_AGENT_MAX_WORKERS: int = Field(default=2, ge=1, le=16)
+    MULTI_AGENT_TIMEOUT: int = Field(default=300, ge=30)
+    MULTI_AGENT_LLM_TIMEOUT: int = Field(default=240, ge=30)
 
     MAC_STUDIO_IP: str = "hsptest-macstudio"
     MAC_STUDIO_URL: str = "http://hsptest-macstudio:8080"
@@ -151,6 +153,8 @@ MIN_CONFIDENCE = settings.MIN_CONFIDENCE
 TRADING_STYLE = settings.TRADING_STYLE
 DEFAULT_LLM_PROVIDER = settings.DEFAULT_LLM_PROVIDER
 MULTI_AGENT_MAX_WORKERS = settings.MULTI_AGENT_MAX_WORKERS
+MULTI_AGENT_TIMEOUT = settings.MULTI_AGENT_TIMEOUT
+MULTI_AGENT_LLM_TIMEOUT = settings.MULTI_AGENT_LLM_TIMEOUT
 MAC_STUDIO_IP = settings.MAC_STUDIO_IP
 MAC_STUDIO_URL = settings.MAC_STUDIO_URL
 AGENT_API_URL = settings.AGENT_API_URL

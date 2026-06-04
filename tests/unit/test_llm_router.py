@@ -150,6 +150,60 @@ def test_call_agent_llm_exception_returns_neutral():
     assert "LLM_CALL_ERROR" in result.risk_flags
 
 
+def test_call_agent_llm_respects_ollama_preference():
+    """ollama 선호 에이전트는 Gemini key가 있어도 Ollama tier부터 호출."""
+    from llm.router import call_agent_llm
+
+    mock_router = MagicMock()
+    mock_router.completion.return_value = _make_api_response(_valid_json())
+
+    with patch.dict(
+        os.environ,
+        {"GEMINI_API_KEY": "test-gemini-key", "GOOGLE_API_KEY": ""},
+        clear=False,
+    ), patch(
+        "llm.router.call_with_breaker", side_effect=lambda fn, *a, **kw: fn(*a, **kw)
+    ):
+        result = call_agent_llm(
+            mock_router,
+            "Risk Manager",
+            "analyze AAPL",
+            preferred_provider="ollama",
+        )
+
+    assert result.signal == "buy"
+    assert mock_router.completion.call_args.kwargs["model"] == "agent-llm-secondary"
+
+
+def test_call_agent_llm_falls_back_to_primary_after_ollama_error():
+    """Ollama tier 호출 자체가 실패하면 Gemini primary를 한 번 더 시도."""
+    from llm.router import call_agent_llm
+
+    mock_router = MagicMock()
+    mock_router.completion.side_effect = [
+        ConnectionError("ollama down"),
+        _make_api_response(_valid_json()),
+    ]
+
+    with patch.dict(
+        os.environ,
+        {"GEMINI_API_KEY": "test-gemini-key", "GOOGLE_API_KEY": ""},
+        clear=False,
+    ), patch(
+        "llm.router.call_with_breaker", side_effect=lambda fn, *a, **kw: fn(*a, **kw)
+    ):
+        result = call_agent_llm(
+            mock_router,
+            "ML Specialist",
+            "analyze AAPL",
+            preferred_provider="ollama",
+        )
+
+    assert result.signal == "buy"
+    called_models = [call.kwargs["model"] for call in mock_router.completion.call_args_list]
+    assert called_models == ["agent-llm-secondary", "agent-llm-primary"]
+
+
 # ── circuit breaker ───────────────────────────────────────────────────
 
 
@@ -183,6 +237,28 @@ def test_circuit_breaker_reset():
     assert _BREAKER.state == "closed"
 
 
+def test_named_circuit_breakers_are_isolated():
+    """한 에이전트 breaker 장애가 다른 에이전트 호출을 막지 않는다."""
+    from llm.circuit_breakers import call_with_breaker, reset_breaker
+
+    reset_breaker()
+
+    def _always_fail(*a, **kw):
+        raise ConnectionError("forced fail")
+
+    def _ok(*a, **kw):
+        return "ok"
+
+    for _ in range(3):
+        try:
+            call_with_breaker(_always_fail, breaker_name="agent-a")
+        except Exception:
+            pass
+
+    assert call_with_breaker(_ok, breaker_name="agent-b") == "ok"
+    reset_breaker()
+
+
 # ── JSON 추출 헬퍼 ────────────────────────────────────────────────────
 
 
@@ -211,13 +287,28 @@ def test_build_router_without_gemini_key():
     """GEMINI_API_KEY 미설정 시 Ollama 모델만 포함."""
     from llm.router import build_router
 
-    with patch.dict(os.environ, {"GEMINI_API_KEY": ""}, clear=False):
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""}, clear=False):
         router = build_router()
 
     model_names = [m["model_name"] for m in router.model_list]
     assert "agent-llm-secondary" in model_names
     assert "agent-llm-tertiary" in model_names
     assert "agent-llm-primary" not in model_names
+
+
+def test_build_router_uses_google_key_as_gemini_fallback():
+    """GOOGLE_API_KEY만 있어도 Gemini primary를 활성화."""
+    from llm.router import build_router
+
+    with patch.dict(
+        os.environ,
+        {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "test-google-key"},
+        clear=False,
+    ):
+        router = build_router()
+
+    model_names = [m["model_name"] for m in router.model_list]
+    assert "agent-llm-primary" in model_names
 
 
 # ── DecisionMakerResponse 스키마 ─────────────────────────────────────
@@ -246,6 +337,8 @@ def test_decision_maker_response_signal_normalization():
     from llm.schemas import DecisionMakerResponse
     r = DecisionMakerResponse(final_signal="매수", final_confidence=6.0)  # type: ignore
     assert r.final_signal == "buy"
+    r2 = DecisionMakerResponse(final_signal="STRONG BUY", final_confidence=6.0)  # type: ignore
+    assert r2.final_signal == "buy"
 
 
 def test_decision_maker_response_defaults():

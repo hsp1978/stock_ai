@@ -12,10 +12,30 @@ from typing import Dict, Any
 import requests
 from requests.adapters import HTTPAdapter
 
+
+def _setting(name: str, default: str = "") -> str:
+    if name in os.environ:
+        return os.environ.get(name, "")
+    try:
+        from config import settings
+
+        configured = getattr(settings, name, default)
+        return str(configured) if configured is not None else default
+    except Exception:
+        return default
+
+
+def _int_setting(name: str, default: int) -> int:
+    try:
+        return int(_setting(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 # LLM 노드 설정
 LLM_NODES = {
     "rtx_5070": {
-        "url": "http://localhost:11434",
+        "url": _setting("OLLAMA_BASE_URL", "http://localhost:11434"),
         "models": {
             "qwen3_14b": "qwen3:14b-q4_K_M",  # 최신 Qwen3 - 2x 효율
             "qwen_14b": "qwen2.5:14b-instruct-q4_K_M",  # 폴백용
@@ -26,7 +46,7 @@ LLM_NODES = {
     },
     "mac_studio": {
         # MAC_STUDIO_URL 미설정 시 Tailscale hostname으로 시도 (실패하면 폴백 로직이 RTX 5070으로 라우팅)
-        "url": os.getenv("MAC_STUDIO_URL", "http://hsptest-macstudio:8080"),
+        "url": _setting("MAC_STUDIO_URL", "http://hsptest-macstudio:8080"),
         # Mac Studio M1 Max 32GB 통합 메모리 — 32B(q4_K_M, ~19GB)가 안전 한계.
         # 70B(~40GB)는 OOM 으로 로드 불가하므로 라우팅 매핑에서 제외.
         "models": {
@@ -177,7 +197,7 @@ def get_fallback_config(agent_name: str) -> Dict[str, Any]:
     rtx_config = LLM_NODES["rtx_5070"]
 
     # 폴백 timeout 도 MULTI_AGENT_LLM_TIMEOUT 과 정합 (기본 240s)
-    _fallback_timeout = int(os.getenv("MULTI_AGENT_LLM_TIMEOUT", "240"))
+    _fallback_timeout = _int_setting("MULTI_AGENT_LLM_TIMEOUT", 240)
 
     # 고성능 에이전트는 더 많은 시간 할당
     if agent_name in ["Technical Analyst", "Quant Analyst", "Decision Maker"]:
