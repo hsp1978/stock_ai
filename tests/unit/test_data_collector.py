@@ -369,3 +369,42 @@ def test_fetch_fundamentals_uses_ttl_cache():
     assert first["_cache_hit"] is False
     assert second["_cache_hit"] is True
     assert yf_fetch.call_count == 1
+
+
+def test_get_data_cache_status_reports_ohlcv_and_fundamental_freshness():
+    import data_collector as dc
+
+    df = _make_df()
+    entry = CacheEntry.build("AAPL", df, "yfinance")
+    dc._entry_cache[("AAPL", "2y")] = entry
+    dc._fundamental_cache["AAPL"] = {
+        "fetched_at": datetime.now(timezone.utc),
+        "data": {
+            "_source": "yfinance",
+            "_sources_attempted": ["yfinance"],
+            "_errors": [],
+            "data_quality": "full",
+        },
+    }
+
+    status = dc.get_data_cache_status(["AAPL"], period="2y")
+    ticker_status = status["tickers"]["AAPL"]
+
+    assert ticker_status["ohlcv"]["present"] is True
+    assert ticker_status["ohlcv"]["fresh"] is True
+    assert ticker_status["ohlcv"]["source"] == "yfinance"
+    assert ticker_status["fundamentals"]["present"] is True
+    assert ticker_status["fundamentals"]["fresh"] is True
+    assert ticker_status["fundamentals"]["data_quality"] == "full"
+
+
+def test_get_data_cache_status_reports_missing_ticker():
+    import data_collector as dc
+
+    status = dc.get_data_cache_status(["MSFT"], period="2y")
+    ticker_status = status["tickers"]["MSFT"]
+
+    assert ticker_status["ohlcv"]["present"] is False
+    assert ticker_status["ohlcv"]["fresh"] is False
+    assert ticker_status["fundamentals"]["present"] is False
+    assert ticker_status["fundamentals"]["data_quality"] == "missing"

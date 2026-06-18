@@ -54,6 +54,7 @@ try:
         SCAN_INTERVAL_MINUTES, TRADING_STYLE, WATCHLIST,
         COOLING_OFF_DAYS, ACCOUNT_SIZE, OUTPUT_DIR,
         AGENT_API_HOST, AGENT_API_PORT, ANALYSIS_AUX_FETCH_TIMEOUT,
+        DEFAULT_HISTORY_PERIOD,
     )
 except ImportError:
     # config에서 일부 변수가 없을 경우 기본값 사용
@@ -67,9 +68,11 @@ except ImportError:
     AGENT_API_HOST = os.getenv("AGENT_API_HOST", "localhost")
     AGENT_API_PORT = int(os.getenv("AGENT_API_PORT", "8100"))
     ANALYSIS_AUX_FETCH_TIMEOUT = int(os.getenv("ANALYSIS_AUX_FETCH_TIMEOUT", "20"))
+    DEFAULT_HISTORY_PERIOD = os.getenv("DEFAULT_HISTORY_PERIOD", "2y")
 from data_collector import (
     fetch_ohlcv, calculate_indicators,
     fetch_fundamentals, fetch_options_pcr, fetch_insider_trades,
+    get_data_cache_status,
 )
 from analysis_tools import ChartAnalysisAgent, generate_agent_chart
 from quant_indicators import analyze_quant_indicators
@@ -84,7 +87,7 @@ from portfolio_optimizer import (
 from paper_trader import (
     get_portfolio_status, execute_paper_order,
     process_agent_signal, update_position_prices,
-    reset_paper_trading,
+    reset_paper_trading, adjust_corporate_actions,
 )
 from db import (
     init_db, insert_scan,
@@ -107,7 +110,7 @@ _DIRECT_SECTOR = False
 _DIRECT_MACRO = False
 
 try:
-    from news_analyzer import fetch_news_with_sentiment
+    from news_analyzer import fetch_news_with_sentiment, get_news_cache_status
     _DIRECT_NEWS = True
 except ImportError as e:
     print(f"[local_engine] news_analyzer import 실패 (HTTP fallback): {e}")
@@ -147,6 +150,8 @@ cooling_off_state: dict = {}
 _STATE_COOLING_OFF = "service.cooling_off_state"
 _STATE_LATEST_RESULTS = "service.latest_results.summary"
 _STATE_SCAN_HISTORY = "service.scan_history"
+_STATE_JOB_STATUS = "service.ops.job_status"
+_STATE_DATA_HEALTH = "service.ops.data_health.last_result"
 _STATE_LOCK = threading.RLock()
 _AUX_FETCH_TIMEOUT = ANALYSIS_AUX_FETCH_TIMEOUT
 _LATEST_SUMMARY_CACHE: dict = {}
@@ -417,6 +422,190 @@ def engine_health() -> dict:
     }
 
 
+_KNOWN_OPS_JOBS = {
+    "watchlist_scan": "Watchlist Scan",
+    "daily_signal_validation": "Signal Validation",
+    "corporate_actions": "Corporate Actions",
+    "data_health_check": "Data Health Check",
+}
+
+
+def _collect_data_health_tickers(tickers: Optional[list[str]] = None) -> list[str]:
+    if tickers:
+        source = tickers
+    else:
+        source = []
+        try:
+            source.extend(_load_watchlist_files())
+        except Exception:
+            pass
+        source.extend(latest_results.keys())
+        try:
+            portfolio = get_portfolio_status()
+            positions = portfolio.get("positions") or {}
+            source.extend(positions.keys())
+        except Exception:
+            pass
+
+    result = []
+    seen = set()
+    for ticker in source:
+        t = str(ticker).upper().strip()
+        if t and t not in seen:
+            result.append(t)
+            seen.add(t)
+    return result
+
+
+def engine_job_status() -> dict:
+    raw = get_app_state(_STATE_JOB_STATUS, {}) or {}
+    jobs = dict(raw) if isinstance(raw, dict) else {}
+    for job_id, label in _KNOWN_OPS_JOBS.items():
+        jobs.setdefault(
+            job_id,
+            {
+                "job_id": job_id,
+                "label": label,
+                "status": "never_run",
+                "last_started_at": None,
+                "last_finished_at": None,
+                "last_duration_sec": None,
+                "last_error": None,
+                "last_result_summary": None,
+                "run_count": 0,
+                "error_count": 0,
+            },
+        )
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "scheduler": {
+            "enabled": False,
+            "running": False,
+            "jobs": [],
+            "mode": "local_engine",
+        },
+        "jobs": [jobs[job_id] for job_id in sorted(jobs)],
+    }
+
+
+def engine_data_health(refresh: bool = False, tickers: Optional[list[str]] = None) -> dict:
+    last = get_app_state(_STATE_DATA_HEALTH, {}) or {}
+    if last and not refresh:
+        return _sanitize(last)
+
+    target_tickers = _collect_data_health_tickers(tickers)
+    cache_status = get_data_cache_status(target_tickers, period=DEFAULT_HISTORY_PERIOD)
+    try:
+        news_status = get_news_cache_status(target_tickers)
+    except Exception:
+        news_status = {"tickers": {}}
+
+    rows = []
+    stale = []
+    degraded = []
+    for ticker in target_tickers:
+        market = (cache_status.get("tickers") or {}).get(ticker, {})
+        news = (news_status.get("tickers") or {}).get(ticker, {})
+        ohlcv = market.get("ohlcv") or {}
+        fundamentals = market.get("fundamentals") or {}
+        severity = "ok"
+        reasons = []
+        if not ohlcv.get("present") or ohlcv.get("fresh") is False:
+            severity = "stale"
+            reasons.append("ohlcv_missing_or_stale")
+        quality = fundamentals.get("data_quality")
+        if not fundamentals.get("present") or quality in {"missing", "empty"}:
+            if severity != "stale":
+                severity = "degraded"
+            reasons.append("fundamentals_missing")
+        elif fundamentals.get("fresh") is False:
+            if severity != "stale":
+                severity = "degraded"
+            reasons.append("fundamentals_stale")
+        if not news.get("present"):
+            reasons.append("news_not_cached")
+        elif not news.get("fresh"):
+            reasons.append("news_stale")
+
+        row = {
+            "ticker": ticker,
+            "severity": severity,
+            "reasons": reasons,
+            "ohlcv_source": ohlcv.get("source"),
+            "ohlcv_fetched_at": ohlcv.get("fetched_at"),
+            "ohlcv_age_sec": ohlcv.get("age_sec"),
+            "ohlcv_latest_bar": ohlcv.get("latest_bar_date"),
+            "fundamental_source": fundamentals.get("source"),
+            "fundamental_quality": quality,
+            "fundamental_fetched_at": fundamentals.get("fetched_at"),
+            "fundamental_age_sec": fundamentals.get("age_sec"),
+            "news_present": news.get("present", False),
+            "news_fresh": news.get("fresh", False),
+        }
+        rows.append(row)
+        if severity == "stale":
+            stale.append(row)
+        elif severity == "degraded":
+            degraded.append(row)
+
+    if not target_tickers:
+        status = "empty"
+    elif stale:
+        status = "stale"
+    elif degraded:
+        status = "degraded"
+    else:
+        status = "ok"
+
+    payload = {
+        "status": status,
+        "generated_at": datetime.now().isoformat(),
+        "ticker_count": len(target_tickers),
+        "ok_count": sum(1 for row in rows if row["severity"] == "ok"),
+        "stale_count": len(stale),
+        "degraded_count": len(degraded),
+        "stale": stale[:20],
+        "degraded": degraded[:20],
+        "rows": rows,
+        "cache": {
+            "market_data": cache_status,
+            "news": news_status,
+        },
+    }
+    try:
+        set_app_state(_STATE_DATA_HEALTH, payload)
+    except Exception:
+        pass
+    return _sanitize(payload)
+
+
+def engine_ops_snapshot() -> dict:
+    job_data = engine_job_status()
+    return {
+        "scheduler": job_data.get("scheduler", {}),
+        "jobs": job_data.get("jobs", []),
+        "data_health": engine_data_health(),
+        "alerts": get_app_state("service.ops.alerts", {}) or {},
+    }
+
+
+def engine_ops_run_job(job_id: str, force: bool = False) -> dict:
+    normalized = job_id.strip().lower()
+    if normalized in {"watchlist_scan", "scan"}:
+        return engine_scan_all()
+    if normalized in {"daily_signal_validation", "signal_validation"}:
+        result = engine_signal_validation()
+        return {"status": "completed" if not result.get("error") else "error", "result": result}
+    if normalized in {"corporate_actions", "corporate_action"}:
+        try:
+            return {"status": "completed", **adjust_corporate_actions(force=force)}
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+    if normalized in {"data_health_check", "data_health"}:
+        return engine_data_health(refresh=True)
+    return {"error": f"Unknown ops job: {job_id}"}
+
+
 def engine_system_monitor() -> dict:
     """운영 관측용 통합 스냅샷."""
     llm_status = {
@@ -490,6 +679,7 @@ def engine_system_monitor() -> dict:
         "llm": llm_status,
         "signals": signal_status,
         "paper": paper_status,
+        "ops": engine_ops_snapshot(),
     }
 
 
@@ -1350,6 +1540,11 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
             return engine_health()
         elif path == "/system-monitor":
             return engine_system_monitor()
+        elif path == "/ops/jobs":
+            return engine_job_status()
+        elif path.startswith("/ops/data-health"):
+            refresh = "refresh=true" in path.lower()
+            return engine_data_health(refresh=refresh)
         elif path == "/":
             return engine_info()
         elif path == "/results":
@@ -1591,6 +1786,10 @@ def engine_dispatch_post(
             except Exception as e:
                 print(f"[local_engine] screener API 호출 실패: {e}")
                 return {"error": str(e)}
+        elif path.startswith("/ops/jobs/") and "/run" in path:
+            job_id = path.split("/ops/jobs/")[1].split("/run")[0]
+            force = "force=true" in path.lower()
+            return engine_ops_run_job(job_id, force=force)
         elif path.startswith("/quant/run"):
             tickers_str = ""
             benchmark = ""

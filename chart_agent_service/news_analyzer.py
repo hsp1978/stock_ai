@@ -41,6 +41,63 @@ def _news_cache_fresh(entry: dict[str, Any]) -> bool:
     return (datetime.now(timezone.utc) - fetched_at).total_seconds() < ttl
 
 
+def get_news_cache_status(tickers: list[str] | None = None) -> dict[str, Any]:
+    """
+    뉴스 TTL 캐시의 freshness 메타데이터를 반환한다.
+
+    네트워크를 호출하지 않는 관측용 함수다. analyze_sentiment=True/False 캐시가
+    모두 있을 수 있으므로 티커별 entries 배열로 노출한다.
+    """
+    with _news_cache_lock:
+        snapshot = copy.deepcopy(_news_cache)
+
+    if tickers:
+        ticker_list = [t.upper().strip() for t in tickers if t and t.strip()]
+    else:
+        ticker_list = sorted({key[0] for key in snapshot})
+
+    ttl = max(1, int(settings.NEWS_TTL_MINUTES)) * 60
+    result: dict[str, Any] = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "ttl_sec": ttl,
+        "tickers": {},
+    }
+
+    for ticker in ticker_list:
+        entries = []
+        for analyze_sentiment in (True, False):
+            cache_entry = snapshot.get((ticker, analyze_sentiment))
+            if cache_entry is None:
+                continue
+            fetched_at = cache_entry.get("fetched_at")
+            age = (
+                max(0.0, (datetime.now(timezone.utc) - fetched_at).total_seconds())
+                if isinstance(fetched_at, datetime)
+                else None
+            )
+            data = cache_entry.get("data") or {}
+            entries.append(
+                {
+                    "analyze_sentiment": analyze_sentiment,
+                    "present": True,
+                    "fetched_at": fetched_at.isoformat() if isinstance(fetched_at, datetime) else None,
+                    "age_sec": age,
+                    "fresh": bool(age is not None and age < ttl),
+                    "sources": data.get("sources") or [],
+                    "news_count": data.get("news_count", 0),
+                    "overall_sentiment": data.get("overall_sentiment"),
+                }
+            )
+
+        result["tickers"][ticker] = {
+            "present": bool(entries),
+            "fresh": any(entry.get("fresh") for entry in entries),
+            "entries": entries,
+        }
+
+    return result
+
+
 # ── LiteLLM Router 감성 분석 (Step 9: Ollama 직접 호출 → Router) ──
 
 

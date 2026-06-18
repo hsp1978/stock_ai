@@ -309,6 +309,134 @@ def clear_fundamental_cache() -> None:
         _fundamental_cache.clear()
 
 
+def _age_seconds(fetched_at: datetime | None) -> float | None:
+    if not isinstance(fetched_at, datetime):
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - fetched_at).total_seconds())
+
+
+def get_data_cache_status(
+    tickers: list[str] | None = None,
+    period: str = DEFAULT_HISTORY_PERIOD,
+) -> dict[str, Any]:
+    """
+    OHLCV/fundamental TTL 캐시의 freshness 메타데이터를 반환한다.
+
+    네트워크를 호출하지 않는 관측용 함수다. 스케줄러/대시보드가 현재
+    캐시 상태를 읽고 stale/missing 여부를 판단할 때 사용한다.
+    """
+    with _entry_cache_lock:
+        entry_snapshot = dict(_entry_cache)
+    with _ohlcv_cache_lock:
+        legacy_snapshot = dict(_ohlcv_cache)
+    with _fundamental_cache_lock:
+        fundamental_snapshot = dict(_fundamental_cache)
+
+    if tickers:
+        ticker_list = [t.upper().strip() for t in tickers if t and t.strip()]
+    else:
+        found = {key[0] for key in entry_snapshot if len(key) >= 2 and key[1] == period}
+        found.update(key[0] for key in legacy_snapshot if len(key) >= 2 and key[1] == period)
+        found.update(fundamental_snapshot.keys())
+        ticker_list = sorted(found)
+
+    ohlcv_ttl = _get_ttl_seconds(period)
+    fundamental_ttl = float(settings.FUNDAMENTAL_TTL_HOURS) * 3600.0
+    result: dict[str, Any] = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "period": period,
+        "ohlcv_ttl_sec": ohlcv_ttl,
+        "fundamental_ttl_sec": fundamental_ttl,
+        "tickers": {},
+    }
+
+    for ticker in ticker_list:
+        key = (ticker, period)
+        entry = entry_snapshot.get(key)
+        legacy_df = legacy_snapshot.get(key)
+        fundamental = fundamental_snapshot.get(ticker)
+
+        ohlcv_status: dict[str, Any]
+        if entry is not None:
+            age = _age_seconds(entry.fetched_at)
+            ohlcv_status = {
+                "present": True,
+                "source": entry.source,
+                "fetched_at": entry.fetched_at.isoformat(),
+                "age_sec": age,
+                "fresh": bool(age is not None and age < ohlcv_ttl),
+                "row_count": entry.row_count,
+                "latest_bar_date": entry.latest_bar_date.isoformat(),
+                "data_hash": entry.data_hash,
+            }
+        elif legacy_df is not None:
+            latest_bar = None
+            try:
+                latest_idx = legacy_df.index[-1]
+                latest_bar = (
+                    latest_idx.date().isoformat()
+                    if hasattr(latest_idx, "date")
+                    else str(latest_idx)[:10]
+                )
+            except Exception:
+                pass
+            ohlcv_status = {
+                "present": True,
+                "source": "yfinance_batch",
+                "fetched_at": None,
+                "age_sec": None,
+                "fresh": None,
+                "row_count": int(len(legacy_df)),
+                "latest_bar_date": latest_bar,
+                "data_hash": None,
+            }
+        else:
+            ohlcv_status = {
+                "present": False,
+                "source": None,
+                "fetched_at": None,
+                "age_sec": None,
+                "fresh": False,
+                "row_count": 0,
+                "latest_bar_date": None,
+                "data_hash": None,
+            }
+
+        fundamental_status: dict[str, Any]
+        if fundamental is not None:
+            fetched_at = fundamental.get("fetched_at")
+            data = fundamental.get("data") or {}
+            age = _age_seconds(fetched_at)
+            fundamental_status = {
+                "present": True,
+                "source": data.get("_source"),
+                "sources_attempted": data.get("_sources_attempted") or [],
+                "errors": data.get("_errors") or [],
+                "fetched_at": fetched_at.isoformat() if isinstance(fetched_at, datetime) else None,
+                "age_sec": age,
+                "fresh": bool(age is not None and age < fundamental_ttl),
+                "data_quality": data.get("data_quality", "unknown"),
+            }
+        else:
+            fundamental_status = {
+                "present": False,
+                "source": None,
+                "sources_attempted": [],
+                "errors": [],
+                "fetched_at": None,
+                "age_sec": None,
+                "fresh": False,
+                "data_quality": "missing",
+            }
+
+        result["tickers"][ticker] = {
+            "ohlcv": ohlcv_status,
+            "fundamentals": fundamental_status,
+        }
+
+    return result
+
+
 def _stabilize_latest_indicator_row(
     df: pd.DataFrame,
     indicator_cols: list[str],

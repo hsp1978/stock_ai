@@ -4082,17 +4082,20 @@ def render_system_monitor():
     llm = data.get("llm", {})
     signals = data.get("signals", {})
     paper = data.get("paper", {})
+    ops = data.get("ops", {})
+    data_health = ops.get("data_health", {}) if isinstance(ops, dict) else {}
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Cached Results", f"{service.get('cached_results', 0):,}")
     c2.metric("Scan Count", f"{service.get('scan_count', 0):,}")
     c3.metric("Scheduler", "RUNNING" if service.get("scheduler_running") else "OFF")
-    c4.metric("Generated", str(data.get("generated_at", ""))[:19].replace("T", " "))
+    c4.metric("Data Health", str(data_health.get("status", "unknown")).upper())
+    c5.metric("Generated", str(data.get("generated_at", ""))[:19].replace("T", " "))
 
     st.divider()
 
-    tab_nodes, tab_agents, tab_signals, tab_paper = st.tabs(
-        ["LLM Nodes", "Agent Runtime", "Signal Quality", "Paper Portfolio"]
+    tab_nodes, tab_agents, tab_jobs, tab_data, tab_signals, tab_paper = st.tabs(
+        ["LLM Nodes", "Agent Runtime", "Ops Jobs", "Data Freshness", "Signal Quality", "Paper Portfolio"]
     )
 
     with tab_nodes:
@@ -4178,6 +4181,120 @@ def render_system_monitor():
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No agent runtime samples yet. Run a multi-agent analysis to populate this view.")
+
+    with tab_jobs:
+        scheduler = ops.get("scheduler", {}) if isinstance(ops, dict) else {}
+        jobs = ops.get("jobs", []) if isinstance(ops, dict) else []
+
+        j1, j2, j3, j4 = st.columns(4)
+        j1.metric("Scheduler", "RUNNING" if scheduler.get("running") else "OFF")
+        j2.metric("Registered Jobs", f"{len(scheduler.get('jobs') or []):,}")
+        j3.metric("Tracked Jobs", f"{len(jobs):,}")
+        j4.metric("Job Errors", f"{sum(int(j.get('error_count', 0) or 0) for j in jobs):,}")
+
+        action_1, action_2, action_3 = st.columns([1, 1, 2])
+        with action_1:
+            if st.button("Run Data Check", use_container_width=True):
+                result = api_post("/ops/jobs/data_health_check/run", timeout=90)
+                if result and not result.get("error"):
+                    st.success(f"Data check: {result.get('status', 'completed')}")
+                else:
+                    st.error((result or {}).get("error") or "Data check failed")
+        with action_2:
+            if st.button("Run Corp Actions", use_container_width=True):
+                result = api_post("/ops/jobs/corporate_actions/run?force=true", timeout=120)
+                if result and not result.get("error"):
+                    st.success(
+                        f"Checked {result.get('checked', 0)} · Applied {result.get('applied', 0)}"
+                    )
+                else:
+                    st.error((result or {}).get("error") or "Corporate action check failed")
+        with action_3:
+            if st.button("Refresh Monitor", use_container_width=True):
+                st.cache_data.clear() if hasattr(st, "cache_data") else None
+                st.rerun()
+
+        if jobs:
+            job_rows = []
+            for job in jobs:
+                job_rows.append({
+                    "Job": job.get("label") or job.get("job_id"),
+                    "Status": str(job.get("status", "unknown")).upper(),
+                    "Runs": job.get("run_count", 0),
+                    "Errors": job.get("error_count", 0),
+                    "Last Started": str(job.get("last_started_at") or "")[:19].replace("T", " "),
+                    "Last Finished": str(job.get("last_finished_at") or "")[:19].replace("T", " "),
+                    "Duration Sec": job.get("last_duration_sec"),
+                    "Last Error": job.get("last_error") or "",
+                })
+            st.dataframe(job_rows, use_container_width=True, hide_index=True)
+        else:
+            st.info("No ops job state yet.")
+
+        sched_jobs = scheduler.get("jobs") or []
+        if sched_jobs:
+            st.markdown("#### Scheduler Queue")
+            st.dataframe(
+                [{
+                    "Job": item.get("id"),
+                    "Trigger": item.get("trigger"),
+                    "Next Run": str(item.get("next_run_time") or "")[:19].replace("T", " "),
+                } for item in sched_jobs],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with tab_data:
+        if data_health:
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("Status", str(data_health.get("status", "unknown")).upper())
+            d2.metric("Tickers", f"{data_health.get('ticker_count', 0):,}")
+            d3.metric("Stale", f"{data_health.get('stale_count', 0):,}")
+            d4.metric("Degraded", f"{data_health.get('degraded_count', 0):,}")
+
+            rows = data_health.get("rows") or []
+            if rows:
+                freshness_rows = []
+                for row in rows:
+                    freshness_rows.append({
+                        "Ticker": row.get("ticker"),
+                        "Severity": str(row.get("severity", "")).upper(),
+                        "Reasons": ", ".join(row.get("reasons") or []),
+                        "OHLCV Source": row.get("ohlcv_source") or "",
+                        "OHLCV Age H": round((row.get("ohlcv_age_sec") or 0) / 3600, 2)
+                        if row.get("ohlcv_age_sec") is not None else None,
+                        "Latest Bar": row.get("ohlcv_latest_bar") or "",
+                        "Fund Source": row.get("fundamental_source") or "",
+                        "Fund Quality": row.get("fundamental_quality") or "",
+                        "Fund Age H": round((row.get("fundamental_age_sec") or 0) / 3600, 2)
+                        if row.get("fundamental_age_sec") is not None else None,
+                        "News Cached": bool(row.get("news_present")),
+                        "News Fresh": bool(row.get("news_fresh")),
+                    })
+                df_fresh = pd.DataFrame(freshness_rows)
+                severity_order = {"STALE": 0, "DEGRADED": 1, "OK": 2}
+                df_fresh["_order"] = df_fresh["Severity"].map(severity_order).fillna(9)
+                df_fresh = df_fresh.sort_values(["_order", "Ticker"]).drop(columns=["_order"])
+                st.dataframe(df_fresh, use_container_width=True, hide_index=True)
+
+                chart_df = df_fresh.groupby("Severity").size().reset_index(name="Count")
+                fig = go.Figure(go.Bar(
+                    x=chart_df["Severity"],
+                    y=chart_df["Count"],
+                    marker_color=["#ef4444" if s == "STALE" else "#f59e0b" if s == "DEGRADED" else "#10b981"
+                                  for s in chart_df["Severity"]],
+                ))
+                fig.update_layout(**_plotly_base_layout(
+                    height=280,
+                    yaxis_title="Tickers",
+                    xaxis_title="Data state",
+                    margin=dict(l=35, r=20, t=25, b=35),
+                ))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No data freshness rows yet.")
+        else:
+            st.info("Data health snapshot unavailable.")
 
     with tab_signals:
         accuracy = signals.get("accuracy_7d") if isinstance(signals, dict) else {}
