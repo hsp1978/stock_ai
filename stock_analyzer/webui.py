@@ -692,7 +692,7 @@ def api_post(path: str, timeout: int = 300, json_body: dict = None):
     /paper/partial-close) HTTP fallback. json_body는 HTTP 경로에서 사용된다.
     """
     if _USE_LOCAL_ENGINE and not _force_http_api(path):
-        result = engine_dispatch_post(path, json_body=json_body)
+        result = engine_dispatch_post(path, json_body=json_body, timeout=timeout)
         if result is not None:
             return result
     last_error = None
@@ -1557,7 +1557,7 @@ with st.sidebar:
 
     st.divider()
 
-    page = st.radio("Navigation", ["Home", "Dashboard", "Detail", "Multi-Agent", "Scan Log", "Signal Accuracy", "Screener", "Trading", "Virtual Trade", "Backtest", "ML Predict", "Portfolio", "Ranking", "Paper Trade", "History"], label_visibility="collapsed")
+    page = st.radio("Navigation", ["Home", "Dashboard", "Detail", "Multi-Agent", "Quant Indicators", "Scan Log", "System Monitor", "Signal Accuracy", "Screener", "Trading", "Virtual Trade", "Backtest", "ML Predict", "Portfolio", "Ranking", "Paper Trade", "History"], label_visibility="collapsed")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -3065,6 +3065,264 @@ def render_portfolio():
 
 
 # ═══════════════════════════════════════════════════════════════
+#  퀀트 지표 전용 분석 페이지
+# ═══════════════════════════════════════════════════════════════
+
+def _quant_signal_style(signal: str) -> str:
+    s = (signal or "").lower()
+    if s == "buy":
+        return "buy"
+    if s == "sell":
+        return "sell"
+    return "hold"
+
+
+def render_quant_indicators():
+    log_action("page_view", page="quant_indicators")
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">Quant Indicators</div>
+        <div class="page-subtitle">가격·거래량·변동성·상관 기반 정량 지표 전용 분석</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    watchlist = load_watchlist()
+    c1, c2, c3 = st.columns([2, 2, 1])
+    with c1:
+        input_mode = st.radio(
+            "종목 선택 방식",
+            ["Watchlist", "직접 입력"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="quant_input_mode",
+        )
+    with c2:
+        if input_mode == "Watchlist" and watchlist:
+            options = {format_ticker_label(t, "flag_name_code"): t for t in watchlist}
+            selected_label = st.selectbox(
+                "분석 종목",
+                list(options.keys()),
+                label_visibility="collapsed",
+                key="quant_watchlist_ticker",
+            )
+            ticker = options[selected_label]
+            resolved_note = ""
+        else:
+            raw_ticker = st.text_input(
+                "티커 또는 종목명",
+                value=st.session_state.get("quant_last_input", "005930.KS"),
+                placeholder="예: AAPL, NVDA, 삼성전자, 005930",
+                label_visibility="collapsed",
+                key="quant_raw_ticker",
+            )
+            ticker, resolved_note = resolve_ticker(raw_ticker)
+            st.session_state.quant_last_input = raw_ticker
+    with c3:
+        custom_benchmark = st.text_input(
+            "Benchmark",
+            value="",
+            placeholder="기본값",
+            help="비워두면 한국은 KOSPI, 미국은 SPY 사용",
+            label_visibility="collapsed",
+            key="quant_benchmark",
+        )
+
+    if resolved_note:
+        st.caption(resolved_note)
+
+    run_cols = st.columns([1, 1, 3])
+    with run_cols[0]:
+        run_now = st.button(
+            "Run Quant",
+            type="primary",
+            use_container_width=True,
+            disabled=not ticker,
+            key="quant_run_btn",
+        )
+    with run_cols[1]:
+        refresh_latest = st.button("Latest", use_container_width=True, key="quant_latest_btn")
+
+    if run_now:
+        query = f"/quant/{ticker}"
+        if custom_benchmark.strip():
+            query += f"?benchmark={custom_benchmark.strip().upper()}"
+        with st.status(f"{ticker} 퀀트 지표 분석 중...", expanded=True) as status:
+            st.write("OHLCV 수집 및 기본 지표 계산")
+            st.write("모멘텀·평균회귀·변동성·추세·거래량·벤치마크 점수화")
+            result = api_get(query, timeout=180)
+            if result and result.get("status") == "ok":
+                st.session_state.quant_result = result
+                status.update(label="퀀트 분석 완료", state="complete", expanded=False)
+            elif result:
+                status.update(label="퀀트 분석 실패", state="error", expanded=True)
+                st.error(result.get("error") or ", ".join(result.get("invalid_reasons", [])) or "분석 실패")
+            else:
+                status.update(label="퀀트 분석 실패", state="error", expanded=True)
+                st.error("API 응답 없음")
+
+    if refresh_latest:
+        latest = api_get("/quant/latest?limit=20")
+        if latest and latest.get("results"):
+            st.session_state.quant_latest = latest
+        else:
+            st.info("최근 퀀트 분석 결과가 없습니다.")
+
+    latest_data = st.session_state.get("quant_latest")
+    if latest_data and latest_data.get("results"):
+        with st.expander("최근 퀀트 분석 결과", expanded=False):
+            rows = []
+            for row in latest_data["results"]:
+                rows.append({
+                    "Ticker": row.get("ticker"),
+                    "Score": row.get("quant_score"),
+                    "Grade": row.get("grade"),
+                    "Bias": row.get("signal_label"),
+                    "Confidence": row.get("confidence"),
+                    "Regime": row.get("regime"),
+                    "Analyzed": (row.get("analyzed_at") or "")[:19],
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    data = st.session_state.get("quant_result")
+    if not data:
+        st.info("종목을 선택하고 Run Quant를 실행하세요. 이 탭은 뉴스·공시·LLM 판단을 제외한 정량 지표만 사용합니다.")
+        return
+
+    if data.get("status") != "ok":
+        st.warning(f"분석 불가: {', '.join(data.get('invalid_reasons', []))}")
+        return
+
+    signal_class = _quant_signal_style(data.get("signal"))
+    st.markdown(
+        f"""
+        <div class="section-header">
+            <div>
+                <div class="section-title">{format_ticker_label(data.get('ticker', ''), 'flag_name_code')}</div>
+                <div class="section-subtitle">as of {(data.get('as_of') or '')[:19]} · benchmark {data.get('benchmark_ticker') or 'n/a'}</div>
+            </div>
+            <span class="signal-badge-lg {signal_class}">{data.get('signal_label', 'NEUTRAL')}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Quant Score", f"{data.get('quant_score', 0):.1f}/100")
+    m2.metric("Grade", data.get("grade", "?"))
+    m3.metric("Confidence", f"{data.get('confidence', 0):.1f}/10")
+    m4.metric("Regime", str(data.get("regime", "?")).replace("_", " ").title())
+    m5.metric("Current", _fmt_price(data.get("current_price", 0), data.get("ticker", "")))
+
+    risk_penalty = float(data.get("risk_penalty") or 0)
+    if risk_penalty <= -8:
+        st.warning(f"리스크 페널티 {risk_penalty:.1f}점 적용: 변동성, 낙폭, 하방 위험을 먼저 확인하세요.")
+    elif data.get("warnings"):
+        st.caption("Warnings: " + ", ".join(data.get("warnings", [])[:5]))
+
+    components = data.get("components") or {}
+    component_labels = {
+        "momentum": "Momentum",
+        "mean_reversion": "Mean Reversion",
+        "volatility": "Volatility",
+        "trend": "Trend",
+        "volume": "Volume",
+        "benchmark": "Benchmark",
+    }
+    component_rows = []
+    for key, comp in components.items():
+        weight = float(comp.get("weight") or 0)
+        score = float(comp.get("score") or 0)
+        component_rows.append({
+            "Factor": component_labels.get(key, key),
+            "Score": score,
+            "Weight": weight,
+            "Percent": round(score / weight * 100, 1) if weight else 0,
+            "Direction": comp.get("direction", "neutral"),
+        })
+
+    if component_rows:
+        comp_df = pd.DataFrame(component_rows)
+        colors = [
+            "#02d4a1" if d == "buy" else "#fd526f" if d == "sell" else "#ffb347"
+            for d in comp_df["Direction"]
+        ]
+        fig = go.Figure(go.Bar(
+            x=comp_df["Percent"],
+            y=comp_df["Factor"],
+            orientation="h",
+            marker_color=colors,
+            text=[f"{s:.1f}/{w:.0f}" for s, w in zip(comp_df["Score"], comp_df["Weight"])],
+            textposition="auto",
+        ))
+        fig.update_layout(**_plotly_base_layout(
+            height=320,
+            margin=dict(l=120, r=30, t=20, b=30),
+            xaxis=dict(range=[0, 100], ticksuffix="%", gridcolor="rgba(255,255,255,0.08)"),
+            yaxis=dict(autorange="reversed"),
+            showlegend=False,
+        ))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        comp_df = pd.DataFrame()
+
+    tab_summary, tab_details, tab_risk, tab_json = st.tabs(["Factor Table", "Indicator Detail", "Risk", "JSON"])
+    with tab_summary:
+        if not comp_df.empty:
+            st.dataframe(comp_df, use_container_width=True, hide_index=True)
+        cols = st.columns(2)
+        with cols[0]:
+            st.markdown("**Strengths**")
+            strengths = data.get("strengths") or []
+            if strengths:
+                for item in strengths:
+                    st.write(f"- {item}")
+            else:
+                st.caption("강점 신호 없음")
+        with cols[1]:
+            st.markdown("**Warnings**")
+            warnings = data.get("warnings") or []
+            if warnings:
+                for item in warnings:
+                    st.write(f"- {item}")
+            else:
+                st.caption("경고 신호 없음")
+
+    with tab_details:
+        detail_rows = []
+        for factor, comp in components.items():
+            for key, value in comp.items():
+                if key in ("score", "weight", "direction"):
+                    continue
+                if isinstance(value, dict):
+                    for sub_key, sub_value in value.items():
+                        detail_rows.append({
+                            "Factor": component_labels.get(factor, factor),
+                            "Metric": f"{key}.{sub_key}",
+                            "Value": sub_value,
+                        })
+                else:
+                    detail_rows.append({
+                        "Factor": component_labels.get(factor, factor),
+                        "Metric": key,
+                        "Value": value,
+                    })
+        st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+
+    with tab_risk:
+        risk = data.get("risk") or {}
+        r1, r2, r3, r4, r5 = st.columns(5)
+        r1.metric("Max DD 120D", f"{risk.get('max_drawdown_120d', 0) or 0:.1f}%")
+        r2.metric("Downside Vol", f"{risk.get('downside_volatility', 0) or 0:.1f}%")
+        r3.metric("VaR 95%", f"{risk.get('var_95_daily', 0) or 0:.2f}%")
+        r4.metric("Sharpe", f"{risk.get('sharpe_120d', 0) or 0:.2f}")
+        r5.metric("Penalty", f"{risk.get('penalty', 0) or 0:.1f}")
+        st.caption("VaR/CVaR는 최근 수익률 분포 기반 일간 손실 추정치입니다.")
+
+    with tab_json:
+        st.json(data)
+
+
+# ═══════════════════════════════════════════════════════════════
 #  팩터 랭킹 페이지
 # ═══════════════════════════════════════════════════════════════
 
@@ -3802,6 +4060,176 @@ def render_multi_agent():
             )
 
 
+def render_system_monitor():
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">System Monitor</div>
+        <div class="page-subtitle">LLM routing capacity · signal calibration · paper portfolio snapshot</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    data = api_get("/system-monitor", timeout=20)
+    if not data:
+        st.markdown("""
+        <div class="empty-state">
+            <div class="es-icon">!</div>
+            <div class="es-text">System monitor data unavailable. Check agent API status.</div>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    service = data.get("service", {})
+    llm = data.get("llm", {})
+    signals = data.get("signals", {})
+    paper = data.get("paper", {})
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Cached Results", f"{service.get('cached_results', 0):,}")
+    c2.metric("Scan Count", f"{service.get('scan_count', 0):,}")
+    c3.metric("Scheduler", "RUNNING" if service.get("scheduler_running") else "OFF")
+    c4.metric("Generated", str(data.get("generated_at", ""))[:19].replace("T", " "))
+
+    st.divider()
+
+    tab_nodes, tab_agents, tab_signals, tab_paper = st.tabs(
+        ["LLM Nodes", "Agent Runtime", "Signal Quality", "Paper Portfolio"]
+    )
+
+    with tab_nodes:
+        nodes = llm.get("nodes", {}) if isinstance(llm, dict) else {}
+        if nodes:
+            node_rows = []
+            for node, metrics in nodes.items():
+                capacity = metrics.get("capacity", 0) or 0
+                inflight = metrics.get("inflight", 0) or 0
+                usage_pct = (inflight / capacity * 100) if capacity else 0
+                node_rows.append({
+                    "Node": node,
+                    "Inflight": inflight,
+                    "Capacity": capacity,
+                    "Available": metrics.get("available_slots", 0),
+                    "Usage %": round(usage_pct, 1),
+                    "Overloads": metrics.get("overload_count", 0),
+                    "URL": metrics.get("url", ""),
+                })
+            st.dataframe(node_rows, use_container_width=True, hide_index=True)
+
+            chart_df = pd.DataFrame(node_rows)
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=chart_df["Node"],
+                y=chart_df["Inflight"],
+                name="Inflight",
+                marker_color="#38bdf8",
+            ))
+            fig.add_trace(go.Bar(
+                x=chart_df["Node"],
+                y=chart_df["Available"],
+                name="Available",
+                marker_color="#10b981",
+            ))
+            fig.update_layout(**_plotly_base_layout(
+                height=320,
+                barmode="stack",
+                yaxis_title="Requests",
+                margin=dict(l=35, r=20, t=30, b=35),
+            ))
+            st.plotly_chart(fig, use_container_width=True)
+
+            mac_health = llm.get("mac_studio_health", {})
+            if mac_health:
+                h1, h2, h3 = st.columns(3)
+                h1.metric("Mac Studio", "ONLINE" if mac_health.get("available") else "OFFLINE")
+                h2.metric("Failures", str(mac_health.get("failures", 0)))
+                h3.metric("Last Status", str(mac_health.get("last_status") or "n/a"))
+                if mac_health.get("last_error"):
+                    st.caption(f"Last error: {mac_health.get('last_error')}")
+        else:
+            st.info(llm.get("error") or "No LLM node metrics yet.")
+
+    with tab_agents:
+        perf = ((llm.get("agent_performance") or {}).get("agent_performance") or {})
+        if perf:
+            rows = []
+            for agent, metrics in perf.items():
+                rows.append({
+                    "Agent": agent,
+                    "Runs": metrics.get("count", 0),
+                    "Avg Seconds": round(metrics.get("avg_time", 0), 2),
+                    "Node Usage": ", ".join(
+                        f"{node}:{count}" for node, count in (metrics.get("node_usage") or {}).items()
+                    ),
+                })
+            perf_df = pd.DataFrame(rows).sort_values("Avg Seconds", ascending=False)
+            st.dataframe(perf_df, use_container_width=True, hide_index=True)
+
+            fig = go.Figure(go.Bar(
+                x=perf_df["Avg Seconds"],
+                y=perf_df["Agent"],
+                orientation="h",
+                marker_color="#f59e0b",
+            ))
+            fig.update_layout(**_plotly_base_layout(
+                height=max(320, 42 * len(perf_df)),
+                xaxis_title="Avg seconds",
+                yaxis_title="",
+                margin=dict(l=120, r=20, t=25, b=35),
+            ))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No agent runtime samples yet. Run a multi-agent analysis to populate this view.")
+
+    with tab_signals:
+        accuracy = signals.get("accuracy_7d") if isinstance(signals, dict) else {}
+        if accuracy and not accuracy.get("error"):
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric("7D Evaluated", f"{accuracy.get('total_evaluated', 0):,}")
+            a2.metric("7D Win Rate", f"{accuracy.get('win_rate_pct', 0):.1f}%")
+            a3.metric("Avg Return", f"{accuracy.get('avg_return_pct', 0):+.2f}%")
+            a4.metric("Samples", f"{accuracy.get('sample_size', 0):,}")
+
+            bands = [b for b in accuracy.get("by_confidence_band", []) if b.get("total", 0) > 0]
+            if bands:
+                band_df = pd.DataFrame(bands)
+                fig = go.Figure(go.Bar(
+                    x=band_df["band"],
+                    y=band_df["win_rate_pct"],
+                    text=[f"n={n}" for n in band_df["total"]],
+                    marker_color="#10b981",
+                ))
+                fig.add_hline(y=50, line_dash="dash", line_color="#8d909e")
+                fig.update_layout(**_plotly_base_layout(
+                    height=330,
+                    yaxis_title="Win rate %",
+                    xaxis_title="Confidence band",
+                    yaxis=dict(range=[0, 100]),
+                    margin=dict(l=35, r=20, t=30, b=35),
+                ))
+                st.plotly_chart(fig, use_container_width=True)
+
+            calib = signals.get("calibrator") or {}
+            v1, v2, v3 = st.columns(3)
+            v1.metric("Calibrator", "ON" if calib.get("active") else "OFF")
+            v2.metric("Calibration Samples", f"{calib.get('total_samples', 0):,}")
+            v3.metric("Last Refit", str(calib.get("last_refit") or "never")[:19])
+        else:
+            st.info((signals or {}).get("error") or "No evaluated signal data yet.")
+
+    with tab_paper:
+        if paper and not paper.get("error"):
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Equity", f"${paper.get('total_equity', 0):,.2f}")
+            p2.metric("PnL", f"${paper.get('total_pnl', 0):+,.2f}",
+                      delta=f"{paper.get('total_pnl_pct', 0):+.2f}%")
+            p3.metric("Open Positions", f"{paper.get('open_positions', 0)}")
+            p4.metric("Win Rate", f"{paper.get('win_rate_pct', 0):.1f}%")
+            q1, q2 = st.columns(2)
+            q1.metric("Cash", f"${paper.get('cash', 0):,.2f}")
+            q2.metric("Position Value", f"${paper.get('position_value', 0):,.2f}")
+        else:
+            st.info((paper or {}).get("error") or "Paper trading status unavailable.")
+
+
 # ═══════════════════════════════════════════════════════════════
 #  신호 정확도 페이지 (Sprint 2)
 # ═══════════════════════════════════════════════════════════════
@@ -4054,7 +4482,9 @@ def render_screener():
 
     # ── 실행 (스크리너 단독 or 파이프라인) ─────────
     if run_now:
-        est_total = 120 + (analyze_top * 60) if analyze_top > 0 else 120
+        workers = max(1, int(os.getenv("SCAN_PARALLEL_WORKERS", "2")))
+        ma_batches = (int(analyze_top) + workers - 1) // workers
+        est_total = 120 + (ma_batches * 300) if analyze_top > 0 else 120
         est_min = est_total // 60
         est_s = est_total % 60
         est_str = f"{est_min}분 {est_s}초" if est_min else f"{est_s}초"
@@ -5254,8 +5684,12 @@ elif page == "Detail":
     render_detail()
 elif page == "Multi-Agent":
     render_multi_agent()
+elif page == "Quant Indicators":
+    render_quant_indicators()
 elif page == "Scan Log":
     render_scan_log()
+elif page == "System Monitor":
+    render_system_monitor()
 elif page == "Signal Accuracy":
     render_signal_accuracy()
 elif page == "Screener":

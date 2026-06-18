@@ -150,6 +150,41 @@ def test_call_agent_llm_exception_returns_neutral():
     assert "LLM_CALL_ERROR" in result.risk_flags
 
 
+def test_call_agent_llm_deadline_before_call_returns_neutral():
+    """이미 지난 deadline은 LLM 호출 없이 안전 응답."""
+    from llm.router import call_agent_llm
+
+    mock_router = MagicMock()
+
+    result = call_agent_llm(mock_router, "Test Agent", "test", timeout_seconds=0)
+
+    assert result.signal == "neutral"
+    assert result.confidence == 0.0
+    assert "LLM_DEADLINE_EXCEEDED" in result.risk_flags
+    mock_router.completion.assert_not_called()
+
+
+def test_call_agent_llm_passes_timeout_to_router_completion():
+    """남은 deadline이 Router.completion timeout으로 전달된다."""
+    from llm.router import call_agent_llm
+
+    mock_router = MagicMock()
+    mock_router.completion.return_value = _make_api_response(_valid_json())
+
+    with patch(
+        "llm.router.call_with_breaker", side_effect=lambda fn, *a, **kw: fn(*a, **kw)
+    ):
+        result = call_agent_llm(
+            mock_router,
+            "Technical Analyst",
+            "analyze AAPL",
+            timeout_seconds=3.2,
+        )
+
+    assert result.signal == "buy"
+    assert mock_router.completion.call_args.kwargs["timeout"] == 3.2
+
+
 def test_call_agent_llm_respects_ollama_preference():
     """ollama 선호 에이전트는 Gemini key가 있어도 Ollama tier부터 호출."""
     from llm.router import call_agent_llm
@@ -161,6 +196,8 @@ def test_call_agent_llm_respects_ollama_preference():
         os.environ,
         {"GEMINI_API_KEY": "test-gemini-key", "GOOGLE_API_KEY": ""},
         clear=False,
+    ), patch(
+        "llm.router._node_available_for_model", return_value=True
     ), patch(
         "llm.router.call_with_breaker", side_effect=lambda fn, *a, **kw: fn(*a, **kw)
     ):
@@ -175,8 +212,8 @@ def test_call_agent_llm_respects_ollama_preference():
     assert mock_router.completion.call_args.kwargs["model"] == "agent-llm-secondary"
 
 
-def test_call_agent_llm_falls_back_to_primary_after_ollama_error():
-    """Ollama tier 호출 자체가 실패하면 Gemini primary를 한 번 더 시도."""
+def test_call_agent_llm_falls_back_to_tertiary_after_mac_ollama_error():
+    """Mac Studio Ollama 호출이 실패하면 RTX Ollama tier를 먼저 시도."""
     from llm.router import call_agent_llm
 
     mock_router = MagicMock()
@@ -190,6 +227,8 @@ def test_call_agent_llm_falls_back_to_primary_after_ollama_error():
         {"GEMINI_API_KEY": "test-gemini-key", "GOOGLE_API_KEY": ""},
         clear=False,
     ), patch(
+        "llm.router._node_available_for_model", return_value=True
+    ), patch(
         "llm.router.call_with_breaker", side_effect=lambda fn, *a, **kw: fn(*a, **kw)
     ):
         result = call_agent_llm(
@@ -201,7 +240,79 @@ def test_call_agent_llm_falls_back_to_primary_after_ollama_error():
 
     assert result.signal == "buy"
     called_models = [call.kwargs["model"] for call in mock_router.completion.call_args_list]
-    assert called_models == ["agent-llm-secondary", "agent-llm-primary"]
+    assert called_models == ["agent-llm-secondary", "agent-llm-tertiary"]
+
+
+def test_call_agent_llm_falls_back_to_primary_after_ollama_tiers_fail():
+    """Ollama tier들이 모두 실패하면 Gemini primary를 마지막으로 시도."""
+    from llm.router import call_agent_llm
+
+    mock_router = MagicMock()
+    mock_router.completion.side_effect = [
+        ConnectionError("mac down"),
+        ConnectionError("rtx down"),
+        _make_api_response(_valid_json()),
+    ]
+
+    with patch.dict(
+        os.environ,
+        {"GEMINI_API_KEY": "test-gemini-key", "GOOGLE_API_KEY": ""},
+        clear=False,
+    ), patch(
+        "llm.router._node_available_for_model", return_value=True
+    ), patch(
+        "llm.router.call_with_breaker", side_effect=lambda fn, *a, **kw: fn(*a, **kw)
+    ):
+        result = call_agent_llm(
+            mock_router,
+            "ML Specialist",
+            "analyze AAPL",
+            preferred_provider="ollama",
+        )
+
+    assert result.signal == "buy"
+    called_models = [call.kwargs["model"] for call in mock_router.completion.call_args_list]
+    assert called_models == [
+        "agent-llm-secondary",
+        "agent-llm-tertiary",
+        "agent-llm-primary",
+    ]
+
+
+def test_call_agent_llm_skips_overloaded_mac_slot():
+    """Mac Studio 슬롯이 꽉 차면 요청을 보내지 않고 RTX tier로 넘어간다."""
+    from contextlib import nullcontext
+    from llm.router import call_agent_llm
+
+    mock_router = MagicMock()
+    mock_router.completion.return_value = _make_api_response(_valid_json())
+
+    def fake_slot(model_name):
+        if model_name == "agent-llm-secondary":
+            return nullcontext(False)
+        return nullcontext(True)
+
+    with patch.dict(
+        os.environ,
+        {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""},
+        clear=False,
+    ), patch(
+        "llm.router._node_available_for_model", return_value=True
+    ), patch(
+        "llm.router._node_slot_for_model", side_effect=fake_slot
+    ), patch(
+        "llm.router.call_with_breaker", side_effect=lambda fn, *a, **kw: fn(*a, **kw)
+    ):
+        result = call_agent_llm(
+            mock_router,
+            "ML Specialist",
+            "analyze AAPL",
+            preferred_provider="ollama",
+        )
+
+    assert result.signal == "buy"
+    called_models = [call.kwargs["model"] for call in mock_router.completion.call_args_list]
+    assert called_models == ["agent-llm-tertiary"]
 
 
 # ── circuit breaker ───────────────────────────────────────────────────

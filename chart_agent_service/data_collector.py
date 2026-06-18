@@ -11,11 +11,14 @@ Step 3: CacheEntry(TTL 메타) + tenacity retry + 다중 소스 fallback 추가.
 """
 
 import logging
+import os
 import threading
 from datetime import datetime, timezone
+from typing import Any
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from tenacity import (
     retry,
@@ -59,6 +62,42 @@ _entry_cache_lock = threading.Lock()
 _ohlcv_cache: dict = {}
 _ohlcv_cache_lock = threading.Lock()
 
+# ─── 펀더멘털 TTL 캐시 ────────────────────────────────────────
+_fundamental_cache: dict[str, dict[str, Any]] = {}
+_fundamental_cache_lock = threading.Lock()
+
+_FUNDAMENTAL_FIELDS = [
+    "market_cap",
+    "pe_ratio",
+    "forward_pe",
+    "peg_ratio",
+    "price_to_book",
+    "dividend_yield",
+    "eps",
+    "revenue_growth",
+    "profit_margin",
+    "debt_to_equity",
+    "free_cash_flow",
+    "return_on_equity",
+    "beta",
+    "52w_high",
+    "52w_low",
+    "avg_volume",
+    "short_ratio",
+    "sector",
+    "industry",
+    "current_price",
+]
+
+_FUNDAMENTAL_QUALITY_FIELDS = [
+    "market_cap",
+    "pe_ratio",
+    "eps",
+    "beta",
+    "sector",
+    "industry",
+]
+
 
 # ── 헬퍼 ──────────────────────────────────────────────────────
 
@@ -78,6 +117,17 @@ def _get_ttl_seconds(period: str) -> float:
 def _is_fresh(entry: CacheEntry, period: str) -> bool:
     age = (datetime.now(timezone.utc) - entry.fetched_at).total_seconds()
     return age < _get_ttl_seconds(period)
+
+
+def _is_fundamental_cache_fresh(entry: dict[str, Any]) -> bool:
+    ttl = float(settings.FUNDAMENTAL_TTL_HOURS) * 3600.0
+    if ttl <= 0:
+        return False
+    fetched_at = entry.get("fetched_at")
+    if not isinstance(fetched_at, datetime):
+        return False
+    age = (datetime.now(timezone.utc) - fetched_at).total_seconds()
+    return age < ttl
 
 
 def _dedupe_sources(sources: list) -> list:
@@ -253,9 +303,67 @@ def clear_ohlcv_cache() -> None:
         _entry_cache.clear()
 
 
-def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """기술 지표 일괄 계산"""
+def clear_fundamental_cache() -> None:
+    """펀더멘털 TTL 캐시 초기화 (테스트/수동 복구용)."""
+    with _fundamental_cache_lock:
+        _fundamental_cache.clear()
+
+
+def _stabilize_latest_indicator_row(
+    df: pd.DataFrame,
+    indicator_cols: list[str],
+) -> pd.DataFrame:
+    """Keep latest OHLC live, but freeze indicator columns at the prior bar."""
+    if len(df) < 2 or not indicator_cols:
+        df.attrs["indicator_mode"] = "confirmed"
+        df.attrs["indicator_asof"] = None
+        return df
+
+    latest_idx = df.index[-1]
+    confirmed_idx = df.index[-2]
+
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        if col in df.columns:
+            df[f"Live_{col}"] = df[col]
+
+    df.loc[latest_idx, indicator_cols] = df.loc[confirmed_idx, indicator_cols]
+    df["Indicator_Mode"] = "confirmed"
+    df["Indicator_AsOf"] = None
+    df.loc[latest_idx, "Indicator_AsOf"] = (
+        confirmed_idx.isoformat() if hasattr(confirmed_idx, "isoformat") else str(confirmed_idx)
+    )
+    df.attrs["indicator_mode"] = "confirmed"
+    df.attrs["indicator_asof"] = df.loc[latest_idx, "Indicator_AsOf"]
+
+    live_close = float(df.loc[latest_idx, "Live_Close"]) if "Live_Close" in df.columns else None
+    if live_close and live_close > 0:
+        for col in indicator_cols:
+            is_price_level = (
+                col.startswith(("SMA_", "EMA_"))
+                or (col.startswith("VWAP_") and col.removeprefix("VWAP_").isdigit())
+            )
+            if (
+                is_price_level
+                and not pd.isna(df.loc[latest_idx, col])
+                and float(df.loc[latest_idx, col]) != 0
+            ):
+                df.loc[latest_idx, f"Live_Dist_{col}"] = (
+                    live_close / float(df.loc[latest_idx, col]) - 1
+                ) * 100
+    return df
+
+
+def calculate_indicators(df: pd.DataFrame, mode: str = "confirmed") -> pd.DataFrame:
+    """기술 지표 일괄 계산.
+
+    mode="confirmed" (default): latest row keeps live OHLC values, while indicator
+    columns are frozen to the prior confirmed bar to avoid intraday repaint.
+    mode="live": preserve legacy behavior and include the latest row in indicators.
+    """
+    if mode not in {"confirmed", "live"}:
+        raise ValueError("mode must be 'confirmed' or 'live'")
     df = df.copy()
+    original_cols = set(df.columns)
 
     # ── SMA / EMA ──
     for p in SMA_PERIODS:
@@ -318,12 +426,75 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["OBV"] = (df["Volume"] * direction).fillna(0).cumsum()
     df["Volume_SMA_20"] = df["Volume"].rolling(window=20, min_periods=20).mean()
 
+    # ── Rolling VWAP ──
+    typical_price = (df["High"] + df["Low"] + df["Close"]) / 3
+    volume = df["Volume"].fillna(0)
+    tpv = typical_price * volume
+    for p in (20, 60):
+        vol_sum = volume.rolling(window=p, min_periods=p).sum().replace(0, np.nan)
+        vwap = tpv.rolling(window=p, min_periods=p).sum() / vol_sum
+        df[f"VWAP_{p}"] = vwap
+        df[f"VWAP_DIST_{p}"] = (df["Close"] / vwap - 1) * 100
+    df["VWAP_SLOPE_20"] = df["VWAP_20"].pct_change(5) * 100
+
+    indicator_cols = [c for c in df.columns if c not in original_cols]
+    if mode == "confirmed":
+        df = _stabilize_latest_indicator_row(df, indicator_cols)
+    else:
+        df["Indicator_Mode"] = "live"
+        df["Indicator_AsOf"] = None
+        df.attrs["indicator_mode"] = "live"
+        df.attrs["indicator_asof"] = (
+            df.index[-1].isoformat() if len(df.index) and hasattr(df.index[-1], "isoformat")
+            else str(df.index[-1]) if len(df.index) else None
+        )
+
     return df
 
 
-def fetch_fundamentals(ticker: str) -> dict:
-    t = yf.Ticker(ticker)
-    info = t.info or {}
+def _safe_float(value: Any, multiplier: float = 1.0) -> float | None:
+    if value in (None, "", "None", "N/A", "-"):
+        return None
+    try:
+        if isinstance(value, str):
+            value = value.replace(",", "").replace("%", "").strip()
+        parsed = float(value) * multiplier
+        if pd.isna(parsed):
+            return None
+        return parsed
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any, multiplier: float = 1.0) -> int | None:
+    parsed = _safe_float(value, multiplier=multiplier)
+    return int(parsed) if parsed is not None else None
+
+
+def _empty_fundamentals() -> dict[str, Any]:
+    return {field: None for field in _FUNDAMENTAL_FIELDS}
+
+
+def _fundamental_quality(data: dict[str, Any]) -> str:
+    present = sum(1 for key in _FUNDAMENTAL_QUALITY_FIELDS if data.get(key) is not None)
+    if present >= 5:
+        return "full"
+    if present >= 2:
+        return "partial"
+    if any(data.get(key) is not None for key in _FUNDAMENTAL_FIELDS):
+        return "sparse"
+    return "empty"
+
+
+def _merge_fundamentals(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key in _FUNDAMENTAL_FIELDS:
+        if merged.get(key) is None and incoming.get(key) is not None:
+            merged[key] = incoming[key]
+    return merged
+
+
+def _normalize_yfinance_fundamentals(info: dict[str, Any]) -> dict[str, Any]:
     return {
         "market_cap": info.get("marketCap"),
         "pe_ratio": info.get("trailingPE"),
@@ -336,6 +507,7 @@ def fetch_fundamentals(ticker: str) -> dict:
         "profit_margin": info.get("profitMargins"),
         "debt_to_equity": info.get("debtToEquity"),
         "free_cash_flow": info.get("freeCashflow"),
+        "return_on_equity": info.get("returnOnEquity"),
         "beta": info.get("beta"),
         "52w_high": info.get("fiftyTwoWeekHigh"),
         "52w_low": info.get("fiftyTwoWeekLow"),
@@ -343,7 +515,236 @@ def fetch_fundamentals(ticker: str) -> dict:
         "short_ratio": info.get("shortRatio"),
         "sector": info.get("sector"),
         "industry": info.get("industry"),
+        "current_price": info.get("currentPrice") or info.get("regularMarketPrice"),
     }
+
+
+def _fetch_yfinance_fundamentals(ticker: str) -> dict[str, Any]:
+    t = yf.Ticker(ticker)
+    info = t.info or {}
+    if not info:
+        return {}
+    return _normalize_yfinance_fundamentals(info)
+
+
+def _request_json(url: str, params: dict[str, Any], timeout: float = 8.0) -> Any:
+    response = requests.get(url, params=params, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def _fetch_finnhub_fundamentals(ticker: str) -> dict[str, Any]:
+    token = settings.FINNHUB_API_KEY or os.getenv("FINNHUB_API_KEY", "")
+    if not token:
+        return {}
+    payload = _request_json(
+        "https://finnhub.io/api/v1/stock/metric",
+        {"symbol": ticker.upper(), "metric": "all", "token": token},
+    )
+    metric = payload.get("metric") if isinstance(payload, dict) else {}
+    if not metric:
+        return {}
+    return {
+        "market_cap": _safe_int(metric.get("marketCapitalization"), 1_000_000),
+        "pe_ratio": _safe_float(metric.get("peTTM")),
+        "forward_pe": _safe_float(metric.get("forwardPEAnnual")),
+        "price_to_book": _safe_float(metric.get("pbAnnual")),
+        "dividend_yield": _safe_float(metric.get("dividendYieldIndicatedAnnual"), 0.01),
+        "eps": _safe_float(metric.get("epsTTM")),
+        "revenue_growth": _safe_float(metric.get("revenueGrowthTTMYoy"), 0.01),
+        "profit_margin": _safe_float(metric.get("netProfitMarginTTM"), 0.01),
+        "debt_to_equity": _safe_float(metric.get("totalDebt/totalEquityAnnual")),
+        "return_on_equity": _safe_float(metric.get("roeTTM"), 0.01),
+        "beta": _safe_float(metric.get("beta")),
+        "52w_high": _safe_float(metric.get("52WeekHigh")),
+        "52w_low": _safe_float(metric.get("52WeekLow")),
+        "avg_volume": _safe_int(metric.get("10DayAverageTradingVolume"), 1_000_000),
+    }
+
+
+def _fetch_alphavantage_fundamentals(ticker: str) -> dict[str, Any]:
+    api_key = (
+        settings.ALPHAVANTAGE_API_KEY
+        or os.getenv("ALPHAVANTAGE_API_KEY", "")
+        or os.getenv("ALPHA_VANTAGE_API_KEY", "")
+    )
+    if not api_key:
+        return {}
+    payload = _request_json(
+        "https://www.alphavantage.co/query",
+        {"function": "OVERVIEW", "symbol": ticker.upper(), "apikey": api_key},
+    )
+    if not isinstance(payload, dict) or not payload.get("Symbol"):
+        return {}
+    return {
+        "market_cap": _safe_int(payload.get("MarketCapitalization")),
+        "pe_ratio": _safe_float(payload.get("TrailingPE")),
+        "forward_pe": _safe_float(payload.get("ForwardPE")),
+        "peg_ratio": _safe_float(payload.get("PEGRatio")),
+        "price_to_book": _safe_float(payload.get("PriceToBookRatio")),
+        "dividend_yield": _safe_float(payload.get("DividendYield")),
+        "eps": _safe_float(payload.get("EPS")),
+        "revenue_growth": _safe_float(payload.get("QuarterlyRevenueGrowthYOY")),
+        "profit_margin": _safe_float(payload.get("ProfitMargin")),
+        "return_on_equity": _safe_float(payload.get("ReturnOnEquityTTM")),
+        "beta": _safe_float(payload.get("Beta")),
+        "52w_high": _safe_float(payload.get("52WeekHigh")),
+        "52w_low": _safe_float(payload.get("52WeekLow")),
+        "sector": payload.get("Sector"),
+        "industry": payload.get("Industry"),
+    }
+
+
+def _fetch_fmp_fundamentals(ticker: str) -> dict[str, Any]:
+    api_key = settings.FMP_API_KEY or os.getenv("FMP_API_KEY", "")
+    if not api_key:
+        return {}
+
+    result: dict[str, Any] = {}
+    profile_payload = _request_json(
+        f"https://financialmodelingprep.com/api/v3/profile/{ticker.upper()}",
+        {"apikey": api_key},
+    )
+    profile = profile_payload[0] if isinstance(profile_payload, list) and profile_payload else {}
+    if isinstance(profile, dict):
+        result.update(
+            {
+                "market_cap": _safe_int(profile.get("mktCap")),
+                "dividend_yield": _safe_float(profile.get("lastDiv")),
+                "beta": _safe_float(profile.get("beta")),
+                "avg_volume": _safe_int(profile.get("volAvg")),
+                "sector": profile.get("sector"),
+                "industry": profile.get("industry"),
+                "current_price": _safe_float(profile.get("price")),
+            }
+        )
+
+    ratios_payload = _request_json(
+        f"https://financialmodelingprep.com/api/v3/ratios-ttm/{ticker.upper()}",
+        {"apikey": api_key},
+    )
+    ratios = ratios_payload[0] if isinstance(ratios_payload, list) and ratios_payload else {}
+    if isinstance(ratios, dict):
+        result.update(
+            {
+                "pe_ratio": _safe_float(ratios.get("peRatioTTM")),
+                "peg_ratio": _safe_float(ratios.get("pegRatioTTM")),
+                "price_to_book": _safe_float(ratios.get("priceToBookRatioTTM")),
+                "dividend_yield": result.get("dividend_yield")
+                or _safe_float(ratios.get("dividendYielTTM")),
+                "profit_margin": _safe_float(ratios.get("netProfitMarginTTM")),
+                "return_on_equity": _safe_float(ratios.get("returnOnEquityTTM")),
+                "debt_to_equity": _safe_float(ratios.get("debtEquityRatioTTM")),
+            }
+        )
+    return result
+
+
+def _fetch_naver_fundamentals(ticker: str) -> dict[str, Any]:
+    if not _is_korean_ticker(ticker):
+        return {}
+    code = ticker.upper().split(".")[0]
+    response = requests.get(
+        f"https://finance.naver.com/item/main.naver?code={code}",
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=8,
+    )
+    response.raise_for_status()
+    try:
+        from bs4 import BeautifulSoup
+    except Exception:
+        return {}
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    result: dict[str, Any] = {}
+
+    marker_map = {
+        "PER": "pe_ratio",
+        "PBR": "price_to_book",
+        "EPS": "eps",
+        "배당수익률": "dividend_yield",
+    }
+    parts = text.replace("l", " ").split()
+    for idx, token in enumerate(parts):
+        key = marker_map.get(token)
+        if not key:
+            continue
+        for candidate in parts[idx + 1: idx + 5]:
+            parsed = _safe_float(candidate)
+            if parsed is not None:
+                result[key] = parsed / 100.0 if key == "dividend_yield" else parsed
+                break
+
+    market_sum = soup.select_one("#_market_sum")
+    if market_sum:
+        unit = market_sum.find_next(string=lambda value: value and "억원" in value)
+        market_cap_100m = _safe_float(market_sum.get_text(strip=True))
+        if market_cap_100m is not None:
+            result["market_cap"] = int(market_cap_100m * 100_000_000)
+        elif unit:
+            result["market_cap"] = None
+    return result
+
+
+def fetch_fundamentals(ticker: str) -> dict:
+    ticker = ticker.upper().strip()
+    now = datetime.now(timezone.utc)
+
+    with _fundamental_cache_lock:
+        cached = _fundamental_cache.get(ticker)
+    if cached is not None and _is_fundamental_cache_fresh(cached):
+        result = dict(cached["data"])
+        result["_cache_hit"] = True
+        return result
+
+    source_fns = [
+        ("naver", _fetch_naver_fundamentals),
+        ("yfinance", _fetch_yfinance_fundamentals),
+        ("finnhub", _fetch_finnhub_fundamentals),
+        ("alphavantage", _fetch_alphavantage_fundamentals),
+        ("fmp", _fetch_fmp_fundamentals),
+    ] if _is_korean_ticker(ticker) else [
+        ("yfinance", _fetch_yfinance_fundamentals),
+        ("finnhub", _fetch_finnhub_fundamentals),
+        ("alphavantage", _fetch_alphavantage_fundamentals),
+        ("fmp", _fetch_fmp_fundamentals),
+    ]
+
+    merged = _empty_fundamentals()
+    attempted: list[str] = []
+    used: list[str] = []
+    errors: list[str] = []
+
+    for source_name, fetcher in source_fns:
+        attempted.append(source_name)
+        try:
+            data = fetcher(ticker)
+            normalized = {field: data.get(field) for field in _FUNDAMENTAL_FIELDS}
+            if _fundamental_quality(normalized) == "empty":
+                continue
+            merged = _merge_fundamentals(merged, normalized)
+            used.append(source_name)
+            if _fundamental_quality(merged) == "full":
+                break
+        except Exception as exc:
+            errors.append(f"{source_name}: {str(exc)[:160]}")
+            logger.warning("[%s] fundamentals failed via %s: %s", ticker, source_name, exc)
+
+    quality = _fundamental_quality(merged)
+    result = {
+        **merged,
+        "_source": "+".join(used) if used else "none",
+        "_sources_attempted": attempted,
+        "_errors": errors,
+        "_fetched_at": now.isoformat(),
+        "_cache_hit": False,
+        "data_quality": quality,
+    }
+
+    with _fundamental_cache_lock:
+        _fundamental_cache[ticker] = {"fetched_at": now, "data": dict(result)}
+    return result
 
 
 def fetch_options_pcr(ticker: str) -> dict:

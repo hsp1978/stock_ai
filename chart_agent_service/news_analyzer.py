@@ -1,14 +1,44 @@
 """
 뉴스 수집 및 감성 분석 모듈
-- yfinance 뉴스 + Google News RSS (feedparser)
+- yfinance 뉴스 + Google News RSS + Naver Finance RSS/HTML fallback
 - Ollama LLM 감성 분석
 """
 
+import copy
+import os
+import threading
 from datetime import datetime, timezone
-from typing import List, Dict
+from typing import Any, List, Dict
 
 import feedparser
+import requests
 import yfinance as yf
+
+from config import settings
+
+
+_news_cache: dict[tuple[str, bool], dict[str, Any]] = {}
+_news_cache_lock = threading.Lock()
+
+
+def clear_news_cache() -> None:
+    """뉴스 TTL 캐시 초기화 (테스트/수동 복구용)."""
+    with _news_cache_lock:
+        _news_cache.clear()
+
+
+def _is_korean_ticker(ticker: str) -> bool:
+    t = ticker.upper()
+    stripped = t.split(".")[0]
+    return t.endswith((".KS", ".KQ")) or (stripped.isdigit() and len(stripped) == 6)
+
+
+def _news_cache_fresh(entry: dict[str, Any]) -> bool:
+    fetched_at = entry.get("fetched_at")
+    if not isinstance(fetched_at, datetime):
+        return False
+    ttl = max(1, int(settings.NEWS_TTL_MINUTES)) * 60
+    return (datetime.now(timezone.utc) - fetched_at).total_seconds() < ttl
 
 
 # ── LiteLLM Router 감성 분석 (Step 9: Ollama 직접 호출 → Router) ──
@@ -122,31 +152,147 @@ def _fetch_google_news(ticker: str) -> List[Dict]:
     return articles
 
 
-# ── 메인 함수 ────────────────────────────────────────────────────
+def _fetch_naver_news(ticker: str) -> List[Dict]:
+    """Naver Finance 종목 뉴스 수집 (한국 종목 전용)."""
+    if not _is_korean_ticker(ticker):
+        return []
+
+    articles = []
+    code = ticker.upper().split(".")[0]
+    try:
+        response = requests.get(
+            "https://finance.naver.com/item/news_news.naver",
+            params={"code": code, "page": 1},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding or "euc-kr"
+
+        try:
+            from bs4 import BeautifulSoup
+        except Exception:
+            return []
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        for row in soup.select("table.type5 tr")[:20]:
+            link = row.select_one("td.title a")
+            if not link:
+                continue
+            title = link.get_text(" ", strip=True)
+            href = link.get("href", "")
+            source_cell = row.select_one("td.info")
+            date_cell = row.select_one("td.date")
+            source = source_cell.get_text(" ", strip=True) if source_cell else "Naver Finance"
+            published = date_cell.get_text(" ", strip=True) if date_cell else ""
+            url = f"https://finance.naver.com{href}" if href.startswith("/") else href
+            if title:
+                articles.append(
+                    {
+                        "title": title,
+                        "source": source or "Naver Finance",
+                        "published": published or datetime.now(tz=timezone.utc).isoformat(),
+                        "url": url,
+                        "_text": title,
+                    }
+                )
+    except Exception:
+        pass
+    return articles
 
 
-def fetch_news_with_sentiment(ticker: str) -> Dict:
-    """종목 뉴스 수집 + Ollama 감성 분석 통합."""
-    ticker = ticker.upper()
+def _fetch_alphavantage_news(ticker: str) -> List[Dict]:
+    """Alpha Vantage News Sentiment API fallback (API key 설정 시)."""
+    api_key = (
+        settings.ALPHAVANTAGE_API_KEY
+        or os.getenv("ALPHAVANTAGE_API_KEY", "")
+        or os.getenv("ALPHA_VANTAGE_API_KEY", "")
+    )
+    if not api_key:
+        return []
 
-    # 두 소스에서 뉴스 수집 후 중복 제거 (제목 기준)
-    yf_articles = _fetch_yfinance_news(ticker)
-    gn_articles = _fetch_google_news(ticker)
+    articles = []
+    try:
+        response = requests.get(
+            "https://www.alphavantage.co/query",
+            params={
+                "function": "NEWS_SENTIMENT",
+                "tickers": ticker.upper(),
+                "limit": 10,
+                "apikey": api_key,
+            },
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        for item in (payload.get("feed") or [])[:10]:
+            title = item.get("title", "")
+            if not title:
+                continue
+            articles.append(
+                {
+                    "title": title,
+                    "source": item.get("source") or "Alpha Vantage",
+                    "published": item.get("time_published") or datetime.now(tz=timezone.utc).isoformat(),
+                    "url": item.get("url", ""),
+                    "_text": item.get("summary") or title,
+                }
+            )
+    except Exception:
+        pass
+    return articles
+
+
+def _collect_articles(ticker: str) -> tuple[list[dict], list[str]]:
+    sources = [
+        ("yfinance", _fetch_yfinance_news),
+        ("google_news", _fetch_google_news),
+        ("alphavantage", _fetch_alphavantage_news),
+    ]
+    if _is_korean_ticker(ticker):
+        sources.insert(1, ("naver", _fetch_naver_news))
 
     seen_titles = set()
     combined = []
-    for a in yf_articles + gn_articles:
-        key = a["title"].strip().lower()[:60]
-        if key and key not in seen_titles:
-            seen_titles.add(key)
-            combined.append(a)
+    used_sources = []
+    for source_name, fetcher in sources:
+        articles = fetcher(ticker)
+        if articles:
+            used_sources.append(source_name)
+        for article in articles:
+            key = (article.get("title") or "").strip().lower()[:80]
+            if key and key not in seen_titles:
+                seen_titles.add(key)
+                combined.append(article)
 
-    combined = combined[:15]  # 최대 15건
+    return combined[:15], used_sources
+
+
+# ── 메인 함수 ────────────────────────────────────────────────────
+
+
+def fetch_news_with_sentiment(ticker: str, analyze_sentiment: bool = True) -> Dict:
+    """종목 뉴스 수집 + Ollama 감성 분석 통합."""
+    ticker = ticker.upper()
+    cache_key = (ticker, analyze_sentiment)
+
+    with _news_cache_lock:
+        cached = _news_cache.get(cache_key)
+    if cached is not None and _news_cache_fresh(cached):
+        result = copy.deepcopy(cached["data"])
+        result["_cache_hit"] = True
+        return result
+
+    combined, used_sources = _collect_articles(ticker)
 
     # 감성 분석
     analyzed = []
     for a in combined:
-        sentiment_data = _analyze_sentiment_ollama(a["title"], a["_text"])
+        sentiment_data = (
+            _analyze_sentiment_ollama(a["title"], a["_text"])
+            if analyze_sentiment
+            else {"sentiment": "neutral", "score": 0.0, "summary": "", "keywords": []}
+        )
         analyzed.append(
             {
                 "title": a["title"],
@@ -162,19 +308,29 @@ def fetch_news_with_sentiment(ticker: str) -> Dict:
 
     # 종합 감성 계산
     scores = [a["score"] for a in analyzed]
-    overall_score = round(sum(scores) / len(scores), 2) if scores else 0.0
-    if overall_score >= 2:
+    overall_score = round(sum(scores) / len(scores), 2) if scores and analyze_sentiment else None
+    if overall_score is None:
+        overall_sentiment = "headline_only" if analyzed else "neutral"
+    elif overall_score >= 2:
         overall_sentiment = "bullish"
     elif overall_score <= -2:
         overall_sentiment = "bearish"
     else:
         overall_sentiment = "neutral"
 
-    return {
+    result = {
         "ticker": ticker,
         "news_count": len(analyzed),
         "overall_sentiment": overall_sentiment,
         "overall_score": overall_score,
         "articles": analyzed,
+        "sources": used_sources,
+        "_cache_hit": False,
         "analyzed_at": datetime.now(tz=timezone.utc).isoformat(),
     }
+    with _news_cache_lock:
+        _news_cache[cache_key] = {
+            "fetched_at": datetime.now(timezone.utc),
+            "data": copy.deepcopy(result),
+        }
+    return result

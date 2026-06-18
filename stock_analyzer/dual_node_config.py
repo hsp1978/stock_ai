@@ -7,6 +7,8 @@
 
 import os
 import threading
+import time
+from contextlib import contextmanager
 from typing import Dict, Any
 
 import requests
@@ -28,6 +30,13 @@ def _setting(name: str, default: str = "") -> str:
 def _int_setting(name: str, default: int) -> int:
     try:
         return int(_setting(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_setting(name: str, default: float) -> float:
+    try:
+        return float(_setting(name, str(default)))
     except (TypeError, ValueError):
         return default
 
@@ -157,6 +166,18 @@ def get_llm_config(agent_name: str) -> Dict[str, Any]:
 
 _session_lock = threading.Lock()
 _http_session: "requests.Session | None" = None
+_mac_health_lock = threading.Lock()
+_mac_health_cache: Dict[str, Any] = {
+    "checked_at": 0.0,
+    "available": False,
+    "failures": 0,
+    "last_error": None,
+    "last_status": None,
+}
+_node_lock = threading.Lock()
+_node_semaphores: Dict[str, threading.BoundedSemaphore] = {}
+_node_inflight: Dict[str, int] = {}
+_node_overloads: Dict[str, int] = {}
 
 
 def get_http_session() -> requests.Session:
@@ -173,15 +194,130 @@ def get_http_session() -> requests.Session:
     return _http_session
 
 
-def is_mac_studio_available() -> bool:
-    """Mac Studio 연결 상태 확인"""
+def reset_mac_studio_health_cache() -> None:
+    """테스트/수동 복구용 Mac Studio health cache 초기화."""
+    with _mac_health_lock:
+        _mac_health_cache.update({
+            "checked_at": 0.0,
+            "available": False,
+            "failures": 0,
+            "last_error": None,
+            "last_status": None,
+        })
+
+
+def mac_studio_health_snapshot() -> Dict[str, Any]:
+    with _mac_health_lock:
+        return dict(_mac_health_cache)
+
+
+def is_mac_studio_available(force_refresh: bool = False) -> bool:
+    """Mac Studio 연결 상태 확인. 짧은 TTL 캐시와 연속 실패 기준으로 오진단을 줄인다."""
     mac_url = LLM_NODES["mac_studio"]["url"]
+    ttl = _float_setting("MAC_STUDIO_HEALTH_TTL_SECONDS", 10.0)
+    timeout = _float_setting("MAC_STUDIO_HEALTH_TIMEOUT", 7.0)
+    fail_threshold = max(1, _int_setting("MAC_STUDIO_HEALTH_FAILURE_THRESHOLD", 2))
+    now = time.monotonic()
+
+    with _mac_health_lock:
+        cache_age = now - float(_mac_health_cache.get("checked_at") or 0.0)
+        if not force_refresh and _mac_health_cache["checked_at"] and cache_age < ttl:
+            return bool(_mac_health_cache["available"])
 
     try:
-        response = get_http_session().get(f"{mac_url}/api/tags", timeout=2)
-        return response.status_code == 200
-    except Exception:
-        return False
+        response = get_http_session().get(f"{mac_url}/api/tags", timeout=timeout)
+        available = response.status_code == 200
+        with _mac_health_lock:
+            if available:
+                _mac_health_cache.update({
+                    "checked_at": now,
+                    "available": True,
+                    "failures": 0,
+                    "last_error": None,
+                    "last_status": response.status_code,
+                })
+            else:
+                failures = int(_mac_health_cache.get("failures") or 0) + 1
+                keep_previous = bool(_mac_health_cache.get("available")) and failures < fail_threshold
+                _mac_health_cache.update({
+                    "checked_at": now,
+                    "available": keep_previous,
+                    "failures": failures,
+                    "last_error": f"HTTP {response.status_code}",
+                    "last_status": response.status_code,
+                })
+            return bool(_mac_health_cache["available"])
+    except Exception as exc:
+        with _mac_health_lock:
+            failures = int(_mac_health_cache.get("failures") or 0) + 1
+            keep_previous = bool(_mac_health_cache.get("available")) and failures < fail_threshold
+            _mac_health_cache.update({
+                "checked_at": now,
+                "available": keep_previous,
+                "failures": failures,
+                "last_error": str(exc)[:200],
+                "last_status": None,
+            })
+            return bool(_mac_health_cache["available"])
+
+
+def _node_limit(node: str) -> int:
+    if node == "mac_studio":
+        return max(1, _int_setting("MAC_STUDIO_MAX_INFLIGHT", 4))
+    if node == "rtx_5070":
+        return max(1, _int_setting("RTX_5070_MAX_INFLIGHT", 2))
+    return max(1, _int_setting("LLM_NODE_MAX_INFLIGHT", 2))
+
+
+def _get_node_semaphore(node: str) -> threading.BoundedSemaphore:
+    with _node_lock:
+        sem = _node_semaphores.get(node)
+        if sem is None:
+            sem = threading.BoundedSemaphore(_node_limit(node))
+            _node_semaphores[node] = sem
+            _node_inflight.setdefault(node, 0)
+            _node_overloads.setdefault(node, 0)
+        return sem
+
+
+@contextmanager
+def node_slot(node: str, block: bool = False):
+    """노드별 동시 LLM 요청 수를 제한한다."""
+    sem = _get_node_semaphore(node)
+    acquired = sem.acquire(blocking=block)
+    if not acquired:
+        with _node_lock:
+            _node_overloads[node] = _node_overloads.get(node, 0) + 1
+        yield False
+        return
+    with _node_lock:
+        _node_inflight[node] = _node_inflight.get(node, 0) + 1
+    try:
+        yield True
+    finally:
+        with _node_lock:
+            _node_inflight[node] = max(0, _node_inflight.get(node, 0) - 1)
+        sem.release()
+
+
+def node_load_snapshot() -> Dict[str, int]:
+    with _node_lock:
+        return dict(_node_inflight)
+
+
+def node_capacity_snapshot() -> Dict[str, Dict[str, int]]:
+    with _node_lock:
+        nodes = set(LLM_NODES.keys()) | set(_node_inflight.keys()) | set(_node_overloads.keys())
+        return {
+            node: {
+                "inflight": int(_node_inflight.get(node, 0)),
+                "capacity": int(_node_limit(node)),
+                "available_slots": max(0, int(_node_limit(node)) - int(_node_inflight.get(node, 0))),
+                "overload_count": int(_node_overloads.get(node, 0)),
+            }
+            for node in sorted(nodes)
+        }
+
 
 def get_fallback_config(agent_name: str) -> Dict[str, Any]:
     """

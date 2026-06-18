@@ -14,7 +14,7 @@ import json
 import math
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from datetime import datetime
 from typing import Optional
 
@@ -53,7 +53,7 @@ try:
         BUY_THRESHOLD, SELL_THRESHOLD, MIN_CONFIDENCE,
         SCAN_INTERVAL_MINUTES, TRADING_STYLE, WATCHLIST,
         COOLING_OFF_DAYS, ACCOUNT_SIZE, OUTPUT_DIR,
-        AGENT_API_HOST, AGENT_API_PORT,
+        AGENT_API_HOST, AGENT_API_PORT, ANALYSIS_AUX_FETCH_TIMEOUT,
     )
 except ImportError:
     # config에서 일부 변수가 없을 경우 기본값 사용
@@ -66,11 +66,13 @@ except ImportError:
     )
     AGENT_API_HOST = os.getenv("AGENT_API_HOST", "localhost")
     AGENT_API_PORT = int(os.getenv("AGENT_API_PORT", "8100"))
+    ANALYSIS_AUX_FETCH_TIMEOUT = int(os.getenv("ANALYSIS_AUX_FETCH_TIMEOUT", "20"))
 from data_collector import (
     fetch_ohlcv, calculate_indicators,
     fetch_fundamentals, fetch_options_pcr, fetch_insider_trades,
 )
 from analysis_tools import ChartAnalysisAgent, generate_agent_chart
+from quant_indicators import analyze_quant_indicators
 from backtest_engine import (
     run_all_backtests, optimize_strategy_params, backtest_walk_forward,
 )
@@ -89,6 +91,7 @@ from db import (
     get_scan_logs, get_scan_logs_by_ticker,
     get_scan_log_latest, get_scan_log_date_range,
     get_weekly_summary, get_weekly_ticker,
+    get_app_state, set_app_state,
 )
 from portfolio_rebalancer import (
     execute_rebalancing, get_rebalance_history, get_rebalance_status,
@@ -137,8 +140,143 @@ AGENT_API_URL = os.getenv("AGENT_API_URL", f"http://{AGENT_API_HOST}:{AGENT_API_
 # ═══════════════════════════════════════════════════════════════
 
 latest_results: dict = {}
+latest_quant_results: dict = {}
 scan_history: list = []
 cooling_off_state: dict = {}
+
+_STATE_COOLING_OFF = "service.cooling_off_state"
+_STATE_LATEST_RESULTS = "service.latest_results.summary"
+_STATE_SCAN_HISTORY = "service.scan_history"
+_STATE_LOCK = threading.RLock()
+_AUX_FETCH_TIMEOUT = ANALYSIS_AUX_FETCH_TIMEOUT
+_LATEST_SUMMARY_CACHE: dict = {}
+
+
+def _compact_latest_entry(entry: dict) -> dict:
+    result = (entry or {}).get("result") or {}
+    compact_result = {
+        "final_signal": result.get("final_signal"),
+        "composite_score": result.get("composite_score"),
+        "confidence": result.get("confidence"),
+        "signal_distribution": result.get("signal_distribution"),
+        "company_name": result.get("company_name"),
+        "current_price": result.get("current_price") or result.get("price"),
+        "chart_path": result.get("chart_path"),
+        "json_path": result.get("json_path"),
+        "analyzed_at": result.get("analyzed_at"),
+    }
+    return {
+        "result": {k: v for k, v in compact_result.items() if v is not None},
+        "timestamp": (entry or {}).get("timestamp"),
+        "alert_sent_at": (entry or {}).get("alert_sent_at"),
+    }
+
+
+def _persist_latest_result_summary(ticker: str | None = None) -> None:
+    try:
+        with _STATE_LOCK:
+            if ticker:
+                if ticker in latest_results:
+                    _LATEST_SUMMARY_CACHE[ticker] = _compact_latest_entry(latest_results[ticker])
+                else:
+                    _LATEST_SUMMARY_CACHE.pop(ticker, None)
+                set_app_state(_STATE_LATEST_RESULTS, _LATEST_SUMMARY_CACHE)
+            else:
+                _LATEST_SUMMARY_CACHE.clear()
+                _LATEST_SUMMARY_CACHE.update(
+                    {t: _compact_latest_entry(entry) for t, entry in latest_results.items()}
+                )
+                set_app_state(_STATE_LATEST_RESULTS, _LATEST_SUMMARY_CACHE)
+    except Exception as exc:
+        print(f"[local_engine] latest_results 저장 실패: {exc}")
+
+
+def _stage_latest_result_summary(ticker: str) -> None:
+    with _STATE_LOCK:
+        if ticker in latest_results:
+            _LATEST_SUMMARY_CACHE[ticker] = _compact_latest_entry(latest_results[ticker])
+        else:
+            _LATEST_SUMMARY_CACHE.pop(ticker, None)
+
+
+def _flush_latest_result_summaries() -> None:
+    try:
+        with _STATE_LOCK:
+            set_app_state(_STATE_LATEST_RESULTS, _LATEST_SUMMARY_CACHE)
+    except Exception as exc:
+        print(f"[local_engine] latest_results batch 저장 실패: {exc}")
+
+
+def _persist_scan_history() -> None:
+    try:
+        with _STATE_LOCK:
+            set_app_state(_STATE_SCAN_HISTORY, scan_history[-100:])
+    except Exception as exc:
+        print(f"[local_engine] scan_history 저장 실패: {exc}")
+
+
+def _restore_runtime_state() -> None:
+    try:
+        cooling = get_app_state(_STATE_COOLING_OFF, {}) or {}
+        latest = get_app_state(_STATE_LATEST_RESULTS, {}) or {}
+        history = get_app_state(_STATE_SCAN_HISTORY, []) or []
+        with _STATE_LOCK:
+            if isinstance(cooling, dict):
+                cooling_off_state.clear()
+                cooling_off_state.update(cooling)
+            if isinstance(latest, dict):
+                latest_results.clear()
+                latest_results.update(latest)
+                _LATEST_SUMMARY_CACHE.clear()
+                _LATEST_SUMMARY_CACHE.update(
+                    {t: _compact_latest_entry(entry) for t, entry in latest.items()}
+                )
+            if isinstance(history, list):
+                scan_history.clear()
+                scan_history.extend(history[-100:])
+        print(
+            f"[local_engine] 상태 복원: cooling_off={len(cooling_off_state)}, "
+            f"latest={len(latest_results)}, history={len(scan_history)}"
+        )
+    except Exception as exc:
+        print(f"[local_engine] 상태 복원 실패: {exc}")
+
+
+def _fetch_analysis_inputs(ticker: str):
+    print(f"  [{ticker}] 데이터 병렬 수집...")
+    executor = ThreadPoolExecutor(max_workers=4)
+    futures = {
+        "ohlcv": executor.submit(fetch_ohlcv, ticker),
+        "fundamentals": executor.submit(fetch_fundamentals, ticker),
+        "options_pcr": executor.submit(fetch_options_pcr, ticker),
+        "insider_trades": executor.submit(fetch_insider_trades, ticker),
+    }
+    try:
+        df = futures["ohlcv"].result(timeout=_AUX_FETCH_TIMEOUT)
+        df = calculate_indicators(df)
+
+        defaults = {
+            "fundamentals": {},
+            "options_pcr": {},
+            "insider_trades": [],
+        }
+        values = {}
+        for name, default in defaults.items():
+            try:
+                values[name] = futures[name].result(timeout=_AUX_FETCH_TIMEOUT)
+            except FutureTimeoutError:
+                print(f"  [{ticker}] {name} 수집 시간 초과")
+                values[name] = default
+            except Exception as exc:
+                print(f"  [{ticker}] {name} 수집 실패: {exc}")
+                values[name] = default
+
+        return df, values["fundamentals"], values["options_pcr"], values["insider_trades"]
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+_restore_runtime_state()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -279,6 +417,82 @@ def engine_health() -> dict:
     }
 
 
+def engine_system_monitor() -> dict:
+    """운영 관측용 통합 스냅샷."""
+    llm_status = {
+        "available": False,
+        "error": None,
+        "nodes": {},
+        "mac_studio_health": {},
+        "agent_performance": {},
+    }
+    try:
+        from dual_node_config import (
+            LLM_NODES,
+            mac_studio_health_snapshot,
+            node_capacity_snapshot,
+            performance_monitor,
+        )
+
+        node_capacity = node_capacity_snapshot()
+        llm_status.update(
+            {
+                "available": True,
+                "nodes": {
+                    node: {
+                        **metrics,
+                        "url": LLM_NODES.get(node, {}).get("url"),
+                        "description": LLM_NODES.get(node, {}).get("description"),
+                    }
+                    for node, metrics in node_capacity.items()
+                },
+                "mac_studio_health": mac_studio_health_snapshot(),
+                "agent_performance": performance_monitor.get_summary(),
+            }
+        )
+    except Exception as exc:
+        llm_status["error"] = str(exc)[:200]
+
+    try:
+        from signal_tracker import get_accuracy_stats, get_calibrator
+
+        signal_status = {
+            "accuracy_7d": get_accuracy_stats(horizon=7, days_back=180),
+            "calibrator": get_calibrator().status(),
+            "last_validation": get_app_state("service.signal_validation.last_result", {"status": "never_run"}),
+        }
+    except Exception as exc:
+        signal_status = {"error": str(exc)[:200]}
+
+    try:
+        portfolio = get_portfolio_status()
+        paper_status = {
+            "total_equity": portfolio.get("total_equity"),
+            "cash": portfolio.get("cash"),
+            "position_value": portfolio.get("position_value"),
+            "total_pnl": portfolio.get("total_pnl"),
+            "total_pnl_pct": portfolio.get("total_pnl_pct"),
+            "open_positions": portfolio.get("open_positions"),
+            "win_rate_pct": portfolio.get("win_rate_pct"),
+        }
+    except Exception as exc:
+        paper_status = {"error": str(exc)[:200]}
+
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "service": {
+            "status": "healthy",
+            "cached_results": len(latest_results),
+            "scan_count": len(scan_history),
+            "scheduler_running": False,
+            "last_scan": scan_history[-1]["timestamp"] if scan_history else None,
+        },
+        "llm": llm_status,
+        "signals": signal_status,
+        "paper": paper_status,
+    }
+
+
 def engine_info() -> dict:
     """서비스 설정 정보"""
     return {
@@ -300,28 +514,15 @@ def engine_info() -> dict:
     }
 
 
-def engine_scan_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
+def engine_scan_ticker(
+    ticker: str,
+    ai_mode: str = "ollama",
+    persist_state: bool = True,
+) -> Optional[dict]:
     """단일 종목 에이전트 분석."""
     ticker = ticker.upper()
     try:
-        print(f"  [{ticker}] 데이터 수집...")
-        df = fetch_ohlcv(ticker)
-        df = calculate_indicators(df)
-
-        print(f"  [{ticker}] 펀더멘털/옵션/내부자 데이터...")
-        fundamentals, options_pcr, insider_trades = {}, {}, []
-        try:
-            fundamentals = fetch_fundamentals(ticker)
-        except Exception as e:
-            print(f"  [{ticker}] 펀더멘털 실패: {e}")
-        try:
-            options_pcr = fetch_options_pcr(ticker)
-        except Exception as e:
-            print(f"  [{ticker}] 옵션 PCR 실패: {e}")
-        try:
-            insider_trades = fetch_insider_trades(ticker)
-        except Exception as e:
-            print(f"  [{ticker}] 내부자거래 실패: {e}")
+        df, fundamentals, options_pcr, insider_trades = _fetch_analysis_inputs(ticker)
 
         print(f"  [{ticker}] 분석 도구 실행...")
         agent = ChartAnalysisAgent(ticker, df)
@@ -354,6 +555,10 @@ def engine_scan_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
             "timestamp": datetime.now().isoformat(),
             "alert_sent_at": latest_results.get(ticker, {}).get("alert_sent_at"),
         }
+        if persist_state:
+            _persist_latest_result_summary(ticker)
+        else:
+            _stage_latest_result_summary(ticker)
 
         # DB 기록
         insert_scan(ticker, result)
@@ -401,7 +606,7 @@ def engine_scan_all(tickers: Optional[list] = None) -> dict:
     lock = threading.Lock()
 
     def _scan_one(ticker):
-        return ticker, engine_scan_ticker(ticker)
+        return ticker, engine_scan_ticker(ticker, persist_state=False)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_scan_one, t): t for t in tickers}
@@ -429,6 +634,8 @@ def engine_scan_all(tickers: Optional[list] = None) -> dict:
         scan_history.append(scan_entry)
         if len(scan_history) > 100:
             scan_history.pop(0)
+        _flush_latest_result_summaries()
+        _persist_scan_history()
 
     elapsed = time.time() - t_start
     print(f"\n  ✅ 스캔 완료: {len(tickers)}개 / {elapsed:.1f}s "
@@ -565,6 +772,70 @@ def engine_factor_ranking() -> dict:
         return _sanitize({"count": len(ranking), "ranking": ranking})
     except Exception as e:
         return {"error": str(e)}
+
+
+def _default_quant_benchmark(ticker: str) -> str:
+    t = (ticker or "").upper()
+    if t.endswith((".KS", ".KQ")):
+        return "^KS11"
+    return "SPY"
+
+
+def engine_quant_analyze(ticker: str, benchmark: str = "") -> dict:
+    """LLM/뉴스/공시를 제외한 퀀트 전용 분석."""
+    ticker = ticker.upper()
+    benchmark = (benchmark or _default_quant_benchmark(ticker)).upper()
+    try:
+        df = fetch_ohlcv(ticker)
+        df = calculate_indicators(df)
+
+        benchmark_df = None
+        if benchmark:
+            try:
+                benchmark_df = fetch_ohlcv(benchmark)
+            except Exception as exc:
+                print(f"[local_engine] benchmark fetch failed ({benchmark}): {exc}")
+
+        result = analyze_quant_indicators(ticker, df, benchmark_df=benchmark_df)
+        result["benchmark_ticker"] = benchmark if benchmark_df is not None else None
+        result["analyzed_at"] = datetime.now().isoformat()
+
+        latest_quant_results[ticker] = {
+            "result": result,
+            "timestamp": result["analyzed_at"],
+        }
+        return _sanitize(result)
+    except Exception as e:
+        return {"ticker": ticker, "status": "error", "error": str(e)}
+
+
+def engine_quant_latest(limit: int = 50) -> dict:
+    """최근 퀀트 전용 분석 요약."""
+    rows = []
+    for ticker, data in latest_quant_results.items():
+        r = data.get("result", {})
+        rows.append({
+            "ticker": ticker,
+            "quant_score": r.get("quant_score"),
+            "grade": r.get("grade"),
+            "signal": r.get("signal"),
+            "signal_label": r.get("signal_label"),
+            "confidence": r.get("confidence"),
+            "regime": r.get("regime"),
+            "current_price": r.get("current_price"),
+            "analyzed_at": data.get("timestamp"),
+        })
+    rows.sort(key=lambda row: row.get("analyzed_at") or "", reverse=True)
+    return {"count": len(rows[:limit]), "results": rows[:limit]}
+
+
+def engine_quant_batch(tickers: Optional[list[str]] = None, benchmark: str = "") -> dict:
+    """여러 종목 퀀트 전용 분석."""
+    targets = tickers or _load_watchlist_files()
+    results = {}
+    for ticker in targets:
+        results[ticker] = engine_quant_analyze(ticker, benchmark=benchmark)
+    return _sanitize({"status": "completed", "count": len(results), "results": results})
 
 
 def engine_paper_status() -> dict:
@@ -1029,6 +1300,45 @@ def engine_rebalance_history(limit: int = 10) -> dict:
         return {"error": str(e)}
 
 
+def engine_signal_accuracy(
+    horizon: int = 7,
+    min_confidence: float = 0.0,
+    signal: Optional[str] = None,
+    days_back: int = 180,
+) -> dict:
+    try:
+        from signal_tracker import get_accuracy_stats
+
+        return _sanitize(
+            get_accuracy_stats(
+                horizon=horizon,
+                min_confidence=min_confidence,
+                signal=signal,
+                days_back=days_back,
+            )
+        )
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def engine_signal_validation(days_back: int = 45, limit: int = 500) -> dict:
+    try:
+        from signal_tracker import run_daily_validation
+
+        return _sanitize(run_daily_validation(days_back=days_back, limit=limit))
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def engine_signal_calibrator_status() -> dict:
+    try:
+        from signal_tracker import get_calibrator
+
+        return _sanitize(get_calibrator().status())
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ═══════════════════════════════════════════════════════════════
 #  디스패처 — webui.py의 api_get/api_post 호환 레이어
 # ═══════════════════════════════════════════════════════════════
@@ -1038,6 +1348,8 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
     try:
         if path == "/health":
             return engine_health()
+        elif path == "/system-monitor":
+            return engine_system_monitor()
         elif path == "/":
             return engine_info()
         elif path == "/results":
@@ -1107,6 +1419,20 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
             return engine_correlation_beta()
         elif path == "/ranking":
             return engine_factor_ranking()
+        elif path.startswith("/quant/latest"):
+            limit = 50
+            if "limit=" in path:
+                try:
+                    limit = int(path.split("limit=")[1].split("&")[0])
+                except ValueError:
+                    pass
+            return engine_quant_latest(limit)
+        elif path.startswith("/quant/"):
+            ticker = path.split("/quant/")[1].split("?")[0]
+            benchmark = ""
+            if "benchmark=" in path:
+                benchmark = path.split("benchmark=")[1].split("&")[0]
+            return engine_quant_analyze(ticker, benchmark=benchmark)
         elif path == "/paper":
             return engine_paper_status()
         elif path.startswith("/news/"):
@@ -1209,13 +1535,42 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
             if "dry_run=true" in path.lower():
                 dry_run = True
             return engine_portfolio_rebalance(method, interval, drift, dry_run)
+        elif path.startswith("/signal-accuracy/calibrator"):
+            return engine_signal_calibrator_status()
+        elif path.startswith("/signal-accuracy"):
+            horizon = 7
+            min_confidence = 0.0
+            signal = None
+            days_back = 180
+            if "horizon=" in path:
+                try:
+                    horizon = int(path.split("horizon=")[1].split("&")[0])
+                except ValueError:
+                    pass
+            if "min_confidence=" in path:
+                try:
+                    min_confidence = float(path.split("min_confidence=")[1].split("&")[0])
+                except ValueError:
+                    pass
+            if "days_back=" in path:
+                try:
+                    days_back = int(path.split("days_back=")[1].split("&")[0])
+                except ValueError:
+                    pass
+            if "signal=" in path:
+                signal = path.split("signal=")[1].split("&")[0] or None
+            return engine_signal_accuracy(horizon, min_confidence, signal, days_back)
     except Exception as e:
         print(f"[dispatch_get 오류] {path}: {e}")
         return {"error": str(e)}
     return None
 
 
-def engine_dispatch_post(path: str, json_body: Optional[dict] = None) -> Optional[dict]:
+def engine_dispatch_post(
+    path: str,
+    json_body: Optional[dict] = None,
+    timeout: Optional[int] = None,
+) -> Optional[dict]:
     """POST 요청 경로를 로컬 엔진 함수로 라우팅.
 
     핸들러가 없는 경로(예: /trading/*, /paper/virtual-buy, /paper/partial-close)는
@@ -1228,13 +1583,23 @@ def engine_dispatch_post(path: str, json_body: Optional[dict] = None) -> Optiona
             # Screener 관련 요청은 HTTP API로 전달
             import httpx
             url = f"{AGENT_API_URL.rstrip('/')}{path}"
+            request_timeout = timeout or int(os.getenv("SCREENER_HTTP_TIMEOUT", "1800"))
             try:
-                resp = httpx.post(url, timeout=900)
+                resp = httpx.post(url, timeout=request_timeout)
                 resp.raise_for_status()
                 return resp.json()
             except Exception as e:
                 print(f"[local_engine] screener API 호출 실패: {e}")
                 return {"error": str(e)}
+        elif path.startswith("/quant/run"):
+            tickers_str = ""
+            benchmark = ""
+            if "tickers=" in path:
+                tickers_str = path.split("tickers=")[1].split("&")[0]
+            if "benchmark=" in path:
+                benchmark = path.split("benchmark=")[1].split("&")[0]
+            tickers = [t.strip().upper() for t in tickers_str.split(",") if t.strip()] if tickers_str else None
+            return engine_quant_batch(tickers=tickers, benchmark=benchmark)
         elif path.startswith("/scan/"):
             ticker = path.split("/scan/")[1].split("?")[0]
             return engine_scan_ticker(ticker)
@@ -1283,6 +1648,20 @@ def engine_dispatch_post(path: str, json_body: Optional[dict] = None) -> Optiona
                 tickers_str = path.split("tickers=")[1].split("&")[0]
             tickers = [t.strip() for t in tickers_str.split(",") if t.strip()]
             return engine_set_watchlist(tickers)
+        elif path.startswith("/signal-accuracy/evaluate"):
+            days_back = 45
+            limit = 500
+            if "days_back=" in path:
+                try:
+                    days_back = int(path.split("days_back=")[1].split("&")[0])
+                except ValueError:
+                    pass
+            if "limit=" in path:
+                try:
+                    limit = int(path.split("limit=")[1].split("&")[0])
+                except ValueError:
+                    pass
+            return engine_signal_validation(days_back, limit)
         elif path == "/restart":
             return {
                 "status": "restarting",

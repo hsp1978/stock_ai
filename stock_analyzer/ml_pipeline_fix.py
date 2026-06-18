@@ -16,6 +16,66 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
+ML_HORIZON_DAYS = 5
+
+
+def _format_index_value(value) -> str:
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def _latest_valid_feature_frame(features: pd.DataFrame, columns: List[str]) -> Tuple[pd.DataFrame, object]:
+    clean = features.replace([np.inf, -np.inf], np.nan).loc[:, columns].dropna()
+    if clean.empty:
+        raise ValueError("최신 예측에 사용할 유효 피처가 없습니다")
+    latest = clean.iloc[[-1]]
+    return latest, latest.index[-1]
+
+
+def _prediction_metadata(df: pd.DataFrame, feature_date, horizon: int) -> Dict:
+    last_date = df.index[-1] if len(df.index) else None
+    staleness_rows = 0
+    if last_date is not None:
+        matches = np.flatnonzero(df.index == feature_date)
+        if len(matches):
+            staleness_rows = int(len(df.index) - 1 - matches[-1])
+        else:
+            try:
+                staleness_rows = int((df.index > feature_date).sum())
+            except Exception:
+                staleness_rows = 0
+    return {
+        "horizon_days": horizon,
+        "prediction_feature_date": _format_index_value(feature_date),
+        "data_last_date": _format_index_value(last_date) if last_date is not None else None,
+        "prediction_staleness_rows": staleness_rows,
+        "latest_feature_is_current": staleness_rows == 0,
+    }
+
+
+def _split_train_test_with_gap(
+    X: pd.DataFrame,
+    y: pd.Series,
+    horizon: int,
+    train_fraction: float = 0.8,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, Dict]:
+    split_at = int(len(X) * train_fraction)
+    gap = max(0, int(horizon))
+    train_end = max(0, split_at - gap)
+    if train_end <= 0 or split_at >= len(X):
+        raise ValueError("학습/테스트 분할 불가")
+    X_train, X_test = X.iloc[:train_end], X.iloc[split_at:]
+    y_train, y_test = y.iloc[:train_end], y.iloc[split_at:]
+    if X_train.empty or X_test.empty:
+        raise ValueError("학습/테스트 데이터 부족")
+    return X_train, X_test, y_train, y_test, {
+        "train_size": len(X_train),
+        "test_size": len(X_test),
+        "trainable_rows": len(X),
+        "split_index": split_at,
+        "purge_gap": split_at - train_end,
+    }
+
+
 def validate_ml_data(df: pd.DataFrame, ticker: str) -> Tuple[bool, str, Dict]:
     """
     ML 학습용 데이터 검증 및 품질 체크
@@ -224,9 +284,11 @@ def enhanced_ml_ensemble(ticker: str, df: pd.DataFrame, debug: bool = False) -> 
     # 3. 피처 생성
     features = create_robust_features(df_fixed, ticker)
 
+    horizon = ML_HORIZON_DAYS
+
     # 4. 타겟 생성 (5일 후 상승/하락)
     # 미래 종가가 없는 마지막 5개 행은 학습 라벨로 사용할 수 없다.
-    future_close = df_fixed["Close"].shift(-5)
+    future_close = df_fixed["Close"].shift(-horizon)
     target = (future_close > df_fixed["Close"]).astype("float64")
     target[future_close.isna()] = np.nan
 
@@ -242,20 +304,31 @@ def enhanced_ml_ensemble(ticker: str, df: pd.DataFrame, debug: bool = False) -> 
     X = combined.drop("target", axis=1)
     y = combined["target"].astype(int)
 
-    # 6. 학습/테스트 분할
-    train_size = int(len(X) * 0.8)
-    if train_size < 30:  # 최소 학습 데이터
-        result["warnings"].append(f"학습 데이터 너무 적음: {train_size}개")
+    try:
+        latest_X, latest_feature_date = _latest_valid_feature_frame(features, list(X.columns))
+    except ValueError as e:
+        result["warnings"].append(str(e))
         return result
 
-    X_train, X_test = X.iloc[:train_size], X.iloc[train_size:]
-    y_train, y_test = y.iloc[:train_size], y.iloc[train_size:]
+    # 6. 학습/테스트 분할
+    try:
+        X_train, X_test, y_train, y_test, split_meta = _split_train_test_with_gap(X, y, horizon)
+    except ValueError as e:
+        result["warnings"].append(str(e))
+        return result
+
+    if len(X_train) < 30:  # 최소 학습 데이터
+        result["warnings"].append(f"학습 데이터 너무 적음: {len(X_train)}개")
+        return result
+    result.update(split_meta)
+    result.update(_prediction_metadata(df_fixed, latest_feature_date, horizon))
 
     # 7. 스케일링
     from sklearn.preprocessing import StandardScaler
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
+    latest_features = scaler.transform(latest_X)
 
     # 8. 모델 학습 (에러 핸들링 강화)
     successful_models = []
@@ -275,13 +348,12 @@ def enhanced_ml_ensemble(ticker: str, df: pd.DataFrame, debug: bool = False) -> 
         from sklearn.metrics import accuracy_score
         rf_acc = accuracy_score(y_test, rf_pred)
 
-        # 최신 예측
-        latest_features = scaler.transform(X.iloc[[-1]])
         latest_proba_rf = rf_model.predict_proba(latest_features)[0][1]
 
         result["models"]["random_forest"] = {
             "accuracy": round(rf_acc, 4),
             "up_probability": round(latest_proba_rf, 4),
+            "prediction_feature_date": result.get("prediction_feature_date"),
             "status": "success"
         }
         successful_models.append(("rf", latest_proba_rf, rf_acc))
@@ -309,6 +381,7 @@ def enhanced_ml_ensemble(ticker: str, df: pd.DataFrame, debug: bool = False) -> 
         result["models"]["gradient_boosting"] = {
             "accuracy": round(gb_acc, 4),
             "up_probability": round(latest_proba_gb, 4),
+            "prediction_feature_date": result.get("prediction_feature_date"),
             "status": "success"
         }
         successful_models.append(("gb", latest_proba_gb, gb_acc))
@@ -337,6 +410,7 @@ def enhanced_ml_ensemble(ticker: str, df: pd.DataFrame, debug: bool = False) -> 
         result["models"]["lightgbm"] = {
             "accuracy": round(lgb_acc, 4),
             "up_probability": round(latest_proba_lgb, 4),
+            "prediction_feature_date": result.get("prediction_feature_date"),
             "status": "success"
         }
         successful_models.append(("lgb", latest_proba_lgb, lgb_acc))
@@ -363,6 +437,7 @@ def enhanced_ml_ensemble(ticker: str, df: pd.DataFrame, debug: bool = False) -> 
         result["models"]["xgboost"] = {
             "accuracy": round(xgb_acc, 4),
             "up_probability": round(latest_proba_xgb, 4),
+            "prediction_feature_date": result.get("prediction_feature_date"),
             "status": "success"
         }
         successful_models.append(("xgb", latest_proba_xgb, xgb_acc))
@@ -417,7 +492,12 @@ def enhanced_ml_ensemble(ticker: str, df: pd.DataFrame, debug: bool = False) -> 
             "confidence": round(confidence, 1),
             "raw_confidence": round(raw_confidence, 1),
             "avg_accuracy": round(avg_accuracy, 4),
-            "sample_size": n_samples
+            "sample_size": n_samples,
+            "horizon_days": horizon,
+            "prediction_feature_date": result.get("prediction_feature_date"),
+            "data_last_date": result.get("data_last_date"),
+            "latest_feature_is_current": result.get("latest_feature_is_current"),
+            "purge_gap": result.get("purge_gap"),
         }
     else:
         result["warnings"].append("모든 ML 모델 학습 실패")

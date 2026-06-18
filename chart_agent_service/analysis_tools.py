@@ -571,28 +571,68 @@ class AnalysisTools:
         vol_sma = float(self.latest.get('Volume_SMA_20', vol))
         vol_ratio = vol / vol_sma if vol_sma > 0 else 1.0
 
-        # 거래량 급변 감지 (1시간/4시간 단위)
+        if 'VWAP_20' not in self.df.columns and all(
+            c in self.df.columns for c in ['High', 'Low', 'Close', 'Volume']
+        ):
+            typical_price = (self.df['High'] + self.df['Low'] + self.df['Close']) / 3
+            volume_for_vwap = self.df['Volume'].fillna(0)
+            tpv = typical_price * volume_for_vwap
+            vol_sum = volume_for_vwap.rolling(20, min_periods=20).sum().replace(0, np.nan)
+            self.df['VWAP_20'] = tpv.rolling(20, min_periods=20).sum() / vol_sum
+            self.df['VWAP_DIST_20'] = (self.df['Close'] / self.df['VWAP_20'] - 1) * 100
+            self.df['VWAP_SLOPE_20'] = self.df['VWAP_20'].pct_change(5) * 100
+
+        latest = self.df.iloc[-1]
+        price_now = float(self.close.iloc[-1])
+        vwap_20 = None
+        vwap_distance_pct = None
+        vwap_slope_20 = None
+        vwap_state = "unavailable"
+        if 'VWAP_20' in self.df.columns and not pd.isna(latest.get('VWAP_20')):
+            vwap_20 = float(latest['VWAP_20'])
+            if vwap_20 > 0:
+                vwap_distance_pct = float(latest.get('VWAP_DIST_20', (price_now / vwap_20 - 1) * 100))
+                slope_raw = latest.get('VWAP_SLOPE_20')
+                vwap_slope_20 = 0.0 if pd.isna(slope_raw) else float(slope_raw)
+                if price_now >= vwap_20 and vwap_slope_20 >= 0:
+                    vwap_state = "above_rising"
+                elif price_now >= vwap_20:
+                    vwap_state = "above_flat_or_falling"
+                elif vwap_slope_20 < 0:
+                    vwap_state = "below_falling"
+                else:
+                    vwap_state = "below_stabilizing"
+
+        # 일봉 거래량 상태 감지: 20일 평균, 60일 분위, 5일/20일 평균 비율 기준
         volume_change_warning = None
         volume_change_rate = 0.0
-        if len(self.df) >= 5:
-            # 최근 5봉 거래량 비율 추이
-            recent_vol_ratios = []
-            for i in range(-5, 0):
-                v = float(self.df['Volume'].iloc[i])
-                v_sma = float(self.df.get('Volume_SMA_20', pd.Series([v])).iloc[i] if 'Volume_SMA_20' in self.df.columns else v)
-                recent_vol_ratios.append(v / v_sma if v_sma > 0 else 1.0)
+        volume_zscore_20 = None
+        volume_percentile_60 = None
+        volume_5d_avg_ratio_to_20d = None
+        if len(self.df) >= 20:
+            vol_20 = self.df['Volume'].tail(20).astype(float)
+            vol_mean_20 = float(vol_20.mean())
+            vol_std_20 = float(vol_20.std())
+            if vol_std_20 > 0:
+                volume_zscore_20 = (vol - vol_mean_20) / vol_std_20
+            recent_5d_avg = float(self.df['Volume'].tail(5).mean()) if len(self.df) >= 5 else vol
+            volume_5d_avg_ratio_to_20d = recent_5d_avg / vol_mean_20 if vol_mean_20 > 0 else 1.0
 
-            # 급변 감지: 직전 봉 대비 50% 이상 변동
-            if len(recent_vol_ratios) >= 2:
-                prev_ratio = recent_vol_ratios[-2]
-                curr_ratio = vol_ratio
-                if prev_ratio > 0:
-                    volume_change_rate = abs(curr_ratio - prev_ratio) / prev_ratio
-                    if volume_change_rate > 0.5:
-                        if curr_ratio < prev_ratio:
-                            volume_change_warning = "volume_sudden_drop"
-                        else:
-                            volume_change_warning = "volume_sudden_spike"
+        if len(self.df) >= 60:
+            vol_60 = self.df['Volume'].tail(60).astype(float)
+            volume_percentile_60 = float((vol_60 <= vol).mean())
+
+        if volume_zscore_20 is not None and volume_zscore_20 >= 2.0:
+            volume_change_warning = "daily_volume_expansion"
+            volume_change_rate = volume_zscore_20
+        elif volume_percentile_60 is not None and volume_percentile_60 >= 0.9:
+            volume_change_warning = "daily_volume_expansion"
+            volume_change_rate = volume_percentile_60
+        elif vol_ratio < 0.5 and (
+            volume_5d_avg_ratio_to_20d is None or volume_5d_avg_ratio_to_20d < 0.7
+        ):
+            volume_change_warning = "daily_volume_dry_up"
+            volume_change_rate = vol_ratio
 
         obv = self.df['OBV'].dropna()
         obv_trend = "flat"
@@ -627,34 +667,55 @@ class AnalysisTools:
         if vol_ratio > 2.0:
             score += 1 if price_change > 0 else -1
 
-        # 거래량 급변 시 점수 조정
-        if volume_change_warning == "volume_sudden_drop":
-            score -= 2  # 거래량 급감은 추세 약화 신호
-        elif volume_change_warning == "volume_sudden_spike":
-            score += 1 if price_change > 0 else -1  # 방향성에 따라
+        if vwap_state == "above_rising":
+            score += 2
+        elif vwap_state == "below_falling":
+            score -= 2
+        if vwap_distance_pct is not None and 0 <= vwap_distance_pct <= 3 and obv_trend == "rising":
+            score += 1
+        elif vwap_distance_pct is not None and vwap_distance_pct > 8 and vol_ratio > 1.5:
+            score -= 1
+
+        # 일봉 거래량 상태를 점수에 반영
+        if volume_change_warning == "daily_volume_dry_up":
+            score -= 2 if price_change > 0 else 1
+        elif volume_change_warning == "daily_volume_expansion":
+            score += 1 if price_change > 0 else -1
 
         score = max(-10, min(10, score))
         signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
 
         detail_text = f"거래량비={vol_ratio:.2f}x, OBV추세={obv_trend}, 매집분산={accumulation}"
+        if vwap_distance_pct is not None:
+            detail_text += f", VWAP20={vwap_state}({vwap_distance_pct:+.1f}%)"
         if volume_change_warning:
-            detail_text += f", ⚠️{volume_change_warning} ({volume_change_rate:.0%} 변동)"
+            detail_text += f", {volume_change_warning}"
 
         result.update({
             "signal": signal,
             "score": round(score, 1),
             "current_volume": int(vol),
             "volume_ratio": round(vol_ratio, 2),
-            "volume_sma_period": 20,  # [개선 #6] 시간프레임 명시
-            "volume_change_lookback": 5,  # 최근 5봉 비교
+            "volume_sma_period": 20,
+            "volume_trend_lookback_days": 5,
+            "volume_change_lookback": 5,  # backward compatibility
             "volume_change_warning": volume_change_warning,
             "volume_change_rate": round(volume_change_rate, 2) if volume_change_rate else 0.0,
+            "volume_zscore_20": round(volume_zscore_20, 2) if volume_zscore_20 is not None else None,
+            "volume_percentile_60": round(volume_percentile_60, 2) if volume_percentile_60 is not None else None,
+            "volume_5d_avg_ratio_to_20d": round(volume_5d_avg_ratio_to_20d, 2) if volume_5d_avg_ratio_to_20d is not None else None,
             "obv_trend": obv_trend,
             "obv_trend_periods": {"short": 5, "long": 20},  # OBV 비교 기간
+            "vwap_period": 20,
+            "vwap_20": round(vwap_20, 2) if vwap_20 is not None else None,
+            "vwap_distance_pct": round(vwap_distance_pct, 2) if vwap_distance_pct is not None else None,
+            "vwap_slope_20": round(vwap_slope_20, 2) if vwap_slope_20 is not None else None,
+            "vwap_state": vwap_state,
             "price_volume_divergence_period": 10,  # 가격-거래량 괴리 분석 기간
             "accumulation_distribution": accumulation,
-            "timeframe": "daily",  # 일봉 기준
-            "detail": detail_text + " (일봉 기준, SMA20 대비)"  # 시간프레임 명시
+            "timeframe": "daily",
+            "configured_timeframe": TIMEFRAME,
+            "detail": detail_text + " (일봉 기준, SMA20/60일분위/VWAP20 대비)"
         })
         return result
 
@@ -2415,6 +2476,19 @@ def _is_directional_result(result: dict) -> bool:
     return result.get("tool") not in NON_DIRECTIONAL_TOOLS
 
 
+def _annotate_rule_reference(result: dict) -> dict:
+    """Keep legacy signal/score fields, but label them as heuristic references."""
+    if not isinstance(result, dict):
+        return result
+    if "signal" in result and "heuristic_signal" not in result:
+        result["heuristic_signal"] = result.get("signal")
+    if "score" in result and "heuristic_score" not in result:
+        result["heuristic_score"] = result.get("score")
+    if "signal" in result or "score" in result:
+        result.setdefault("judgment_source", "rule_based_reference")
+    return result
+
+
 def _format_tool_catalog() -> str:
     rows = []
     for i, definition in enumerate(TOOL_DEFINITIONS, start=1):
@@ -2471,7 +2545,7 @@ class ChartAnalysisAgent:
         """tool 이름으로 분석 실행"""
         fn = self._tool_map.get(name)
         if fn:
-            return fn()
+            return _annotate_rule_reference(fn())
         return {"tool": name, "error": f"Unknown tool: {name}"}
 
     def run_all_tools(self) -> list:
@@ -2484,9 +2558,14 @@ class ChartAnalysisAgent:
             if name == "entry_plan_analysis":
                 continue  # 마지막 단계에서 별도 실행
             try:
-                results.append(fn())
+                results.append(_annotate_rule_reference(fn()))
             except Exception as e:
-                results.append({"tool": name, "error": str(e), "signal": "neutral", "score": 0})
+                results.append(_annotate_rule_reference({
+                    "tool": name,
+                    "error": str(e),
+                    "signal": "neutral",
+                    "score": 0,
+                }))
 
         # 종합 score 기반으로 임시 signal/confidence를 산출하여 entry_plan에 전달
         avg_score = 0
@@ -2506,14 +2585,14 @@ class ChartAnalysisAgent:
                 confidence=composite_confidence,
                 other_results=results,
             )
-            results.append(entry_result)
+            results.append(_annotate_rule_reference(entry_result))
         except Exception as e:
-            results.append({
+            results.append(_annotate_rule_reference({
                 "tool": "entry_plan_analysis",
                 "error": str(e),
                 "signal": "neutral",
                 "score": 0,
-            })
+            }))
 
         self.tool_results = results
         return results
@@ -2540,6 +2619,8 @@ class ChartAnalysisAgent:
                 "name": r.get("name", ""),
                 "signal": signal,
                 "score": score,
+                "heuristic_signal": r.get("heuristic_signal", signal),
+                "heuristic_score": r.get("heuristic_score", score),
                 "detail": r.get("detail", ""),
             })
 
@@ -2601,6 +2682,7 @@ class ChartAnalysisAgent:
 - 최소 8개 이상의 도구를 사용해야 한다.
 - 각 도구의 결과를 종합하여 최종 매수/매도/관망 판단을 내린다.
 - risk_position_sizing과 entry_plan_analysis는 실행 계획 도구이며 방향성 판단 점수에는 포함하지 않는다.
+- 도구의 signal/score는 룰 기반 참고값이다. 최종 판단은 지표 수치, 상태, 경고를 근거로 독립적으로 내린다.
 
 분석 도구 목록:
 {tool_catalog}
@@ -2737,10 +2819,10 @@ class ChartAnalysisAgent:
 
 {summary_text}
 
-## 종합 스코어
+## 룰 기반 참고 스코어
 - 평균 점수: {composite['composite_score']} / 10
-- 신호 분포: 매수 {composite['signal_distribution']['buy']}개, 매도 {composite['signal_distribution']['sell']}개, 중립 {composite['signal_distribution']['neutral']}개
-- 시스템 판단: {composite['final_signal']}
+- 참고 신호 분포: 매수 {composite['signal_distribution']['buy']}개, 매도 {composite['signal_distribution']['sell']}개, 중립 {composite['signal_distribution']['neutral']}개
+- 룰 기반 참고 판단: {composite['final_signal']}
 
 위 분석 도구의 결과를 종합하여 최종 판단을 한국어로 작성하라.
 다음 형식을 따르라:
@@ -2790,12 +2872,15 @@ class ChartAnalysisAgent:
         lines = []
         for i, r in enumerate(self.tool_results, 1):
             lines.append(f"### {i}. {r.get('name', r.get('tool', '?'))}")
-            lines.append(f"- 신호: {r.get('signal', '?')}")
-            lines.append(f"- 점수: {r.get('score', 0)} / 10")
+            lines.append(f"- 룰 참고 신호: {r.get('heuristic_signal', r.get('signal', '?'))}")
+            lines.append(f"- 룰 참고 점수: {r.get('heuristic_score', r.get('score', 0))} / 10")
             lines.append(f"- 요약: {r.get('detail', '')}")
             # 주요 수치 포함
             for k, v in r.items():
-                if k not in ('tool', 'name', 'signal', 'score', 'detail') and not isinstance(v, (dict, list)):
+                if k not in (
+                    'tool', 'name', 'signal', 'score', 'heuristic_signal',
+                    'heuristic_score', 'judgment_source', 'detail'
+                ) and not isinstance(v, (dict, list)):
                     lines.append(f"- {k}: {v}")
             lines.append("")
         return "\n".join(lines)

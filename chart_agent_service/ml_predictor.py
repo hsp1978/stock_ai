@@ -94,6 +94,83 @@ def _build_target(df: pd.DataFrame, horizon: int = 5) -> pd.Series:
     return target
 
 
+def _format_index_value(value) -> str:
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def _latest_feature_frame(
+    features: pd.DataFrame, columns: Optional[list] = None
+) -> Tuple[pd.DataFrame, object]:
+    """Return the newest valid feature row, independent of target availability."""
+    clean = features.replace([np.inf, -np.inf], np.nan)
+    if columns is not None:
+        missing = [c for c in columns if c not in clean.columns]
+        if missing:
+            raise ValueError(f"최신 예측 피처 컬럼 누락: {missing}")
+        clean = clean.loc[:, columns]
+    clean = clean.dropna()
+    if clean.empty:
+        raise ValueError("최신 예측에 사용할 유효 피처가 없습니다")
+    latest = clean.iloc[[-1]]
+    return latest, latest.index[-1]
+
+
+def _prediction_metadata(df: pd.DataFrame, feature_date, horizon: int) -> dict:
+    last_date = df.index[-1] if len(df.index) else None
+    staleness_rows = 0
+    if last_date is not None:
+        matches = np.flatnonzero(df.index == feature_date)
+        if len(matches):
+            staleness_rows = int(len(df.index) - 1 - matches[-1])
+        else:
+            try:
+                staleness_rows = int((df.index > feature_date).sum())
+            except Exception:
+                staleness_rows = 0
+    return {
+        "horizon_days": horizon,
+        "prediction_feature_date": _format_index_value(feature_date),
+        "data_last_date": _format_index_value(last_date) if last_date is not None else None,
+        "prediction_staleness_rows": staleness_rows,
+        "latest_feature_is_current": staleness_rows == 0,
+    }
+
+
+def _split_train_test_with_gap(
+    X: pd.DataFrame,
+    y: pd.Series,
+    horizon: int,
+    train_fraction: float = 0.8,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, dict]:
+    """Chronological split with a purged gap equal to the prediction horizon."""
+    split_at = int(len(X) * train_fraction)
+    gap = max(0, int(horizon))
+    train_end = max(0, split_at - gap)
+
+    if train_end <= 0 or split_at >= len(X):
+        raise ValueError("학습/테스트 분할 불가")
+
+    X_train, X_test = X.iloc[:train_end], X.iloc[split_at:]
+    y_train, y_test = y.iloc[:train_end], y.iloc[split_at:]
+    if X_train.empty or X_test.empty:
+        raise ValueError("학습/테스트 데이터 부족")
+
+    return X_train, X_test, y_train, y_test, {
+        "train_size": len(X_train),
+        "test_size": len(X_test),
+        "trainable_rows": len(X),
+        "split_index": split_at,
+        "purge_gap": split_at - train_end,
+    }
+
+
+def _make_tscv(TimeSeriesSplit, n_splits: int, horizon: int):
+    try:
+        return TimeSeriesSplit(n_splits=n_splits, gap=max(0, int(horizon)))
+    except TypeError:
+        return TimeSeriesSplit(n_splits=n_splits)
+
+
 def train_predict(ticker: str, df: pd.DataFrame,
                   horizon: int = 5, model_type: str = "rf") -> dict:
     try:
@@ -114,9 +191,11 @@ def train_predict(ticker: str, df: pd.DataFrame,
     X = combined.drop("target", axis=1)
     y = combined["target"].astype(int)
 
-    train_size = int(len(X) * 0.8)
-    X_train, X_test = X.iloc[:train_size], X.iloc[train_size:]
-    y_train, y_test = y.iloc[:train_size], y.iloc[train_size:]
+    latest_X, latest_feature_date = _latest_feature_frame(features, list(X.columns))
+    try:
+        X_train, X_test, y_train, y_test, split_meta = _split_train_test_with_gap(X, y, horizon)
+    except ValueError as e:
+        return {"error": str(e), "ticker": ticker, "rows": len(combined)}
 
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
@@ -137,14 +216,20 @@ def train_predict(ticker: str, df: pd.DataFrame,
     y_proba = model.predict_proba(X_test_scaled)
     accuracy = accuracy_score(y_test, y_pred)
 
-    tscv = TimeSeriesSplit(n_splits=3)
+    tscv = _make_tscv(TimeSeriesSplit, n_splits=3, horizon=horizon)
     cv_scores = []
-    for train_idx, val_idx in tscv.split(X_train_scaled):
-        model_cv = model.__class__(**model.get_params())
-        model_cv.fit(X_train_scaled[train_idx], y_train.iloc[train_idx])
-        cv_scores.append(accuracy_score(y_train.iloc[val_idx], model_cv.predict(X_train_scaled[val_idx])))
+    try:
+        for train_idx, val_idx in tscv.split(X_train):
+            scaler_cv = StandardScaler()
+            X_cv_train = scaler_cv.fit_transform(X_train.iloc[train_idx])
+            X_cv_val = scaler_cv.transform(X_train.iloc[val_idx])
+            model_cv = model.__class__(**model.get_params())
+            model_cv.fit(X_cv_train, y_train.iloc[train_idx])
+            cv_scores.append(accuracy_score(y_train.iloc[val_idx], model_cv.predict(X_cv_val)))
+    except Exception:
+        cv_scores = []
 
-    latest_features = scaler.transform(X.iloc[[-1]])
+    latest_features = scaler.transform(latest_X)
     latest_proba = model.predict_proba(latest_features)[0]
     latest_pred = model.predict(latest_features)[0]
 
@@ -170,30 +255,43 @@ def train_predict(ticker: str, df: pd.DataFrame,
     score = max(-10, min(10, score))
     signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
 
+    cv_mean = float(np.mean(cv_scores)) if cv_scores else None
+    cv_std = float(np.std(cv_scores)) if cv_scores else None
+    metadata = _prediction_metadata(df, latest_feature_date, horizon)
+
     return {
         "tool": "ml_prediction",
         "name": f"ML 예측 ({model_type.upper()}, {horizon}일)",
         "ticker": ticker,
         "signal": signal,
         "score": round(score, 1),
-        "horizon_days": horizon,
         "model_type": model_type,
         "prediction": "UP" if latest_pred == 1 else "DOWN",
         "up_probability": round(float(up_prob), 4),
         "down_probability": round(float(1 - up_prob), 4),
         "test_accuracy": round(accuracy, 4),
-        "cv_accuracy_mean": round(float(np.mean(cv_scores)), 4),
-        "cv_accuracy_std": round(float(np.std(cv_scores)), 4),
-        "train_size": train_size,
-        "test_size": len(X_test),
+        "cv_accuracy_mean": round(cv_mean, 4) if cv_mean is not None else None,
+        "cv_accuracy_std": round(cv_std, 4) if cv_std is not None else None,
+        **split_meta,
+        **metadata,
         "feature_count": X.shape[1],
         "top_features": [{"name": f, "importance": round(imp, 4)} for f, imp in top_features],
         "detail": f"{horizon}일후 {('UP' if latest_pred == 1 else 'DOWN')}({up_prob:.1%}), "
-                   f"정확도={accuracy:.1%}, CV={np.mean(cv_scores):.1%}"
+                   f"정확도={accuracy:.1%}, CV={(cv_mean if cv_mean is not None else 0):.1%}"
     }
 
 
-def _compute_shap_values(model, X_train, X_test, model_type: str = "tree") -> dict:
+def _positive_class_shap(shap_values):
+    if isinstance(shap_values, list):
+        return shap_values[1] if len(shap_values) > 1 else shap_values[0]
+    arr = np.asarray(shap_values)
+    if arr.ndim == 3:
+        return arr[:, :, 1] if arr.shape[2] > 1 else arr[:, :, 0]
+    return arr
+
+
+def _compute_shap_values(model, X_train, X_test, model_type: str = "tree",
+                         latest_X: Optional[pd.DataFrame] = None) -> dict:
     """SHAP 설명력 계산 (Cluefin 스타일)"""
     try:
         import shap
@@ -203,24 +301,27 @@ def _compute_shap_values(model, X_train, X_test, model_type: str = "tree") -> di
     try:
         if model_type in ("rf", "gb", "lgb", "xgb"):
             explainer = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(X_test)
-
-            # 이진 분류: class 1 (상승) SHAP 사용
-            if isinstance(shap_values, list):
-                shap_values = shap_values[1]
+            shap_values = _positive_class_shap(explainer.shap_values(X_test))
 
             # 평균 절대 SHAP 값으로 중요도 계산
             mean_abs_shap = np.abs(shap_values).mean(axis=0)
             feature_importance_shap = dict(zip(X_test.columns, mean_abs_shap))
 
-            # 최근 1개 샘플의 SHAP 값 (설명력)
-            latest_shap = dict(zip(X_test.columns, shap_values[-1]))
+            if latest_X is not None:
+                latest_values = _positive_class_shap(explainer.shap_values(latest_X))
+                latest_row = latest_values[0]
+                explanation_target = "latest_prediction_feature"
+            else:
+                latest_row = shap_values[-1]
+                explanation_target = "last_test_sample"
+            latest_shap = dict(zip(X_test.columns, latest_row))
 
             return {
                 "feature_importance_shap": {k: round(float(v), 6) for k, v in
                     sorted(feature_importance_shap.items(), key=lambda x: x[1], reverse=True)[:10]},
                 "latest_shap_values": {k: round(float(v), 6) for k, v in
                     sorted(latest_shap.items(), key=lambda x: abs(x[1]), reverse=True)[:10]},
+                "explanation_target": explanation_target,
                 "shap_available": True,
             }
         else:
@@ -249,9 +350,11 @@ def train_predict_lgb(ticker: str, df: pd.DataFrame, horizon: int = 5) -> dict:
     X = combined.drop("target", axis=1)
     y = combined["target"].astype(int)
 
-    train_size = int(len(X) * 0.8)
-    X_train, X_test = X.iloc[:train_size], X.iloc[train_size:]
-    y_train, y_test = y.iloc[:train_size], y.iloc[train_size:]
+    latest_X, latest_feature_date = _latest_feature_frame(features, list(X.columns))
+    try:
+        X_train, X_test, y_train, y_test, split_meta = _split_train_test_with_gap(X, y, horizon)
+    except ValueError as e:
+        return {"error": str(e), "ticker": ticker, "rows": len(combined)}
 
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
@@ -270,8 +373,8 @@ def train_predict_lgb(ticker: str, df: pd.DataFrame, horizon: int = 5) -> dict:
     y_proba = model.predict_proba(X_test_df)
     accuracy = accuracy_score(y_test, y_pred)
 
-    latest_features = scaler.transform(X.iloc[[-1]])
-    latest_features_df = pd.DataFrame(latest_features, columns=X.columns)
+    latest_features = scaler.transform(latest_X)
+    latest_features_df = pd.DataFrame(latest_features, columns=X.columns, index=latest_X.index)
     latest_proba = model.predict_proba(latest_features_df)[0]
     latest_pred = model.predict(latest_features_df)[0]
 
@@ -290,7 +393,8 @@ def train_predict_lgb(ticker: str, df: pd.DataFrame, horizon: int = 5) -> dict:
         score += 1
     score = max(-10, min(10, score))
 
-    shap_result = _compute_shap_values(model, X_train_df, X_test_df, "lgb")
+    shap_result = _compute_shap_values(model, X_train_df, X_test_df, "lgb", latest_features_df)
+    metadata = _prediction_metadata(df, latest_feature_date, horizon)
 
     return {
         "tool": "ml_lgb",
@@ -298,9 +402,12 @@ def train_predict_lgb(ticker: str, df: pd.DataFrame, horizon: int = 5) -> dict:
         "ticker": ticker,
         "signal": "buy" if score > 2 else ("sell" if score < -2 else "neutral"),
         "score": round(score, 1),
+        "horizon_days": horizon,
         "prediction": "UP" if latest_pred == 1 else "DOWN",
         "up_probability": round(float(up_prob), 4),
         "test_accuracy": round(accuracy, 4),
+        **split_meta,
+        **metadata,
         "shap": shap_result,
         "detail": f"{horizon}일후 {('UP' if latest_pred == 1 else 'DOWN')}({up_prob:.1%}), 정확도={accuracy:.1%}"
     }
@@ -325,9 +432,11 @@ def train_predict_xgb(ticker: str, df: pd.DataFrame, horizon: int = 5) -> dict:
     X = combined.drop("target", axis=1)
     y = combined["target"].astype(int)
 
-    train_size = int(len(X) * 0.8)
-    X_train, X_test = X.iloc[:train_size], X.iloc[train_size:]
-    y_train, y_test = y.iloc[:train_size], y.iloc[train_size:]
+    latest_X, latest_feature_date = _latest_feature_frame(features, list(X.columns))
+    try:
+        X_train, X_test, y_train, y_test, split_meta = _split_train_test_with_gap(X, y, horizon)
+    except ValueError as e:
+        return {"error": str(e), "ticker": ticker, "rows": len(combined)}
 
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
@@ -346,8 +455,8 @@ def train_predict_xgb(ticker: str, df: pd.DataFrame, horizon: int = 5) -> dict:
     y_proba = model.predict_proba(X_test_df)
     accuracy = accuracy_score(y_test, y_pred)
 
-    latest_features = scaler.transform(X.iloc[[-1]])
-    latest_features_df = pd.DataFrame(latest_features, columns=X.columns)
+    latest_features = scaler.transform(latest_X)
+    latest_features_df = pd.DataFrame(latest_features, columns=X.columns, index=latest_X.index)
     latest_proba = model.predict_proba(latest_features_df)[0]
     latest_pred = model.predict(latest_features_df)[0]
 
@@ -366,7 +475,8 @@ def train_predict_xgb(ticker: str, df: pd.DataFrame, horizon: int = 5) -> dict:
         score += 1
     score = max(-10, min(10, score))
 
-    shap_result = _compute_shap_values(model, X_train_df, X_test_df, "xgb")
+    shap_result = _compute_shap_values(model, X_train_df, X_test_df, "xgb", latest_features_df)
+    metadata = _prediction_metadata(df, latest_feature_date, horizon)
 
     return {
         "tool": "ml_xgb",
@@ -374,9 +484,12 @@ def train_predict_xgb(ticker: str, df: pd.DataFrame, horizon: int = 5) -> dict:
         "ticker": ticker,
         "signal": "buy" if score > 2 else ("sell" if score < -2 else "neutral"),
         "score": round(score, 1),
+        "horizon_days": horizon,
         "prediction": "UP" if latest_pred == 1 else "DOWN",
         "up_probability": round(float(up_prob), 4),
         "test_accuracy": round(accuracy, 4),
+        **split_meta,
+        **metadata,
         "shap": shap_result,
         "detail": f"{horizon}일후 {('UP' if latest_pred == 1 else 'DOWN')}({up_prob:.1%}), 정확도={accuracy:.1%}"
     }
@@ -400,17 +513,24 @@ def train_predict_lstm(ticker: str, df: pd.DataFrame, horizon: int = 5, lookback
     if len(combined) < lookback + 50:
         return {"error": f"데이터 부족 (최소 {lookback + 50}개 필요)", "ticker": ticker}
 
-    X = combined.drop("target", axis=1).values
+    X_df = combined.drop("target", axis=1)
     y = combined["target"].astype(int).values
+    feature_clean = features.replace([np.inf, -np.inf], np.nan).loc[:, list(X_df.columns)].dropna()
+    if len(feature_clean) < lookback:
+        return {"error": "최신 LSTM 시퀀스 피처 부족", "ticker": ticker}
+    latest_feature_date = feature_clean.index[-1]
+    X = X_df.values
 
-    train_cut = int(len(X) * 0.8)
-    if train_cut <= lookback or train_cut >= len(X):
+    split_at = int(len(X) * 0.8)
+    train_cut = max(0, split_at - max(0, int(horizon)))
+    if train_cut <= lookback or split_at >= len(X):
         return {"error": "학습/테스트 분할 불가", "ticker": ticker}
 
     # 스케일링: 학습 구간으로만 fit하여 테스트/최신 구간 누수 방지
     scaler = StandardScaler()
     scaler.fit(X[:train_cut])
     X_scaled = scaler.transform(X)
+    latest_seq_scaled = scaler.transform(feature_clean.tail(lookback).values)
 
     # 시계열 윈도우 생성 (lookback 기간)
     X_seq, y_seq, target_indices = [], [], []
@@ -422,8 +542,9 @@ def train_predict_lstm(ticker: str, df: pd.DataFrame, horizon: int = 5, lookback
     target_indices = np.array(target_indices)
 
     train_mask = target_indices < train_cut
-    X_train, X_test = X_seq[train_mask], X_seq[~train_mask]
-    y_train, y_test = y_seq[train_mask], y_seq[~train_mask]
+    test_mask = target_indices >= split_at
+    X_train, X_test = X_seq[train_mask], X_seq[test_mask]
+    y_train, y_test = y_seq[train_mask], y_seq[test_mask]
     if len(X_train) == 0 or len(X_test) == 0:
         return {"error": "LSTM 학습/테스트 시퀀스 부족", "ticker": ticker}
 
@@ -437,8 +558,15 @@ def train_predict_lstm(ticker: str, df: pd.DataFrame, horizon: int = 5, lookback
     ])
     model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
 
+    fit_X, fit_y = X_train, y_train
+    fit_kwargs = {"epochs": 20, "batch_size": 32, "verbose": 0, "shuffle": False}
+    if len(X_train) > 10:
+        val_size = max(1, int(len(X_train) * 0.1))
+        fit_X, fit_y = X_train[:-val_size], y_train[:-val_size]
+        fit_kwargs["validation_data"] = (X_train[-val_size:], y_train[-val_size:])
+
     # 조용히 학습
-    model.fit(X_train, y_train, epochs=20, batch_size=32, validation_split=0.1, verbose=0)
+    model.fit(fit_X, fit_y, **fit_kwargs)
 
     # 예측
     y_pred_proba = model.predict(X_test, verbose=0).flatten()
@@ -446,7 +574,7 @@ def train_predict_lstm(ticker: str, df: pd.DataFrame, horizon: int = 5, lookback
     accuracy = accuracy_score(y_test, y_pred)
 
     # 최신 예측
-    latest_seq = X_scaled[-lookback:].reshape(1, lookback, X.shape[1])
+    latest_seq = latest_seq_scaled.reshape(1, lookback, X.shape[1])
     latest_proba = float(model.predict(latest_seq, verbose=0)[0, 0])
     latest_pred = 1 if latest_proba > 0.5 else 0
 
@@ -463,15 +591,27 @@ def train_predict_lstm(ticker: str, df: pd.DataFrame, horizon: int = 5, lookback
         score += 1
     score = max(-10, min(10, score))
 
+    split_meta = {
+        "train_size": len(X_train),
+        "test_size": len(X_test),
+        "trainable_rows": len(X_df),
+        "split_index": split_at,
+        "purge_gap": split_at - train_cut,
+    }
+    metadata = _prediction_metadata(df, latest_feature_date, horizon)
+
     return {
         "tool": "ml_lstm",
         "name": f"LSTM 예측 ({horizon}일)",
         "ticker": ticker,
         "signal": "buy" if score > 2 else ("sell" if score < -2 else "neutral"),
         "score": round(score, 1),
+        "horizon_days": horizon,
         "prediction": "UP" if latest_pred == 1 else "DOWN",
         "up_probability": round(latest_proba, 4),
         "test_accuracy": round(accuracy, 4),
+        **split_meta,
+        **metadata,
         "lookback": lookback,
         "detail": f"{horizon}일후 {('UP' if latest_pred == 1 else 'DOWN')}({latest_proba:.1%}), 정확도={accuracy:.1%}"
     }

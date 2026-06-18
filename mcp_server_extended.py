@@ -43,6 +43,9 @@ class StockAIServerExtended:
 
     def __init__(self):
         self.server = Server("stock-ai-agent-extended")
+        self._tool_semaphore = asyncio.Semaphore(
+            int(os.getenv("MCP_MAX_CONCURRENT_TOOLS", "2"))
+        )
         self.setup_handlers()
 
     def setup_handlers(self):
@@ -178,8 +181,12 @@ class StockAIServerExtended:
                 )]
 
     async def execute_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """도구 실행 로직"""
+        """도구 실행 로직. 무거운 동기 작업은 worker thread로 격리한다."""
+        async with self._tool_semaphore:
+            return await asyncio.to_thread(self._execute_tool_sync, name, arguments)
 
+    def _execute_tool_sync(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """동기 엔진 호출 본문. execute_tool()에서 to_thread로 실행된다."""
         # === 핵심 도구 실행 ===
         if name == "analyze_stock":
             ticker = arguments.get("ticker", "").upper()

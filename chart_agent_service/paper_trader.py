@@ -37,6 +37,9 @@ def _load_state() -> dict:
         "positions": {},
         "closed_trades": [],
         "order_history": [],
+        "corporate_action_history": [],
+        "applied_corporate_actions": {},
+        "corporate_actions_last_checked": {},
         "created_at": datetime.now().isoformat(),
     }
 
@@ -44,6 +47,190 @@ def _load_state() -> dict:
 def _save_state(state: dict):
     with open(PAPER_STATE_FILE, "w") as f:
         json.dump(state, f, indent=2, ensure_ascii=False, default=str)
+
+
+def _round_qty(qty: float):
+    rounded = round(float(qty), 6)
+    return int(rounded) if abs(rounded - int(rounded)) < 1e-6 else rounded
+
+
+def _adjust_price_fields(pos: dict, factor: float | None = None, cash_dividend: float = 0.0) -> None:
+    price_fields = [
+        "entry_price",
+        "current_price",
+        "peak_price",
+        "stop_loss_price",
+        "take_profit_price",
+    ]
+    for field in price_fields:
+        value = pos.get(field)
+        try:
+            adjusted = float(value)
+        except (TypeError, ValueError):
+            continue
+        if adjusted <= 0:
+            continue
+        if factor and factor > 0:
+            adjusted = adjusted / factor
+        if cash_dividend > 0:
+            adjusted = max(0.0, adjusted - cash_dividend)
+        pos[field] = round(adjusted, 6)
+
+
+def _event_key(ticker: str, event_type: str, event_date: str, value: float) -> str:
+    return f"{ticker.upper()}:{event_date}:{event_type}:{float(value):.8f}"
+
+
+def _event_date_str(index_value) -> str:
+    if hasattr(index_value, "date"):
+        return index_value.date().isoformat()
+    return str(index_value)[:10]
+
+
+def _entry_date(pos: dict):
+    raw = pos.get("entry_date") or ""
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).date()
+    except Exception:
+        return None
+
+
+def _fetch_corporate_actions(ticker: str):
+    import yfinance as yf
+
+    actions = yf.Ticker(ticker).actions
+    if actions is None or actions.empty:
+        return []
+
+    events = []
+    for idx, row in actions.iterrows():
+        event_date = _event_date_str(idx)
+        split = float(row.get("Stock Splits") or 0)
+        dividend = float(row.get("Dividends") or 0)
+        if split and split > 0 and split != 1.0:
+            events.append({"date": event_date, "type": "split", "value": split})
+        if dividend and dividend > 0:
+            events.append({"date": event_date, "type": "dividend", "value": dividend})
+    return events
+
+
+def _apply_corporate_actions_to_state(
+    state: dict,
+    tickers: Optional[list[str]] = None,
+    force: bool = False,
+) -> dict:
+    positions = state.get("positions", {})
+    if not positions:
+        return {"checked": 0, "applied": 0, "events": [], "errors": []}
+
+    target_tickers = [t.upper() for t in (tickers or positions.keys()) if t.upper() in positions]
+    today = datetime.now().date().isoformat()
+    last_checked = state.setdefault("corporate_actions_last_checked", {})
+    applied = state.setdefault("applied_corporate_actions", {})
+    history = state.setdefault("corporate_action_history", [])
+
+    checked = 0
+    applied_count = 0
+    applied_events = []
+    errors = []
+
+    for ticker in target_tickers:
+        if not force and last_checked.get(ticker) == today:
+            continue
+
+        checked += 1
+        pos = positions.get(ticker)
+        entry = _entry_date(pos or {})
+        try:
+            events = _fetch_corporate_actions(ticker)
+        except Exception as exc:
+            errors.append({"ticker": ticker, "error": str(exc)[:160]})
+            last_checked[ticker] = today
+            continue
+
+        applied_keys = set(applied.setdefault(ticker, []))
+        for event in events:
+            event_date = event["date"]
+            try:
+                if entry and datetime.fromisoformat(event_date).date() < entry:
+                    continue
+            except Exception:
+                pass
+
+            key = _event_key(ticker, event["type"], event_date, event["value"])
+            if key in applied_keys:
+                continue
+
+            before = {
+                "qty": pos.get("qty"),
+                "entry_price": pos.get("entry_price"),
+                "current_price": pos.get("current_price"),
+                "peak_price": pos.get("peak_price"),
+                "stop_loss_price": pos.get("stop_loss_price"),
+                "take_profit_price": pos.get("take_profit_price"),
+                "cash": state.get("cash", ACCOUNT_SIZE),
+            }
+
+            if event["type"] == "split":
+                factor = float(event["value"])
+                pos["qty"] = _round_qty(float(pos.get("qty", 0)) * factor)
+                _adjust_price_fields(pos, factor=factor)
+            elif event["type"] == "dividend":
+                dividend = float(event["value"])
+                qty = float(pos.get("qty", 0))
+                cash_credit = dividend * qty
+                state["cash"] = state.get("cash", ACCOUNT_SIZE) + cash_credit
+                _adjust_price_fields(pos, cash_dividend=dividend)
+                event["cash_credit"] = round(cash_credit, 6)
+            else:
+                continue
+
+            after = {
+                "qty": pos.get("qty"),
+                "entry_price": pos.get("entry_price"),
+                "current_price": pos.get("current_price"),
+                "peak_price": pos.get("peak_price"),
+                "stop_loss_price": pos.get("stop_loss_price"),
+                "take_profit_price": pos.get("take_profit_price"),
+                "cash": state.get("cash", ACCOUNT_SIZE),
+            }
+            record = {
+                "ticker": ticker,
+                "event_key": key,
+                "event_date": event_date,
+                "event_type": event["type"],
+                "value": event["value"],
+                "cash_credit": event.get("cash_credit", 0),
+                "before": before,
+                "after": after,
+                "applied_at": datetime.now().isoformat(),
+            }
+            history.append(record)
+            applied[ticker].append(key)
+            applied_keys.add(key)
+            applied_events.append(record)
+            applied_count += 1
+
+        last_checked[ticker] = today
+
+    return {
+        "checked": checked,
+        "applied": applied_count,
+        "events": applied_events,
+        "errors": errors,
+    }
+
+
+def adjust_corporate_actions(
+    tickers: Optional[list[str]] = None,
+    force: bool = False,
+) -> dict:
+    """보유 포지션의 분할/배당 이벤트를 idempotent하게 반영한다."""
+    state = _load_state()
+    result = _apply_corporate_actions_to_state(state, tickers=tickers, force=force)
+    if result["checked"] or result["applied"]:
+        _save_state(state)
+    return result
 
 
 def get_portfolio_status() -> dict:
@@ -100,6 +287,7 @@ def get_portfolio_status() -> dict:
             for ticker, p in positions.items()
         },
         "recent_trades": closed[-10:] if closed else [],
+        "recent_corporate_actions": state.get("corporate_action_history", [])[-10:],
     }
 
 
@@ -269,6 +457,7 @@ def update_position_prices(prices: dict[str, float]) -> list[dict]:
         자동 청산된 주문 목록
     """
     state = _load_state()
+    _apply_corporate_actions_to_state(state, tickers=list(prices.keys()))
     positions = state.get("positions", {})
     auto_closed = []
 
@@ -350,6 +539,9 @@ def reset_paper_trading() -> dict:
         "positions": {},
         "closed_trades": [],
         "order_history": [],
+        "corporate_action_history": [],
+        "applied_corporate_actions": {},
+        "corporate_actions_last_checked": {},
         "created_at": datetime.now().isoformat(),
     }
     _save_state(state)

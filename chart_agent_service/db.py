@@ -4,13 +4,22 @@
 - 주간 요약 쿼리 함수 제공
 """
 
+import json
 import os
 import sqlite3
+import threading
+import atexit
 from datetime import datetime, timedelta
+from typing import Any
 
 from config import OUTPUT_DIR
 
 DB_PATH = os.path.join(OUTPUT_DIR, "scan_log.db")
+_CONNECT_TIMEOUT_SECONDS = 30.0
+_BUSY_TIMEOUT_MS = 30_000
+_DB_LOCAL = threading.local()
+_DB_CONNECTIONS: list[sqlite3.Connection] = []
+_DB_CONNECTIONS_LOCK = threading.Lock()
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS scan_log (
@@ -98,6 +107,14 @@ CREATE INDEX IF NOT EXISTS idx_kse_triggered_at ON kill_switch_events(triggered_
 CREATE INDEX IF NOT EXISTS idx_kse_action       ON kill_switch_events(action);
 """
 
+_CREATE_APP_STATE_TABLE = """
+CREATE TABLE IF NOT EXISTS app_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
 # 사용자 행위 로그 — WebUI 페이지 진입/수동 스캔/검색 등 (scan_log 와 별도)
 _CREATE_USER_ACTION_TABLE = """
 CREATE TABLE IF NOT EXISTS user_action_log (
@@ -133,11 +150,76 @@ CREATE TABLE IF NOT EXISTS screener_results (
 """
 
 
-def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+class _ConnectionProxy:
+    """Thread-local SQLite connection proxy.
+
+    Existing call sites invoke conn.close() after every operation. The proxy keeps
+    that API compatible while avoiding connect/close churn in scan worker threads.
+    """
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    def close(self) -> None:
+        """No-op by design; use close_thread_connection() for real cleanup."""
+        return None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
+def _open_sqlite_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=_CONNECT_TIMEOUT_SECONDS,
+        check_same_thread=False,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+    with _DB_CONNECTIONS_LOCK:
+        _DB_CONNECTIONS.append(conn)
     return conn
+
+
+def _get_conn() -> _ConnectionProxy:
+    current_path = getattr(_DB_LOCAL, "path", None)
+    current_conn = getattr(_DB_LOCAL, "conn", None)
+    if current_conn is None or current_path != DB_PATH:
+        if current_conn is not None:
+            try:
+                current_conn.close()
+            except Exception:
+                pass
+        current_conn = _open_sqlite_connection()
+        _DB_LOCAL.conn = current_conn
+        _DB_LOCAL.path = DB_PATH
+    return _ConnectionProxy(current_conn)
+
+
+def close_thread_connection() -> None:
+    conn = getattr(_DB_LOCAL, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        finally:
+            _DB_LOCAL.conn = None
+            _DB_LOCAL.path = None
+
+
+def close_all_connections() -> None:
+    with _DB_CONNECTIONS_LOCK:
+        conns = list(_DB_CONNECTIONS)
+        _DB_CONNECTIONS.clear()
+    for conn in conns:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+atexit.register(close_all_connections)
 
 
 def _migrate_signal_outcomes(conn: sqlite3.Connection) -> None:
@@ -169,6 +251,7 @@ def init_db():
     conn.execute(_CREATE_SCREENER_TABLE)
     conn.execute(_CREATE_USER_ACTION_TABLE)
     conn.executescript(_CREATE_KILL_SWITCH_TABLE)
+    conn.execute(_CREATE_APP_STATE_TABLE)
     # entry_price 컬럼 마이그레이션 (기존 DB 호환)
     try:
         conn.execute("ALTER TABLE scan_log ADD COLUMN entry_price REAL")
@@ -178,6 +261,49 @@ def init_db():
     conn.commit()
     conn.close()
     print(f"[DB] 초기화 완료: {DB_PATH}")
+
+
+# ─── 앱 런타임 상태 ─────────────────────────────────────
+
+
+def set_app_state(key: str, value) -> None:
+    """작은 런타임 상태를 JSON으로 저장한다."""
+    payload = json.dumps(value, ensure_ascii=False, default=str)
+    conn = _get_conn()
+    conn.execute(
+        """INSERT INTO app_state (key, value, updated_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET
+             value = excluded.value,
+             updated_at = excluded.updated_at""",
+        (key, payload, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_app_state(key: str, default=None):
+    """저장된 런타임 상태를 JSON으로 복원한다."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT value FROM app_state WHERE key = ?",
+        (key,),
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return default
+    try:
+        return json.loads(row["value"])
+    except (TypeError, json.JSONDecodeError):
+        return default
+
+
+def delete_app_state(key: str) -> None:
+    """저장된 런타임 상태를 삭제한다."""
+    conn = _get_conn()
+    conn.execute("DELETE FROM app_state WHERE key = ?", (key,))
+    conn.commit()
+    conn.close()
 
 
 # ─── 기록 ───────────────────────────────────────────────

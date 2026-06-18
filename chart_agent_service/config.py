@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     MULTI_AGENT_MAX_WORKERS: int = Field(default=2, ge=1, le=16)
     MULTI_AGENT_TIMEOUT: int = Field(default=300, ge=30)
     MULTI_AGENT_LLM_TIMEOUT: int = Field(default=240, ge=30)
+    ANALYSIS_AUX_FETCH_TIMEOUT: int = Field(default=20, ge=1, le=300)
+    GPU_MONITOR_INTERVAL_SECONDS: float = Field(default=7.0, ge=1)
+    GPU_THROTTLE_MEMORY_MB: int = Field(default=11000, ge=0)
 
     MAC_STUDIO_IP: str = "hsptest-macstudio"
     MAC_STUDIO_URL: str = "http://hsptest-macstudio:8080"
@@ -46,6 +49,8 @@ class Settings(BaseSettings):
     DART_API_KEY: str = ""
     FRED_API_KEY: str = ""
     FMP_API_KEY: str = ""
+    FINNHUB_API_KEY: str = ""
+    ALPHAVANTAGE_API_KEY: str = ""
 
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8100
@@ -55,6 +60,9 @@ class Settings(BaseSettings):
 
     SCAN_INTERVAL_MINUTES: int = Field(default=30, ge=1)
     SCAN_PARALLEL_WORKERS: int = Field(default=3, ge=1, le=16)
+    SERVICE_SCHEDULER_ENABLED: bool = True
+    SIGNAL_VALIDATION_HOUR: int = Field(default=23, ge=0, le=23)
+    SIGNAL_VALIDATION_MINUTE: int = Field(default=0, ge=0, le=59)
 
     WATCHLIST: str = ""
 
@@ -118,6 +126,8 @@ class Settings(BaseSettings):
     OHLCV_TTL_EOD_HOURS: float = Field(default=24.0, ge=0)
     OHLCV_TTL_INTRADAY_MINUTES: int = Field(default=5, ge=1)
     OHLCV_RETRY_COUNT: int = Field(default=3, ge=1, le=10)
+    FUNDAMENTAL_TTL_HOURS: float = Field(default=12.0, ge=0)
+    NEWS_TTL_MINUTES: int = Field(default=30, ge=1)
 
     # ── GlobalKillSwitch 임계값 ─────────────────────────────────────
     DAILY_LOSS_LIMIT_ALERT_PCT: float = Field(default=2.0, ge=0)
@@ -146,6 +156,9 @@ TELEGRAM_CHAT_ID = settings.TELEGRAM_CHAT_ID
 API_HOST = settings.API_HOST
 API_PORT = settings.API_PORT
 SCAN_INTERVAL_MINUTES = settings.SCAN_INTERVAL_MINUTES
+SERVICE_SCHEDULER_ENABLED = settings.SERVICE_SCHEDULER_ENABLED
+SIGNAL_VALIDATION_HOUR = settings.SIGNAL_VALIDATION_HOUR
+SIGNAL_VALIDATION_MINUTE = settings.SIGNAL_VALIDATION_MINUTE
 WATCHLIST = settings.WATCHLIST
 BUY_THRESHOLD = settings.BUY_THRESHOLD
 SELL_THRESHOLD = settings.SELL_THRESHOLD
@@ -155,6 +168,9 @@ DEFAULT_LLM_PROVIDER = settings.DEFAULT_LLM_PROVIDER
 MULTI_AGENT_MAX_WORKERS = settings.MULTI_AGENT_MAX_WORKERS
 MULTI_AGENT_TIMEOUT = settings.MULTI_AGENT_TIMEOUT
 MULTI_AGENT_LLM_TIMEOUT = settings.MULTI_AGENT_LLM_TIMEOUT
+ANALYSIS_AUX_FETCH_TIMEOUT = settings.ANALYSIS_AUX_FETCH_TIMEOUT
+GPU_MONITOR_INTERVAL_SECONDS = settings.GPU_MONITOR_INTERVAL_SECONDS
+GPU_THROTTLE_MEMORY_MB = settings.GPU_THROTTLE_MEMORY_MB
 MAC_STUDIO_IP = settings.MAC_STUDIO_IP
 MAC_STUDIO_URL = settings.MAC_STUDIO_URL
 AGENT_API_URL = settings.AGENT_API_URL

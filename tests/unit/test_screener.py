@@ -46,6 +46,43 @@ def test_rsi_strong_uptrend_is_100_not_nan():
     assert df["RSI"].iloc[-1] == 100.0
 
 
+def test_calc_indicators_lite_adds_vwap_columns():
+    df = screener._calc_indicators_lite(_ohlcv(80, step=0.0))
+
+    assert {"VWAP_20", "VWAP_60", "VWAP_DIST_20", "VWAP_SLOPE_20"}.issubset(df.columns)
+    assert round(df["VWAP_20"].iloc[-1], 3) == 100.0
+    assert round(df["VWAP_DIST_20"].iloc[-1], 3) == 0.0
+
+
+def test_vwap_support_scores_near_vwap():
+    df = screener._calc_indicators_lite(_ohlcv(80, step=0.0))
+
+    points, reason = screener._score_vwap_support(df)
+
+    assert points == screener.SCORE_WEIGHTS["vwap_support"]
+    assert "VWAP20 지지" in reason
+
+
+def test_vwap_breakdown_penalizes_meaningful_break():
+    raw = _ohlcv(80, step=0.0)
+    close_loc = raw.columns.get_loc("Close")
+    open_loc = raw.columns.get_loc("Open")
+    high_loc = raw.columns.get_loc("High")
+    low_loc = raw.columns.get_loc("Low")
+    for offset, close in enumerate([99.0, 98.0, 97.0, 96.0, 95.0, 94.0]):
+        row_idx = len(raw) - 6 + offset
+        raw.iloc[row_idx, close_loc] = close
+        raw.iloc[row_idx, open_loc] = close + 0.5
+        raw.iloc[row_idx, high_loc] = close + 1.0
+        raw.iloc[row_idx, low_loc] = close - 1.0
+    df = screener._calc_indicators_lite(raw)
+
+    points, reason = screener._penalty_vwap_breakdown(df)
+
+    assert points == -screener.PENALTY_WEIGHTS["vwap_breakdown"]
+    assert "VWAP20 하회" in reason
+
+
 def test_macd_cross_ten_bars_ago_keeps_minimum_freshness_score():
     idx = pd.date_range("2025-01-01", periods=30, freq="B")
     df = pd.DataFrame(index=idx)
@@ -82,6 +119,43 @@ def test_run_id_has_microsecond_resolution(monkeypatch):
     assert first["run_id"].endswith("_000001")
     assert second["run_id"].endswith("_000002")
     assert first["run_id"] != second["run_id"]
+
+
+def test_naver_market_sum_page_parses_market_cap_100m():
+    html = """
+    <html><body>
+      <table class="type_2">
+        <tr>
+          <td>1</td><td><a href="/item/main.naver?code=005930">삼성전자</a></td>
+          <td>70,000</td><td>상승</td><td>1.0%</td><td>100</td>
+          <td>2,500</td><td>5,969,783</td>
+        </tr>
+        <tr>
+          <td>2</td><td><a href="/item/main.naver?code=000660">SK하이닉스</a></td>
+          <td>180,000</td><td>하락</td><td>-1.0%</td><td>5,000</td>
+          <td>1,999</td><td>728,002</td>
+        </tr>
+      </table>
+      <table class="Nnavi"><tr><td><a href="/sise/sise_market_sum.naver?sosok=0&page=3">3</a></td></tr></table>
+    </body></html>
+    """
+
+    rows, last_page = screener._parse_naver_market_sum_page(
+        html,
+        market_name="KOSPI",
+        suffix=".KS",
+        min_market_cap=200_000_000_000,
+    )
+
+    assert last_page == 3
+    assert rows == [
+        {
+            "ticker": "005930.KS",
+            "name": "삼성전자",
+            "market": "KOSPI",
+            "market_cap": 250_000_000_000.0,
+        }
+    ]
 
 
 def test_korean_screener_keeps_pykrx_priority_without_yfinance_prefetch(monkeypatch):

@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, TypeVar
 
 import litellm
@@ -178,6 +179,7 @@ def call_agent_llm(
     prompt: str,
     response_model: type[T] = AgentLLMResponse,  # type: ignore[assignment]
     preferred_provider: str | None = None,
+    timeout_seconds: float | None = None,
 ) -> T:
     """
     LiteLLM Router + circuit breaker를 통해 LLM을 호출하고
@@ -185,6 +187,11 @@ def call_agent_llm(
 
     파싱 실패 시 neutral 안전 응답을 반환하므로 호출자에서 예외 처리 불필요.
     """
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        return _safe_response(
+            response_model, "deadline_exceeded_before_call", ["LLM_DEADLINE_EXCEEDED"]
+        )
+
     schema = response_model.model_json_schema()
     messages = [
         {
@@ -201,34 +208,88 @@ def call_agent_llm(
     last_exc: Exception | None = None
 
     for model_name in model_candidates:
-        try:
-            api_response = call_with_breaker(
-                _do_router_completion,
-                router,
-                model_name,
-                messages,
-                breaker_name=f"agent_llm:{agent_role}:{model_name}",
-                response_format={"type": "json_object"},
-            )
-            raw = (api_response.choices[0].message.content or "").strip()
-            json_str = _extract_json(raw)
-            return response_model.model_validate_json(json_str)
-
-        except ValidationError as exc:
-            logger.warning("LLM response parse fail for %s: %s", agent_role, exc)
-            return _safe_response(
-                response_model, f"parse_error: {exc}", ["LLM_PARSE_ERROR"]
-            )
-
-        except Exception as exc:
-            last_exc = exc
+        if not _node_available_for_model(model_name):
+            last_exc = RuntimeError(f"node_unavailable:{_node_for_model(model_name)}")
             logger.warning(
-                "LLM call fail for %s via %s: %s", agent_role, model_name, exc
+                "LLM node unavailable for %s via %s", agent_role, model_name
             )
+            continue
+
+        with _node_slot_for_model(model_name) as acquired:
+            if not acquired:
+                last_exc = RuntimeError(f"node_overloaded:{_node_for_model(model_name)}")
+                logger.warning(
+                    "LLM node overloaded for %s via %s", agent_role, model_name
+                )
+                continue
+
+            try:
+                completion_kwargs = {
+                    "response_format": {"type": "json_object"},
+                }
+                if timeout_seconds is not None:
+                    completion_kwargs["timeout"] = max(1, min(float(timeout_seconds), 300.0))
+                api_response = call_with_breaker(
+                    _do_router_completion,
+                    router,
+                    model_name,
+                    messages,
+                    breaker_name=f"agent_llm:{agent_role}:{model_name}",
+                    **completion_kwargs,
+                )
+                raw = (api_response.choices[0].message.content or "").strip()
+                json_str = _extract_json(raw)
+                return response_model.model_validate_json(json_str)
+
+            except ValidationError as exc:
+                logger.warning("LLM response parse fail for %s: %s", agent_role, exc)
+                return _safe_response(
+                    response_model, f"parse_error: {exc}", ["LLM_PARSE_ERROR"]
+                )
+
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "LLM call fail for %s via %s: %s", agent_role, model_name, exc
+                )
 
     return _safe_response(
         response_model, f"call_error: {last_exc}", ["LLM_CALL_ERROR"]
     )
+
+
+def _node_for_model(model_name: str) -> str | None:
+    if model_name == "agent-llm-secondary":
+        return "mac_studio"
+    if model_name == "agent-llm-tertiary":
+        return "rtx_5070"
+    return None
+
+
+def _node_available_for_model(model_name: str) -> bool:
+    node = _node_for_model(model_name)
+    if node != "mac_studio":
+        return True
+
+    try:
+        from dual_node_config import is_mac_studio_available
+
+        return bool(is_mac_studio_available())
+    except Exception:
+        return True
+
+
+def _node_slot_for_model(model_name: str):
+    node = _node_for_model(model_name)
+    if node is None:
+        return nullcontext(True)
+
+    try:
+        from dual_node_config import node_slot
+
+        return node_slot(node, block=False)
+    except Exception:
+        return nullcontext(True)
 
 
 def _model_candidates(preferred_provider: str | None = None) -> list[str]:
@@ -236,14 +297,18 @@ def _model_candidates(preferred_provider: str | None = None) -> list[str]:
     has_primary = _has_primary()
 
     if provider == "gemini" and has_primary:
-        return ["agent-llm-primary", "agent-llm-secondary"]
+        return ["agent-llm-primary", "agent-llm-secondary", "agent-llm-tertiary"]
     if provider == "ollama":
         return (
-            ["agent-llm-secondary", "agent-llm-primary"]
+            ["agent-llm-secondary", "agent-llm-tertiary", "agent-llm-primary"]
             if has_primary
-            else ["agent-llm-secondary"]
+            else ["agent-llm-secondary", "agent-llm-tertiary"]
         )
-    return ["agent-llm-primary"] if has_primary else ["agent-llm-secondary"]
+    return (
+        ["agent-llm-primary", "agent-llm-secondary", "agent-llm-tertiary"]
+        if has_primary
+        else ["agent-llm-secondary", "agent-llm-tertiary"]
+    )
 
 
 def _has_primary() -> bool:
@@ -263,3 +328,4 @@ def _safe_response(model_cls: type[T], reason: str, flags: list[str]) -> T:
     except Exception:
         # schema가 달라 signal 필드가 없으면 빈 객체 반환
         return model_cls()  # type: ignore[return-value]
+
