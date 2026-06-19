@@ -13,6 +13,7 @@ for _d in (_ANALYZER_DIR, _AGENT_DIR):
     if _d not in sys.path:  # noqa: E402
         sys.path.insert(0, _d)
 
+import multi_agent as multi_agent_module  # noqa: E402
 from multi_agent import (  # noqa: E402
     AgentResult,
     BaseAgent,
@@ -91,6 +92,46 @@ def test_collect_agent_futures_converts_unfinished_future_to_agent_error():
     assert results[1].error == (
         "Agent timed out after 1s and was excluded from final aggregation"
     )
+
+
+def test_analyze_converts_unfinished_futures_timeout_to_system_failure(monkeypatch):
+    import ticker_verifier
+
+    orchestrator = object.__new__(MultiAgentOrchestrator)
+    orchestrator.agents = []
+    orchestrator.ollama_healthy = True
+    orchestrator.max_workers = 1
+    orchestrator.decision_maker = None
+
+    monkeypatch.setattr(
+        MultiAgentOrchestrator,
+        "_get_stock_name",
+        lambda self, ticker: None,
+    )
+    monkeypatch.setattr(
+        ticker_verifier,
+        "verify_and_validate",
+        lambda ticker: {
+            "exists": True,
+            "can_analyze": True,
+            "company_name": ticker,
+            "data_quality": {"quality_score": 80},
+            "warnings": [],
+        },
+    )
+
+    def _raise_unfinished_timeout(ticker):
+        raise TimeoutError("7 (of 7) futures unfinished")
+
+    monkeypatch.setattr(multi_agent_module, "fetch_ohlcv", _raise_unfinished_timeout)
+
+    result = orchestrator.analyze("SPY")
+
+    assert "error" not in result
+    assert result["runtime"]["timeout_fallback"] is True
+    assert result["final_decision"]["final_signal"] == "neutral"
+    assert result["final_decision"]["system_failure"] is True
+    assert "future timeout" in result["final_decision"]["consensus"]
 
 
 def test_base_agent_parse_failure_never_infers_buy_from_text():

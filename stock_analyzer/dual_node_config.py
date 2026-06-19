@@ -178,6 +178,9 @@ _node_lock = threading.Lock()
 _node_semaphores: Dict[str, threading.BoundedSemaphore] = {}
 _node_inflight: Dict[str, int] = {}
 _node_overloads: Dict[str, int] = {}
+_node_failures: Dict[str, int] = {}
+_node_cooldown_until: Dict[str, float] = {}
+_node_last_error: Dict[str, str | None] = {}
 
 
 def get_http_session() -> requests.Session:
@@ -187,7 +190,9 @@ def get_http_session() -> requests.Session:
         with _session_lock:
             if _http_session is None:
                 sess = requests.Session()
-                adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20)
+                # [수정] ThreadPoolExecutor가 여러 개 실행되며 좀비 스레드가 생길 경우
+                # Connection Pool 고갈로 인한 무한 블로킹 방지를 위해 pool_maxsize 대폭 증가
+                adapter = HTTPAdapter(pool_connections=20, pool_maxsize=100)
                 sess.mount("http://", adapter)
                 sess.mount("https://", adapter)
                 _http_session = sess
@@ -269,6 +274,16 @@ def _node_limit(node: str) -> int:
     return max(1, _int_setting("LLM_NODE_MAX_INFLIGHT", 2))
 
 
+def _node_failure_threshold(node: str) -> int:
+    env_name = f"{node.upper()}_FAILURE_THRESHOLD"
+    return max(1, _int_setting(env_name, _int_setting("LLM_NODE_FAILURE_THRESHOLD", 2)))
+
+
+def _node_cooldown_seconds(node: str) -> float:
+    env_name = f"{node.upper()}_COOLDOWN_SECONDS"
+    return max(0.0, _float_setting(env_name, _float_setting("LLM_NODE_COOLDOWN_SECONDS", 90.0)))
+
+
 def _get_node_semaphore(node: str) -> threading.BoundedSemaphore:
     with _node_lock:
         sem = _node_semaphores.get(node)
@@ -277,7 +292,46 @@ def _get_node_semaphore(node: str) -> threading.BoundedSemaphore:
             _node_semaphores[node] = sem
             _node_inflight.setdefault(node, 0)
             _node_overloads.setdefault(node, 0)
+            _node_failures.setdefault(node, 0)
+            _node_cooldown_until.setdefault(node, 0.0)
+            _node_last_error.setdefault(node, None)
         return sem
+
+
+def is_node_in_cooldown(node: str) -> bool:
+    with _node_lock:
+        return time.monotonic() < float(_node_cooldown_until.get(node) or 0.0)
+
+
+def record_node_failure(node: str | None, exc: Exception) -> None:
+    """Record node-level call failure and open a short cooldown after repeats."""
+    if not node:
+        return
+    now = time.monotonic()
+    with _node_lock:
+        failures = int(_node_failures.get(node) or 0) + 1
+        _node_failures[node] = failures
+        _node_last_error[node] = str(exc)[:200]
+        if failures >= _node_failure_threshold(node):
+            _node_cooldown_until[node] = now + _node_cooldown_seconds(node)
+
+
+def record_node_success(node: str | None) -> None:
+    if not node:
+        return
+    with _node_lock:
+        _node_failures[node] = 0
+        _node_cooldown_until[node] = 0.0
+        _node_last_error[node] = None
+
+
+def reset_node_cooldowns(node: str | None = None) -> None:
+    with _node_lock:
+        targets = [node] if node else list(set(LLM_NODES.keys()) | set(_node_failures.keys()))
+        for target in targets:
+            _node_failures[target] = 0
+            _node_cooldown_until[target] = 0.0
+            _node_last_error[target] = None
 
 
 @contextmanager
@@ -305,15 +359,19 @@ def node_load_snapshot() -> Dict[str, int]:
         return dict(_node_inflight)
 
 
-def node_capacity_snapshot() -> Dict[str, Dict[str, int]]:
+def node_capacity_snapshot() -> Dict[str, Dict[str, Any]]:
     with _node_lock:
         nodes = set(LLM_NODES.keys()) | set(_node_inflight.keys()) | set(_node_overloads.keys())
+        now = time.monotonic()
         return {
             node: {
                 "inflight": int(_node_inflight.get(node, 0)),
                 "capacity": int(_node_limit(node)),
                 "available_slots": max(0, int(_node_limit(node)) - int(_node_inflight.get(node, 0))),
                 "overload_count": int(_node_overloads.get(node, 0)),
+                "failure_count": int(_node_failures.get(node, 0)),
+                "cooldown_remaining_sec": int(max(0.0, float(_node_cooldown_until.get(node) or 0.0) - now)),
+                "last_error": _node_last_error.get(node),
             }
             for node in sorted(nodes)
         }

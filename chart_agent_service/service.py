@@ -1072,8 +1072,15 @@ def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
                 insert_scan(ticker, result, alert_sent=(alert is not None))
                 _try_insert_signal_outcome(ticker, result)
 
-    # ── 단계 3: 캐시 정리 ─────────────────────────────────────
-    clear_ohlcv_cache()
+    # ── 단계 3: warm 캐시에서 data_health 스냅샷 갱신 ──────────────
+    # 과거: 스캔 끝에 clear_ohlcv_cache() 로 캐시를 비워, 이후 data_health 가
+    #       빈 캐시를 읽고 전 종목 ohlcv_missing 오보(false-negative)를 냈다.
+    # 변경: 캐시를 warm 상태로 유지(다음 스캔 시작 시 clear 로 freshness 보장)하고
+    #       즉시 data_health 를 갱신해 모니터링이 실제 상태를 반영하게 한다.
+    try:
+        build_data_health()
+    except Exception as exc:
+        print(f"  [data_health] 스캔 후 갱신 실패: {exc}")
 
     elapsed = time.time() - t_scan_start
     avg = elapsed / len(tickers) if tickers else 0

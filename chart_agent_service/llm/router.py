@@ -33,6 +33,9 @@ litellm.set_verbose = False
 
 T = TypeVar("T", bound=BaseModel)
 
+# 스키마 미준수(파싱) 실패 시 동일 모델 최대 시도 횟수. 1 = 재시도 없음.
+_PARSE_MAX_ATTEMPTS = 2
+
 
 def _setting(name: str, default: str = "") -> str:
     """환경변수 우선, 없으면 chart_agent_service/config.py 설정값 사용."""
@@ -107,20 +110,11 @@ def build_router() -> Router:
         ]
     )
 
-    # fallback chain: primary → secondary → tertiary
-    if gemini_key:
-        fallbacks = [
-            {"agent-llm-primary": ["agent-llm-secondary", "agent-llm-tertiary"]},
-            {"agent-llm-secondary": ["agent-llm-tertiary"]},
-        ]
-    else:
-        fallbacks = [{"agent-llm-secondary": ["agent-llm-tertiary"]}]
-
     return Router(
         model_list=model_list,
-        fallbacks=fallbacks,
-        num_retries=2,
-        retry_after=5,
+        fallbacks=[],          # [수정] 내부 폴백 비활성화. 외부 루프에서 node_slot 제어와 함께 폴백 처리.
+        num_retries=0,         # [수정] 내부 재시도 비활성화. 좀비 스레드 방지.
+        retry_after=1,
         routing_strategy="usage-based-routing",
         set_verbose=False,
     )
@@ -193,12 +187,20 @@ def call_agent_llm(
         )
 
     schema = response_model.model_json_schema()
+    required_keys = schema.get("required") or list(
+        (schema.get("properties") or {}).keys()
+    )
     messages = [
         {
             "role": "system",
             "content": (
                 f"You are {agent_role}. "
-                f"Respond ONLY in JSON matching this schema: {json.dumps(schema)}"
+                "Respond with ONLY a single JSON object INSTANCE that fills in the "
+                "values for the required keys. Output the answer values only — never "
+                'echo the schema itself, and never include "properties", "description", '
+                '"enum", "type", or "$defs" keys in your output.\n'
+                f"Required keys: {', '.join(required_keys)}.\n"
+                f"Schema (for reference only, do not repeat it): {json.dumps(schema)}"
             ),
         },
         {"role": "user", "content": prompt},
@@ -223,36 +225,61 @@ def call_agent_llm(
                 )
                 continue
 
-            try:
-                completion_kwargs = {
-                    "response_format": {"type": "json_object"},
-                }
-                if timeout_seconds is not None:
-                    completion_kwargs["timeout"] = max(1, min(float(timeout_seconds), 300.0))
-                api_response = call_with_breaker(
-                    _do_router_completion,
-                    router,
-                    model_name,
-                    messages,
-                    breaker_name=f"agent_llm:{agent_role}:{model_name}",
-                    **completion_kwargs,
-                )
-                raw = (api_response.choices[0].message.content or "").strip()
-                json_str = _extract_json(raw)
-                return response_model.model_validate_json(json_str)
+            # 파싱(스키마 미준수) 실패는 모델 환각인 경우가 많아 같은 모델로 1회
+            # 재시도하고, 그래도 실패하면 다음 후보 모델로 폴백한다.
+            for attempt in range(_PARSE_MAX_ATTEMPTS):
+                try:
+                    completion_kwargs = {
+                        "response_format": {"type": "json_object"},
+                    }
+                    if timeout_seconds is not None:
+                        completion_kwargs["timeout"] = max(
+                            1,
+                            min(
+                                float(timeout_seconds),
+                                _model_timeout_cap(model_name),
+                                300.0,
+                            ),
+                        )
+                    api_response = call_with_breaker(
+                        _do_router_completion,
+                        router,
+                        model_name,
+                        messages,
+                        breaker_name=f"agent_llm:{agent_role}:{model_name}",
+                        **completion_kwargs,
+                    )
+                    _record_node_success_for_model(model_name)
+                    raw = (api_response.choices[0].message.content or "").strip()
+                    json_str = _extract_json(raw)
+                    return response_model.model_validate_json(json_str)
 
-            except ValidationError as exc:
-                logger.warning("LLM response parse fail for %s: %s", agent_role, exc)
-                return _safe_response(
-                    response_model, f"parse_error: {exc}", ["LLM_PARSE_ERROR"]
-                )
+                except ValidationError as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "LLM response parse fail for %s via %s (attempt %d/%d): %s",
+                        agent_role,
+                        model_name,
+                        attempt + 1,
+                        _PARSE_MAX_ATTEMPTS,
+                        exc,
+                    )
+                    # 같은 모델 재시도 소진 시 루프 탈출 → 다음 후보 모델 폴백
+                    continue
 
-            except Exception as exc:
-                last_exc = exc
-                logger.warning(
-                    "LLM call fail for %s via %s: %s", agent_role, model_name, exc
-                )
+                except Exception as exc:
+                    last_exc = exc
+                    _record_node_failure_for_model(model_name, exc)
+                    logger.warning(
+                        "LLM call fail for %s via %s: %s", agent_role, model_name, exc
+                    )
+                    # 호출 자체 실패는 같은 모델 재시도 무의미 → 다음 후보로
+                    break
 
+    if isinstance(last_exc, ValidationError):
+        return _safe_response(
+            response_model, f"parse_error: {last_exc}", ["LLM_PARSE_ERROR"]
+        )
     return _safe_response(
         response_model, f"call_error: {last_exc}", ["LLM_CALL_ERROR"]
     )
@@ -266,8 +293,31 @@ def _node_for_model(model_name: str) -> str | None:
     return None
 
 
+def _model_timeout_cap(model_name: str) -> float:
+    if model_name == "agent-llm-primary":
+        return float(_int_setting("GEMINI_LLM_TIMEOUT", 30))
+    return float(_int_setting("MULTI_AGENT_LLM_TIMEOUT", 240))
+
+
 def _node_available_for_model(model_name: str) -> bool:
     node = _node_for_model(model_name)
+    if node is None:
+        return True
+
+    # rtx_5070 은 로컬 최후 폴백 노드다. 누적 실패 cooldown 으로 완전히 차단하면
+    # Mac/Gemini 동시 장애 시 모든 후보가 unavailable 이 되어 전체 에이전트가
+    # 무응답(전원 장애)이 된다. 따라서 cooldown 게이트에서 제외하고 항상 시도
+    # 대상으로 둔다. 동시성 제한은 node_slot 이, 실패 집계는 record_node_failure 가
+    # 계속 담당한다.
+    if node != "rtx_5070":
+        try:
+            from dual_node_config import is_node_in_cooldown
+
+            if is_node_in_cooldown(node):
+                return False
+        except Exception:
+            pass
+
     if node != "mac_studio":
         return True
 
@@ -290,6 +340,30 @@ def _node_slot_for_model(model_name: str):
         return node_slot(node, block=False)
     except Exception:
         return nullcontext(True)
+
+
+def _record_node_failure_for_model(model_name: str, exc: Exception) -> None:
+    node = _node_for_model(model_name)
+    if node is None:
+        return
+    try:
+        from dual_node_config import record_node_failure
+
+        record_node_failure(node, exc)
+    except Exception:
+        pass
+
+
+def _record_node_success_for_model(model_name: str) -> None:
+    node = _node_for_model(model_name)
+    if node is None:
+        return
+    try:
+        from dual_node_config import record_node_success
+
+        record_node_success(node)
+    except Exception:
+        pass
 
 
 def _model_candidates(preferred_provider: str | None = None) -> list[str]:
@@ -328,4 +402,3 @@ def _safe_response(model_cls: type[T], reason: str, flags: list[str]) -> T:
     except Exception:
         # schema가 달라 signal 필드가 없으면 빈 객체 반환
         return model_cls()  # type: ignore[return-value]
-

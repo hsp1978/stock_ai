@@ -18,6 +18,9 @@ import pytest
 _AGENT_DIR = os.path.join(os.path.dirname(__file__), "../../chart_agent_service")
 if _AGENT_DIR not in sys.path:  # noqa: E402
     sys.path.insert(0, _AGENT_DIR)
+_ANALYZER_DIR = os.path.join(os.path.dirname(__file__), "../../stock_analyzer")
+if _ANALYZER_DIR not in sys.path:  # noqa: E402
+    sys.path.insert(0, _ANALYZER_DIR)
 
 from llm.schemas import AgentLLMResponse, NewsSentimentResponse  # noqa: E402
 
@@ -185,6 +188,31 @@ def test_call_agent_llm_passes_timeout_to_router_completion():
     assert mock_router.completion.call_args.kwargs["timeout"] == 3.2
 
 
+def test_call_agent_llm_caps_ollama_timeout(monkeypatch):
+    """남은 전체 시간이 길어도 Ollama 단일 호출은 LLM timeout 상한을 넘기지 않는다."""
+    import dual_node_config
+    from llm.router import call_agent_llm
+
+    mock_router = MagicMock()
+    mock_router.completion.return_value = _make_api_response(_valid_json())
+    monkeypatch.setenv("MULTI_AGENT_LLM_TIMEOUT", "42")
+    dual_node_config.reset_node_cooldowns()
+
+    with patch(
+        "llm.router.call_with_breaker", side_effect=lambda fn, *a, **kw: fn(*a, **kw)
+    ):
+        result = call_agent_llm(
+            mock_router,
+            "Technical Analyst",
+            "analyze AAPL",
+            preferred_provider="ollama",
+            timeout_seconds=600,
+        )
+
+    assert result.signal == "buy"
+    assert mock_router.completion.call_args.kwargs["timeout"] == 42
+
+
 def test_call_agent_llm_respects_ollama_preference():
     """ollama 선호 에이전트는 Gemini key가 있어도 Ollama tier부터 호출."""
     from llm.router import call_agent_llm
@@ -313,6 +341,42 @@ def test_call_agent_llm_skips_overloaded_mac_slot():
     assert result.signal == "buy"
     called_models = [call.kwargs["model"] for call in mock_router.completion.call_args_list]
     assert called_models == ["agent-llm-tertiary"]
+
+
+def test_call_agent_llm_skips_node_in_cooldown(monkeypatch):
+    """노드가 cooldown 상태면 slot 획득 전에 해당 tier를 건너뛴다."""
+    from contextlib import nullcontext
+    import dual_node_config
+    from llm.router import call_agent_llm
+
+    mock_router = MagicMock()
+    mock_router.completion.return_value = _make_api_response(_valid_json())
+
+    monkeypatch.setenv("LLM_NODE_FAILURE_THRESHOLD", "1")
+    monkeypatch.setenv("LLM_NODE_COOLDOWN_SECONDS", "60")
+    dual_node_config.reset_node_cooldowns("mac_studio")
+    dual_node_config.record_node_failure("mac_studio", TimeoutError("down"))
+
+    with patch.dict(
+        os.environ,
+        {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""},
+        clear=False,
+    ), patch(
+        "llm.router._node_slot_for_model", return_value=nullcontext(True)
+    ), patch(
+        "llm.router.call_with_breaker", side_effect=lambda fn, *a, **kw: fn(*a, **kw)
+    ):
+        result = call_agent_llm(
+            mock_router,
+            "ML Specialist",
+            "analyze AAPL",
+            preferred_provider="ollama",
+        )
+
+    assert result.signal == "buy"
+    called_models = [call.kwargs["model"] for call in mock_router.completion.call_args_list]
+    assert called_models == ["agent-llm-tertiary"]
+    dual_node_config.reset_node_cooldowns("mac_studio")
 
 
 # ── circuit breaker ───────────────────────────────────────────────────
@@ -483,3 +547,57 @@ def test_call_agent_llm_with_decision_maker_schema():
     assert isinstance(result, DecisionMakerResponse)
     assert result.final_signal == "sell"
     assert result.final_confidence == 6.0
+
+
+# ── 회귀: 파싱 실패 재시도/폴백 + RTX cooldown 우회 ────────────────────
+
+
+def test_call_agent_llm_retries_parse_failure_then_recovers():
+    """첫 응답이 스키마 미준수(JSON 아님)여도 재시도로 유효 응답을 복구한다.
+
+    이전: ValidationError 시 즉시 parse_error 단락 → 에이전트 무효화.
+    현재: 같은 모델 재시도 후 다음 후보 모델 폴백으로 복구.
+    """
+    from llm.router import call_agent_llm
+
+    mock_router = MagicMock()
+    # 1차 호출은 파싱 실패, 2차부터는 유효 JSON
+    mock_router.completion.side_effect = [
+        _make_api_response(_invalid_json()),
+        _make_api_response(_valid_json()),
+        _make_api_response(_valid_json()),
+        _make_api_response(_valid_json()),
+    ]
+
+    with patch(
+        "llm.router.call_with_breaker", side_effect=lambda fn, *a, **kw: fn(*a, **kw)
+    ):
+        result = call_agent_llm(mock_router, "Technical Analyst", "analyze AAPL")
+
+    assert isinstance(result, AgentLLMResponse)
+    assert result.signal == "buy"
+    assert "LLM_PARSE_ERROR" not in result.risk_flags
+    assert mock_router.completion.call_count >= 2
+
+
+def test_rtx_node_bypasses_cooldown_gate():
+    """rtx_5070(로컬 최후 폴백)은 cooldown 중에도 항상 시도 대상이어야 한다.
+
+    Mac/Gemini 동시 장애 + RTX 일시 실패 시 전원 장애(전체 unavailable)를 막는다.
+    """
+    import dual_node_config
+    from llm.router import _node_available_for_model
+
+    dual_node_config.reset_node_cooldowns()
+    try:
+        for _ in range(5):
+            dual_node_config.record_node_failure("rtx_5070", RuntimeError("x"))
+            dual_node_config.record_node_failure("mac_studio", RuntimeError("x"))
+
+        assert dual_node_config.is_node_in_cooldown("rtx_5070") is True
+        # RTX 는 cooldown 이어도 available (게이트 우회)
+        assert _node_available_for_model("agent-llm-tertiary") is True
+        # Mac 은 cooldown 존중 → unavailable (네트워크 호출 없이 차단)
+        assert _node_available_for_model("agent-llm-secondary") is False
+    finally:
+        dual_node_config.reset_node_cooldowns()

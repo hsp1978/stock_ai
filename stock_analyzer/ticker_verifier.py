@@ -12,7 +12,31 @@ Ticker Verifier - 실제 종목 존재 여부 검증
 import yfinance as yf
 from typing import Dict, Tuple, Optional
 import warnings
+import os
 warnings.filterwarnings('ignore')
+
+
+def _yfinance_timeout() -> int:
+    try:
+        from config import YFINANCE_TIMEOUT
+        default = int(YFINANCE_TIMEOUT)
+    except Exception:
+        default = 8
+    try:
+        return int(os.getenv("YFINANCE_TIMEOUT") or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ticker_history(stock: yf.Ticker, period: str):
+    try:
+        return stock.history(
+            period=period,
+            timeout=_yfinance_timeout(),
+            raise_errors=True,
+        )
+    except TypeError:
+        return stock.history(period=period)
 
 
 def verify_ticker_exists(ticker: str) -> Tuple[bool, Dict, str]:
@@ -27,38 +51,38 @@ def verify_ticker_exists(ticker: str) -> Tuple[bool, Dict, str]:
     """
 
     try:
-        # yfinance Ticker 객체 생성
         stock = yf.Ticker(ticker)
 
-        # info 가져오기 시도
-        info = stock.info
+        # stock.info는 yfinance 내부 concurrent futures timeout을 자주 유발한다.
+        # 존재 검증은 가격 히스토리 중심으로 수행하고, 메타데이터는 선택적으로 보강한다.
+        history = _ticker_history(stock, period="5d")
+        if history is None or history.empty or "Close" not in history.columns:
+            return False, {}, f"가격 데이터가 없습니다: {ticker} (거래 정지 또는 상장폐지 가능성)"
 
-        # 기본 검증 - info가 비어있거나 기본값만 있는 경우
-        if not info or len(info) <= 1:
-            return False, {}, f"종목 정보를 찾을 수 없습니다: {ticker}"
-
-        # 회사명 확인
-        company_name = info.get('longName') or info.get('shortName')
-        if not company_name:
-            # 회사명이 없으면 의심스러운 티커
-            return False, {}, f"회사명을 확인할 수 없습니다: {ticker}"
-
-        # 시장 정보 확인
-        market = info.get('market') or info.get('exchange')
-
-        # 가격 데이터 확인
-        current_price = info.get('currentPrice') or info.get('regularMarketPrice')
+        current_price = history["Close"].iloc[-1]
         if current_price is None or current_price <= 0:
-            # 최근 데이터로 한번 더 시도
-            history = stock.history(period="5d")
-            if history.empty or len(history) == 0:
-                return False, {}, f"가격 데이터가 없습니다: {ticker} (거래 정지 또는 상장폐지 가능성)"
+            return False, {}, f"가격 데이터가 없습니다: {ticker} (거래 정지 또는 상장폐지 가능성)"
 
-            # history에서 마지막 종가 확인
-            current_price = history['Close'].iloc[-1] if not history.empty else None
+        fast_info = {}
+        try:
+            raw_fast_info = stock.fast_info
+            fast_info = {
+                key: raw_fast_info.get(key)
+                for key in (
+                    "currency",
+                    "exchange",
+                    "quoteType",
+                    "lastPrice",
+                    "last_price",
+                )
+            }
+        except Exception:
+            fast_info = {}
 
-        # 종목 타입 확인
-        quote_type = info.get('quoteType', '')
+        company_name = ticker
+        market = fast_info.get("exchange")
+        quote_type = fast_info.get("quoteType", "")
+        currency = fast_info.get("currency", "Unknown")
 
         # 검증된 정보 구성
         verified_info = {
@@ -66,18 +90,18 @@ def verify_ticker_exists(ticker: str) -> Tuple[bool, Dict, str]:
             'company_name': company_name,
             'market': market,
             'current_price': current_price,
-            'currency': info.get('currency', 'Unknown'),
+            'currency': currency,
             'quote_type': quote_type,
-            'sector': info.get('sector'),
-            'industry': info.get('industry'),
-            'market_cap': info.get('marketCap'),
+            'sector': None,
+            'industry': None,
+            'market_cap': None,
             'verified': True
         }
 
         # 한국 종목 특별 체크
         if ticker.endswith('.KS') or ticker.endswith('.KQ'):
             # 한국 종목인 경우 추가 검증
-            if verified_info['currency'] not in ['KRW', None]:
+            if verified_info['currency'] not in ['KRW', None, 'Unknown']:
                 return False, {}, f"한국 종목이 아닌 것으로 의심됨: 통화 {verified_info['currency']}"
 
         return True, verified_info, ""
@@ -119,7 +143,7 @@ def get_ticker_data_quality(ticker: str) -> Dict:
         stock = yf.Ticker(ticker)
 
         # 1년치 데이터 가져오기
-        history = stock.history(period="1y")
+        history = _ticker_history(stock, period="1y")
 
         if not history.empty:
             quality['has_price_data'] = True
@@ -151,13 +175,8 @@ def get_ticker_data_quality(ticker: str) -> Dict:
             if days_since_trade > 5:  # 5일 이상 거래 없음
                 quality['warnings'].append(f"마지막 거래일로부터 {days_since_trade}일 경과")
 
-        # 재무 데이터 체크
-        try:
-            financials = stock.financials
-            if financials is not None and not financials.empty:
-                quality['has_financial_data'] = True
-        except Exception:
-            pass
+        # stock.financials도 yfinance 메타데이터 경로를 타며 timeout을 만들 수 있다.
+        # 품질 판정에는 가격/거래량/기간만으로 충분하므로 검증 단계에서는 생략한다.
 
         # 품질 점수 계산
         score = 0

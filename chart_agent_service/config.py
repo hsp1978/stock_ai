@@ -36,12 +36,21 @@ class Settings(BaseSettings):
     MULTI_AGENT_MAX_WORKERS: int = Field(default=2, ge=1, le=16)
     MULTI_AGENT_TIMEOUT: int = Field(default=300, ge=30)
     MULTI_AGENT_LLM_TIMEOUT: int = Field(default=240, ge=30)
+    GEMINI_LLM_TIMEOUT: int = Field(default=30, ge=1, le=120)
     ANALYSIS_AUX_FETCH_TIMEOUT: int = Field(default=20, ge=1, le=300)
     GPU_MONITOR_INTERVAL_SECONDS: float = Field(default=7.0, ge=1)
     GPU_THROTTLE_MEMORY_MB: int = Field(default=11000, ge=0)
 
     MAC_STUDIO_IP: str = "hsptest-macstudio"
     MAC_STUDIO_URL: str = "http://hsptest-macstudio:8080"
+    MAC_STUDIO_HEALTH_TTL_SECONDS: float = Field(default=10.0, ge=0)
+    MAC_STUDIO_HEALTH_TIMEOUT: float = Field(default=7.0, ge=0.1, le=60)
+    MAC_STUDIO_HEALTH_FAILURE_THRESHOLD: int = Field(default=2, ge=1, le=20)
+    MAC_STUDIO_MAX_INFLIGHT: int = Field(default=4, ge=1, le=32)
+    RTX_5070_MAX_INFLIGHT: int = Field(default=2, ge=1, le=32)
+    LLM_NODE_MAX_INFLIGHT: int = Field(default=2, ge=1, le=32)
+    LLM_NODE_FAILURE_THRESHOLD: int = Field(default=2, ge=1, le=20)
+    LLM_NODE_COOLDOWN_SECONDS: float = Field(default=90.0, ge=0, le=3600)
 
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
@@ -131,6 +140,7 @@ class Settings(BaseSettings):
     OHLCV_TTL_EOD_HOURS: float = Field(default=24.0, ge=0)
     OHLCV_TTL_INTRADAY_MINUTES: int = Field(default=5, ge=1)
     OHLCV_RETRY_COUNT: int = Field(default=3, ge=1, le=10)
+    YFINANCE_TIMEOUT: int = Field(default=8, ge=1, le=60)
     FUNDAMENTAL_TTL_HOURS: float = Field(default=12.0, ge=0)
     NEWS_TTL_MINUTES: int = Field(default=30, ge=1)
 
@@ -178,11 +188,21 @@ DEFAULT_LLM_PROVIDER = settings.DEFAULT_LLM_PROVIDER
 MULTI_AGENT_MAX_WORKERS = settings.MULTI_AGENT_MAX_WORKERS
 MULTI_AGENT_TIMEOUT = settings.MULTI_AGENT_TIMEOUT
 MULTI_AGENT_LLM_TIMEOUT = settings.MULTI_AGENT_LLM_TIMEOUT
+GEMINI_LLM_TIMEOUT = settings.GEMINI_LLM_TIMEOUT
 ANALYSIS_AUX_FETCH_TIMEOUT = settings.ANALYSIS_AUX_FETCH_TIMEOUT
+YFINANCE_TIMEOUT = settings.YFINANCE_TIMEOUT
 GPU_MONITOR_INTERVAL_SECONDS = settings.GPU_MONITOR_INTERVAL_SECONDS
 GPU_THROTTLE_MEMORY_MB = settings.GPU_THROTTLE_MEMORY_MB
 MAC_STUDIO_IP = settings.MAC_STUDIO_IP
 MAC_STUDIO_URL = settings.MAC_STUDIO_URL
+MAC_STUDIO_HEALTH_TTL_SECONDS = settings.MAC_STUDIO_HEALTH_TTL_SECONDS
+MAC_STUDIO_HEALTH_TIMEOUT = settings.MAC_STUDIO_HEALTH_TIMEOUT
+MAC_STUDIO_HEALTH_FAILURE_THRESHOLD = settings.MAC_STUDIO_HEALTH_FAILURE_THRESHOLD
+MAC_STUDIO_MAX_INFLIGHT = settings.MAC_STUDIO_MAX_INFLIGHT
+RTX_5070_MAX_INFLIGHT = settings.RTX_5070_MAX_INFLIGHT
+LLM_NODE_MAX_INFLIGHT = settings.LLM_NODE_MAX_INFLIGHT
+LLM_NODE_FAILURE_THRESHOLD = settings.LLM_NODE_FAILURE_THRESHOLD
+LLM_NODE_COOLDOWN_SECONDS = settings.LLM_NODE_COOLDOWN_SECONDS
 AGENT_API_URL = settings.AGENT_API_URL
 SCAN_PARALLEL_WORKERS = settings.SCAN_PARALLEL_WORKERS
 GOOGLE_API_KEY = settings.GOOGLE_API_KEY

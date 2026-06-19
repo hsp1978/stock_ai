@@ -44,6 +44,8 @@ def _reset_node_slots():
     with dual_node_config._node_lock:
         dual_node_config._node_semaphores.clear()
         dual_node_config._node_inflight.clear()
+        dual_node_config._node_overloads.clear()
+    dual_node_config.reset_node_cooldowns()
 
 
 def test_mac_studio_health_uses_longer_timeout_and_ttl_cache(monkeypatch):
@@ -96,6 +98,28 @@ def test_node_slot_rejects_when_limit_is_full(monkeypatch):
             assert nested_acquired is False
 
     assert dual_node_config.node_load_snapshot()["mac_studio"] == 0
+
+
+def test_node_failure_opens_cooldown_and_success_resets(monkeypatch):
+    monkeypatch.setenv("LLM_NODE_FAILURE_THRESHOLD", "2")
+    monkeypatch.setenv("LLM_NODE_COOLDOWN_SECONDS", "60")
+    dual_node_config.reset_node_cooldowns("rtx_5070")
+
+    dual_node_config.record_node_failure("rtx_5070", TimeoutError("first"))
+    assert dual_node_config.is_node_in_cooldown("rtx_5070") is False
+
+    dual_node_config.record_node_failure("rtx_5070", TimeoutError("second"))
+    assert dual_node_config.is_node_in_cooldown("rtx_5070") is True
+
+    snapshot = dual_node_config.node_capacity_snapshot()["rtx_5070"]
+    assert snapshot["failure_count"] == 2
+    assert snapshot["cooldown_remaining_sec"] > 0
+    assert snapshot["last_error"] == "second"
+
+    dual_node_config.record_node_success("rtx_5070")
+    assert dual_node_config.is_node_in_cooldown("rtx_5070") is False
+    snapshot = dual_node_config.node_capacity_snapshot()["rtx_5070"]
+    assert snapshot["failure_count"] == 0
 
 
 def test_ollama_falls_back_when_mac_node_is_overloaded(monkeypatch):

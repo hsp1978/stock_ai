@@ -54,6 +54,9 @@ except ImportError:  # pragma: no cover - package import path
     from stock_analyzer.gpu_monitor import get_gpu_memory_snapshot
 
 
+MULTI_AGENT_RUNTIME_VERSION = "timeout_wait_fallback_v3"
+
+
 def _int_env(name: str, default: int) -> int:
     try:
         return int(os.getenv(name) or default)
@@ -63,6 +66,65 @@ def _int_env(name: str, default: int) -> int:
 
 def _str_env(name: str, default: str) -> str:
     return os.getenv(name) or default
+
+
+def _looks_like_unfinished_futures_timeout(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "futures unfinished" in text or (
+        "future" in text and "unfinished" in text
+    )
+
+
+def _timeout_failure_result(
+    ticker: str,
+    message: str,
+    warnings: List[str],
+    started_at: datetime,
+) -> Dict[str, Any]:
+    warning_list = list(warnings or [])
+    warning_list.append(
+        "내부 데이터/에이전트 future 타임아웃이 발생해 V2 분석을 neutral 시스템 장애 결과로 단락했습니다."
+    )
+    total_time = (datetime.now() - started_at).total_seconds()
+    reasoning = (
+        "멀티에이전트 분석 중 내부 future 타임아웃이 발생했습니다. "
+        "일부 yfinance/LLM 호출이 응답하지 않아 유효 에이전트 의견을 만들 수 없습니다. "
+        "V1 지표와 캐시된 데이터만 참고하고, 데이터 소스 또는 LLM 노드 상태를 점검해야 합니다."
+    )
+    final_decision = {
+        "final_signal": "neutral",
+        "final_confidence": 0.0,
+        "consensus": "유효 의견 0명 (future timeout)",
+        "conflicts": "내부 future timeout",
+        "reasoning": reasoning,
+        "key_risks": [
+            "데이터/LLM 호출 타임아웃",
+            "멀티에이전트 분석 무효",
+            message[:300],
+        ],
+        "agent_count": 0,
+        "valid_agent_count": 0,
+        "excluded_failed_count": 0,
+        "signal_distribution": {"buy": 0, "sell": 0, "neutral": 0},
+        "analyzed_at": datetime.now().isoformat(),
+        "warnings": warning_list,
+        "system_failure": True,
+    }
+    final_decision = _ensure_decision_context(final_decision)
+    return {
+        "ticker": ticker,
+        "multi_agent_mode": True,
+        "warnings": warning_list,
+        "agent_results": [],
+        "final_decision": final_decision,
+        "total_execution_time": total_time,
+        "analyzed_at": datetime.now().isoformat(),
+        "runtime": {
+            "orchestrator_version": MULTI_AGENT_RUNTIME_VERSION,
+            "timeout_fallback": True,
+        },
+        "system_failure": True,
+    }
 
 
 def _ensure_decision_context(decision: Dict[str, Any]) -> Dict[str, Any]:
@@ -383,7 +445,8 @@ class BaseAgent:
             last_status = None
 
             # 첫 번째 시도: 할당된 노드. 노드 큐가 꽉 차면 오래 기다리지 않고 폴백으로 넘긴다.
-            max_retries = 2
+            # [수정] max_retries=1 로 변경하여, 무한 대기 좀비 스레드 방지
+            max_retries = 1
             primary_node = llm_config.get("node", "rtx_5070")
             with node_slot(primary_node, block=False) as primary_slot_acquired:
                 if not primary_slot_acquired:
@@ -1735,17 +1798,8 @@ class MultiAgentOrchestrator:
                 except:
                     pass
 
-            # 기타 주식의 경우 yfinance에서 종목명 시도
-            try:
-                import yfinance as yf
-                stock = yf.Ticker(ticker)
-                info = stock.info
-                if info:
-                    name = info.get('longName') or info.get('shortName')
-                    if name:
-                        return name
-            except:
-                pass
+            # 기타 주식명 조회를 위해 yfinance.info를 호출하지 않는다.
+            # 해당 경로는 내부 future timeout을 자주 만들며, 표시는 티커만으로 충분하다.
 
         except Exception:
             pass
@@ -2003,10 +2057,10 @@ class MultiAgentOrchestrator:
             # 2. 병렬 에이전트 실행 (GPU 메모리 보호)
             print(f"  [2/3] {len(self.agents)}개 에이전트 병렬 실행 중 (워커: {self.max_workers})")
             agent_results = []
+            _ma_timeout = _int_env("MULTI_AGENT_TIMEOUT", MULTI_AGENT_TIMEOUT)
 
             executor = ThreadPoolExecutor(max_workers=self.max_workers)
             try:
-                _ma_timeout = _int_env("MULTI_AGENT_TIMEOUT", MULTI_AGENT_TIMEOUT)
                 deadline_at = time.monotonic() + _ma_timeout
                 for agent in self.agents:
                     agent.deadline_at = deadline_at
@@ -2098,6 +2152,12 @@ class MultiAgentOrchestrator:
                 "frame_summary": {
                     "total_rows": len(df),
                     "has_sufficient_data": len(df) >= 100
+                },
+                "runtime": {
+                    "orchestrator_version": MULTI_AGENT_RUNTIME_VERSION,
+                    "timeout_seconds": _ma_timeout,
+                    "max_workers": self.max_workers,
+                    "timeout_fallback": False,
                 }
             }
 
@@ -2106,6 +2166,15 @@ class MultiAgentOrchestrator:
             return result
 
         except Exception as e:
+            if _looks_like_unfinished_futures_timeout(e):
+                print(f"\n[MultiAgent] future 타임아웃 단락: {str(e)}")
+                return _timeout_failure_result(
+                    ticker=ticker,
+                    message=str(e),
+                    warnings=warnings,
+                    started_at=start_time,
+                )
+
             print(f"\n[MultiAgent] 오류: {str(e)}")
             traceback.print_exc()
 
