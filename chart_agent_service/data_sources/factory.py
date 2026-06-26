@@ -9,7 +9,7 @@ from typing import Optional
 from data_sources.base import DataSource
 
 
-VALID_SOURCES = {"yfinance", "alpaca", "polygon", "kis"}
+VALID_SOURCES = {"yfinance", "alpaca", "polygon", "kis", "toss"}
 
 
 def get_data_source_name() -> str:
@@ -43,6 +43,15 @@ def get_data_source(name: Optional[str] = None) -> DataSource:
             return PolygonSource()
         except ImportError:
             pass
+
+    if name == "toss":
+        from data_sources.toss_source import TossDataSource
+        src = TossDataSource()
+        # 자격증명 없으면 yfinance로 폴백
+        if not src._credentials_present():
+            from data_sources.yfinance_source import YFinanceSource
+            return YFinanceSource()
+        return src
 
     if name == "kis":
         # Phase 2.3에서 구현될 예비 슬롯

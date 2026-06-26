@@ -9,6 +9,7 @@ TRADING_MODE:
 
 LIVE 모드 사용 시 BROKER_NAME 환경변수로 구체적 증권사 선택:
   BROKER_NAME=alpaca
+  BROKER_NAME=toss
   BROKER_NAME=kis
 """
 from __future__ import annotations
@@ -56,6 +57,15 @@ def get_broker(mode: Optional[str] = None) -> BrokerInterface:
             try:
                 from brokers.alpaca_broker import AlpacaBroker
                 broker = AlpacaBroker()
+                # 자격증명 없으면 dry_run으로 안전 폴백 (실수로 LIVE 설정 방지)
+                if broker._credentials_present():
+                    return broker
+            except ImportError:
+                pass
+        if broker_name == "toss":
+            try:
+                from brokers.toss_broker import TossBroker
+                broker = TossBroker()
                 # 자격증명 없으면 dry_run으로 안전 폴백 (실수로 LIVE 설정 방지)
                 if broker._credentials_present():
                     return broker

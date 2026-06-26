@@ -34,7 +34,7 @@ Tailscale Tailnet (testffa97.ts.net)
 
 - Docker Compose `--profile dev` 사용. `network_mode: host` (단일 사용자 dev 전제).
 - Mac Studio 다운 시 RTX 5070 단독 폴백 (`dual_node_config.py` 자동 검출).
-- 외부 의존: yfinance, FDR, DART, FRED, Google News, Gemini API, OpenAI API.
+- 외부 의존: yfinance, FDR, DART, FRED, Google News, Gemini API, OpenAI API, 토스증권 Open API.
 
 ---
 
@@ -196,6 +196,14 @@ make help
 | `PyPortfolioOpt` | Black-Litterman | P3 |
 | `prometheus-fastapi-instrumentator` | 메트릭 | 시스템 보고서 P1 |
 | `respx` | HTTP mocking | 테스트 도입 시 |
+
+**증권사/시세 연동 (신규 라이브러리 없이 httpx+tenacity 사용)**:
+- 토스증권 Open API (`openapi.tossinvest.com`, OAuth2 Client Credentials): 국내(KRX)·미국
+  주문/계좌 + 국내 시세. 브로커 `BROKER_NAME=toss`, 데이터소스 `DATA_SOURCE=toss`.
+  자격증명 미설정 시 각각 dry_run / yfinance로 안전 폴백. 계좌 API는
+  `X-Tossinvest-Account: {accountSeq}`(계좌번호로 자동 식별) 헤더 필수. 모의투자 도메인
+  미정의 → `TOSS_PAPER` 토글만 제공. 어댑터: `brokers/toss_{auth,broker}.py`,
+  `data_sources/toss_source.py`.
 
 신규 의존성 추가 시:
 1. `pyproject.toml` 명시

@@ -103,7 +103,7 @@ class Settings(BaseSettings):
     DEFAULT_SCAN_LIMIT: int = Field(default=30, ge=1)
 
     TRADING_MODE: Literal["paper", "dry_run", "approval", "live"] = "paper"
-    BROKER_NAME: Literal["", "alpaca", "kis"] = ""
+    BROKER_NAME: Literal["", "alpaca", "kis", "toss"] = ""
     APPROVAL_EXEC_MODE: Literal["paper", "dry_run", "live"] = "paper"
     DAILY_ORDER_LIMIT_USD: float = Field(default=1000, ge=0)
     DAILY_ORDER_LIMIT_KRW: float = Field(default=1000000, ge=0)
@@ -125,7 +125,16 @@ class Settings(BaseSettings):
     ALPACA_DATA_URL: str = "https://data.alpaca.markets"
     ALPACA_DATA_FEED: Literal["iex", "sip"] = "iex"
 
-    DATA_SOURCE: Literal["yfinance", "alpaca", "polygon", "kis"] = "yfinance"
+    DATA_SOURCE: Literal["yfinance", "alpaca", "polygon", "kis", "toss"] = "yfinance"
+
+    # ── 토스증권 Open API (국내+미국, OAuth2 Client Credentials) ──────
+    # 발급: https://corp.tossinvest.com/ko/open-api → developers.tossinvest.com
+    # 모의투자(Sandbox) 도메인 미정의 → TOSS_PAPER 토글만 제공(추후 대응).
+    TOSS_APP_KEY: str = ""
+    TOSS_APP_SECRET: str = ""
+    TOSS_ACCOUNT_NO: str = ""          # 계좌번호(문자열) — accountSeq는 자동 식별
+    TOSS_BASE_URL: str = "https://openapi.tossinvest.com"
+    TOSS_PAPER: bool = True
 
     # ── Step 11: 시장 캘린더 ──────────────────────────────────────────
     DEFAULT_MARKET_KR: str = "KRX"
@@ -211,6 +220,11 @@ FRED_API_KEY = settings.FRED_API_KEY
 FMP_API_KEY = settings.FMP_API_KEY
 TRADING_MODE = settings.TRADING_MODE
 BROKER_NAME = settings.BROKER_NAME
+TOSS_APP_KEY = settings.TOSS_APP_KEY
+TOSS_APP_SECRET = settings.TOSS_APP_SECRET
+TOSS_ACCOUNT_NO = settings.TOSS_ACCOUNT_NO
+TOSS_BASE_URL = settings.TOSS_BASE_URL
+TOSS_PAPER = settings.TOSS_PAPER
 APPROVAL_EXEC_MODE = settings.APPROVAL_EXEC_MODE
 DAILY_ORDER_LIMIT_USD = settings.DAILY_ORDER_LIMIT_USD
 DAILY_ORDER_LIMIT_KRW = settings.DAILY_ORDER_LIMIT_KRW
