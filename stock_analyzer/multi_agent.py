@@ -1138,11 +1138,54 @@ class ValueInvestor(BaseAgent):
             profit_margin = info.get('profitMargins')
             current_price = info.get('currentPrice', info.get('regularMarketPrice'))
 
+            # 1.3. [KRX 보강] 한국 종목은 KRX 일별 펀더멘털(PER/PBR/EPS/BPS)로
+            # yfinance 결측을 채우고 ROE를 교차검증한다 (KRX_ID/KRX_PW 필요).
+            krx_fund: Dict[str, Any] = {}
+            roe_source = "yfinance" if roe is not None else None
+            roe_yfinance = roe
+            try:
+                from krx_fundamentals import fetch_krx_fundamentals
+                krx_fund = fetch_krx_fundamentals(ticker)
+            except Exception:
+                krx_fund = {"available": False, "reason": "krx_fundamentals 모듈 로드 실패"}
+
+            if krx_fund.get("available"):
+                if not pe_ratio and krx_fund.get("per"):
+                    pe_ratio = krx_fund["per"]
+                if not pb_ratio and krx_fund.get("pbr"):
+                    pb_ratio = krx_fund["pbr"]
+                krx_roe = krx_fund.get("roe")
+                if krx_roe and krx_roe > 0:
+                    if roe is None or roe <= 0:
+                        roe = krx_roe
+                        roe_source = "krx"
+                    elif max(krx_roe / roe, roe / krx_roe) >= 3.0:
+                        # yfinance ROE가 KRX 기준과 3배 이상 괴리 — 국내 종목은
+                        # 거래소 공시 기반 KRX 값을 우선한다 (KDR stale 데이터 대응).
+                        roe = krx_roe
+                        roe_source = "krx (yfinance 괴리로 대체)"
+
             # 1.5. [데이터 품질] 펀더멘털 정합성 교차검증
             # yfinance 지표는 KDR·비주력 종목에서 과거 회계연도/오류 값을 반환할 수 있다.
             # 항등식 ROE ≈ PBR / PER 로 내부 일관성을 검증하고, 3배 이상 괴리 시
             # 데이터 품질 경고를 남기며 해당 분석의 신뢰도를 제한한다.
             data_quality_warnings = []
+            data_source_notes = []
+            if roe_source == "krx (yfinance 괴리로 대체)":
+                data_quality_warnings.append(
+                    f"yfinance ROE {roe_yfinance:.1%} vs KRX 기준 ROE {roe:.1%} 3배 이상 괴리 "
+                    f"— KRX(EPS/BPS) 값으로 대체"
+                )
+            elif roe_source == "krx":
+                data_source_notes.append("ROE: KRX EPS/BPS 기준 (yfinance 결측 보강)")
+            if krx_fund.get("available"):
+                data_source_notes.append(
+                    f"KRX 펀더멘털 사용 (기준일 {krx_fund.get('as_of', '?')})"
+                )
+            elif krx_fund.get("reason") and "KRX 티커 아님" not in str(krx_fund.get("reason")):
+                data_source_notes.append(
+                    f"KRX 펀더멘털 미사용: {krx_fund.get('reason')}"
+                )
             implied_roe = None
             if pe_ratio and pb_ratio and pe_ratio > 0 and pb_ratio > 0:
                 implied_roe = pb_ratio / pe_ratio
@@ -1227,7 +1270,10 @@ class ValueInvestor(BaseAgent):
                     "margin_of_safety": margin_of_safety,
                     "current_price": current_price,
                     "implied_roe": implied_roe,
-                    "data_quality_warnings": data_quality_warnings
+                    "data_quality_warnings": data_quality_warnings,
+                    "data_source_notes": data_source_notes,
+                    "roe_source": roe_source,
+                    "krx_fundamentals": krx_fund
                 }
             }]
 
@@ -1238,6 +1284,8 @@ class ValueInvestor(BaseAgent):
                 data_quality_text += "\n- 데이터 품질 경고가 있으므로 재무 지표 기반 판단은 보수적으로 하세요."
             else:
                 data_quality_text = "- 이상 없음"
+            if data_source_notes:
+                data_quality_text += "\n" + "\n".join(f"- {n}" for n in data_source_notes)
 
             # 지표 포매팅 (조건부 표현식 미리 계산)
             pe_str = f"{pe_ratio:.2f}" if pe_ratio else 'N/A'
