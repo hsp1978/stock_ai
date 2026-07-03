@@ -132,6 +132,7 @@ class EnhancedDecisionMaker:
 
         # 2. 에이전트 의견 및 점수 집계 (신호 정규화 적용)
         signal_counts = {"buy": 0, "sell": 0, "neutral": 0}
+        weighted_votes = {"buy": 0.0, "sell": 0.0, "neutral": 0.0}  # 신뢰도 가중 표
         confidence_sum = 0.0
         valid_agents = 0
         failed_agents = []  # 실패한 에이전트 추적
@@ -162,6 +163,7 @@ class EnhancedDecisionMaker:
             # 신호 정규화
             normalized_signal = normalize_signal(result.signal)
             signal_counts[normalized_signal] += 1
+            weighted_votes[normalized_signal] += result.confidence
             confidence_sum += result.confidence
             valid_agents += 1
             signed_confidence = self._signed_confidence(normalized_signal, result.confidence)
@@ -313,7 +315,8 @@ class EnhancedDecisionMaker:
             tech_analysis,
             quant_analysis,
             currency,
-            fundamental_risks
+            fundamental_risks,
+            weighted_votes=weighted_votes,
         )
 
         # reflect sanity check
@@ -326,8 +329,29 @@ class EnhancedDecisionMaker:
         except Exception:
             pass
 
+        # 6.5. [리스크 정합] 에이전트가 보고한 리스크를 핵심 리스크에 병합
+        # 리스크 요약이 본문(켈리 음수, R/R 열위, 지정학, 밸류 우려)과 모순되지 않도록 한다.
+        agent_risks = self._collect_agent_risks(agent_results)
+        merged_risks = [r for r in (final_decision.get("risks") or []) if r != "특별한 리스크 없음"]
+        for risk in agent_risks:
+            if risk not in merged_risks:
+                merged_risks.append(risk)
+        final_decision["risks"] = merged_risks if merged_risks else ["특별한 리스크 없음"]
+
+        # 6.6. [켈리 게이트] 켈리 비중 음수(통계적 엣지 없음)인데 buy면 신뢰도 상한 적용
+        kelly_no_bet = any("켈리" in r and ("음수" in r or "엣지 부족" in r) for r in agent_risks)
+        if kelly_no_bet and final_decision["signal"] == "buy":
+            final_decision["confidence"] = min(float(final_decision["confidence"]), 3.0)
+            kelly_msg = "켈리 기준 베팅 부적합 vs 매수 신호 충돌"
+            prev_conflict = final_decision.get("conflicts")
+            final_decision["conflicts"] = (
+                f"{prev_conflict}, {kelly_msg}" if prev_conflict and prev_conflict != "없음" else kelly_msg
+            )
+
         # 7. 경고 메시지 수집
         warnings = []
+        if kelly_no_bet and final_decision["signal"] == "buy":
+            warnings.append("KELLY_NEGATIVE_NO_BET")
         if not is_valid and fixed_ticker:
             warnings.append(f"티커 자동 수정: {error_msg}")
         if not is_valid and not fixed_ticker:
@@ -527,6 +551,54 @@ class EnhancedDecisionMaker:
                 "warnings": ["Fundamental 데이터 수집 실패"],
                 "critical_risks": []
             }
+
+    def _collect_agent_risks(self, agent_results) -> List[str]:
+        """에이전트 evidence에서 명시적 리스크를 추출해 핵심 리스크로 승격한다.
+
+        대상: 켈리 음수/no_trade, 지지저항 R/R 열위, 지정학 리스크, 밸류 저퀄리티,
+        펀더멘털 데이터 품질 경고.
+        """
+        risks: List[str] = []
+
+        def add(risk: str) -> None:
+            if risk and risk not in risks:
+                risks.append(risk)
+
+        for result in agent_results:
+            if getattr(result, "error", None):
+                continue
+            for ev in (result.evidence or []):
+                tool = ev.get("tool", "")
+                tool_result = ev.get("result", {}) or {}
+                if tool == "kelly_criterion_analysis":
+                    kelly_full = tool_result.get("kelly_full_pct")
+                    if kelly_full is not None and kelly_full <= 0:
+                        win_rate = tool_result.get("win_rate") or 0
+                        wl_ratio = tool_result.get("win_loss_ratio") or 0
+                        add(
+                            f"켈리 비중 음수 ({kelly_full:+.1f}%, 승률 {win_rate:.1%}, "
+                            f"W/L {wl_ratio:.2f}) → 통계적 엣지 없음, 신규 베팅 부적합"
+                        )
+                    elif tool_result.get("no_trade_warning"):
+                        add(str(tool_result["no_trade_warning"]))
+                elif tool == "support_resistance_analysis":
+                    rr = tool_result.get("risk_reward_ratio")
+                    if rr is not None and 0 < rr < 0.8:
+                        add(f"손익비 불리: 지지/저항 기준 R/R {rr:.2f} < 0.8")
+                elif tool == "geopolitical_analysis":
+                    for risk in (tool_result.get("risks") or [])[:3]:
+                        add(f"지정학: {risk}")
+                elif tool == "value_investing_analysis":
+                    roe = tool_result.get("roe")
+                    if roe is not None and 0 <= roe < 0.05:
+                        add(f"저ROE {roe:.1%}: 자본 효율 열위")
+                    dte = tool_result.get("debt_to_equity")
+                    if dte is not None and dte > 150:
+                        add(f"높은 부채비율 {dte:.0f}%")
+                    for warn in (tool_result.get("data_quality_warnings") or []):
+                        add(f"펀더멘털 데이터 품질: {warn}")
+
+        return risks
 
     def _extract_scores(self, result) -> Dict[str, float]:
         """에이전트 결과에서 점수 추출"""
@@ -761,8 +833,9 @@ class EnhancedDecisionMaker:
 
     def _make_final_decision(self, signal_counts, signal_strength,
                             volatility_check, tech_analysis, quant_analysis, currency,
-                            fundamental_risks=None) -> Dict:
+                            fundamental_risks=None, weighted_votes=None) -> Dict:
         """최종 판단 (내부자 거래 특별 처리 포함)"""
+        weighted_votes = weighted_votes or {"buy": 0.0, "sell": 0.0, "neutral": 0.0}
 
         # 1. 점수 기반 판단
         total_score = signal_strength["total_score"]
@@ -812,18 +885,37 @@ class EnhancedDecisionMaker:
 
         # 3. 기본 신호 결정 (에이전트 의견 반영)
         # 에이전트 의견이 있는 경우 우선 고려
+        minority_note = None
         if signal_counts["buy"] > 0 or signal_counts["sell"] > 0:
             # 다수결 기반
             if signal_counts["buy"] > signal_counts["sell"] + signal_counts["neutral"]:
                 base_signal = "buy"
             elif signal_counts["sell"] > signal_counts["buy"] + signal_counts["neutral"]:
                 base_signal = "sell"
-            elif total_score > 5 and signal_counts["buy"] > signal_counts["sell"]:
+            # [정합성] 점수 보조 경로: 소수(1명) 의견이 최종 신호를 결정하지 못하도록
+            # 최소 2명 지지 + 신뢰도 가중 우세를 함께 요구한다.
+            elif (
+                total_score > 5
+                and signal_counts["buy"] >= 2
+                and signal_counts["buy"] > signal_counts["sell"]
+                and weighted_votes["buy"] > weighted_votes["sell"]
+            ):
                 base_signal = "buy"
-            elif total_score < -5 and signal_counts["sell"] > signal_counts["buy"]:
+            elif (
+                total_score < -5
+                and signal_counts["sell"] >= 2
+                and signal_counts["sell"] > signal_counts["buy"]
+                and weighted_votes["sell"] > weighted_votes["buy"]
+            ):
                 base_signal = "sell"
             else:
                 base_signal = "neutral"
+                dominant = "buy" if signal_counts["buy"] >= signal_counts["sell"] else "sell"
+                if signal_counts[dominant] == 1 and signal_counts["neutral"] >= 2:
+                    minority_note = (
+                        f"소수 의견 차단: {dominant} 1명 vs 중립 {signal_counts['neutral']}명 "
+                        f"— 단일 에이전트 의견으로 신호를 채택하지 않음"
+                    )
         else:
             # 모든 에이전트가 neutral인 경우 점수 기반 (약하게)
             if total_score > 10:  # 기준 상향 (5 → 10)
@@ -912,9 +1004,17 @@ class EnhancedDecisionMaker:
             # 일반 경고는 warnings에만 포함됨
 
         # 7. 판단 근거
+        # [산술 정합] 종합 점수의 모든 성분을 표기해 합계가 재검산 가능하도록 한다.
         reasoning_parts = []
-        reasoning_parts.append(f"종합 점수: {total_score:+.1f} (기술: {tech_analysis['total_score']:+.1f}, 퀀트: {quant_analysis['total_score']:+.1f})")
+        ml_contribution = float(signal_strength.get("ml_adjusted", {}).get("contribution", 0) or 0)
+        insider_contribution = float(signal_strength.get("insider", {}).get("contribution", 0) or 0)
         domain = signal_strength.get("domain_contributions", {})
+        domain_total = sum(float(v or 0) for v in domain.values())
+        reasoning_parts.append(
+            f"종합 점수: {total_score:+.1f} = 기술 {tech_analysis['total_score']:+.1f} "
+            f"+ 퀀트 {quant_analysis['total_score']:+.1f} + ML {ml_contribution:+.1f} "
+            f"+ 내부자 {insider_contribution:+.1f} + 도메인 {domain_total:+.1f}"
+        )
         if any(abs(float(v or 0)) > 0 for v in domain.values()):
             reasoning_parts.append(
                 "도메인 보정: "
@@ -925,12 +1025,25 @@ class EnhancedDecisionMaker:
             )
         reasoning_parts.append(f"신호 강도: {strength_level}")
 
+        # [레벨 구분] 에이전트 표결과 하위 지표 신호를 명확히 분리해 표기한다.
+        vote_summary = (
+            f"에이전트 표결: 매수 {signal_counts['buy']}명 / 매도 {signal_counts['sell']}명 "
+            f"/ 중립 {signal_counts['neutral']}명"
+        )
         if base_signal == "buy":
-            reasoning_parts.append(f"매수 신호 우세 (기술 {tech_analysis['buy_count']}개, 퀀트 {quant_analysis['buy_count']}개)")
+            reasoning_parts.append(
+                f"매수 우세 — {vote_summary} "
+                f"(하위 지표: 기술 buy {tech_analysis['buy_count']}개, 퀀트 buy {quant_analysis['buy_count']}개)"
+            )
         elif base_signal == "sell":
-            reasoning_parts.append(f"매도 신호 우세 (기술 {tech_analysis['sell_count']}개, 퀀트 {quant_analysis['sell_count']}개)")
+            reasoning_parts.append(
+                f"매도 우세 — {vote_summary} "
+                f"(하위 지표: 기술 sell {tech_analysis['sell_count']}개, 퀀트 sell {quant_analysis['sell_count']}개)"
+            )
         else:
-            reasoning_parts.append("중립 구간 - 방향성 불명확")
+            reasoning_parts.append(f"중립 — {vote_summary}")
+            if minority_note:
+                reasoning_parts.append(minority_note)
 
         return {
             "signal": base_signal,
