@@ -3658,27 +3658,45 @@ def render_multi_agent():
         col1, col2 = st.columns(2)
 
         with col1:
-            st.markdown("""
-            <div class="summary-card">
-                <div style="font-size:0.7rem; color:var(--on-surface-variant); margin-bottom:8px;">Single LLM (V1.0)</div>
-                <div style="font-size:1.8rem; font-family:'JetBrains Mono'; font-weight:700; margin-bottom:12px;">
-                    {}
+            # V1.0 실행 실패는 N/A/0.00으로 위장하지 않고 명시적으로 표기한다.
+            single_failed = not single or not single.get("final_signal")
+            if single_failed:
+                st.markdown("""
+                <div class="summary-card" style="border:2px solid var(--error);">
+                    <div style="font-size:0.7rem; color:var(--error); margin-bottom:8px;">Single LLM (V1.0) ⚠️</div>
+                    <div style="font-size:1.2rem; font-family:'JetBrains Mono'; font-weight:700; margin-bottom:12px; color:var(--error);">
+                        실행 실패
+                    </div>
+                    <div style="font-size:0.8rem; color:var(--on-surface-variant);">
+                        V1.0 분석 결과를 가져오지 못했습니다 (신호/점수 없음)
+                    </div>
+                    <div style="margin-top:12px; font-size:0.7rem; opacity:0.6;">
+                        agent-api /scan 실패 여부를 확인하세요
+                    </div>
                 </div>
-                <div style="font-size:0.8rem; color:var(--on-surface-variant);">
-                    점수: <span style="color:{};">{:+.2f}</span> / {}: {}/10
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div class="summary-card">
+                    <div style="font-size:0.7rem; color:var(--on-surface-variant); margin-bottom:8px;">Single LLM (V1.0)</div>
+                    <div style="font-size:1.8rem; font-family:'JetBrains Mono'; font-weight:700; margin-bottom:12px;">
+                        {}
+                    </div>
+                    <div style="font-size:0.8rem; color:var(--on-surface-variant);">
+                        점수: <span style="color:{};">{:+.2f}</span> / {}: {}/10
+                    </div>
+                    <div style="margin-top:12px; font-size:0.7rem; opacity:0.6;">
+                        {}개 도구 분석 → 단일 LLM 판단
+                    </div>
                 </div>
-                <div style="margin-top:12px; font-size:0.7rem; opacity:0.6;">
-                    {}개 도구 분석 → 단일 LLM 판단
-                </div>
-            </div>
-            """.format(
-                single.get("final_signal", "?"),
-                "var(--buy)" if single.get("composite_score", 0) > 0 else "var(--sell)" if single.get("composite_score", 0) < 0 else "var(--outline)",
-                single.get("composite_score", 0),
-                _confidence_label((single.get("final_signal") or "").upper()),
-                single.get("confidence", 0),
-                len(single.get("tool_summaries") or []) or 17,
-            ), unsafe_allow_html=True)
+                """.format(
+                    single.get("final_signal", "?"),
+                    "var(--buy)" if single.get("composite_score", 0) > 0 else "var(--sell)" if single.get("composite_score", 0) < 0 else "var(--outline)",
+                    single.get("composite_score", 0),
+                    _confidence_label((single.get("final_signal") or "").upper()),
+                    single.get("confidence", 0),
+                    len(single.get("tool_summaries") or []) or 17,
+                ), unsafe_allow_html=True)
 
         with col2:
             # multi가 None이거나 error가 있는 경우 처리
@@ -3984,7 +4002,7 @@ def render_multi_agent():
             summary_df = pd.DataFrame([{
                 "Ticker": ticker,
                 "분석시간": multi.get('analyzed_at', ''),
-                "Single LLM 신호": single.get("final_signal", "N/A"),
+                "Single LLM 신호": single.get("final_signal") or "실행 실패",
                 "Single LLM 점수": single.get("composite_score", 0),
                 "Multi-Agent 신호": final_decision.get('final_signal', 'N/A'),
                 "Multi-Agent 신뢰도": final_decision.get('final_confidence', 0),
@@ -4005,6 +4023,18 @@ def render_multi_agent():
 
         with col3:
             # Markdown Report Export
+            if not single or not single.get("final_signal"):
+                single_v1_section = (
+                    "- **상태**: ⚠️ 실행 실패 — V1.0 분석 결과 없음 "
+                    "(agent-api /scan 실패 여부 확인 필요)"
+                )
+            else:
+                single_v1_section = (
+                    f"- **최종 신호**: {single.get('final_signal')}\n"
+                    f"- **종합 점수**: {single.get('composite_score', 0):+.2f}\n"
+                    f"- **{_confidence_label((single.get('final_signal') or '').upper())}**: "
+                    f"{single.get('confidence', 0)}/10"
+                )
             markdown_report = f"""# {ticker} 주식 분석 리포트
 
 ## 📅 분석 정보
@@ -4015,9 +4045,7 @@ def render_multi_agent():
 ## 🎯 분석 결과 요약
 
 ### Single LLM Analysis (V1.0)
-- **최종 신호**: {single.get("final_signal", "N/A")}
-- **종합 점수**: {single.get("composite_score", 0):+.2f}
-- **{_confidence_label((single.get("final_signal") or "").upper())}**: {single.get("confidence", 0)}/10
+{single_v1_section}
 
 ### Multi-Agent Analysis (V2.0)
 - **최종 신호**: {final_decision.get('final_signal', 'N/A')}

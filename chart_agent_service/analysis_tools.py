@@ -105,6 +105,9 @@ class AnalysisTools:
         day_low = float(self.latest['Low'])
         _cur = "₩" if _market_from_ticker(ticker) == "KR" else "$"
         _pfmt = (lambda v: f"{_cur}{v:,.0f}") if _cur == "₩" else (lambda v: f"{_cur}{v:.2f}")
+        # 티커 통화 기준 가격 포맷터 — detail 문자열에서 '$' 하드코딩 금지
+        self.currency_symbol = _cur
+        self.fmt_price = _pfmt
 
         if current_price > day_high:
             self.entry_price_warnings.append(f"진입가 {_pfmt(current_price)} > 당일 고가 {_pfmt(day_high)}")
@@ -266,7 +269,7 @@ class AnalysisTools:
             "cross_signal": cross_signal,
             "volume_ratio": round(volume_ratio, 2) if 'volume_ratio' in locals() else None,
             "volume_warning": volume_warning if 'volume_warning' in locals() else None,
-            "detail": f"가격 ${price:.2f}, 배열={alignment}, 크로스={cross_signal}" +
+            "detail": f"가격 {self.fmt_price(price)}, 배열={alignment}, 크로스={cross_signal}" +
                       (f", 거래량 {volume_ratio:.1f}x" if 'volume_ratio' in locals() else "") +
                       (f" [{volume_warning}]" if 'volume_warning' in locals() and volume_warning else "")
         })
@@ -782,7 +785,7 @@ class AnalysisTools:
             "nearest_level": nearest_level,
             "nearest_support": round(nearest_support, 2),
             "nearest_resistance": round(nearest_resistance, 2),
-            "detail": f"되돌림={retracement_pct:.1%}, 가까운 레벨={nearest_level}, 지지=${nearest_support:.2f}"
+            "detail": f"되돌림={retracement_pct:.1%}, 가까운 레벨={nearest_level}, 지지={self.fmt_price(nearest_support)}"
         })
         return result
 
@@ -1109,7 +1112,7 @@ class AnalysisTools:
             "upside_pct": round(upside_pct, 2),
             "downside_pct": round(downside_pct, 2),
             "risk_reward_ratio": round(risk_reward, 2),
-            "detail": f"R/R={risk_reward:.1f}, 저항=${nearest_resistance:.2f}(+{upside_pct:.1f}%), 지지=${nearest_support:.2f}(-{downside_pct:.1f}%)"
+            "detail": f"R/R={risk_reward:.1f}, 저항={self.fmt_price(nearest_resistance)}(+{upside_pct:.1f}%), 지지={self.fmt_price(nearest_support)}(-{downside_pct:.1f}%)"
         })
         return result
 
@@ -2917,12 +2920,13 @@ def generate_agent_chart(ticker: str, df: pd.DataFrame, composite: dict, save_pa
             composite.get('final_signal', 'HOLD'), GOLD)
 
         risk_info = ""
+        _chart_cur = "₩" if _market_from_ticker(ticker) == "KR" else "$"
         for td in composite.get("tool_details", []):
             if td.get("tool") == "risk_position_sizing":
                 sl = td.get("stop_loss", "")
                 tp = td.get("take_profit", "")
                 qty = td.get("recommended_qty", "")
-                risk_info = f"  |  SL: ${sl}  TP: ${tp}  Qty: {qty}"
+                risk_info = f"  |  SL: {_chart_cur}{sl}  TP: {_chart_cur}{tp}  Qty: {qty}"
                 break
 
         # ── Panel 1: Price + MA ──

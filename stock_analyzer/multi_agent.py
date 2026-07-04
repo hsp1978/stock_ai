@@ -606,12 +606,9 @@ class BaseAgent:
             if confidence == 0.0 and signal != "neutral":
                 signal = "neutral"
 
-            # [개선 #9] reasoning 최소 기준 검증
-            sentences = [s.strip() for s in reasoning.split('.') if s.strip()]
-            if len(sentences) < 3:
-                # reasoning이 너무 짧으면 경고 추가
-                reasoning = reasoning + f" [경고: reasoning {len(sentences)}문장 < 최소 3문장]"
-
+            # NOTE: 과거 'reasoning 최소 3문장' 미달 시 경고 문구를 reasoning에
+            # 덧붙였으나, 내부 품질 경고가 최종 리포트에 그대로 노출되는 문제가 있어
+            # 제거했다. 문장 수 요구는 프롬프트 지침으로만 유지한다.
             return signal, confidence, reasoning
 
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -799,6 +796,20 @@ ML 모델이 작동하지 않으므로 중립 판단을 내려야 합니다.
                 confidence = 0.0
                 reasoning = f"ML 정확도 {avg_accuracy:.1%}는 50% 미만으로 무작위 추측 수준 - 신호 무시"
                 warnings.append(f"ML accuracy {avg_accuracy:.1%} < 50% threshold - ignoring signal")
+
+            # [캘리브레이션] 확률→신뢰도 직접 매핑(예: 58.4% → 5.84/10) 방지.
+            # 이진 분류에서 신뢰도는 랜덤(50%) 대비 엣지에 비례해야 한다.
+            # 엣지 기반 상한: |p - 0.5| * 20 → p=0.584면 최대 1.7/10.
+            else:
+                edge_cap = round(abs(probability - 0.5) * 20.0, 1)
+                if confidence > edge_cap:
+                    reasoning += (
+                        f" [캘리브레이션: 상승확률 {probability:.1%}의 엣지({abs(probability - 0.5):.1%})"
+                        f" 기준 신뢰도 {confidence:.1f} → {edge_cap:.1f} 하향]"
+                    )
+                    confidence = edge_cap
+                    if confidence == 0.0:
+                        signal = "neutral"
 
             execution_time = (datetime.now() - start_time).total_seconds()
 
@@ -1127,6 +1138,79 @@ class ValueInvestor(BaseAgent):
             profit_margin = info.get('profitMargins')
             current_price = info.get('currentPrice', info.get('regularMarketPrice'))
 
+            # 1.3. [KRX 보강] 한국 종목은 KRX 일별 펀더멘털(PER/PBR/EPS/BPS)로
+            # yfinance 결측을 채우고 ROE를 교차검증한다 (KRX_ID/KRX_PW 필요).
+            krx_fund: Dict[str, Any] = {}
+            roe_source = "yfinance" if roe is not None else None
+            roe_yfinance = roe
+            try:
+                from krx_fundamentals import fetch_krx_fundamentals
+                krx_fund = fetch_krx_fundamentals(ticker)
+            except Exception:
+                krx_fund = {"available": False, "reason": "krx_fundamentals 모듈 로드 실패"}
+
+            if krx_fund.get("available"):
+                if not pe_ratio and krx_fund.get("per"):
+                    pe_ratio = krx_fund["per"]
+                if not pb_ratio and krx_fund.get("pbr"):
+                    pb_ratio = krx_fund["pbr"]
+                krx_roe = krx_fund.get("roe")
+                if krx_roe and krx_roe > 0:
+                    if roe is None or roe <= 0:
+                        roe = krx_roe
+                        roe_source = "krx"
+                    elif max(krx_roe / roe, roe / krx_roe) >= 3.0:
+                        # yfinance ROE가 KRX 기준과 3배 이상 괴리 — 국내 종목은
+                        # 거래소 공시 기반 KRX 값을 우선한다 (KDR stale 데이터 대응).
+                        roe = krx_roe
+                        roe_source = "krx (yfinance 괴리로 대체)"
+
+            # 1.5. [데이터 품질] 펀더멘털 정합성 교차검증
+            # yfinance 지표는 KDR·비주력 종목에서 과거 회계연도/오류 값을 반환할 수 있다.
+            # 항등식 ROE ≈ PBR / PER 로 내부 일관성을 검증하고, 3배 이상 괴리 시
+            # 데이터 품질 경고를 남기며 해당 분석의 신뢰도를 제한한다.
+            data_quality_warnings = []
+            data_source_notes = []
+            if roe_source == "krx (yfinance 괴리로 대체)":
+                data_quality_warnings.append(
+                    f"yfinance ROE {roe_yfinance:.1%} vs KRX 기준 ROE {roe:.1%} 3배 이상 괴리 "
+                    f"— KRX(EPS/BPS) 값으로 대체"
+                )
+            elif roe_source == "krx":
+                data_source_notes.append("ROE: KRX EPS/BPS 기준 (yfinance 결측 보강)")
+            if krx_fund.get("available"):
+                data_source_notes.append(
+                    f"KRX 펀더멘털 사용 (기준일 {krx_fund.get('as_of', '?')})"
+                )
+            elif krx_fund.get("reason") and "KRX 티커 아님" not in str(krx_fund.get("reason")):
+                data_source_notes.append(
+                    f"KRX 펀더멘털 미사용: {krx_fund.get('reason')}"
+                )
+            implied_roe = None
+            if pe_ratio and pb_ratio and pe_ratio > 0 and pb_ratio > 0:
+                implied_roe = pb_ratio / pe_ratio
+                if roe and roe > 0:
+                    ratio = max(implied_roe / roe, roe / implied_roe)
+                    if ratio >= 3.0:
+                        data_quality_warnings.append(
+                            f"ROE {roe:.1%} vs PBR/PER 암시 ROE {implied_roe:.1%} "
+                            f"({ratio:.1f}배 괴리) — 재무 데이터 시점 불일치 의심"
+                        )
+            # 결산 데이터 staleness 체크 (KDR 등 결산월 상이 종목 대응)
+            last_fiscal = info.get('lastFiscalYearEnd')
+            if last_fiscal:
+                try:
+                    from datetime import timezone as _tz
+                    fiscal_age_days = (
+                        datetime.now(_tz.utc) - datetime.fromtimestamp(last_fiscal, tz=_tz.utc)
+                    ).days
+                    if fiscal_age_days > 550:
+                        data_quality_warnings.append(
+                            f"최근 결산 데이터가 {fiscal_age_days}일 경과 — 재무 지표 stale 가능성"
+                        )
+                except Exception:
+                    pass
+
             # 2. 안전마진 (Margin of Safety) 계산
             margin_of_safety = None
             if forward_pe and forward_pe > 0:
@@ -1184,12 +1268,24 @@ class ValueInvestor(BaseAgent):
                     "quality_factors": quality_factors,
                     "valuation": valuation,
                     "margin_of_safety": margin_of_safety,
-                    "current_price": current_price
+                    "current_price": current_price,
+                    "implied_roe": implied_roe,
+                    "data_quality_warnings": data_quality_warnings,
+                    "data_source_notes": data_source_notes,
+                    "roe_source": roe_source,
+                    "krx_fundamentals": krx_fund
                 }
             }]
 
             # 프롬프트 생성
             quality_text = "\n".join(f"- {f}" for f in quality_factors) if quality_factors else "- 데이터 부족"
+            if data_quality_warnings:
+                data_quality_text = "\n".join(f"- ⚠️ {w}" for w in data_quality_warnings)
+                data_quality_text += "\n- 데이터 품질 경고가 있으므로 재무 지표 기반 판단은 보수적으로 하세요."
+            else:
+                data_quality_text = "- 이상 없음"
+            if data_source_notes:
+                data_quality_text += "\n" + "\n".join(f"- {n}" for n in data_source_notes)
 
             # 지표 포매팅 (조건부 표현식 미리 계산)
             pe_str = f"{pe_ratio:.2f}" if pe_ratio else 'N/A'
@@ -1223,6 +1319,9 @@ class ValueInvestor(BaseAgent):
 - 현재 평가: {valuation}
 - 안전마진: {safety_str}
 
+## 데이터 품질
+{data_quality_text}
+
 다음 JSON 형식으로만 응답하세요:
 {{
   "signal": "buy" 또는 "sell" 또는 "neutral",
@@ -1252,6 +1351,11 @@ Benjamin Graham 원칙:
             if quality_score < 2 and signal == "buy":
                 confidence = max(1.0, confidence - 2.0)
                 reasoning += " [경고: 기업 퀄리티 낮음]"
+
+            # 데이터 품질 경고 시 신뢰도 상한 (방향 무관 — 근거 데이터 자체가 불신)
+            if data_quality_warnings and confidence > 4.0:
+                confidence = 4.0
+                reasoning += f" [데이터 품질 경고 {len(data_quality_warnings)}건: 신뢰도 4.0 상한]"
 
             execution_time = (datetime.now() - start_time).total_seconds()
 
