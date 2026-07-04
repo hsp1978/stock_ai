@@ -1453,7 +1453,7 @@ def get_quant_ticker(ticker: str, benchmark: str = ""):
 @app.post("/quant/run")
 def run_quant_batch(tickers: str = "", benchmark: str = ""):
     """여러 종목 퀀트 전용 분석. tickers 미지정 시 watchlist 사용."""
-    targets = [t.strip().upper() for t in tickers.split(",") if t.strip()] if tickers else load_watchlist()
+    targets = [t.strip().upper() for t in tickers.split(",") if t.strip()] if tickers else _load_watchlist_files()
     results = {}
     for ticker in targets:
         results[ticker] = analyze_quant_ticker(ticker, benchmark=benchmark)
