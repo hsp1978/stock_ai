@@ -63,6 +63,13 @@ def fetch_krx_fundamentals(ticker: str, lookback_days: int = 14) -> Dict[str, An
             code,
         )
         if df is None or df.empty:
+            # KRX 일별 재무 지표는 KDR(외국기업 주식예탁증권, 코드 9xxxxx)을
+            # 제공하지 않는다 (실측: 2026-07, KOSDAQ 스냅샷에 9xxxxx 0종목).
+            if code.startswith("9"):
+                return {
+                    "available": False,
+                    "reason": "KDR(외국기업)은 KRX 재무 지표 미제공 — yfinance 폴백",
+                }
             return {"available": False, "reason": "KRX 펀더멘털 데이터 없음"}
 
         # BPS가 0이면 무의미한 행 (거래정지 등) — 유효 행 중 최신 사용

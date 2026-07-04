@@ -99,9 +99,21 @@ def test_fetch_handles_empty_dataframe(monkeypatch):
     _set_credentials(monkeypatch)
     _install_fake_pykrx(monkeypatch, pd.DataFrame())
 
+    result = fetch_krx_fundamentals("035720.KQ")
+
+    assert result["available"] is False
+    assert result["reason"] == "KRX 펀더멘털 데이터 없음"
+
+
+def test_kdr_empty_result_gets_explicit_reason(monkeypatch):
+    """KDR(9xxxxx)은 KRX 재무 지표 미제공 — 사유를 명시해 폴백."""
+    _set_credentials(monkeypatch)
+    _install_fake_pykrx(monkeypatch, pd.DataFrame())
+
     result = fetch_krx_fundamentals("950170.KQ")
 
     assert result["available"] is False
+    assert "KDR" in result["reason"]
 
 
 def test_fetch_handles_pykrx_exception(monkeypatch):
