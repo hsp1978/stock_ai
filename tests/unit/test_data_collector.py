@@ -50,9 +50,11 @@ def clear_cache():
 
     dc._entry_cache.clear()
     dc._ohlcv_cache.clear()
+    dc._fundamental_cache.clear()
     yield
     dc._entry_cache.clear()
     dc._ohlcv_cache.clear()
+    dc._fundamental_cache.clear()
 
 
 # ── CacheEntry.build ─────────────────────────────────────────────────
@@ -284,3 +286,125 @@ def test_is_korean_ticker():
     assert dc._is_korean_ticker("AAPL") is False
     assert dc._is_korean_ticker("SPY") is False
     assert dc._is_korean_ticker("TSLA") is False
+
+
+def test_calculate_indicators_adds_vwap_columns():
+    import data_collector as dc
+
+    df = dc.calculate_indicators(_make_df(80), mode="live")
+
+    assert {"VWAP_20", "VWAP_60", "VWAP_DIST_20", "VWAP_SLOPE_20"}.issubset(df.columns)
+    assert pd.notna(df["VWAP_20"].iloc[-1])
+    assert round(df["VWAP_20"].iloc[-1], 3) == 100.667
+    assert round(df["VWAP_DIST_20"].iloc[-1], 3) == 1.325
+
+
+def test_calculate_indicators_confirmed_mode_freezes_latest_indicator_row():
+    import data_collector as dc
+
+    raw = _make_df(80)
+    raw.loc[raw.index[-1], "Close"] = 150.0
+    live = dc.calculate_indicators(raw, mode="live")
+    confirmed = dc.calculate_indicators(raw)
+
+    assert confirmed.attrs["indicator_mode"] == "confirmed"
+    assert confirmed["Close"].iloc[-1] == 150.0
+    assert confirmed["Live_Close"].iloc[-1] == 150.0
+    assert confirmed["SMA_20"].iloc[-1] == live["SMA_20"].iloc[-2]
+    assert confirmed["VWAP_20"].iloc[-1] == live["VWAP_20"].iloc[-2]
+    assert confirmed["VWAP_DIST_20"].iloc[-1] == live["VWAP_DIST_20"].iloc[-2]
+    assert pd.notna(confirmed["Live_Dist_SMA_20"].iloc[-1])
+
+
+def test_fetch_fundamentals_falls_back_after_yfinance_failure():
+    import data_collector as dc
+
+    fallback = {
+        "market_cap": 1_000_000_000,
+        "pe_ratio": 12.5,
+        "eps": 3.2,
+        "beta": 1.1,
+        "sector": "Technology",
+        "industry": "Software",
+    }
+
+    with (
+        patch("data_collector._is_korean_ticker", return_value=False),
+        patch("data_collector._fetch_yfinance_fundamentals", side_effect=RuntimeError("yf down")),
+        patch("data_collector._fetch_finnhub_fundamentals", return_value=fallback),
+        patch("data_collector._fetch_alphavantage_fundamentals", return_value={}),
+        patch("data_collector._fetch_fmp_fundamentals", return_value={}),
+    ):
+        result = dc.fetch_fundamentals("AAPL")
+
+    assert result["market_cap"] == 1_000_000_000
+    assert result["pe_ratio"] == 12.5
+    assert result["_source"] == "finnhub"
+    assert result["data_quality"] == "full"
+    assert result["_errors"]
+
+
+def test_fetch_fundamentals_uses_ttl_cache():
+    import data_collector as dc
+
+    source = {
+        "market_cap": 1_000_000_000,
+        "pe_ratio": 12.5,
+        "eps": 3.2,
+        "beta": 1.1,
+        "sector": "Technology",
+        "industry": "Software",
+    }
+
+    with (
+        patch("data_collector._is_korean_ticker", return_value=False),
+        patch("data_collector._fetch_yfinance_fundamentals", return_value=source) as yf_fetch,
+        patch("data_collector._fetch_finnhub_fundamentals", return_value={}),
+        patch("data_collector._fetch_alphavantage_fundamentals", return_value={}),
+        patch("data_collector._fetch_fmp_fundamentals", return_value={}),
+    ):
+        first = dc.fetch_fundamentals("AAPL")
+        second = dc.fetch_fundamentals("AAPL")
+
+    assert first["_cache_hit"] is False
+    assert second["_cache_hit"] is True
+    assert yf_fetch.call_count == 1
+
+
+def test_get_data_cache_status_reports_ohlcv_and_fundamental_freshness():
+    import data_collector as dc
+
+    df = _make_df()
+    entry = CacheEntry.build("AAPL", df, "yfinance")
+    dc._entry_cache[("AAPL", "2y")] = entry
+    dc._fundamental_cache["AAPL"] = {
+        "fetched_at": datetime.now(timezone.utc),
+        "data": {
+            "_source": "yfinance",
+            "_sources_attempted": ["yfinance"],
+            "_errors": [],
+            "data_quality": "full",
+        },
+    }
+
+    status = dc.get_data_cache_status(["AAPL"], period="2y")
+    ticker_status = status["tickers"]["AAPL"]
+
+    assert ticker_status["ohlcv"]["present"] is True
+    assert ticker_status["ohlcv"]["fresh"] is True
+    assert ticker_status["ohlcv"]["source"] == "yfinance"
+    assert ticker_status["fundamentals"]["present"] is True
+    assert ticker_status["fundamentals"]["fresh"] is True
+    assert ticker_status["fundamentals"]["data_quality"] == "full"
+
+
+def test_get_data_cache_status_reports_missing_ticker():
+    import data_collector as dc
+
+    status = dc.get_data_cache_status(["MSFT"], period="2y")
+    ticker_status = status["tickers"]["MSFT"]
+
+    assert ticker_status["ohlcv"]["present"] is False
+    assert ticker_status["ohlcv"]["fresh"] is False
+    assert ticker_status["fundamentals"]["present"] is False
+    assert ticker_status["fundamentals"]["data_quality"] == "missing"

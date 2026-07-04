@@ -566,6 +566,16 @@ def resolve_ticker(user_input: str) -> tuple[str, str]:
 
     upper = text.upper()
     if upper.isascii() and len(upper) <= 10:
+        is_plain_kr_code = (
+            (upper.isdigit() and len(upper) == 6)
+            or (len(upper) == 6 and upper[:4].isdigit() and upper[4].isalpha() and upper[5].isdigit())
+        )
+        if is_plain_kr_code:
+            try:
+                normalized, _market = normalize_ticker(upper, "KR")
+            except Exception:
+                normalized = f"{upper}.KS"
+            return normalized, f"{text} → {normalized}"
         return upper, ""
 
     # 한글이 포함된 경우 ticker_suggestion 먼저 시도 (한국 주식 우선)
@@ -624,23 +634,55 @@ def resolve_ticker(user_input: str) -> tuple[str, str]:
     return text, ""
 
 
+def _agent_api_candidates() -> list[str]:
+    """AGENT_API_URL이 오래된 원격 주소여도 로컬 agent-api로 폴백."""
+    candidates = [
+        AGENT_API_URL,
+        f"http://{AGENT_API_HOST}:{AGENT_API_PORT}",
+        f"http://localhost:{AGENT_API_PORT}",
+        f"http://127.0.0.1:{AGENT_API_PORT}",
+    ]
+    seen = set()
+    result = []
+    for base in candidates:
+        base = (base or "").rstrip("/")
+        if base and base not in seen:
+            result.append(base)
+            seen.add(base)
+    return result
+
+
+def _force_http_api(path: str) -> bool:
+    # Paper/Virtual Trade 상태는 agent-api의 mounted output을 단일 소스로 쓴다.
+    return path.startswith("/paper") or path.startswith("/trading/")
+
+
 def api_get(path: str, timeout: int = 10):
     # /ml/* 는 LSTM(TF) 풀스택이 webui 컨테이너에 없으므로 agent-api(GPU TF)로
     # 강제 HTTP. 다른 path 는 in-process 우선(_USE_LOCAL_ENGINE).
     # 로컬 엔진이 None 반환 시 (핸들러 부재 — 예: /trading/*) HTTP fallback.
-    if _USE_LOCAL_ENGINE and not path.startswith("/ml/"):
+    if _USE_LOCAL_ENGINE and not path.startswith("/ml/") and not _force_http_api(path):
         result = engine_dispatch_get(path)
         if result is not None:
             return result
-    try:
-        resp = httpx.get(f"{AGENT_API_URL}{path}", timeout=timeout)
-        resp.raise_for_status()
-        return resp.json()
-    except httpx.ConnectError:
-        return None
-    except Exception as e:
-        st.error(f"API Error: {e}")
-        return None
+    last_error = None
+    for base_url in _agent_api_candidates():
+        try:
+            resp = httpx.get(f"{base_url}{path}", timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.ConnectError as e:
+            last_error = e
+            continue
+        except httpx.HTTPStatusError as e:
+            last_error = e
+            break
+        except Exception as e:
+            last_error = e
+            continue
+    if last_error is not None and not isinstance(last_error, httpx.ConnectError):
+        st.error(f"API Error: {last_error}")
+    return None
 
 
 def api_post(path: str, timeout: int = 300, json_body: dict = None):
@@ -649,22 +691,31 @@ def api_post(path: str, timeout: int = 300, json_body: dict = None):
     로컬 엔진이 None 반환 시 (핸들러 부재 — 예: /trading/*, /paper/virtual-buy,
     /paper/partial-close) HTTP fallback. json_body는 HTTP 경로에서 사용된다.
     """
-    if _USE_LOCAL_ENGINE:
-        result = engine_dispatch_post(path, json_body=json_body)
+    if _USE_LOCAL_ENGINE and not _force_http_api(path):
+        result = engine_dispatch_post(path, json_body=json_body, timeout=timeout)
         if result is not None:
             return result
-    try:
-        if json_body is not None:
-            resp = httpx.post(f"{AGENT_API_URL}{path}", json=json_body, timeout=timeout)
-        else:
-            resp = httpx.post(f"{AGENT_API_URL}{path}", timeout=timeout)
-        resp.raise_for_status()
-        return resp.json()
-    except httpx.ConnectError:
-        return None
-    except Exception as e:
-        st.error(f"API Error: {e}")
-        return None
+    last_error = None
+    for base_url in _agent_api_candidates():
+        try:
+            if json_body is not None:
+                resp = httpx.post(f"{base_url}{path}", json=json_body, timeout=timeout)
+            else:
+                resp = httpx.post(f"{base_url}{path}", timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.ConnectError as e:
+            last_error = e
+            continue
+        except httpx.HTTPStatusError as e:
+            last_error = e
+            break
+        except Exception as e:
+            last_error = e
+            continue
+    if last_error is not None and not isinstance(last_error, httpx.ConnectError):
+        st.error(f"API Error: {last_error}")
+    return None
 
 
 def _get_session_id() -> str:
@@ -1506,7 +1557,7 @@ with st.sidebar:
 
     st.divider()
 
-    page = st.radio("Navigation", ["Home", "Dashboard", "Detail", "Multi-Agent", "Scan Log", "Signal Accuracy", "Screener", "Trading", "Virtual Trade", "Backtest", "ML Predict", "Portfolio", "Ranking", "Paper Trade", "History"], label_visibility="collapsed")
+    page = st.radio("Navigation", ["Home", "Dashboard", "Detail", "Multi-Agent", "Quant Indicators", "Scan Log", "System Monitor", "Signal Accuracy", "Screener", "Trading", "Virtual Trade", "Backtest", "ML Predict", "Portfolio", "Ranking", "Paper Trade", "History"], label_visibility="collapsed")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2432,7 +2483,12 @@ def render_detail():
         return
 
     tickers = sorted(data["results"].keys())
-    selected = st.selectbox("Select Ticker", tickers, label_visibility="collapsed")
+    selected = st.selectbox(
+        "Select Ticker",
+        tickers,
+        format_func=lambda ticker: format_ticker_label(ticker, "flag_name_code"),
+        label_visibility="collapsed",
+    )
     if not selected:
         return
 
@@ -3009,6 +3065,264 @@ def render_portfolio():
 
 
 # ═══════════════════════════════════════════════════════════════
+#  퀀트 지표 전용 분석 페이지
+# ═══════════════════════════════════════════════════════════════
+
+def _quant_signal_style(signal: str) -> str:
+    s = (signal or "").lower()
+    if s == "buy":
+        return "buy"
+    if s == "sell":
+        return "sell"
+    return "hold"
+
+
+def render_quant_indicators():
+    log_action("page_view", page="quant_indicators")
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">Quant Indicators</div>
+        <div class="page-subtitle">가격·거래량·변동성·상관 기반 정량 지표 전용 분석</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    watchlist = load_watchlist()
+    c1, c2, c3 = st.columns([2, 2, 1])
+    with c1:
+        input_mode = st.radio(
+            "종목 선택 방식",
+            ["Watchlist", "직접 입력"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="quant_input_mode",
+        )
+    with c2:
+        if input_mode == "Watchlist" and watchlist:
+            options = {format_ticker_label(t, "flag_name_code"): t for t in watchlist}
+            selected_label = st.selectbox(
+                "분석 종목",
+                list(options.keys()),
+                label_visibility="collapsed",
+                key="quant_watchlist_ticker",
+            )
+            ticker = options[selected_label]
+            resolved_note = ""
+        else:
+            raw_ticker = st.text_input(
+                "티커 또는 종목명",
+                value=st.session_state.get("quant_last_input", "005930.KS"),
+                placeholder="예: AAPL, NVDA, 삼성전자, 005930",
+                label_visibility="collapsed",
+                key="quant_raw_ticker",
+            )
+            ticker, resolved_note = resolve_ticker(raw_ticker)
+            st.session_state.quant_last_input = raw_ticker
+    with c3:
+        custom_benchmark = st.text_input(
+            "Benchmark",
+            value="",
+            placeholder="기본값",
+            help="비워두면 한국은 KOSPI, 미국은 SPY 사용",
+            label_visibility="collapsed",
+            key="quant_benchmark",
+        )
+
+    if resolved_note:
+        st.caption(resolved_note)
+
+    run_cols = st.columns([1, 1, 3])
+    with run_cols[0]:
+        run_now = st.button(
+            "Run Quant",
+            type="primary",
+            use_container_width=True,
+            disabled=not ticker,
+            key="quant_run_btn",
+        )
+    with run_cols[1]:
+        refresh_latest = st.button("Latest", use_container_width=True, key="quant_latest_btn")
+
+    if run_now:
+        query = f"/quant/{ticker}"
+        if custom_benchmark.strip():
+            query += f"?benchmark={custom_benchmark.strip().upper()}"
+        with st.status(f"{ticker} 퀀트 지표 분석 중...", expanded=True) as status:
+            st.write("OHLCV 수집 및 기본 지표 계산")
+            st.write("모멘텀·평균회귀·변동성·추세·거래량·벤치마크 점수화")
+            result = api_get(query, timeout=180)
+            if result and result.get("status") == "ok":
+                st.session_state.quant_result = result
+                status.update(label="퀀트 분석 완료", state="complete", expanded=False)
+            elif result:
+                status.update(label="퀀트 분석 실패", state="error", expanded=True)
+                st.error(result.get("error") or ", ".join(result.get("invalid_reasons", [])) or "분석 실패")
+            else:
+                status.update(label="퀀트 분석 실패", state="error", expanded=True)
+                st.error("API 응답 없음")
+
+    if refresh_latest:
+        latest = api_get("/quant/latest?limit=20")
+        if latest and latest.get("results"):
+            st.session_state.quant_latest = latest
+        else:
+            st.info("최근 퀀트 분석 결과가 없습니다.")
+
+    latest_data = st.session_state.get("quant_latest")
+    if latest_data and latest_data.get("results"):
+        with st.expander("최근 퀀트 분석 결과", expanded=False):
+            rows = []
+            for row in latest_data["results"]:
+                rows.append({
+                    "Ticker": row.get("ticker"),
+                    "Score": row.get("quant_score"),
+                    "Grade": row.get("grade"),
+                    "Bias": row.get("signal_label"),
+                    "Confidence": row.get("confidence"),
+                    "Regime": row.get("regime"),
+                    "Analyzed": (row.get("analyzed_at") or "")[:19],
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    data = st.session_state.get("quant_result")
+    if not data:
+        st.info("종목을 선택하고 Run Quant를 실행하세요. 이 탭은 뉴스·공시·LLM 판단을 제외한 정량 지표만 사용합니다.")
+        return
+
+    if data.get("status") != "ok":
+        st.warning(f"분석 불가: {', '.join(data.get('invalid_reasons', []))}")
+        return
+
+    signal_class = _quant_signal_style(data.get("signal"))
+    st.markdown(
+        f"""
+        <div class="section-header">
+            <div>
+                <div class="section-title">{format_ticker_label(data.get('ticker', ''), 'flag_name_code')}</div>
+                <div class="section-subtitle">as of {(data.get('as_of') or '')[:19]} · benchmark {data.get('benchmark_ticker') or 'n/a'}</div>
+            </div>
+            <span class="signal-badge-lg {signal_class}">{data.get('signal_label', 'NEUTRAL')}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Quant Score", f"{data.get('quant_score', 0):.1f}/100")
+    m2.metric("Grade", data.get("grade", "?"))
+    m3.metric("Confidence", f"{data.get('confidence', 0):.1f}/10")
+    m4.metric("Regime", str(data.get("regime", "?")).replace("_", " ").title())
+    m5.metric("Current", _fmt_price(data.get("current_price", 0), data.get("ticker", "")))
+
+    risk_penalty = float(data.get("risk_penalty") or 0)
+    if risk_penalty <= -8:
+        st.warning(f"리스크 페널티 {risk_penalty:.1f}점 적용: 변동성, 낙폭, 하방 위험을 먼저 확인하세요.")
+    elif data.get("warnings"):
+        st.caption("Warnings: " + ", ".join(data.get("warnings", [])[:5]))
+
+    components = data.get("components") or {}
+    component_labels = {
+        "momentum": "Momentum",
+        "mean_reversion": "Mean Reversion",
+        "volatility": "Volatility",
+        "trend": "Trend",
+        "volume": "Volume",
+        "benchmark": "Benchmark",
+    }
+    component_rows = []
+    for key, comp in components.items():
+        weight = float(comp.get("weight") or 0)
+        score = float(comp.get("score") or 0)
+        component_rows.append({
+            "Factor": component_labels.get(key, key),
+            "Score": score,
+            "Weight": weight,
+            "Percent": round(score / weight * 100, 1) if weight else 0,
+            "Direction": comp.get("direction", "neutral"),
+        })
+
+    if component_rows:
+        comp_df = pd.DataFrame(component_rows)
+        colors = [
+            "#02d4a1" if d == "buy" else "#fd526f" if d == "sell" else "#ffb347"
+            for d in comp_df["Direction"]
+        ]
+        fig = go.Figure(go.Bar(
+            x=comp_df["Percent"],
+            y=comp_df["Factor"],
+            orientation="h",
+            marker_color=colors,
+            text=[f"{s:.1f}/{w:.0f}" for s, w in zip(comp_df["Score"], comp_df["Weight"])],
+            textposition="auto",
+        ))
+        fig.update_layout(**_plotly_base_layout(
+            height=320,
+            margin=dict(l=120, r=30, t=20, b=30),
+            xaxis=dict(range=[0, 100], ticksuffix="%", gridcolor="rgba(255,255,255,0.08)"),
+            yaxis=dict(autorange="reversed"),
+            showlegend=False,
+        ))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        comp_df = pd.DataFrame()
+
+    tab_summary, tab_details, tab_risk, tab_json = st.tabs(["Factor Table", "Indicator Detail", "Risk", "JSON"])
+    with tab_summary:
+        if not comp_df.empty:
+            st.dataframe(comp_df, use_container_width=True, hide_index=True)
+        cols = st.columns(2)
+        with cols[0]:
+            st.markdown("**Strengths**")
+            strengths = data.get("strengths") or []
+            if strengths:
+                for item in strengths:
+                    st.write(f"- {item}")
+            else:
+                st.caption("강점 신호 없음")
+        with cols[1]:
+            st.markdown("**Warnings**")
+            warnings = data.get("warnings") or []
+            if warnings:
+                for item in warnings:
+                    st.write(f"- {item}")
+            else:
+                st.caption("경고 신호 없음")
+
+    with tab_details:
+        detail_rows = []
+        for factor, comp in components.items():
+            for key, value in comp.items():
+                if key in ("score", "weight", "direction"):
+                    continue
+                if isinstance(value, dict):
+                    for sub_key, sub_value in value.items():
+                        detail_rows.append({
+                            "Factor": component_labels.get(factor, factor),
+                            "Metric": f"{key}.{sub_key}",
+                            "Value": sub_value,
+                        })
+                else:
+                    detail_rows.append({
+                        "Factor": component_labels.get(factor, factor),
+                        "Metric": key,
+                        "Value": value,
+                    })
+        st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+
+    with tab_risk:
+        risk = data.get("risk") or {}
+        r1, r2, r3, r4, r5 = st.columns(5)
+        r1.metric("Max DD 120D", f"{risk.get('max_drawdown_120d', 0) or 0:.1f}%")
+        r2.metric("Downside Vol", f"{risk.get('downside_volatility', 0) or 0:.1f}%")
+        r3.metric("VaR 95%", f"{risk.get('var_95_daily', 0) or 0:.2f}%")
+        r4.metric("Sharpe", f"{risk.get('sharpe_120d', 0) or 0:.2f}")
+        r5.metric("Penalty", f"{risk.get('penalty', 0) or 0:.1f}")
+        st.caption("VaR/CVaR는 최근 수익률 분포 기반 일간 손실 추정치입니다.")
+
+    with tab_json:
+        st.json(data)
+
+
+# ═══════════════════════════════════════════════════════════════
 #  팩터 랭킹 페이지
 # ═══════════════════════════════════════════════════════════════
 
@@ -3303,9 +3617,9 @@ def render_multi_agent():
                 )
                 single_result = api_post(f"/scan/{resolved_ticker}")
 
-            # Multi-Agent 분석 (백엔드가 8개 에이전트 병렬 실행)
-            st.write("🤖 2/3 · 8개 에이전트 병렬 분석 중 (Technical · Quant · Risk · ML · Event · Geopolitical · Value · Decision)...")
-            # 8개 에이전트 병렬 LLM 호출. 백엔드 MULTI_AGENT_TIMEOUT(기본 600s)보다 약간 더 길게.
+            # Multi-Agent 분석 (백엔드가 7개 분석 에이전트 실행 후 Decision Maker가 종합)
+            st.write("🤖 2/3 · 7개 분석 에이전트 병렬 분석 중 (Technical · Quant · Risk · ML · Event · Geopolitical · Value)...")
+            # 7개 분석 에이전트 병렬 LLM 호출. 백엔드 MULTI_AGENT_TIMEOUT보다 약간 더 길게.
             multi_result = api_get(f"/multi-agent/{resolved_ticker}", timeout=660)
 
             # API 실패 시 사용자 친화적 안내
@@ -3746,6 +4060,293 @@ def render_multi_agent():
             )
 
 
+def render_system_monitor():
+    st.markdown("""
+    <div class="page-header">
+        <div class="page-title">System Monitor</div>
+        <div class="page-subtitle">LLM routing capacity · signal calibration · paper portfolio snapshot</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    data = api_get("/system-monitor", timeout=20)
+    if not data:
+        st.markdown("""
+        <div class="empty-state">
+            <div class="es-icon">!</div>
+            <div class="es-text">System monitor data unavailable. Check agent API status.</div>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    service = data.get("service", {})
+    llm = data.get("llm", {})
+    signals = data.get("signals", {})
+    paper = data.get("paper", {})
+    ops = data.get("ops", {})
+    data_health = ops.get("data_health", {}) if isinstance(ops, dict) else {}
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Cached Results", f"{service.get('cached_results', 0):,}")
+    c2.metric("Scan Count", f"{service.get('scan_count', 0):,}")
+    c3.metric("Scheduler", "RUNNING" if service.get("scheduler_running") else "OFF")
+    c4.metric("Data Health", str(data_health.get("status", "unknown")).upper())
+    c5.metric("Generated", str(data.get("generated_at", ""))[:19].replace("T", " "))
+
+    st.divider()
+
+    tab_nodes, tab_agents, tab_jobs, tab_data, tab_signals, tab_paper = st.tabs(
+        ["LLM Nodes", "Agent Runtime", "Ops Jobs", "Data Freshness", "Signal Quality", "Paper Portfolio"]
+    )
+
+    with tab_nodes:
+        nodes = llm.get("nodes", {}) if isinstance(llm, dict) else {}
+        if nodes:
+            node_rows = []
+            for node, metrics in nodes.items():
+                capacity = metrics.get("capacity", 0) or 0
+                inflight = metrics.get("inflight", 0) or 0
+                usage_pct = (inflight / capacity * 100) if capacity else 0
+                node_rows.append({
+                    "Node": node,
+                    "Inflight": inflight,
+                    "Capacity": capacity,
+                    "Available": metrics.get("available_slots", 0),
+                    "Usage %": round(usage_pct, 1),
+                    "Overloads": metrics.get("overload_count", 0),
+                    "URL": metrics.get("url", ""),
+                })
+            st.dataframe(node_rows, use_container_width=True, hide_index=True)
+
+            chart_df = pd.DataFrame(node_rows)
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=chart_df["Node"],
+                y=chart_df["Inflight"],
+                name="Inflight",
+                marker_color="#38bdf8",
+            ))
+            fig.add_trace(go.Bar(
+                x=chart_df["Node"],
+                y=chart_df["Available"],
+                name="Available",
+                marker_color="#10b981",
+            ))
+            fig.update_layout(**_plotly_base_layout(
+                height=320,
+                barmode="stack",
+                yaxis_title="Requests",
+                margin=dict(l=35, r=20, t=30, b=35),
+            ))
+            st.plotly_chart(fig, use_container_width=True)
+
+            mac_health = llm.get("mac_studio_health", {})
+            if mac_health:
+                h1, h2, h3 = st.columns(3)
+                h1.metric("Mac Studio", "ONLINE" if mac_health.get("available") else "OFFLINE")
+                h2.metric("Failures", str(mac_health.get("failures", 0)))
+                h3.metric("Last Status", str(mac_health.get("last_status") or "n/a"))
+                if mac_health.get("last_error"):
+                    st.caption(f"Last error: {mac_health.get('last_error')}")
+        else:
+            st.info(llm.get("error") or "No LLM node metrics yet.")
+
+    with tab_agents:
+        perf = ((llm.get("agent_performance") or {}).get("agent_performance") or {})
+        if perf:
+            rows = []
+            for agent, metrics in perf.items():
+                rows.append({
+                    "Agent": agent,
+                    "Runs": metrics.get("count", 0),
+                    "Avg Seconds": round(metrics.get("avg_time", 0), 2),
+                    "Node Usage": ", ".join(
+                        f"{node}:{count}" for node, count in (metrics.get("node_usage") or {}).items()
+                    ),
+                })
+            perf_df = pd.DataFrame(rows).sort_values("Avg Seconds", ascending=False)
+            st.dataframe(perf_df, use_container_width=True, hide_index=True)
+
+            fig = go.Figure(go.Bar(
+                x=perf_df["Avg Seconds"],
+                y=perf_df["Agent"],
+                orientation="h",
+                marker_color="#f59e0b",
+            ))
+            fig.update_layout(**_plotly_base_layout(
+                height=max(320, 42 * len(perf_df)),
+                xaxis_title="Avg seconds",
+                yaxis_title="",
+                margin=dict(l=120, r=20, t=25, b=35),
+            ))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No agent runtime samples yet. Run a multi-agent analysis to populate this view.")
+
+    with tab_jobs:
+        scheduler = ops.get("scheduler", {}) if isinstance(ops, dict) else {}
+        jobs = ops.get("jobs", []) if isinstance(ops, dict) else []
+
+        j1, j2, j3, j4 = st.columns(4)
+        j1.metric("Scheduler", "RUNNING" if scheduler.get("running") else "OFF")
+        j2.metric("Registered Jobs", f"{len(scheduler.get('jobs') or []):,}")
+        j3.metric("Tracked Jobs", f"{len(jobs):,}")
+        j4.metric("Job Errors", f"{sum(int(j.get('error_count', 0) or 0) for j in jobs):,}")
+
+        action_1, action_2, action_3 = st.columns([1, 1, 2])
+        with action_1:
+            if st.button("Run Data Check", use_container_width=True):
+                result = api_post("/ops/jobs/data_health_check/run", timeout=90)
+                if result and not result.get("error"):
+                    st.success(f"Data check: {result.get('status', 'completed')}")
+                else:
+                    st.error((result or {}).get("error") or "Data check failed")
+        with action_2:
+            if st.button("Run Corp Actions", use_container_width=True):
+                result = api_post("/ops/jobs/corporate_actions/run?force=true", timeout=120)
+                if result and not result.get("error"):
+                    st.success(
+                        f"Checked {result.get('checked', 0)} · Applied {result.get('applied', 0)}"
+                    )
+                else:
+                    st.error((result or {}).get("error") or "Corporate action check failed")
+        with action_3:
+            if st.button("Refresh Monitor", use_container_width=True):
+                st.cache_data.clear() if hasattr(st, "cache_data") else None
+                st.rerun()
+
+        if jobs:
+            job_rows = []
+            for job in jobs:
+                job_rows.append({
+                    "Job": job.get("label") or job.get("job_id"),
+                    "Status": str(job.get("status", "unknown")).upper(),
+                    "Runs": job.get("run_count", 0),
+                    "Errors": job.get("error_count", 0),
+                    "Last Started": str(job.get("last_started_at") or "")[:19].replace("T", " "),
+                    "Last Finished": str(job.get("last_finished_at") or "")[:19].replace("T", " "),
+                    "Duration Sec": job.get("last_duration_sec"),
+                    "Last Error": job.get("last_error") or "",
+                })
+            st.dataframe(job_rows, use_container_width=True, hide_index=True)
+        else:
+            st.info("No ops job state yet.")
+
+        sched_jobs = scheduler.get("jobs") or []
+        if sched_jobs:
+            st.markdown("#### Scheduler Queue")
+            st.dataframe(
+                [{
+                    "Job": item.get("id"),
+                    "Trigger": item.get("trigger"),
+                    "Next Run": str(item.get("next_run_time") or "")[:19].replace("T", " "),
+                } for item in sched_jobs],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with tab_data:
+        if data_health:
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("Status", str(data_health.get("status", "unknown")).upper())
+            d2.metric("Tickers", f"{data_health.get('ticker_count', 0):,}")
+            d3.metric("Stale", f"{data_health.get('stale_count', 0):,}")
+            d4.metric("Degraded", f"{data_health.get('degraded_count', 0):,}")
+
+            rows = data_health.get("rows") or []
+            if rows:
+                freshness_rows = []
+                for row in rows:
+                    freshness_rows.append({
+                        "Ticker": row.get("ticker"),
+                        "Severity": str(row.get("severity", "")).upper(),
+                        "Reasons": ", ".join(row.get("reasons") or []),
+                        "OHLCV Source": row.get("ohlcv_source") or "",
+                        "OHLCV Age H": round((row.get("ohlcv_age_sec") or 0) / 3600, 2)
+                        if row.get("ohlcv_age_sec") is not None else None,
+                        "Latest Bar": row.get("ohlcv_latest_bar") or "",
+                        "Fund Source": row.get("fundamental_source") or "",
+                        "Fund Quality": row.get("fundamental_quality") or "",
+                        "Fund Age H": round((row.get("fundamental_age_sec") or 0) / 3600, 2)
+                        if row.get("fundamental_age_sec") is not None else None,
+                        "News Cached": bool(row.get("news_present")),
+                        "News Fresh": bool(row.get("news_fresh")),
+                    })
+                df_fresh = pd.DataFrame(freshness_rows)
+                severity_order = {"STALE": 0, "DEGRADED": 1, "OK": 2}
+                df_fresh["_order"] = df_fresh["Severity"].map(severity_order).fillna(9)
+                df_fresh = df_fresh.sort_values(["_order", "Ticker"]).drop(columns=["_order"])
+                st.dataframe(df_fresh, use_container_width=True, hide_index=True)
+
+                chart_df = df_fresh.groupby("Severity").size().reset_index(name="Count")
+                fig = go.Figure(go.Bar(
+                    x=chart_df["Severity"],
+                    y=chart_df["Count"],
+                    marker_color=["#ef4444" if s == "STALE" else "#f59e0b" if s == "DEGRADED" else "#10b981"
+                                  for s in chart_df["Severity"]],
+                ))
+                fig.update_layout(**_plotly_base_layout(
+                    height=280,
+                    yaxis_title="Tickers",
+                    xaxis_title="Data state",
+                    margin=dict(l=35, r=20, t=25, b=35),
+                ))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No data freshness rows yet.")
+        else:
+            st.info("Data health snapshot unavailable.")
+
+    with tab_signals:
+        accuracy = signals.get("accuracy_7d") if isinstance(signals, dict) else {}
+        if accuracy and not accuracy.get("error"):
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric("7D Evaluated", f"{accuracy.get('total_evaluated', 0):,}")
+            a2.metric("7D Win Rate", f"{accuracy.get('win_rate_pct', 0):.1f}%")
+            a3.metric("Avg Return", f"{accuracy.get('avg_return_pct', 0):+.2f}%")
+            a4.metric("Samples", f"{accuracy.get('sample_size', 0):,}")
+
+            bands = [b for b in accuracy.get("by_confidence_band", []) if b.get("total", 0) > 0]
+            if bands:
+                band_df = pd.DataFrame(bands)
+                fig = go.Figure(go.Bar(
+                    x=band_df["band"],
+                    y=band_df["win_rate_pct"],
+                    text=[f"n={n}" for n in band_df["total"]],
+                    marker_color="#10b981",
+                ))
+                fig.add_hline(y=50, line_dash="dash", line_color="#8d909e")
+                fig.update_layout(**_plotly_base_layout(
+                    height=330,
+                    yaxis_title="Win rate %",
+                    xaxis_title="Confidence band",
+                    yaxis=dict(range=[0, 100]),
+                    margin=dict(l=35, r=20, t=30, b=35),
+                ))
+                st.plotly_chart(fig, use_container_width=True)
+
+            calib = signals.get("calibrator") or {}
+            v1, v2, v3 = st.columns(3)
+            v1.metric("Calibrator", "ON" if calib.get("active") else "OFF")
+            v2.metric("Calibration Samples", f"{calib.get('total_samples', 0):,}")
+            v3.metric("Last Refit", str(calib.get("last_refit") or "never")[:19])
+        else:
+            st.info((signals or {}).get("error") or "No evaluated signal data yet.")
+
+    with tab_paper:
+        if paper and not paper.get("error"):
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Equity", f"${paper.get('total_equity', 0):,.2f}")
+            p2.metric("PnL", f"${paper.get('total_pnl', 0):+,.2f}",
+                      delta=f"{paper.get('total_pnl_pct', 0):+.2f}%")
+            p3.metric("Open Positions", f"{paper.get('open_positions', 0)}")
+            p4.metric("Win Rate", f"{paper.get('win_rate_pct', 0):.1f}%")
+            q1, q2 = st.columns(2)
+            q1.metric("Cash", f"${paper.get('cash', 0):,.2f}")
+            q2.metric("Position Value", f"${paper.get('position_value', 0):,.2f}")
+        else:
+            st.info((paper or {}).get("error") or "Paper trading status unavailable.")
+
+
 # ═══════════════════════════════════════════════════════════════
 #  신호 정확도 페이지 (Sprint 2)
 # ═══════════════════════════════════════════════════════════════
@@ -3998,7 +4599,9 @@ def render_screener():
 
     # ── 실행 (스크리너 단독 or 파이프라인) ─────────
     if run_now:
-        est_total = 120 + (analyze_top * 60) if analyze_top > 0 else 120
+        workers = max(1, int(os.getenv("SCAN_PARALLEL_WORKERS", "2")))
+        ma_batches = (int(analyze_top) + workers - 1) // workers
+        est_total = 120 + (ma_batches * 300) if analyze_top > 0 else 120
         est_min = est_total // 60
         est_s = est_total % 60
         est_str = f"{est_min}분 {est_s}초" if est_min else f"{est_s}초"
@@ -4138,13 +4741,17 @@ def render_screener():
                     "합의": agreement.get("emoji", "⏳"),
                     "종목": e.get("name", "?"),
                     "스크리너": f"{e['screener_score']}점 ({e['screener_grade']})",
+                    "기간": f"{e.get('horizon_days') or agreement.get('horizon_days', 7)}일",
                     "MA 신호": "—",
                     "MA 확신": "—",
+                    "차이 사유": "미분석",
                     "Entry": "—",
                 })
             else:
                 ma_sig = (e.get("multi_agent_signal") or "?").upper()
                 ma_conf = e.get("multi_agent_confidence", 0)
+                reason_codes = agreement.get("reason_codes") or []
+                reason_label = ", ".join(reason_codes[:2]) if reason_codes else "—"
                 entry = e.get("entry_plan") or {}
                 entry_str = "—"
                 if entry and entry.get("limit_price"):
@@ -4154,8 +4761,10 @@ def render_screener():
                     "합의": f"{agreement.get('emoji', '')} {agreement.get('label', '')}",
                     "종목": e.get("name", "?"),
                     "스크리너": f"{e['screener_score']}점 ({e['screener_grade']})",
+                    "기간": f"{e.get('horizon_days') or agreement.get('horizon_days', 7)}일",
                     "MA 신호": ma_sig,
                     "MA 확신": f"{ma_conf:.1f}/10",
+                    "차이 사유": reason_label,
                     "Entry": entry_str,
                 })
 
@@ -4248,9 +4857,22 @@ def render_screener():
         if st.button("🤖 Multi-Agent 심층 분석", use_container_width=True, key="screener_ma"):
             ticker = sel.get("ticker", "")
             with st.spinner(f"{ticker} 심층 분석 중..."):
-                r = api_post(f"/scan/{ticker}", timeout=300)
-                if r:
-                    st.success(f"완료! {ticker} → {r.get('final_signal')} ({r.get('composite_score', 0):+.1f})")
+                r = api_get(f"/multi-agent/{ticker}", timeout=660)
+                if r and "error" not in r:
+                    fd = r.get("final_decision", {})
+                    sig = (fd.get("final_signal") or "?").upper()
+                    conf = float(fd.get("final_confidence") or 0)
+                    st.session_state.multi_agent_result = {
+                        "ticker": ticker,
+                        "single": {},
+                        "multi": r,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                    st.success(f"완료! {ticker} → {sig} ({conf:.1f}/10)")
+                elif r:
+                    st.error(f"Multi-Agent 분석 실패: {r.get('error', '알 수 없는 오류')}")
+                else:
+                    st.error("Multi-Agent API 응답 없음")
     with ac3:
         if st.button("📝 Virtual Trade 프리필", use_container_width=True, key="screener_vt"):
             # Virtual Trade 페이지의 프리필 세션 변수에 저장
@@ -4565,12 +5187,19 @@ def render_virtual_trade():
             placeholder="예: AAPL, 005930.KS",
             key="vt_ticker_input",
         ).strip().upper()
+        trade_ticker = ""
+        ticker_note = ""
+        if ticker_input:
+            trade_ticker, ticker_note = resolve_ticker(ticker_input)
+            trade_ticker = trade_ticker.upper()
+            if ticker_note and trade_ticker != ticker_input:
+                st.caption(f"정규화: {ticker_note}")
     with col_buy_b:
-        if st.button("📡 현재가 조회", use_container_width=True, disabled=not ticker_input):
-            quote = api_get(f"/paper/quote/{ticker_input}")
+        if st.button("📡 현재가 조회", use_container_width=True, disabled=not trade_ticker):
+            quote = api_get(f"/paper/quote/{trade_ticker}")
             if quote:
                 st.session_state.vt_quote = quote
-                st.session_state.vt_ticker = ticker_input
+                st.session_state.vt_ticker = quote.get("ticker") or trade_ticker
                 st.rerun()
             else:
                 st.error("현재가 조회 실패")
@@ -4584,18 +5213,17 @@ def render_virtual_trade():
     quote = st.session_state.vt_quote
     if quote:
         # 현재가 정보 표시
-        is_kr = ticker_input.endswith((".KS", ".KQ"))
-        currency = "₩" if is_kr else "$"
+        quote_ticker = quote.get("ticker") or trade_ticker
         qa, qb, qc, qd = st.columns(4)
-        qa.metric("현재가", f"{currency}{quote.get('current_price', 0):,.2f}",
+        qa.metric("현재가", _fmt_price(quote.get('current_price', 0), quote_ticker),
                   delta=f"{quote.get('change_pct', 0):+.2f}%")
-        qb.metric("당일 고가", f"{currency}{quote.get('day_high', 0):,.2f}")
-        qc.metric("당일 저가", f"{currency}{quote.get('day_low', 0):,.2f}")
-        qd.metric("호가단위", f"{currency}{quote.get('tick_size', 0):,}")
+        qb.metric("당일 고가", _fmt_price(quote.get('day_high', 0), quote_ticker))
+        qc.metric("당일 저가", _fmt_price(quote.get('day_low', 0), quote_ticker))
+        qd.metric("호가단위", _fmt_price(quote.get('tick_size', 0), quote_ticker))
         st.caption(f"기준 시각: {quote.get('as_of', '')}")
 
     # 매수 파라미터
-    if ticker_input:
+    if trade_ticker:
         default_price = (
             (prefill.get("price") if prefill else None)
             or (quote.get("current_price") if quote else None)
@@ -4615,7 +5243,7 @@ def render_virtual_trade():
             )
         with pc3:
             total_cost = buy_qty * buy_price
-            st.metric("총 투자금", f"${total_cost:,.2f}")
+            st.metric("총 투자금", _fmt_price(total_cost, trade_ticker))
 
         # 손절/익절/trailing 설정 (접이식)
         with st.expander("🛡️ 손절·익절·자동 청산 설정 (선택)", expanded=bool(prefill)):
@@ -4666,7 +5294,7 @@ def render_virtual_trade():
         # 매수 실행
         if st.button("🛒 **가상 매수 실행**", type="primary", use_container_width=True):
             body = {
-                "ticker": ticker_input,
+                "ticker": trade_ticker,
                 "qty": int(buy_qty),
                 "price": float(buy_price),
                 "reason": reason or "수동 가상 매수",
@@ -4678,8 +5306,8 @@ def render_virtual_trade():
             result = api_post("/paper/virtual-buy", json_body=body)
             if result and result.get("status") == "filled":
                 st.success(
-                    f"✅ **{ticker_input}** {buy_qty}주 @ {currency if quote else '$'}{buy_price:,.2f} 체결됨 "
-                    f"(총 ${total_cost:,.2f})"
+                    f"✅ **{trade_ticker}** {buy_qty}주 @ {_fmt_price(buy_price, trade_ticker)} 체결됨 "
+                    f"(총 {_fmt_price(total_cost, trade_ticker)})"
                 )
                 # 프리필 제거
                 st.session_state.pop("vt_prefill", None)
@@ -5173,8 +5801,12 @@ elif page == "Detail":
     render_detail()
 elif page == "Multi-Agent":
     render_multi_agent()
+elif page == "Quant Indicators":
+    render_quant_indicators()
 elif page == "Scan Log":
     render_scan_log()
+elif page == "System Monitor":
+    render_system_monitor()
 elif page == "Signal Accuracy":
     render_signal_accuracy()
 elif page == "Screener":

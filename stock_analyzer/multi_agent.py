@@ -17,10 +17,11 @@ Week 2-3: 8개 전문 에이전트 협업 시스템 (Fincept Terminal 벤치마�
 import os
 import sys
 import json
+import time
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 import traceback
 
 # 프로젝트 경로 설정
@@ -31,10 +32,122 @@ _SERVICE_DIR = os.path.join(_PROJECT_ROOT, 'chart_agent_service')
 if _SERVICE_DIR not in sys.path:
     sys.path.insert(0, _SERVICE_DIR)
 
-from config import DEFAULT_TEST_TICKER
+from config import (
+    DEFAULT_LLM_PROVIDER,
+    DEFAULT_TEST_TICKER,
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
+    GOOGLE_API_KEY,
+    GPU_THROTTLE_MEMORY_MB,
+    MULTI_AGENT_LLM_TIMEOUT,
+    MULTI_AGENT_MAX_WORKERS,
+    MULTI_AGENT_TIMEOUT,
+    OLLAMA_BASE_URL,
+    OPENAI_API_KEY,
+)
 
 from data_collector import fetch_ohlcv, calculate_indicators
 from analysis_tools import AnalysisTools
+try:
+    from gpu_monitor import get_gpu_memory_snapshot
+except ImportError:  # pragma: no cover - package import path
+    from stock_analyzer.gpu_monitor import get_gpu_memory_snapshot
+
+
+MULTI_AGENT_RUNTIME_VERSION = "timeout_wait_fallback_v3"
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _str_env(name: str, default: str) -> str:
+    return os.getenv(name) or default
+
+
+def _looks_like_unfinished_futures_timeout(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "futures unfinished" in text or (
+        "future" in text and "unfinished" in text
+    )
+
+
+def _timeout_failure_result(
+    ticker: str,
+    message: str,
+    warnings: List[str],
+    started_at: datetime,
+) -> Dict[str, Any]:
+    warning_list = list(warnings or [])
+    warning_list.append(
+        "내부 데이터/에이전트 future 타임아웃이 발생해 V2 분석을 neutral 시스템 장애 결과로 단락했습니다."
+    )
+    total_time = (datetime.now() - started_at).total_seconds()
+    reasoning = (
+        "멀티에이전트 분석 중 내부 future 타임아웃이 발생했습니다. "
+        "일부 yfinance/LLM 호출이 응답하지 않아 유효 에이전트 의견을 만들 수 없습니다. "
+        "V1 지표와 캐시된 데이터만 참고하고, 데이터 소스 또는 LLM 노드 상태를 점검해야 합니다."
+    )
+    final_decision = {
+        "final_signal": "neutral",
+        "final_confidence": 0.0,
+        "consensus": "유효 의견 0명 (future timeout)",
+        "conflicts": "내부 future timeout",
+        "reasoning": reasoning,
+        "key_risks": [
+            "데이터/LLM 호출 타임아웃",
+            "멀티에이전트 분석 무효",
+            message[:300],
+        ],
+        "agent_count": 0,
+        "valid_agent_count": 0,
+        "excluded_failed_count": 0,
+        "signal_distribution": {"buy": 0, "sell": 0, "neutral": 0},
+        "analyzed_at": datetime.now().isoformat(),
+        "warnings": warning_list,
+        "system_failure": True,
+    }
+    final_decision = _ensure_decision_context(final_decision)
+    return {
+        "ticker": ticker,
+        "multi_agent_mode": True,
+        "warnings": warning_list,
+        "agent_results": [],
+        "final_decision": final_decision,
+        "total_execution_time": total_time,
+        "analyzed_at": datetime.now().isoformat(),
+        "runtime": {
+            "orchestrator_version": MULTI_AGENT_RUNTIME_VERSION,
+            "timeout_fallback": True,
+        },
+        "system_failure": True,
+    }
+
+
+def _ensure_decision_context(decision: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach the shared decision context schema when a decision lacks one."""
+    if not isinstance(decision, dict):
+        return decision
+    try:
+        from decision_context import build_multi_agent_context, default_horizon_days
+        horizon_days = int(decision.get("horizon_days") or default_horizon_days())
+        decision["horizon_days"] = horizon_days
+        if not decision.get("decision_context"):
+            ctx = build_multi_agent_context(decision, horizon_days=horizon_days)
+            decision["decision_context"] = ctx
+            decision["decision_schema_version"] = ctx["schema_version"]
+        else:
+            decision.setdefault(
+                "decision_schema_version",
+                decision["decision_context"].get("schema_version", "decision_context.v1"),
+            )
+    except Exception:
+        decision.setdefault("horizon_days", 7)
+        decision.setdefault("decision_schema_version", "decision_context.v1")
+    return decision
 
 
 @dataclass
@@ -57,10 +170,24 @@ class AgentResult:
 class BaseAgent:
     """에이전트 기본 클래스"""
 
+    _FACT_EXCLUDE_KEYS = {
+        "tool",
+        "name",
+        "signal",
+        "score",
+        "heuristic_signal",
+        "heuristic_score",
+        "judgment_source",
+        "detail",
+        "formatted",
+        "error",
+    }
+
     def __init__(self, name: str, tools: List[str], llm_provider: str):
         self.name = name
         self.tools = tools
         self.llm_provider = llm_provider
+        self.deadline_at: float | None = None
 
     def _get_stock_name_for_agent(self, ticker: str) -> Optional[str]:
         """에이전트용 종목명 가져오기 (한글명 우선)"""
@@ -96,6 +223,19 @@ class BaseAgent:
         except:
             pass
         return None
+
+    def _summarize_fact_fields(self, result: Dict[str, Any], limit: int = 8) -> str:
+        facts = []
+        for key, value in result.items():
+            if key in self._FACT_EXCLUDE_KEYS or isinstance(value, (dict, list)):
+                continue
+            text = str(value)
+            if len(text) > 80:
+                text = text[:77] + "..."
+            facts.append(f"{key}={text}")
+            if len(facts) >= limit:
+                break
+        return ", ".join(facts) if facts else "수치 필드 없음"
 
     def analyze(self, ticker: str, analysis_tools: AnalysisTools) -> AgentResult:
         """
@@ -178,8 +318,16 @@ class BaseAgent:
             signal = result.get("signal", "neutral")
             score = result.get("score", 0)
             detail = result.get("detail", "")
+            facts = self._summarize_fact_fields(result)
+            try:
+                score_text = f"{float(score):+.1f}"
+            except Exception:
+                score_text = str(score)
 
-            evidence_summary.append(f"- {tool_name}: {signal} (score: {score:+.1f}) - {detail[:100]}")
+            evidence_summary.append(
+                f"- {tool_name}: facts[{facts}] | "
+                f"rule_reference={signal}/{score_text} | detail={detail[:120]}"
+            )
 
         evidence_text = "\n".join(evidence_summary) if evidence_summary else "No data available"
 
@@ -188,6 +336,11 @@ class BaseAgent:
 
 ## 분석 결과
 {evidence_text}
+
+## 해석 원칙
+- rule_reference, signal, score는 도구 내부의 하드코딩 휴리스틱 참고값입니다.
+- 최종 매수/매도/중립 판단은 위 facts의 지표 수치, 상태, 경고를 근거로 독립적으로 내리세요.
+- 휴리스틱 신호와 수치 해석이 충돌하면 수치 해석과 리스크 설명을 우선하세요.
 
 ## 요구사항
 다음 JSON 형식으로만 응답하세요:
@@ -211,7 +364,13 @@ class BaseAgent:
         """LLM 호출 (LiteLLM Router 경유 — Step 9)."""
         try:
             from llm.router import call_agent_llm, get_router
-            response = call_agent_llm(get_router(), self.name, prompt)
+            response = call_agent_llm(
+                get_router(),
+                self.name,
+                prompt,
+                preferred_provider=self.llm_provider,
+                timeout_seconds=self._remaining_timeout(),
+            )
             return json.dumps(
                 {
                     "signal": response.signal,
@@ -226,17 +385,22 @@ class BaseAgent:
             # Router 자체 import/초기화 실패 시만 여기 진입 (call_agent_llm는 예외 미방출)
             return self._empty_response_json(f"LLM Router 오류: {exc}")
 
+    def _remaining_timeout(self) -> float | None:
+        if self.deadline_at is None:
+            return None
+        return max(0.0, self.deadline_at - time.monotonic())
+
     def _call_gemini(self, prompt: str) -> str:
         """Gemini API 호출"""
         try:
             import google.generativeai as genai
 
-            api_key = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
+            api_key = GEMINI_API_KEY or GOOGLE_API_KEY
             if not api_key:
                 return '{"signal": "neutral", "confidence": 0, "reasoning": "Gemini API key not found"}'
 
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'))
+            model = genai.GenerativeModel(GEMINI_MODEL)
 
             response = model.generate_content(prompt)
             return response.text
@@ -246,105 +410,133 @@ class BaseAgent:
 
     @staticmethod
     def _empty_response_json(reason: str = "LLM 응답 없음") -> str:
-        return f'{{"signal": "neutral", "confidence": 0, "reasoning": "{reason}"}}'
+        return json.dumps(
+            {"signal": "neutral", "confidence": 0, "reasoning": reason},
+            ensure_ascii=False,
+        )
 
     def _call_ollama(self, prompt: str) -> str:
         """Ollama API 호출 (듀얼 노드 지원, GPU 메모리 보호)"""
         import time
 
-        # GPU 메모리 체크 (선택적)
+        # GPU 메모리 체크는 백그라운드 캐시를 읽는다.
         try:
-            import subprocess
-            result = subprocess.run(
-                ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'],
-                capture_output=True, text=True, timeout=2
-            )
-            if result.returncode == 0:
-                mem_used = int(result.stdout.strip())
-                # GPU 메모리가 90% 이상이면 대기
-                if mem_used > 11000:  # 12GB GPU 기준 90%
-                    time.sleep(2)  # 짧은 대기
+            gpu_snapshot = get_gpu_memory_snapshot()
+            mem_used = gpu_snapshot.get("memory_used_mb")
+            if gpu_snapshot.get("available") and mem_used is not None and mem_used > GPU_THROTTLE_MEMORY_MB:
+                time.sleep(2)
         except Exception:
-            pass  # nvidia-smi 실행 실패는 무시
+            pass
 
         try:
             from dual_node_config import (
                 get_llm_config, get_fallback_config,
                 performance_monitor, get_http_session,
+                node_slot,
             )
 
             session = get_http_session()
             llm_config = get_llm_config(self.name)
             start_time = datetime.now()
+            remaining_timeout = self._remaining_timeout()
+            request_timeout = _int_env("MULTI_AGENT_LLM_TIMEOUT", MULTI_AGENT_LLM_TIMEOUT)
+            if remaining_timeout is not None:
+                request_timeout = max(1, int(min(request_timeout, remaining_timeout)))
+            last_status = None
 
-            # 첫 번째 시도: 할당된 노드
-            max_retries = 2
-            for attempt in range(max_retries):
-                try:
-                    response = session.post(
-                        f"{llm_config['url']}/api/generate",
-                        json={
-                            "model": llm_config['model'],
-                            "prompt": prompt,
-                            "stream": False,
-                            "think": False,  # qwen3 thinking 모드 비활성화 — 미지원 모델은 무시
-                            "options": {
-                                "temperature": 0.0,
-                                # Ollama API 의 num_gpu 는 "GPU 에 올릴 레이어 수" 이며,
-                                # 1 로 두면 99% 의 레이어를 CPU 로 오프로드해 추론이 10x 이상
-                                # 느려진다. 옵션을 빼서 Ollama 자동 결정에 맡긴다.
-                                "num_thread": 4  # CPU 스레드 제한
-                            }
-                        },
-                        # Mac Studio(32GB)는 32B 모델을 OLLAMA_NUM_PARALLEL=1 로
-                        # 직렬 처리하므로 4개 에이전트가 큐잉될 때 마지막 에이전트
-                        # 대기 시간을 고려해 240s 기본. .env: MULTI_AGENT_LLM_TIMEOUT
-                        timeout=int(os.getenv("MULTI_AGENT_LLM_TIMEOUT", "240"))
-                    )
+            # 첫 번째 시도: 할당된 노드. 노드 큐가 꽉 차면 오래 기다리지 않고 폴백으로 넘긴다.
+            # [수정] max_retries=1 로 변경하여, 무한 대기 좀비 스레드 방지
+            max_retries = 1
+            primary_node = llm_config.get("node", "rtx_5070")
+            with node_slot(primary_node, block=False) as primary_slot_acquired:
+                if not primary_slot_acquired:
+                    last_status = "node_overloaded"
+                else:
+                    for attempt in range(max_retries):
+                        try:
+                            response = session.post(
+                                f"{llm_config['url']}/api/generate",
+                                json={
+                                    "model": llm_config['model'],
+                                    "prompt": prompt,
+                                    "stream": False,
+                                    "think": False,  # qwen3 thinking 모드 비활성화 — 미지원 모델은 무시
+                                    "options": {
+                                        "temperature": 0.0,
+                                        # Ollama API 의 num_gpu 는 "GPU 에 올릴 레이어 수" 이며,
+                                        # 1 로 두면 99% 의 레이어를 CPU 로 오프로드해 추론이 10x 이상
+                                        # 느려진다. 옵션을 빼서 Ollama 자동 결정에 맡긴다.
+                                        "num_thread": 4  # CPU 스레드 제한
+                                    }
+                                },
+                                # Mac Studio(32GB)는 32B 모델을 OLLAMA_NUM_PARALLEL=1 로
+                                # 직렬 처리하므로 4개 에이전트가 큐잉될 때 마지막 에이전트
+                                # 대기 시간을 고려해 240s 기본. .env: MULTI_AGENT_LLM_TIMEOUT
+                                timeout=request_timeout,
+                            )
 
-                    if response.status_code == 200:
-                        exec_time = (datetime.now() - start_time).total_seconds()
-                        performance_monitor.record(self.name, exec_time, llm_config['node'])
-                        text = (response.json().get('response') or '').strip()
-                        return text if text else json.dumps({
-                            "decision": "NEUTRAL",
-                            "confidence": 0.0,
-                            "reasoning": "LLM 응답 없음",
-                            "risks": ["응답 없음"],
-                            "opportunities": []
-                        }, ensure_ascii=False)
-                    elif attempt < max_retries - 1:
-                        # 재시도 전 대기 (지수 백오프)
-                        time.sleep(2 ** attempt)
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        raise  # 마지막 시도에서는 예외 발생
-                    time.sleep(2 ** attempt)
+                            if response.status_code == 200:
+                                exec_time = (datetime.now() - start_time).total_seconds()
+                                performance_monitor.record(self.name, exec_time, primary_node)
+                                text = (response.json().get('response') or '').strip()
+                                return text if text else json.dumps({
+                                    "decision": "NEUTRAL",
+                                    "confidence": 0.0,
+                                    "reasoning": "LLM 응답 없음",
+                                    "risks": ["응답 없음"],
+                                    "opportunities": []
+                                }, ensure_ascii=False)
+                            elif attempt < max_retries - 1:
+                                last_status = response.status_code
+                                # 재시도 전 대기 (지수 백오프)
+                                time.sleep(2 ** attempt)
+                            else:
+                                last_status = response.status_code
+                        except Exception:
+                            if attempt == max_retries - 1:
+                                raise  # 마지막 시도에서는 예외 발생
+                            time.sleep(2 ** attempt)
 
             # Mac Studio 연결 실패 시 폴백
             if llm_config['node'] == 'mac_studio':
                 fallback = get_fallback_config(self.name)
-                response = session.post(
-                    f"{fallback['url']}/api/generate",
-                    json={
-                        "model": fallback['model'],
-                        "prompt": prompt,
-                        "stream": False,
-                        "think": False,  # qwen3 thinking 모드 비활성화
-                        "options": {
-                            "temperature": 0.0,
-                            # num_gpu 제거 — Ollama 자동 결정 (위와 동일 이유)
-                            "num_thread": 4
-                        }
-                    },
-                    timeout=fallback.get('timeout', 120)
-                )
+                fallback_node = fallback.get("node", "rtx_5070")
+                with node_slot(fallback_node, block=False) as fallback_slot_acquired:
+                    if not fallback_slot_acquired:
+                        return self._empty_response_json("LLM 폴백 노드 과부하")
 
-                if response.status_code == 200:
-                    exec_time = (datetime.now() - start_time).total_seconds()
-                    performance_monitor.record(self.name, exec_time, fallback['node'])
-                    text = (response.json().get('response') or '').strip()
-                    return text if text else BaseAgent._empty_response_json()
+                    fallback_remaining = self._remaining_timeout()
+                    fallback_timeout = (
+                        max(1, int(min(float(fallback.get('timeout', 120)), fallback_remaining)))
+                        if fallback_remaining is not None
+                        else fallback.get('timeout', 120)
+                    )
+                    response = session.post(
+                        f"{fallback['url']}/api/generate",
+                        json={
+                            "model": fallback['model'],
+                            "prompt": prompt,
+                            "stream": False,
+                            "think": False,  # qwen3 thinking 모드 비활성화
+                            "options": {
+                                "temperature": 0.0,
+                                # num_gpu 제거 — Ollama 자동 결정 (위와 동일 이유)
+                                "num_thread": 4
+                            }
+                        },
+                        timeout=fallback_timeout
+                    )
+
+                    if response.status_code == 200:
+                        exec_time = (datetime.now() - start_time).total_seconds()
+                        performance_monitor.record(self.name, exec_time, fallback_node)
+                        text = (response.json().get('response') or '').strip()
+                        return text if text else BaseAgent._empty_response_json()
+                    last_status = response.status_code
+
+            if last_status is not None:
+                return self._empty_response_json(f"LLM 서비스 응답 오류: HTTP {last_status}")
+            return self._empty_response_json("LLM 서비스 응답 없음")
 
         except Exception:
             # 내부 에러 상세를 응답에 노출하지 않음 (정보 누설 방지)
@@ -355,7 +547,7 @@ class BaseAgent:
         try:
             from openai import OpenAI
 
-            api_key = os.getenv('OPENAI_API_KEY')
+            api_key = OPENAI_API_KEY
             if not api_key:
                 return self._empty_response_json("OPENAI_API_KEY 환경변수 미설정")
 
@@ -422,20 +614,12 @@ class BaseAgent:
 
             return signal, confidence, reasoning
 
-        except json.JSONDecodeError:
-            # JSON 파싱 실패 시 텍스트 분석
-            signal = "neutral"
-            confidence = 5.0
-
-            response_lower = response.lower()
-            if "buy" in response_lower or "매수" in response_lower:
-                signal = "buy"
-                confidence = 6.0
-            elif "sell" in response_lower or "매도" in response_lower:
-                signal = "sell"
-                confidence = 6.0
-
-            return signal, confidence, response[:200]
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            return (
+                "neutral",
+                0.0,
+                f"LLM structured output parsing failed; neutral fallback applied: {str(exc)[:120]}",
+            )
 
 
 # ============================================
@@ -448,7 +632,7 @@ class TechnicalAnalyst(BaseAgent):
     def __init__(self, llm_provider: str = None):
         # 환경 변수에서 기본값 가져오기
         if llm_provider is None:
-            llm_provider = os.getenv('DEFAULT_LLM_PROVIDER', 'ollama')
+            llm_provider = DEFAULT_LLM_PROVIDER
         super().__init__(
             name="Technical Analyst",
             tools=[
@@ -468,7 +652,7 @@ class QuantAnalyst(BaseAgent):
 
     def __init__(self, llm_provider: str = None):
         if llm_provider is None:
-            llm_provider = os.getenv('DEFAULT_LLM_PROVIDER', 'ollama')
+            llm_provider = DEFAULT_LLM_PROVIDER
         super().__init__(
             name="Quant Analyst",
             tools=[
@@ -488,7 +672,7 @@ class RiskManager(BaseAgent):
 
     def __init__(self, llm_provider: str = None):
         if llm_provider is None:
-            llm_provider = os.getenv('DEFAULT_LLM_PROVIDER', 'ollama')
+            llm_provider = DEFAULT_LLM_PROVIDER
         super().__init__(
             name="Risk Manager",
             tools=[
@@ -505,7 +689,7 @@ class MLSpecialist(BaseAgent):
 
     def __init__(self, llm_provider: str = None):
         if llm_provider is None:
-            llm_provider = os.getenv('DEFAULT_LLM_PROVIDER', 'ollama')
+            llm_provider = DEFAULT_LLM_PROVIDER
         super().__init__(
             name="ML Specialist",
             tools=[],  # ML 도구는 별도 처리
@@ -647,7 +831,7 @@ class EventAnalyst(BaseAgent):
 
     def __init__(self, llm_provider: str = None):
         if llm_provider is None:
-            llm_provider = os.getenv('DEFAULT_LLM_PROVIDER', 'ollama')
+            llm_provider = DEFAULT_LLM_PROVIDER
         super().__init__(
             name="Event Analyst",
             tools=[
@@ -663,12 +847,72 @@ class GeopoliticalAnalyst(BaseAgent):
 
     def __init__(self, llm_provider: str = None):
         if llm_provider is None:
-            llm_provider = os.getenv('DEFAULT_LLM_PROVIDER', 'ollama')
+            llm_provider = DEFAULT_LLM_PROVIDER
         super().__init__(
             name="Geopolitical Analyst",
             tools=[],  # 별도 분석 로직 사용
             llm_provider=llm_provider
         )
+
+    def _dynamic_context_enabled(self, name: str, default: str = "1") -> bool:
+        return (os.getenv(name, default) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _fetch_macro_context(self) -> Dict[str, Any]:
+        if not self._dynamic_context_enabled("GEOPOLITICAL_ENABLE_MACRO_CONTEXT"):
+            return {"disabled": True}
+        try:
+            from macro_context import fetch_macro_context
+
+            macro = fetch_macro_context()
+            return {
+                "market_regime": macro.get("market_regime"),
+                "summary": macro.get("summary"),
+                "vix": macro.get("vix"),
+                "dxy": macro.get("dxy"),
+                "oil_wti": macro.get("oil_wti"),
+                "us10y": macro.get("us10y"),
+                "sp500_trend": macro.get("sp500_trend"),
+                "source": "macro_context.fetch_macro_context",
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _fetch_news_context(self, ticker: str) -> Dict[str, Any]:
+        if not self._dynamic_context_enabled("GEOPOLITICAL_ENABLE_NEWS_CONTEXT"):
+            return {"disabled": True}
+        try:
+            if self._dynamic_context_enabled("GEOPOLITICAL_ENABLE_NEWS_SENTIMENT", default="0"):
+                from news_analyzer import fetch_news_with_sentiment
+
+                news = fetch_news_with_sentiment(ticker)
+                articles = news.get("articles") or []
+                return {
+                    "news_count": news.get("news_count", 0),
+                    "overall_sentiment": news.get("overall_sentiment"),
+                    "overall_score": news.get("overall_score"),
+                    "top_titles": [a.get("title", "") for a in articles[:3] if a.get("title")],
+                    "analyzed_at": news.get("analyzed_at"),
+                    "source": "news_analyzer.fetch_news_with_sentiment",
+                }
+
+            from news_analyzer import fetch_news_with_sentiment
+
+            news = fetch_news_with_sentiment(ticker, analyze_sentiment=False)
+            articles = news.get("articles") or []
+            return {
+                "news_count": news.get("news_count", 0),
+                "overall_sentiment": news.get("overall_sentiment") or "headline_only",
+                "overall_score": None,
+                "top_titles": [a.get("title", "") for a in articles[:3] if a.get("title")],
+                "analyzed_at": news.get("analyzed_at") or datetime.now().isoformat(),
+                "source": "news_analyzer.fetch_news_with_sentiment(headline_only)",
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    @staticmethod
+    def _context_available(context: Dict[str, Any]) -> bool:
+        return bool(context) and not context.get("error") and not context.get("disabled")
 
     def analyze(self, ticker: str, analysis_tools: AnalysisTools) -> AgentResult:
         """지정학적 리스크 및 환율 영향 분석"""
@@ -717,6 +961,48 @@ class GeopoliticalAnalyst(BaseAgent):
             elif country is not None and country in ['Taiwan']:
                 geopolitical_risks.append("대만 해협 긴장, 반도체 공급망 리스크")
 
+            macro_context = self._fetch_macro_context()
+            news_context = self._fetch_news_context(ticker)
+
+            def add_risk(risk: str) -> None:
+                if risk not in geopolitical_risks:
+                    geopolitical_risks.append(risk)
+
+            if self._context_available(macro_context):
+                if macro_context.get("market_regime") == "risk_off":
+                    add_risk("글로벌 위험회피 국면")
+                dxy_signal = (macro_context.get("dxy") or {}).get("signal")
+                if dxy_signal == "headwind" and currency != "USD":
+                    add_risk("달러 강세에 따른 비USD 자산 환율 역풍")
+                oil_signal = (macro_context.get("oil_wti") or {}).get("signal")
+                if oil_signal == "inflationary" and sector in ["Consumer Cyclical", "Industrials"]:
+                    add_risk("유가 상승에 따른 비용 압박")
+
+            if self._context_available(news_context):
+                if news_context.get("overall_sentiment") == "bearish":
+                    add_risk("최근 뉴스 감성 악화")
+                elif news_context.get("overall_sentiment") == "bullish":
+                    add_risk("최근 뉴스 감성은 우호적이나 이벤트 변동성 주의")
+
+            dynamic_sources = [
+                name for name, ctx in (
+                    ("macro", macro_context),
+                    ("news", news_context),
+                )
+                if self._context_available(ctx)
+            ]
+            analysis_mode = (
+                "dynamic_" + "_".join(dynamic_sources)
+                if dynamic_sources
+                else "static_exposure_with_unavailable_context"
+            )
+            context_warnings = []
+            for label, ctx in (("macro", macro_context), ("news", news_context)):
+                if ctx.get("error"):
+                    context_warnings.append(f"{label}: {ctx['error'][:80]}")
+                elif ctx.get("disabled"):
+                    context_warnings.append(f"{label}: disabled")
+
             # 증거 구성
             evidence = [{
                 "tool": "geopolitical_analysis",
@@ -726,7 +1012,11 @@ class GeopoliticalAnalyst(BaseAgent):
                     "sector": sector,
                     "fx_exposure": fx_exposure,
                     "risks": geopolitical_risks,
-                    "risk_count": len(geopolitical_risks)
+                    "risk_count": len(geopolitical_risks),
+                    "analysis_mode": analysis_mode,
+                    "macro_context": macro_context,
+                    "news_context": news_context,
+                    "context_warnings": context_warnings,
                 }
             }]
 
@@ -745,9 +1035,16 @@ class GeopoliticalAnalyst(BaseAgent):
 - 통화: {currency}
 - 섹터: {sector}
 - 환율 노출도: {fx_exposure}
+- 분석 모드: {analysis_mode}
 
 ## 식별된 지정학적 리스크
 {risks_text}
+
+## 동적 매크로 컨텍스트
+{json.dumps(macro_context, ensure_ascii=False, default=str)}
+
+## 동적 뉴스 컨텍스트
+{json.dumps(news_context, ensure_ascii=False, default=str)}
 
 다음 JSON 형식으로만 응답하세요:
 {{
@@ -759,7 +1056,8 @@ class GeopoliticalAnalyst(BaseAgent):
 지침:
 - 리스크가 3개 이상이거나 HIGH 환율 노출이면 → 보수적 판단 (매도 or 중립)
 - 리스크가 적고 안정적이면 → 긍정적 신호 가능
-- 환율이 유리하게 움직이는 구간이면 언급"""
+- 환율이 유리하게 움직이는 구간이면 언급
+- 분석 모드가 static_exposure_with_unavailable_context이면 실시간 이벤트 판단이 제한됨을 근거에 명시"""
 
             response = self._call_llm(prompt)
             signal, confidence, reasoning = self._parse_response(response)
@@ -768,6 +1066,9 @@ class GeopoliticalAnalyst(BaseAgent):
             if len(geopolitical_risks) >= 3 and signal == "buy":
                 confidence = max(1.0, confidence - 2.0)
                 reasoning += " [경고: 지정학적 리스크 높음]"
+            if analysis_mode == "static_exposure_with_unavailable_context" and confidence > 6.0:
+                confidence = 6.0
+                reasoning += " [동적 매크로/뉴스 컨텍스트 없음: 신뢰도 상한 적용]"
 
             execution_time = (datetime.now() - start_time).total_seconds()
 
@@ -800,7 +1101,7 @@ class ValueInvestor(BaseAgent):
 
     def __init__(self, llm_provider: str = None):
         if llm_provider is None:
-            llm_provider = os.getenv('DEFAULT_LLM_PROVIDER', 'ollama')
+            llm_provider = DEFAULT_LLM_PROVIDER
         super().__init__(
             name="Value Investor",
             tools=[],  # 별도 분석 로직 사용
@@ -984,8 +1285,14 @@ class DecisionMaker:
     def __init__(self, llm_provider: str = None):
         self.name = "Decision Maker"
         if llm_provider is None:
-            llm_provider = os.getenv('DEFAULT_LLM_PROVIDER', 'ollama')
+            llm_provider = DEFAULT_LLM_PROVIDER
         self.llm_provider = llm_provider
+        self.deadline_at: float | None = None
+
+    def _remaining_timeout(self) -> float | None:
+        if self.deadline_at is None:
+            return None
+        return max(0.0, self.deadline_at - time.monotonic())
 
     def aggregate(self, ticker: str, agent_results: List[AgentResult]) -> Dict[str, Any]:
         """
@@ -1058,7 +1365,7 @@ class DecisionMaker:
             except Exception:
                 decision["calibration_applied"] = False
 
-            return decision
+            return _ensure_decision_context(decision)
 
         except Exception as e:
             # 폴백: confidence 가중 다수결
@@ -1074,7 +1381,7 @@ class DecisionMaker:
             if excluded_failed:
                 consensus_msg += f" (실패 {excluded_failed}명 제외)"
 
-            return {
+            fallback_decision = {
                 "final_signal": majority_signal,
                 "final_confidence": avg_confidence,
                 "consensus": consensus_msg,
@@ -1089,6 +1396,7 @@ class DecisionMaker:
                 "analyzed_at": datetime.now().isoformat(),
                 "error": "Decision Maker 호출 실패"  # 사용자에게는 내부 메시지 노출 안 함
             }
+            return _ensure_decision_context(fallback_decision)
 
     def _build_decision_prompt(self, ticker: str, agent_results: List[AgentResult], signals: Dict[str, int]) -> str:
         """의사결정 프롬프트 생성"""
@@ -1179,7 +1487,14 @@ class DecisionMaker:
         try:
             from llm.router import call_agent_llm, get_router
             from llm.schemas import DecisionMakerResponse
-            resp = call_agent_llm(get_router(), self.name, prompt, DecisionMakerResponse)
+            resp = call_agent_llm(
+                get_router(),
+                self.name,
+                prompt,
+                DecisionMakerResponse,
+                preferred_provider=self.llm_provider,
+                timeout_seconds=self._remaining_timeout(),
+            )
             return json.dumps(
                 {
                     "final_signal": resp.final_signal,
@@ -1210,7 +1525,7 @@ class DecisionMaker:
         try:
             import google.generativeai as genai
 
-            api_key = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
+            api_key = GEMINI_API_KEY or GOOGLE_API_KEY
             if not api_key:
                 return json.dumps({
                     "final_signal": "neutral",
@@ -1222,7 +1537,7 @@ class DecisionMaker:
                 }, ensure_ascii=False)
 
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'))
+            model = genai.GenerativeModel(GEMINI_MODEL)
 
             response = model.generate_content(prompt)
             return response.text
@@ -1241,7 +1556,7 @@ class DecisionMaker:
         """OpenAI API 호출"""
         from openai import OpenAI
 
-        api_key = os.getenv('OPENAI_API_KEY')
+        api_key = OPENAI_API_KEY
         if not api_key:
             raise ValueError("OPENAI_API_KEY 환경변수 미설정")
 
@@ -1290,15 +1605,53 @@ class DecisionMaker:
 
             return data
 
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
             return {
                 "final_signal": "neutral",
-                "final_confidence": 5.0,
+                "final_confidence": 0.0,
                 "consensus": "Parsing failed",
                 "conflicts": "Response parsing error",
-                "reasoning": response[:200],
+                "reasoning": f"Structured decision parsing failed; neutral fallback applied: {str(exc)[:120]}",
                 "key_risks": ["Decision parsing failed"]
             }
+
+
+def _legacy_decision_maker_allowed() -> bool:
+    return (os.getenv("MULTI_AGENT_ALLOW_LEGACY_DECISION_MAKER") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _build_decision_maker(llm_provider: str):
+    """
+    Build the canonical decision maker.
+
+    EnhancedDecisionMaker owns the normalized buy/sell/neutral contract. The
+    older LLM DecisionMaker uses a different algorithm, so fallback requires an
+    explicit emergency-compatibility opt-in.
+    """
+    try:
+        from enhanced_decision_maker import EnhancedDecisionMaker
+        dm = EnhancedDecisionMaker(llm_provider)
+        dm.decision_maker_mode = "enhanced"
+        return dm
+    except ImportError as exc:
+        if _legacy_decision_maker_allowed():
+            dm = DecisionMaker(llm_provider)
+            dm.decision_maker_mode = "legacy_llm"
+            dm.legacy_fallback_reason = str(exc)
+            print(
+                "  ⚠️ EnhancedDecisionMaker import 실패 — "
+                "MULTI_AGENT_ALLOW_LEGACY_DECISION_MAKER=true 설정으로 legacy DecisionMaker 사용"
+            )
+            return dm
+        raise RuntimeError(
+            "EnhancedDecisionMaker import failed; legacy DecisionMaker fallback is disabled. "
+            "Set MULTI_AGENT_ALLOW_LEGACY_DECISION_MAKER=true only for emergency compatibility."
+        ) from exc
 
 
 # ============================================
@@ -1317,7 +1670,7 @@ class MultiAgentOrchestrator:
         """
         # 기본 provider 설정
         if llm_provider is None:
-            llm_provider = os.getenv('DEFAULT_LLM_PROVIDER', 'ollama')
+            llm_provider = DEFAULT_LLM_PROVIDER
 
         # dual_node_config 에서 에이전트별 provider 자동 로드
         # (agent_providers 명시 인수가 있으면 그걸 우선)
@@ -1356,7 +1709,7 @@ class MultiAgentOrchestrator:
         ]
 
         # 병렬 실행 워커 수 설정
-        self.max_workers = int(os.getenv('MULTI_AGENT_MAX_WORKERS', '2'))
+        self.max_workers = _int_env("MULTI_AGENT_MAX_WORKERS", MULTI_AGENT_MAX_WORKERS)
 
         # Mac Studio 연결 확인
         self.mac_studio_available = False
@@ -1371,17 +1724,13 @@ class MultiAgentOrchestrator:
 
         # Decision Maker provider — dual_node_config 에서 읽거나 기본값 사용
         _dm_provider = agent_providers.get("Decision Maker", llm_provider)
-        try:
-            from enhanced_decision_maker import EnhancedDecisionMaker
-            self.decision_maker = EnhancedDecisionMaker(_dm_provider)
-        except ImportError:
-            self.decision_maker = DecisionMaker(_dm_provider)
+        self.decision_maker = _build_decision_maker(_dm_provider)
 
     def _check_ollama_health(self) -> bool:
         """Ollama 서버 상태 체크"""
         try:
             import requests
-            ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+            ollama_url = _str_env("OLLAMA_BASE_URL", OLLAMA_BASE_URL)
             response = requests.get(f"{ollama_url}/api/tags", timeout=3)
             if response.status_code == 200:
                 # 모델 목록 확인
@@ -1449,22 +1798,85 @@ class MultiAgentOrchestrator:
                 except:
                     pass
 
-            # 기타 주식의 경우 yfinance에서 종목명 시도
-            try:
-                import yfinance as yf
-                stock = yf.Ticker(ticker)
-                info = stock.info
-                if info:
-                    name = info.get('longName') or info.get('shortName')
-                    if name:
-                        return name
-            except:
-                pass
+            # 기타 주식명 조회를 위해 yfinance.info를 호출하지 않는다.
+            # 해당 경로는 내부 future timeout을 자주 만들며, 표시는 티커만으로 충분하다.
 
         except Exception:
             pass
 
         return None
+
+    def _agent_execution_error(
+        self,
+        agent: BaseAgent,
+        message: str,
+        started_at: datetime,
+    ) -> AgentResult:
+        """Build a neutral AgentResult for executor-level failures."""
+        return AgentResult(
+            agent_name=agent.name,
+            signal="neutral",
+            confidence=0.0,
+            reasoning=message,
+            evidence=[],
+            llm_provider=agent.llm_provider,
+            execution_time=(datetime.now() - started_at).total_seconds(),
+            error=message,
+        )
+
+    def _collect_agent_futures(
+        self,
+        futures: Dict[Any, BaseAgent],
+        done: set,
+        not_done: set,
+        timeout_seconds: int,
+        warnings: List[str],
+        started_at: datetime,
+    ) -> List[AgentResult]:
+        """Collect finished agent futures and convert unfinished ones to failures."""
+        agent_results = []
+
+        if not_done:
+            timeout_message = (
+                f"에이전트 실행 전체 타임아웃({timeout_seconds}s) 초과: "
+                f"{len(not_done)}/{len(futures)}개 미완료"
+            )
+            warnings.append(timeout_message)
+            print(f"    ⚠️ {timeout_message}")
+
+        for future, agent in futures.items():
+            if future in done:
+                try:
+                    result = future.result()
+                    if not isinstance(result, AgentResult):
+                        raise TypeError(
+                            f"Invalid agent result type: {type(result).__name__}"
+                        )
+
+                    status = "✓" if not result.error else "✗"
+                    print(
+                        f"    {status} {agent.name}: {result.signal} "
+                        f"({result.confidence:.1f}/10) [{result.execution_time:.1f}s]"
+                    )
+                    agent_results.append(result)
+                except Exception as e:
+                    message = f"Execution failed: {str(e)}"
+                    print(f"    ✗ {agent.name}: Error - {str(e)[:50]}")
+                    agent_results.append(
+                        self._agent_execution_error(agent, message, started_at)
+                    )
+            else:
+                future.cancel()
+                message = (
+                    f"Agent timed out after {timeout_seconds}s and was excluded "
+                    "from final aggregation"
+                )
+                print(f"    ✗ {agent.name}: Timeout after {timeout_seconds}s")
+                agent_results.append(
+                    self._agent_execution_error(agent, message, started_at)
+                )
+
+        return agent_results
 
     def analyze(self, ticker: str) -> Dict[str, Any]:
         """
@@ -1645,8 +2057,16 @@ class MultiAgentOrchestrator:
             # 2. 병렬 에이전트 실행 (GPU 메모리 보호)
             print(f"  [2/3] {len(self.agents)}개 에이전트 병렬 실행 중 (워커: {self.max_workers})")
             agent_results = []
+            _ma_timeout = _int_env("MULTI_AGENT_TIMEOUT", MULTI_AGENT_TIMEOUT)
 
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            executor = ThreadPoolExecutor(max_workers=self.max_workers)
+            try:
+                deadline_at = time.monotonic() + _ma_timeout
+                for agent in self.agents:
+                    agent.deadline_at = deadline_at
+                if hasattr(self.decision_maker, "deadline_at"):
+                    self.decision_maker.deadline_at = deadline_at
+
                 # 각 에이전트에 작업 제출
                 futures = {
                     executor.submit(agent.analyze, ticker, tools): agent
@@ -1656,35 +2076,23 @@ class MultiAgentOrchestrator:
                 # 완료된 작업 수집
                 # MULTI_AGENT_TIMEOUT 으로 조정 가능 (.env). 워커 < 에이전트 수면
                 # 직렬 가깝게 처리되므로 보수적 기본 300초.
-                _ma_timeout = int(os.getenv("MULTI_AGENT_TIMEOUT", "300"))
-                for future in as_completed(futures, timeout=_ma_timeout):
-                    agent = futures[future]
-                    try:
-                        # future가 이미 as_completed 로 완료된 상태라 즉시 반환되지만,
-                        # 안전을 위해 LLM 호출 timeout 보다 살짝 길게 둠.
-                        result = future.result(timeout=int(os.getenv("MULTI_AGENT_LLM_TIMEOUT", "240")) + 10)
-                        agent_results.append(result)
-
-                        # 진행 상황 출력
-                        status = "✓" if not result.error else "✗"
-                        print(f"    {status} {agent.name}: {result.signal} ({result.confidence:.1f}/10) [{result.execution_time:.1f}s]")
-
-                    except Exception as e:
-                        print(f"    ✗ {agent.name}: Error - {str(e)[:50]}")
-                        # 에러 발생 시에도 기본 결과 추가
-                        agent_results.append(AgentResult(
-                            agent_name=agent.name,
-                            signal="neutral",
-                            confidence=0.0,
-                            reasoning=f"Execution failed: {str(e)}",
-                            evidence=[],
-                            llm_provider=agent.llm_provider,
-                            error=str(e)
-                        ))
+                done, not_done = wait(futures, timeout=_ma_timeout)
+                agent_results = self._collect_agent_futures(
+                    futures,
+                    done,
+                    not_done,
+                    _ma_timeout,
+                    warnings,
+                    start_time,
+                )
+            finally:
+                # Do not block the API response on already-timed-out agents.
+                executor.shutdown(wait=False, cancel_futures=True)
 
             # 3. Decision Maker가 종합
             print(f"  [3/3] Decision Maker가 의견 종합 중...")
             final_decision = self.decision_maker.aggregate(ticker, agent_results)
+            final_decision = _ensure_decision_context(final_decision)
 
             # 4. 실전 진입 계획 생성 (매매 시점/분할/손절익절)
             try:
@@ -1744,6 +2152,12 @@ class MultiAgentOrchestrator:
                 "frame_summary": {
                     "total_rows": len(df),
                     "has_sufficient_data": len(df) >= 100
+                },
+                "runtime": {
+                    "orchestrator_version": MULTI_AGENT_RUNTIME_VERSION,
+                    "timeout_seconds": _ma_timeout,
+                    "max_workers": self.max_workers,
+                    "timeout_fallback": False,
                 }
             }
 
@@ -1752,6 +2166,15 @@ class MultiAgentOrchestrator:
             return result
 
         except Exception as e:
+            if _looks_like_unfinished_futures_timeout(e):
+                print(f"\n[MultiAgent] future 타임아웃 단락: {str(e)}")
+                return _timeout_failure_result(
+                    ticker=ticker,
+                    message=str(e),
+                    warnings=warnings,
+                    started_at=start_time,
+                )
+
             print(f"\n[MultiAgent] 오류: {str(e)}")
             traceback.print_exc()
 

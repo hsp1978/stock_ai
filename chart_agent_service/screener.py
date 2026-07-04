@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -27,6 +28,12 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+from decision_context import (
+    build_multi_agent_context,
+    build_screener_context,
+    compare_decision_contexts,
+)
 
 
 # ─────────────────────────────────────────────────────────
@@ -46,8 +53,9 @@ SCORE_WEIGHTS = {
     "macd_cross":      30,  # 최근 10봉 이내 MACD 골든크로스
     "ma_alignment":    20,  # MA5 > MA20 > MA60 정배열
     "rsi_momentum":    20,  # RSI > 50 + 상승 기울기
-    "volume_bullish":  20,  # 최근 3일 중 2일 이상 거래량↑ + 양봉
-    "ma20_support":    10,  # 20일선 지지 확인
+    "volume_bullish":  15,  # 최근 3일 중 2일 이상 거래량↑ + 양봉
+    "ma20_support":     5,  # 20일선 지지 확인
+    "vwap_support":    10,  # VWAP20 지지/상향 추세 확인
 }
 # 최대 100점
 
@@ -55,6 +63,7 @@ PENALTY_WEIGHTS = {
     "macd_deadcross":     20,  # 데드크로스 발생 중
     "rsi_overbought":     15,  # RSI > 78 과매수
     "volume_declining":   10,  # 5일 연속 거래량 감소
+    "vwap_breakdown":     10,  # VWAP20 하향 이탈
     "below_ma120":        10,  # 종가 < MA120 (장기 역행)
     "high_volatility":    15,  # 연환산 변동성 60%+ (극고변동성)
     "extreme_volatility": 25,  # 연환산 변동성 100%+ (비정상 변동성)
@@ -69,6 +78,116 @@ FUNDAMENTAL_DISQUALIFY_PBR_MIN = 5.0      # P/B > 5.0 (동종업계 평균의 5�
 # ─────────────────────────────────────────────────────────
 #  데이터 수집 (유니버스 + 시총)
 # ─────────────────────────────────────────────────────────
+NAVER_MARKET_SUM_URL = "https://finance.naver.com/sise/sise_market_sum.naver"
+
+
+def _parse_int_text(value: object) -> Optional[int]:
+    text = str(value or "").strip().replace(",", "")
+    if not text or not re.fullmatch(r"-?\d+", text):
+        return None
+    return int(text)
+
+
+def _parse_naver_last_page(soup) -> int:
+    last_page = 1
+    for selector in ("td.pgRR a", "table.Nnavi a"):
+        for link in soup.select(selector):
+            href = link.get("href") or ""
+            match = re.search(r"[?&]page=(\d+)", href)
+            if match:
+                last_page = max(last_page, int(match.group(1)))
+    return last_page
+
+
+def _parse_naver_market_sum_page(
+    html: str,
+    market_name: str,
+    suffix: str,
+    min_market_cap: float,
+) -> Tuple[List[Dict], int]:
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    rows: List[Dict] = []
+
+    for tr in soup.select("table.type_2 tr"):
+        link = tr.select_one("a[href*='code=']")
+        if not link:
+            continue
+
+        href = link.get("href") or ""
+        match = re.search(r"code=(\d{6})", href)
+        if not match:
+            continue
+
+        cells = [td.get_text(" ", strip=True) for td in tr.select("td")]
+        if len(cells) < 7:
+            continue
+
+        cap_100m = _parse_int_text(cells[6])
+        if cap_100m is None:
+            continue
+
+        market_cap = float(cap_100m * 100_000_000)
+        if market_cap < min_market_cap:
+            continue
+
+        code = match.group(1)
+        rows.append({
+            "ticker": f"{code}{suffix}",
+            "name": link.get_text(" ", strip=True) or code,
+            "market": market_name,
+            "market_cap": market_cap,
+        })
+
+    return rows, _parse_naver_last_page(soup)
+
+
+def _load_kr_universe_from_naver(min_market_cap: float) -> pd.DataFrame:
+    import requests
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    rows: List[Dict] = []
+    seen = set()
+
+    for sosok, market_name, suffix in [(0, "KOSPI", ".KS"), (1, "KOSDAQ", ".KQ")]:
+        page = 1
+        last_page = 1
+
+        while page <= last_page:
+            resp = requests.get(
+                NAVER_MARKET_SUM_URL,
+                params={"sosok": sosok, "page": page},
+                headers=headers,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            resp.encoding = "euc-kr"
+
+            page_rows, parsed_last_page = _parse_naver_market_sum_page(
+                resp.text,
+                market_name=market_name,
+                suffix=suffix,
+                min_market_cap=min_market_cap,
+            )
+            last_page = max(last_page, parsed_last_page)
+
+            for row in page_rows:
+                if row["ticker"] in seen:
+                    continue
+                seen.add(row["ticker"])
+                rows.append(row)
+
+            # 네이버 시총 페이지는 내림차순이다. 해당 페이지에 기준 이상 종목이
+            # 하나도 없으면 이후 페이지도 기준 미달로 보고 중단한다.
+            if page > 1 and not page_rows:
+                break
+
+            page += 1
+
+    return pd.DataFrame(rows)
+
+
 def load_kr_universe(min_market_cap: float = MIN_MARKET_CAP_KRW) -> pd.DataFrame:
     """
     KOSPI + KOSDAQ 종목 중 시총 기준 이상만 반환.
@@ -157,6 +276,17 @@ def load_kr_universe(min_market_cap: float = MIN_MARKET_CAP_KRW) -> pd.DataFrame
     except Exception as e:
         print(f"[screener] FDR 오류: {e}")
 
+    # 3순위: Naver Finance 시가총액 페이지
+    try:
+        naver = _load_kr_universe_from_naver(min_market_cap)
+        if not naver.empty:
+            print(f"[screener] Naver 시총 fallback 사용: {len(naver)}개")
+            return naver
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[screener] Naver 시총 fallback 오류: {e}")
+
     return pd.DataFrame()
 
 
@@ -201,6 +331,17 @@ def _calc_indicators_lite(df: pd.DataFrame) -> pd.DataFrame:
 
     # 거래량 평균
     df['VOL_MA20'] = volume.rolling(20, min_periods=20).mean()
+
+    # Rolling VWAP: 일봉 데이터 기준 20/60봉 거래량 가중 평균가
+    typical_price = (df['High'] + df['Low'] + close) / 3
+    volume_filled = volume.fillna(0)
+    tpv = typical_price * volume_filled
+    for period in (20, 60):
+        vol_sum = volume_filled.rolling(period, min_periods=period).sum().replace(0, np.nan)
+        vwap = tpv.rolling(period, min_periods=period).sum() / vol_sum
+        df[f'VWAP_{period}'] = vwap
+        df[f'VWAP_DIST_{period}'] = (close / vwap - 1) * 100
+    df['VWAP_SLOPE_20'] = df['VWAP_20'].pct_change(5) * 100
 
     return df
 
@@ -315,6 +456,40 @@ def _score_ma20_support(df: pd.DataFrame) -> Tuple[float, Optional[str]]:
     return 0, None
 
 
+def _score_vwap_support(df: pd.DataFrame) -> Tuple[float, Optional[str]]:
+    """VWAP20 지지 또는 상향 VWAP 구간 확인."""
+    if len(df) < 25 or 'VWAP_20' not in df.columns or pd.isna(df['VWAP_20'].iloc[-1]):
+        return 0, None
+
+    last = df.iloc[-1]
+    price = float(last['Close'])
+    vwap = float(last['VWAP_20'])
+    if vwap <= 0:
+        return 0, None
+
+    dist_pct = float(last.get('VWAP_DIST_20', (price / vwap - 1) * 100))
+    slope_raw = last.get('VWAP_SLOPE_20')
+    slope_pct = 0.0 if pd.isna(slope_raw) else float(slope_raw)
+    prev_close = float(df['Close'].iloc[-2]) if len(df) >= 2 else price
+
+    if 0 <= dist_pct <= 3 and slope_pct >= 0:
+        return (
+            SCORE_WEIGHTS["vwap_support"],
+            f"VWAP20 지지 ({dist_pct:+.1f}%, 기울기 {slope_pct:+.1f}%)",
+        )
+    if 3 < dist_pct <= 8 and slope_pct > 0:
+        return (
+            SCORE_WEIGHTS["vwap_support"] * 0.5,
+            f"VWAP20 상단 추세 ({dist_pct:+.1f}%)",
+        )
+    if -1 <= dist_pct < 0 and price > prev_close:
+        return (
+            SCORE_WEIGHTS["vwap_support"] * 0.5,
+            f"VWAP20 재돌파 근접 ({dist_pct:+.1f}%)",
+        )
+    return 0, None
+
+
 # ─────────────────────────────────────────────────────────
 #  감점 계산
 # ─────────────────────────────────────────────────────────
@@ -350,6 +525,29 @@ def _penalty_volume_declining(df: pd.DataFrame) -> Tuple[float, Optional[str]]:
     v = df['Volume'].tail(5).values
     if all(v[i] < v[i-1] for i in range(1, 5)):
         return -PENALTY_WEIGHTS["volume_declining"], "5일 연속 거래량↓"
+    return 0, None
+
+
+def _penalty_vwap_breakdown(df: pd.DataFrame) -> Tuple[float, Optional[str]]:
+    """VWAP20을 의미 있게 하향 이탈하고 VWAP도 꺾인 구간."""
+    if len(df) < 25 or 'VWAP_20' not in df.columns or pd.isna(df['VWAP_20'].iloc[-1]):
+        return 0, None
+
+    last = df.iloc[-1]
+    price = float(last['Close'])
+    vwap = float(last['VWAP_20'])
+    if vwap <= 0:
+        return 0, None
+
+    dist_pct = float(last.get('VWAP_DIST_20', (price / vwap - 1) * 100))
+    slope_raw = last.get('VWAP_SLOPE_20')
+    slope_pct = 0.0 if pd.isna(slope_raw) else float(slope_raw)
+
+    if price < vwap * 0.97 and slope_pct <= 0:
+        return (
+            -PENALTY_WEIGHTS["vwap_breakdown"],
+            f"VWAP20 하회 ({dist_pct:+.1f}%, 기울기 {slope_pct:+.1f}%)",
+        )
     return 0, None
 
 
@@ -408,6 +606,7 @@ def calculate_score(df: pd.DataFrame) -> Dict:
         ("rsi_momentum",  _score_rsi_momentum),
         ("volume_bullish", _score_volume_bullish),
         ("ma20_support",  _score_ma20_support),
+        ("vwap_support",  _score_vwap_support),
     ]
     for name, fn in score_fns:
         try:
@@ -425,6 +624,7 @@ def calculate_score(df: pd.DataFrame) -> Dict:
         ("macd_deadcross",    _penalty_macd_deadcross),
         ("rsi_overbought",    _penalty_rsi_overbought),
         ("volume_declining",  _penalty_volume_declining),
+        ("vwap_breakdown",    _penalty_vwap_breakdown),
         ("below_ma120",       _penalty_below_ma120),
         ("high_volatility",   _penalty_high_volatility),
     ]
@@ -490,7 +690,7 @@ def run_screener(
         return {
             "run_id": run_id,
             "scanned_at": t_start.isoformat(),
-            "error": "유니버스 로드 실패 (pykrx 또는 FDR 설치 필요)",
+            "error": "유니버스 로드 실패 (pykrx/FDR/Naver Finance 데이터 소스 조회 실패)",
             "universe_size": 0,
             "results": [],
         }
@@ -525,12 +725,22 @@ def run_screener(
             continue
 
         result = calculate_score(df)
+        decision_context = build_screener_context(
+            score=result["score"],
+            grade=result["grade"],
+            breakdown=result.get("breakdown", {}),
+            penalties=result.get("penalties", []),
+        )
         scored.append({
             "ticker": ticker,
             "name": row['name'],
             "market": row['market'],
             "market_cap": row['market_cap'],
             "current_price": float(df['Close'].iloc[-1]),
+            "screener_signal": decision_context["signal"],
+            "screener_confidence": decision_context["confidence"],
+            "horizon_days": decision_context["horizon_days"],
+            "decision_context": decision_context,
             **result,
         })
 
@@ -601,57 +811,44 @@ def run_screener(
 # ─────────────────────────────────────────────────────────
 #  스크리너 → Multi-Agent 파이프라인
 # ─────────────────────────────────────────────────────────
-def _determine_agreement(screener_grade: str, ma_signal: str, ma_confidence: float) -> Dict:
+def _score_floor_for_grade(screener_grade: str) -> float:
+    return {"S": 90.0, "A": 80.0, "B": 70.0, "C": 55.0, "D": 30.0}.get(
+        str(screener_grade or "D").upper(),
+        30.0,
+    )
+
+
+def _determine_agreement(
+    screener_grade: str,
+    ma_signal: str,
+    ma_confidence: float,
+    screener_score: Optional[float] = None,
+    ma_decision: Optional[Dict] = None,
+    screener_row: Optional[Dict] = None,
+) -> Dict:
     """
     스크리너 등급과 Multi-Agent 결과의 일치도 판정.
 
     Returns:
         {level: str, label: str, emoji: str, description: str}
     """
-    grade_tier = {"S": 3, "A": 2, "B": 1, "C": 0, "D": -1}.get(screener_grade or "D", -1)
-    sig = (ma_signal or "").lower()
-
-    # 강한 일치: 스크리너 S/A + MA buy + 신뢰도 ≥ 7 (기존 6에서 강화)
-    # neutral이 다수(> 10개)이거나 sell 신호가 있으면 partial_match로 격하
-    if grade_tier >= 2 and sig == "buy" and ma_confidence >= 7:
-        return {
-            "level": "strong_match", "label": "강한 일치", "emoji": "🟢🟢",
-            "description": "스크리너 상위 + Multi-Agent 매수 확증(신뢰도 7+) — 1순위 후보",
-        }
-    # 부분 일치: 스크리너 S/A + MA buy(신뢰도 낮음) or MA neutral
-    if grade_tier >= 2 and sig == "buy":
-        return {
-            "level": "partial_match", "label": "부분 일치", "emoji": "🟢",
-            "description": "스크리너 강세 + Multi-Agent 매수(신뢰도 7 미만) — 추가 확인 필요",
-        }
-    if grade_tier >= 2 and sig == "neutral":
-        return {
-            "level": "partial_match", "label": "부분 일치", "emoji": "🟡",
-            "description": "스크리너는 상위권이나 Multi-Agent 중립 — 스크리너 단독 결과 신뢰 금지",
-        }
-    # 충돌: 스크리너 A/S인데 MA sell
-    if grade_tier >= 2 and sig == "sell":
-        return {
-            "level": "conflict", "label": "신호 충돌", "emoji": "⚠️",
-            "description": "스크리너는 매수 후보인데 Multi-Agent 매도 — 재검토 필요",
-        }
-    # 뜻밖의 매수: 스크리너 C/D인데 MA buy
-    if grade_tier < 1 and sig == "buy":
-        return {
-            "level": "unexpected_buy", "label": "이례적 매수", "emoji": "🟡",
-            "description": "스크리너 약한 후보인데 Multi-Agent는 매수 — Multi-Agent 근거 확인",
-        }
-    # 동반 약세
-    if grade_tier < 1 and sig in ("sell", "neutral"):
-        return {
-            "level": "aligned_weak", "label": "동반 약세", "emoji": "⚪",
-            "description": "스크리너와 Multi-Agent 모두 약한 후보 — 관망",
-        }
-    # 기본
-    return {
-        "level": "neutral", "label": "일치도 보통", "emoji": "🔵",
-        "description": "스크리너와 Multi-Agent 신호 보통 수준",
-    }
+    score = screener_score if screener_score is not None else _score_floor_for_grade(screener_grade)
+    primary = build_screener_context(
+        score=score,
+        grade=screener_grade,
+        breakdown=(screener_row or {}).get("breakdown") or (screener_row or {}).get("screener_breakdown"),
+        penalties=(screener_row or {}).get("penalties") or (screener_row or {}).get("screener_penalties"),
+    )
+    fd = dict(ma_decision or {})
+    fd.setdefault("final_signal", ma_signal)
+    fd.setdefault("final_confidence", ma_confidence)
+    secondary = build_multi_agent_context(fd, horizon_days=primary["horizon_days"])
+    return compare_decision_contexts(
+        primary,
+        secondary,
+        secondary_decision=fd,
+        screener_row=screener_row,
+    )
 
 
 def run_screener_with_multiagent(
@@ -743,6 +940,10 @@ def run_screener_with_multiagent(
             "current_price": cand.get("current_price"),
             "screener_score": cand["score"],
             "screener_grade": cand["grade"],
+            "screener_signal": cand.get("screener_signal", "neutral"),
+            "screener_confidence": cand.get("screener_confidence", 0.0),
+            "horizon_days": cand.get("horizon_days"),
+            "decision_context": cand.get("decision_context"),
             "screener_breakdown": cand.get("breakdown", {}),
             "screener_penalties": cand.get("penalties", []),
         }
@@ -752,14 +953,25 @@ def run_screener_with_multiagent(
             fd = ma.get("final_decision", {})
             ma_signal = fd.get("final_signal", "neutral")
             ma_conf = float(fd.get("final_confidence", 0))
+            ma_context = build_multi_agent_context(fd, horizon_days=entry.get("horizon_days"))
+            agreement = _determine_agreement(
+                cand["grade"],
+                ma_signal,
+                ma_conf,
+                screener_score=cand["score"],
+                ma_decision=fd,
+                screener_row=cand,
+            )
             entry.update({
                 "multi_agent_analyzed": True,
                 "multi_agent_signal": ma_signal,
                 "multi_agent_confidence": ma_conf,
+                "multi_agent_context": ma_context,
                 "multi_agent_consensus": fd.get("consensus", ""),
                 "multi_agent_reasoning": (fd.get("reasoning") or "")[:200],
                 "entry_plan": fd.get("entry_plan"),
-                "agreement": _determine_agreement(cand["grade"], ma_signal, ma_conf),
+                "agreement": agreement,
+                "decision_divergence": agreement,
             })
         elif ma and "error" in ma:
             entry.update({

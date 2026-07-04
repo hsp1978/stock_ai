@@ -34,9 +34,23 @@ class Settings(BaseSettings):
     DEFAULT_LLM_PROVIDER: Literal["ollama", "gemini", "openai"] = "ollama"
 
     MULTI_AGENT_MAX_WORKERS: int = Field(default=2, ge=1, le=16)
+    MULTI_AGENT_TIMEOUT: int = Field(default=300, ge=30)
+    MULTI_AGENT_LLM_TIMEOUT: int = Field(default=240, ge=30)
+    GEMINI_LLM_TIMEOUT: int = Field(default=30, ge=1, le=120)
+    ANALYSIS_AUX_FETCH_TIMEOUT: int = Field(default=20, ge=1, le=300)
+    GPU_MONITOR_INTERVAL_SECONDS: float = Field(default=7.0, ge=1)
+    GPU_THROTTLE_MEMORY_MB: int = Field(default=11000, ge=0)
 
     MAC_STUDIO_IP: str = "hsptest-macstudio"
     MAC_STUDIO_URL: str = "http://hsptest-macstudio:8080"
+    MAC_STUDIO_HEALTH_TTL_SECONDS: float = Field(default=10.0, ge=0)
+    MAC_STUDIO_HEALTH_TIMEOUT: float = Field(default=7.0, ge=0.1, le=60)
+    MAC_STUDIO_HEALTH_FAILURE_THRESHOLD: int = Field(default=2, ge=1, le=20)
+    MAC_STUDIO_MAX_INFLIGHT: int = Field(default=4, ge=1, le=32)
+    RTX_5070_MAX_INFLIGHT: int = Field(default=2, ge=1, le=32)
+    LLM_NODE_MAX_INFLIGHT: int = Field(default=2, ge=1, le=32)
+    LLM_NODE_FAILURE_THRESHOLD: int = Field(default=2, ge=1, le=20)
+    LLM_NODE_COOLDOWN_SECONDS: float = Field(default=90.0, ge=0, le=3600)
 
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
@@ -44,6 +58,8 @@ class Settings(BaseSettings):
     DART_API_KEY: str = ""
     FRED_API_KEY: str = ""
     FMP_API_KEY: str = ""
+    FINNHUB_API_KEY: str = ""
+    ALPHAVANTAGE_API_KEY: str = ""
 
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8100
@@ -53,6 +69,14 @@ class Settings(BaseSettings):
 
     SCAN_INTERVAL_MINUTES: int = Field(default=30, ge=1)
     SCAN_PARALLEL_WORKERS: int = Field(default=3, ge=1, le=16)
+    SERVICE_SCHEDULER_ENABLED: bool = True
+    SIGNAL_VALIDATION_HOUR: int = Field(default=23, ge=0, le=23)
+    SIGNAL_VALIDATION_MINUTE: int = Field(default=0, ge=0, le=59)
+    CORPORATE_ACTION_CHECK_HOUR: int = Field(default=0, ge=0, le=23)
+    CORPORATE_ACTION_CHECK_MINUTE: int = Field(default=5, ge=0, le=59)
+    DATA_HEALTH_CHECK_MINUTES: int = Field(default=60, ge=5)
+    DATA_HEALTH_ALERT_STALE_HOURS: float = Field(default=24.0, ge=0)
+    OPS_ALERT_DEDUPE_MINUTES: int = Field(default=60, ge=1)
 
     WATCHLIST: str = ""
 
@@ -116,6 +140,9 @@ class Settings(BaseSettings):
     OHLCV_TTL_EOD_HOURS: float = Field(default=24.0, ge=0)
     OHLCV_TTL_INTRADAY_MINUTES: int = Field(default=5, ge=1)
     OHLCV_RETRY_COUNT: int = Field(default=3, ge=1, le=10)
+    YFINANCE_TIMEOUT: int = Field(default=8, ge=1, le=60)
+    FUNDAMENTAL_TTL_HOURS: float = Field(default=12.0, ge=0)
+    NEWS_TTL_MINUTES: int = Field(default=30, ge=1)
 
     # ── GlobalKillSwitch 임계값 ─────────────────────────────────────
     DAILY_LOSS_LIMIT_ALERT_PCT: float = Field(default=2.0, ge=0)
@@ -144,6 +171,14 @@ TELEGRAM_CHAT_ID = settings.TELEGRAM_CHAT_ID
 API_HOST = settings.API_HOST
 API_PORT = settings.API_PORT
 SCAN_INTERVAL_MINUTES = settings.SCAN_INTERVAL_MINUTES
+SERVICE_SCHEDULER_ENABLED = settings.SERVICE_SCHEDULER_ENABLED
+SIGNAL_VALIDATION_HOUR = settings.SIGNAL_VALIDATION_HOUR
+SIGNAL_VALIDATION_MINUTE = settings.SIGNAL_VALIDATION_MINUTE
+CORPORATE_ACTION_CHECK_HOUR = settings.CORPORATE_ACTION_CHECK_HOUR
+CORPORATE_ACTION_CHECK_MINUTE = settings.CORPORATE_ACTION_CHECK_MINUTE
+DATA_HEALTH_CHECK_MINUTES = settings.DATA_HEALTH_CHECK_MINUTES
+DATA_HEALTH_ALERT_STALE_HOURS = settings.DATA_HEALTH_ALERT_STALE_HOURS
+OPS_ALERT_DEDUPE_MINUTES = settings.OPS_ALERT_DEDUPE_MINUTES
 WATCHLIST = settings.WATCHLIST
 BUY_THRESHOLD = settings.BUY_THRESHOLD
 SELL_THRESHOLD = settings.SELL_THRESHOLD
@@ -151,8 +186,23 @@ MIN_CONFIDENCE = settings.MIN_CONFIDENCE
 TRADING_STYLE = settings.TRADING_STYLE
 DEFAULT_LLM_PROVIDER = settings.DEFAULT_LLM_PROVIDER
 MULTI_AGENT_MAX_WORKERS = settings.MULTI_AGENT_MAX_WORKERS
+MULTI_AGENT_TIMEOUT = settings.MULTI_AGENT_TIMEOUT
+MULTI_AGENT_LLM_TIMEOUT = settings.MULTI_AGENT_LLM_TIMEOUT
+GEMINI_LLM_TIMEOUT = settings.GEMINI_LLM_TIMEOUT
+ANALYSIS_AUX_FETCH_TIMEOUT = settings.ANALYSIS_AUX_FETCH_TIMEOUT
+YFINANCE_TIMEOUT = settings.YFINANCE_TIMEOUT
+GPU_MONITOR_INTERVAL_SECONDS = settings.GPU_MONITOR_INTERVAL_SECONDS
+GPU_THROTTLE_MEMORY_MB = settings.GPU_THROTTLE_MEMORY_MB
 MAC_STUDIO_IP = settings.MAC_STUDIO_IP
 MAC_STUDIO_URL = settings.MAC_STUDIO_URL
+MAC_STUDIO_HEALTH_TTL_SECONDS = settings.MAC_STUDIO_HEALTH_TTL_SECONDS
+MAC_STUDIO_HEALTH_TIMEOUT = settings.MAC_STUDIO_HEALTH_TIMEOUT
+MAC_STUDIO_HEALTH_FAILURE_THRESHOLD = settings.MAC_STUDIO_HEALTH_FAILURE_THRESHOLD
+MAC_STUDIO_MAX_INFLIGHT = settings.MAC_STUDIO_MAX_INFLIGHT
+RTX_5070_MAX_INFLIGHT = settings.RTX_5070_MAX_INFLIGHT
+LLM_NODE_MAX_INFLIGHT = settings.LLM_NODE_MAX_INFLIGHT
+LLM_NODE_FAILURE_THRESHOLD = settings.LLM_NODE_FAILURE_THRESHOLD
+LLM_NODE_COOLDOWN_SECONDS = settings.LLM_NODE_COOLDOWN_SECONDS
 AGENT_API_URL = settings.AGENT_API_URL
 SCAN_PARALLEL_WORKERS = settings.SCAN_PARALLEL_WORKERS
 GOOGLE_API_KEY = settings.GOOGLE_API_KEY

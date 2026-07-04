@@ -21,8 +21,17 @@ class YFinanceSource:
     def get_ohlcv(self, ticker: str, period: str = "1y",
                   interval: str = "1d") -> pd.DataFrame:
         import yfinance as yf
+        try:
+            from config import YFINANCE_TIMEOUT
+        except Exception:
+            YFINANCE_TIMEOUT = 8
         t = yf.Ticker(ticker)
-        df = t.history(period=period, interval=interval)
+        df = t.history(
+            period=period,
+            interval=interval,
+            timeout=YFINANCE_TIMEOUT,
+            raise_errors=True,
+        )
         return df if df is not None else pd.DataFrame()
 
     def get_latest_price(self, ticker: str) -> Optional[float]:

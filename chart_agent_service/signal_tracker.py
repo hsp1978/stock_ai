@@ -129,12 +129,12 @@ def _outcome_label(return_pct: float, signal: str) -> str:
 
 def evaluate_past_signals(days_back: int = 45, limit: int = 500) -> Dict:
     """
-    과거 스캔 로그를 순회하여 signal_outcomes 테이블을 갱신.
+    과거 signal_outcomes 레코드를 순회하여 실제 수익률을 갱신.
 
     로직:
-    - scan_log에서 아직 30일 outcome이 없는 레코드 조회
+    - signal_outcomes에서 horizon별 수익률이 아직 없는 레코드 조회
     - 각 레코드마다 7/14/30일 후 가격을 가져와 수익률/outcome 계산
-    - signal_outcomes UPSERT
+    - signal_outcomes UPDATE
 
     Args:
         days_back: 얼마나 오래된 신호까지 재평가할지 (기본 45일)
@@ -143,21 +143,23 @@ def evaluate_past_signals(days_back: int = 45, limit: int = 500) -> Dict:
     Returns:
         처리 통계 dict
     """
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     cutoff = (now - timedelta(days=days_back)).isoformat()
 
     conn = _get_conn()
-    # 30일 평가 완료된 것은 재평가 불필요
     rows = conn.execute(
         """
-        SELECT s.id, s.ticker, s.signal, s.score, s.confidence, s.scanned_at, s.entry_price
-        FROM scan_log s
-        LEFT JOIN signal_outcomes o ON o.scan_log_id = s.id
-        WHERE s.scanned_at >= ?
-          AND (o.outcome_30d IS NULL)
-          AND s.signal IS NOT NULL
-          AND s.signal != ''
-        ORDER BY s.scanned_at DESC
+        SELECT signal_id, ticker, signal_type, signal_source,
+               issued_at, conviction, price_at_signal,
+               price_7d, price_14d, price_30d,
+               return_7d, return_14d, return_30d
+        FROM signal_outcomes
+        WHERE issued_at >= ?
+          AND price_at_signal IS NOT NULL
+          AND (
+            return_7d IS NULL OR return_14d IS NULL OR return_30d IS NULL
+          )
+        ORDER BY issued_at DESC
         LIMIT ?
         """,
         (cutoff, limit),
@@ -166,87 +168,77 @@ def evaluate_past_signals(days_back: int = 45, limit: int = 500) -> Dict:
     processed = 0
     updated = 0
     skipped_no_entry = 0
+    skipped_not_due = 0
     errors = 0
+    completed_by_horizon = {h: 0 for h in HORIZONS}
 
     for row in rows:
-        scan_log_id = row["id"]
+        signal_id = row["signal_id"]
         ticker = row["ticker"]
-        signal = (row["signal"] or "").lower()
-        scanned_at = datetime.fromisoformat(row["scanned_at"])
-        entry_price = row["entry_price"]
-
-        # entry_price가 없으면 scanned_at 당일 종가를 폴백으로 조회
-        if not entry_price:
-            entry_price = _latest_close_for(ticker, scanned_at)
+        issued_at = datetime.fromisoformat(row["issued_at"])
+        if issued_at.tzinfo is None:
+            issued_at = issued_at.replace(tzinfo=timezone.utc)
+        entry_price = row["price_at_signal"]
         if not entry_price:
             skipped_no_entry += 1
             continue
 
-        processed += 1
-
         # 각 horizon별 미래 가격과 outcome 계산
         horizon_data = {}
+        row_updated = False
         for h in HORIZONS:
-            target = scanned_at + timedelta(days=h)
+            ret_key = f"return_{h}d"
+            price_key = f"price_{h}d"
+            if row[ret_key] is not None:
+                horizon_data[h] = (row[price_key], row[ret_key])
+                completed_by_horizon[h] += 1
+                continue
+
+            target = issued_at + timedelta(days=h)
             if target > now:
-                # 아직 도달 안 한 horizon은 NULL로 유지
-                horizon_data[h] = (None, None, None)
+                horizon_data[h] = (row[price_key], row[ret_key])
                 continue
 
             future_price = _latest_close_for(ticker, target)
             if future_price is None:
-                horizon_data[h] = (None, None, None)
+                horizon_data[h] = (row[price_key], row[ret_key])
                 continue
 
-            ret_pct = (future_price / entry_price - 1) * 100
-            outcome = _outcome_label(ret_pct, signal)
-            horizon_data[h] = (future_price, round(ret_pct, 3), outcome)
+            ret = future_price / entry_price - 1
+            horizon_data[h] = (future_price, round(ret, 6))
+            completed_by_horizon[h] += 1
+            row_updated = True
 
-        # UPSERT
+        if not row_updated:
+            skipped_not_due += 1
+            continue
+
+        processed += 1
+
         try:
             conn.execute(
                 """
-                INSERT INTO signal_outcomes
-                  (scan_log_id, ticker, signal, score, confidence, scanned_at, entry_price,
-                   price_7d, return_7d_pct, outcome_7d,
-                   price_14d, return_14d_pct, outcome_14d,
-                   price_30d, return_30d_pct, outcome_30d,
-                   evaluated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?,  ?, ?, ?,  ?, ?, ?,  ?, ?, ?,  ?)
-                ON CONFLICT(scan_log_id) DO UPDATE SET
-                  price_7d=excluded.price_7d,
-                  return_7d_pct=excluded.return_7d_pct,
-                  outcome_7d=excluded.outcome_7d,
-                  price_14d=excluded.price_14d,
-                  return_14d_pct=excluded.return_14d_pct,
-                  outcome_14d=excluded.outcome_14d,
-                  price_30d=excluded.price_30d,
-                  return_30d_pct=excluded.return_30d_pct,
-                  outcome_30d=excluded.outcome_30d,
-                  evaluated_at=excluded.evaluated_at
+                UPDATE signal_outcomes
+                SET price_7d=?, return_7d=?,
+                    price_14d=?, return_14d=?,
+                    price_30d=?, return_30d=?,
+                    evaluated_at=?
+                WHERE signal_id=?
                 """,
                 (
-                    scan_log_id,
-                    ticker,
-                    signal,
-                    row["score"],
-                    row["confidence"],
-                    row["scanned_at"],
-                    entry_price,
                     horizon_data[7][0],
                     horizon_data[7][1],
-                    horizon_data[7][2],
                     horizon_data[14][0],
                     horizon_data[14][1],
-                    horizon_data[14][2],
                     horizon_data[30][0],
                     horizon_data[30][1],
-                    horizon_data[30][2],
                     now.isoformat(),
+                    signal_id,
                 ),
             )
             updated += 1
-        except Exception:
+        except Exception as exc:
+            print(f"[signal_tracker] {ticker} ({signal_id}) 평가 실패: {exc}")
             errors += 1
 
     conn.commit()
@@ -256,7 +248,9 @@ def evaluate_past_signals(days_back: int = 45, limit: int = 500) -> Dict:
         "processed": processed,
         "updated": updated,
         "skipped_no_entry": skipped_no_entry,
+        "skipped_not_due": skipped_not_due,
         "errors": errors,
+        "completed_by_horizon": completed_by_horizon,
         "scanned_at": now.isoformat(),
     }
 
@@ -284,33 +278,45 @@ def get_accuracy_stats(
     if horizon not in HORIZONS:
         horizon = 7
 
-    out_col = f"outcome_{horizon}d"
-    ret_col = f"return_{horizon}d_pct"
-    cutoff = (datetime.now() - timedelta(days=days_back)).isoformat()
+    ret_col = f"return_{horizon}d"
+    threshold = OUTCOME_THRESHOLD_PCT / 100.0
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
 
     conn = _get_conn()
 
     # 기본 필터
     where_parts = [
-        f"{out_col} IS NOT NULL",
-        "confidence >= ?",
-        "scanned_at >= ?",
+        f"{ret_col} IS NOT NULL",
+        "conviction >= ?",
+        "issued_at >= ?",
     ]
     params: List = [min_confidence, cutoff]
     if signal:
-        where_parts.append("signal = ?")
+        where_parts.append("signal_type = ?")
         params.append(signal.lower())
     where = " AND ".join(where_parts)
+    outcome_case = f"""
+        CASE
+          WHEN signal_type='buy' AND {ret_col} > {threshold} THEN 'win'
+          WHEN signal_type='buy' AND {ret_col} < -{threshold} THEN 'loss'
+          WHEN signal_type='buy' THEN 'neutral'
+          WHEN signal_type='sell' AND {ret_col} < -{threshold} THEN 'win'
+          WHEN signal_type='sell' AND {ret_col} > {threshold} THEN 'loss'
+          WHEN signal_type='sell' THEN 'neutral'
+          WHEN ABS({ret_col}) <= {threshold} THEN 'win'
+          ELSE 'loss'
+        END
+    """
 
     # 전체 집계
     row = conn.execute(
         f"""
         SELECT
           COUNT(*) AS total,
-          SUM(CASE WHEN {out_col}='win' THEN 1 ELSE 0 END) AS wins,
-          SUM(CASE WHEN {out_col}='loss' THEN 1 ELSE 0 END) AS losses,
-          SUM(CASE WHEN {out_col}='neutral' THEN 1 ELSE 0 END) AS neutrals,
-          AVG({ret_col}) AS avg_return
+          SUM(CASE WHEN ({outcome_case})='win' THEN 1 ELSE 0 END) AS wins,
+          SUM(CASE WHEN ({outcome_case})='loss' THEN 1 ELSE 0 END) AS losses,
+          SUM(CASE WHEN ({outcome_case})='neutral' THEN 1 ELSE 0 END) AS neutrals,
+          AVG({ret_col}) * 100.0 AS avg_return
         FROM signal_outcomes
         WHERE {where}
         """,
@@ -331,12 +337,15 @@ def get_accuracy_stats(
             f"""
             SELECT
               COUNT(*) AS total,
-              SUM(CASE WHEN {out_col}='win' THEN 1 ELSE 0 END) AS wins,
-              AVG({ret_col}) AS avg_return
+              SUM(CASE WHEN ({outcome_case})='win' THEN 1 ELSE 0 END) AS wins,
+              AVG({ret_col}) * 100.0 AS avg_return
             FROM signal_outcomes
-            WHERE {out_col} IS NOT NULL AND signal = ? AND scanned_at >= ?
+            WHERE {ret_col} IS NOT NULL
+              AND signal_type = ?
+              AND conviction >= ?
+              AND issued_at >= ?
             """,
-            (sig, cutoff),
+            (sig, min_confidence, cutoff),
         ).fetchone()
         t = r["total"] or 0
         w = r["wins"] or 0
@@ -354,12 +363,12 @@ def get_accuracy_stats(
             f"""
             SELECT
               COUNT(*) AS total,
-              SUM(CASE WHEN {out_col}='win' THEN 1 ELSE 0 END) AS wins,
-              AVG({ret_col}) AS avg_return
+              SUM(CASE WHEN ({outcome_case})='win' THEN 1 ELSE 0 END) AS wins,
+              AVG({ret_col}) * 100.0 AS avg_return
             FROM signal_outcomes
-            WHERE {out_col} IS NOT NULL
-              AND confidence >= ? AND confidence < ?
-              AND scanned_at >= ?
+            WHERE {ret_col} IS NOT NULL
+              AND conviction >= ? AND conviction < ?
+              AND issued_at >= ?
             """,
             (lo, hi, cutoff),
         ).fetchone()
@@ -375,6 +384,31 @@ def get_accuracy_stats(
             }
         )
 
+    by_source: Dict[str, Dict] = {}
+    source_rows = conn.execute(
+        f"""
+        SELECT
+          signal_source,
+          COUNT(*) AS total,
+          SUM(CASE WHEN ({outcome_case})='win' THEN 1 ELSE 0 END) AS wins,
+          AVG({ret_col}) * 100.0 AS avg_return
+        FROM signal_outcomes
+        WHERE {where}
+        GROUP BY signal_source
+        ORDER BY total DESC
+        """,
+        params,
+    ).fetchall()
+    for r in source_rows:
+        t = r["total"] or 0
+        w = r["wins"] or 0
+        by_source[r["signal_source"] or "unknown"] = {
+            "total": t,
+            "wins": w,
+            "win_rate_pct": round((w / t * 100) if t else 0, 1),
+            "avg_return_pct": round(r["avg_return"] or 0, 3),
+        }
+
     conn.close()
 
     return {
@@ -389,6 +423,7 @@ def get_accuracy_stats(
         "avg_return_pct": round(avg_return, 3),
         "by_signal": by_signal,
         "by_confidence_band": bands,
+        "by_source": by_source,
         "sample_size": total,
     }
 

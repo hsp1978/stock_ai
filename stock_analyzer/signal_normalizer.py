@@ -12,41 +12,43 @@ from typing import Dict, Tuple, Any
 class SignalNormalizer:
     """신호 정규화 클래스"""
 
-    # 표준 신호 매핑
+    # 표준 신호 매핑. normalize_signal()에서 lowercase/공백 정규화를 먼저 적용한다.
     SIGNAL_MAP = {
         # Buy 변형들
-        "BUY": "buy",
-        "Buy": "buy",
         "buy": "buy",
-        "LONG": "buy",
-        "Long": "buy",
         "long": "buy",
         "bullish": "buy",
-        "BULLISH": "buy",
+        "bull": "buy",
         "strong_buy": "buy",
+        "buy_now": "buy",
+        "buy_on_dip": "buy",
+        "accumulate": "buy",
+        "매수": "buy",
+        "강한_매수": "buy",
+        "상승": "buy",
 
         # Sell 변형들
-        "SELL": "sell",
-        "Sell": "sell",
         "sell": "sell",
-        "SHORT": "sell",
-        "Short": "sell",
         "short": "sell",
         "bearish": "sell",
-        "BEARISH": "sell",
+        "bear": "sell",
         "strong_sell": "sell",
+        "reduce": "sell",
+        "매도": "sell",
+        "강한_매도": "sell",
+        "하락": "sell",
 
         # Neutral 변형들
-        "NEUTRAL": "neutral",
-        "Neutral": "neutral",
         "neutral": "neutral",
-        "HOLD": "neutral",
-        "Hold": "neutral",
         "hold": "neutral",
         "wait": "neutral",
-        "WAIT": "neutral",
+        "resize": "neutral",
         "none": "neutral",
-        "NONE": "neutral",
+        "no_action": "neutral",
+        "관망": "neutral",
+        "보유": "neutral",
+        "대기": "neutral",
+        "중립": "neutral",
     }
 
     @classmethod
@@ -63,10 +65,27 @@ class SignalNormalizer:
         if not signal:
             return "neutral"
 
-        # 공백 제거 및 소문자 변환
-        signal_clean = str(signal).strip()
+        # SSOT(decision_context.normalize_trade_signal)에 위임한다. 단, 이 모듈은
+        # stock_analyzer 단독 컨텍스트(chart_agent_service 미적재)에서도 import 되므로
+        # 위임이 불가능하면 아래 SIGNAL_MAP fallback 으로 degrade 한다.
+        # SIGNAL_MAP 은 SSOT 와 동일 규칙을 유지하는 미러이며 직접 수정 금지.
+        try:
+            from decision_context import normalize_trade_signal
 
-        # 매핑 테이블에서 찾기
+            return normalize_trade_signal(signal)
+        except Exception:
+            pass
+
+        # 공백/구분자/대소문자 정규화
+        signal_clean = (
+            str(signal)
+            .strip()
+            .replace("-", "_")
+            .replace(" ", "_")
+            .lower()
+        )
+
+        # 매핑 테이블에서 찾기 (fallback)
         normalized = cls.SIGNAL_MAP.get(signal_clean, "neutral")
 
         return normalized

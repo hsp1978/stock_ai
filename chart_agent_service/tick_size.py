@@ -34,8 +34,13 @@ def _market_from_ticker(ticker: str) -> str:
     """티커에서 시장 추론 (KR | US)."""
     if not ticker:
         return "US"
-    t = ticker.upper()
-    if t.endswith(".KS") or t.endswith(".KQ"):
+    t = ticker.upper().strip()
+    code = t.split(".", 1)[0]
+    is_plain_kr_code = (
+        (code.isdigit() and len(code) == 6)
+        or (len(code) == 6 and code[:4].isdigit() and code[4].isalpha() and code[5].isdigit())
+    )
+    if t.endswith(".KS") or t.endswith(".KQ") or is_plain_kr_code:
         return "KR"
     return "US"
 

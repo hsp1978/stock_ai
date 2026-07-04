@@ -12,13 +12,13 @@
 """
 import json
 import os as _os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 import os
 import sys
 import time
-import subprocess
+import threading
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 import uvicorn
@@ -28,16 +28,39 @@ from fastapi.responses import FileResponse, JSONResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from pydantic import BaseModel
 
+try:
+    import numpy as _np
+except ImportError:  # pragma: no cover - optional runtime dependency
+    _np = None
+
+try:
+    import orjson as _orjson  # noqa: F401
+    from fastapi.responses import ORJSONResponse as _DefaultJSONResponse
+except Exception:  # pragma: no cover - optional runtime dependency
+    _DefaultJSONResponse = JSONResponse
+
 from config import (
     API_HOST, API_PORT, SCAN_INTERVAL_MINUTES,
     WATCHLIST, OLLAMA_BASE_URL, OLLAMA_MODEL,
     BUY_THRESHOLD, SELL_THRESHOLD, MIN_CONFIDENCE,
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, OUTPUT_DIR,
-    COOLING_OFF_DAYS, TRADING_STYLE,
+    COOLING_OFF_DAYS, TRADING_STYLE, ANALYSIS_AUX_FETCH_TIMEOUT,
+    SERVICE_SCHEDULER_ENABLED, SIGNAL_VALIDATION_HOUR, SIGNAL_VALIDATION_MINUTE,
+    CORPORATE_ACTION_CHECK_HOUR, CORPORATE_ACTION_CHECK_MINUTE,
+    DATA_HEALTH_CHECK_MINUTES, DATA_HEALTH_ALERT_STALE_HOURS,
+    OPS_ALERT_DEDUPE_MINUTES, DEFAULT_HISTORY_PERIOD,
 )
 from safety.kill_switch import KillSwitchASGIMiddleware
-from data_collector import fetch_ohlcv, calculate_indicators, fetch_fundamentals, fetch_options_pcr, fetch_insider_trades
+from data_collector import (
+    calculate_indicators,
+    fetch_fundamentals,
+    fetch_insider_trades,
+    fetch_ohlcv,
+    fetch_options_pcr,
+    get_data_cache_status,
+)
 from analysis_tools import ChartAnalysisAgent, generate_agent_chart
+from quant_indicators import analyze_quant_indicators
 from backtest_engine import run_all_backtests
 from ml_predictor import run_ml_prediction
 from portfolio_optimizer import (
@@ -47,15 +70,16 @@ from portfolio_optimizer import (
 from paper_trader import (
     get_portfolio_status, execute_paper_order,
     process_agent_signal, update_position_prices,
-    reset_paper_trading,
+    reset_paper_trading, adjust_corporate_actions,
 )
-from news_analyzer import fetch_news_with_sentiment
+from news_analyzer import fetch_news_with_sentiment, get_news_cache_status
 from chart_pattern import detect_chart_patterns
 from sector_compare import compare_sector
 from macro_context import fetch_macro_context
 from db import init_db, insert_scan, get_scan_logs, get_scan_logs_by_ticker, \
     get_scan_log_latest, get_scan_log_date_range, \
-    get_weekly_summary, get_weekly_ticker
+    get_weekly_summary, get_weekly_ticker, \
+    get_app_state, set_app_state
 from signal_tracker import insert_signal_outcome
 
 # Multi-Agent import
@@ -133,11 +157,542 @@ def _try_insert_signal_outcome(ticker: str, result: dict) -> None:
 # 최신 분석 결과 캐시 {ticker: {result, timestamp, alert_sent}}
 latest_results: dict = {}
 
+# 최신 퀀트 전용 분석 결과 캐시 {ticker: {result, timestamp}}
+latest_quant_results: dict = {}
+
 # 분석 히스토리 (최근 100건)
 scan_history: list = []
 
 # 냉각기 추적 {ticker: {"signal": "SELL", "triggered_at": isoformat}}
 cooling_off_state: dict = {}
+
+_STATE_COOLING_OFF = "service.cooling_off_state"
+_STATE_LATEST_RESULTS = "service.latest_results.summary"
+_STATE_SCAN_HISTORY = "service.scan_history"
+_STATE_SIGNAL_VALIDATION = "service.signal_validation.last_result"
+_STATE_JOB_STATUS = "service.ops.job_status"
+_STATE_DATA_HEALTH = "service.ops.data_health.last_result"
+_STATE_OPS_ALERTS = "service.ops.alerts"
+_STATE_LOCK = threading.RLock()
+_RUNTIME_STATE_RESTORED = False
+_AUX_FETCH_TIMEOUT = ANALYSIS_AUX_FETCH_TIMEOUT
+_LATEST_SUMMARY_CACHE: dict = {}
+_LAST_SIGNAL_VALIDATION: dict = {}
+_JOB_STATUS: dict = {}
+_LAST_DATA_HEALTH: dict = {}
+_OPS_ALERTS: dict = {}
+_SCHEDULER: BackgroundScheduler | None = None
+_RUN_INITIAL_SCAN_ON_STARTUP = False
+
+_KNOWN_OPS_JOBS = {
+    "watchlist_scan": "Watchlist Scan",
+    "daily_signal_validation": "Signal Validation",
+    "corporate_actions": "Corporate Actions",
+    "data_health_check": "Data Health Check",
+}
+
+
+def _compact_latest_entry(entry: dict) -> dict:
+    """재시작 복원에 필요한 최신 분석 요약만 남긴다."""
+    result = (entry or {}).get("result") or {}
+    compact_result = {
+        "final_signal": result.get("final_signal"),
+        "composite_score": result.get("composite_score"),
+        "confidence": result.get("confidence"),
+        "signal_distribution": result.get("signal_distribution"),
+        "company_name": result.get("company_name"),
+        "current_price": result.get("current_price") or result.get("price"),
+        "chart_path": result.get("chart_path"),
+        "json_path": result.get("json_path"),
+        "analyzed_at": result.get("analyzed_at"),
+    }
+    return {
+        "result": {k: v for k, v in compact_result.items() if v is not None},
+        "timestamp": (entry or {}).get("timestamp"),
+        "alert_sent_at": (entry or {}).get("alert_sent_at"),
+    }
+
+
+def _persist_cooling_off_state() -> None:
+    try:
+        with _STATE_LOCK:
+            set_app_state(_STATE_COOLING_OFF, cooling_off_state)
+    except Exception as exc:
+        print(f"[상태 저장] cooling_off_state 저장 실패: {exc}")
+
+
+def _persist_latest_result_summary(ticker: str | None = None) -> None:
+    try:
+        with _STATE_LOCK:
+            if ticker:
+                if ticker in latest_results:
+                    _LATEST_SUMMARY_CACHE[ticker] = _compact_latest_entry(latest_results[ticker])
+                else:
+                    _LATEST_SUMMARY_CACHE.pop(ticker, None)
+                set_app_state(_STATE_LATEST_RESULTS, _LATEST_SUMMARY_CACHE)
+            else:
+                _LATEST_SUMMARY_CACHE.clear()
+                _LATEST_SUMMARY_CACHE.update(
+                    {t: _compact_latest_entry(entry) for t, entry in latest_results.items()}
+                )
+                set_app_state(_STATE_LATEST_RESULTS, _LATEST_SUMMARY_CACHE)
+    except Exception as exc:
+        print(f"[상태 저장] latest_results 저장 실패: {exc}")
+
+
+def _stage_latest_result_summary(ticker: str) -> None:
+    with _STATE_LOCK:
+        if ticker in latest_results:
+            _LATEST_SUMMARY_CACHE[ticker] = _compact_latest_entry(latest_results[ticker])
+        else:
+            _LATEST_SUMMARY_CACHE.pop(ticker, None)
+
+
+def _flush_latest_result_summaries() -> None:
+    try:
+        with _STATE_LOCK:
+            set_app_state(_STATE_LATEST_RESULTS, _LATEST_SUMMARY_CACHE)
+    except Exception as exc:
+        print(f"[상태 저장] latest_results batch 저장 실패: {exc}")
+
+
+def _persist_scan_history() -> None:
+    try:
+        with _STATE_LOCK:
+            set_app_state(_STATE_SCAN_HISTORY, scan_history[-100:])
+    except Exception as exc:
+        print(f"[상태 저장] scan_history 저장 실패: {exc}")
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone().replace(tzinfo=None)
+        return parsed
+    except Exception:
+        return None
+
+
+def _persist_job_status() -> None:
+    try:
+        with _STATE_LOCK:
+            set_app_state(_STATE_JOB_STATUS, _JOB_STATUS)
+    except Exception as exc:
+        print(f"[상태 저장] job_status 저장 실패: {exc}")
+
+
+def _persist_data_health() -> None:
+    try:
+        with _STATE_LOCK:
+            set_app_state(_STATE_DATA_HEALTH, _LAST_DATA_HEALTH)
+    except Exception as exc:
+        print(f"[상태 저장] data_health 저장 실패: {exc}")
+
+
+def _persist_ops_alerts() -> None:
+    try:
+        with _STATE_LOCK:
+            set_app_state(_STATE_OPS_ALERTS, _OPS_ALERTS)
+    except Exception as exc:
+        print(f"[상태 저장] ops_alerts 저장 실패: {exc}")
+
+
+def _summarize_job_result(result: Any) -> Any:
+    if result is None:
+        return None
+    if isinstance(result, dict):
+        keys = (
+            "status",
+            "ticker_count",
+            "processed",
+            "updated",
+            "adjustments",
+            "stale_count",
+            "degraded_count",
+            "ok_count",
+        )
+        summary = {k: result.get(k) for k in keys if k in result}
+        if "evaluation" in result and isinstance(result["evaluation"], dict):
+            ev = result["evaluation"]
+            summary["evaluation"] = {
+                k: ev.get(k)
+                for k in ("processed", "updated", "errors")
+                if k in ev
+            }
+        return summary or {k: result.get(k) for k in list(result.keys())[:6]}
+    return str(result)[:300]
+
+
+def _record_job_start(job_id: str, label: str | None = None) -> datetime:
+    started = datetime.now()
+    with _STATE_LOCK:
+        prev = _JOB_STATUS.get(job_id, {})
+        _JOB_STATUS[job_id] = {
+            **prev,
+            "job_id": job_id,
+            "label": label or _KNOWN_OPS_JOBS.get(job_id, job_id),
+            "status": "running",
+            "last_started_at": started.isoformat(),
+            "last_finished_at": None,
+            "last_duration_sec": None,
+            "last_error": None,
+            "run_count": int(prev.get("run_count") or 0) + 1,
+            "error_count": int(prev.get("error_count") or 0),
+        }
+    _persist_job_status()
+    return started
+
+
+def _record_job_success(job_id: str, started_at: datetime, result: Any = None) -> None:
+    finished = datetime.now()
+    with _STATE_LOCK:
+        prev = _JOB_STATUS.get(job_id, {})
+        _JOB_STATUS[job_id] = {
+            **prev,
+            "job_id": job_id,
+            "label": prev.get("label") or _KNOWN_OPS_JOBS.get(job_id, job_id),
+            "status": "completed",
+            "last_finished_at": finished.isoformat(),
+            "last_duration_sec": round((finished - started_at).total_seconds(), 2),
+            "last_error": None,
+            "last_result_summary": _summarize_job_result(result),
+        }
+    _persist_job_status()
+
+
+def _record_job_error(job_id: str, started_at: datetime, exc: Exception | str) -> None:
+    finished = datetime.now()
+    message = str(exc)
+    with _STATE_LOCK:
+        prev = _JOB_STATUS.get(job_id, {})
+        _JOB_STATUS[job_id] = {
+            **prev,
+            "job_id": job_id,
+            "label": prev.get("label") or _KNOWN_OPS_JOBS.get(job_id, job_id),
+            "status": "error",
+            "last_finished_at": finished.isoformat(),
+            "last_duration_sec": round((finished - started_at).total_seconds(), 2),
+            "last_error": message[:500],
+            "error_count": int(prev.get("error_count") or 0) + 1,
+        }
+    _persist_job_status()
+    _send_ops_alert(
+        f"Ops job failed: {job_id}",
+        message[:800],
+        severity="error",
+        dedupe_key=f"job_error:{job_id}",
+    )
+
+
+def _job_status_snapshot() -> list[dict]:
+    with _STATE_LOCK:
+        snapshot = {job_id: dict(status) for job_id, status in _JOB_STATUS.items()}
+
+    for job_id, label in _KNOWN_OPS_JOBS.items():
+        snapshot.setdefault(
+            job_id,
+            {
+                "job_id": job_id,
+                "label": label,
+                "status": "never_run",
+                "last_started_at": None,
+                "last_finished_at": None,
+                "last_duration_sec": None,
+                "last_error": None,
+                "last_result_summary": None,
+                "run_count": 0,
+                "error_count": 0,
+            },
+        )
+    return [snapshot[job_id] for job_id in sorted(snapshot)]
+
+
+def _scheduler_snapshot() -> dict:
+    jobs = []
+    if _SCHEDULER is not None:
+        try:
+            for job in _SCHEDULER.get_jobs():
+                next_run = getattr(job, "next_run_time", None)
+                jobs.append(
+                    {
+                        "id": job.id,
+                        "name": job.name,
+                        "trigger": str(job.trigger),
+                        "next_run_time": next_run.isoformat() if next_run else None,
+                    }
+                )
+        except Exception as exc:
+            return {
+                "enabled": SERVICE_SCHEDULER_ENABLED,
+                "running": bool(_SCHEDULER and _SCHEDULER.running),
+                "error": str(exc)[:200],
+                "jobs": [],
+            }
+    return {
+        "enabled": SERVICE_SCHEDULER_ENABLED,
+        "running": bool(_SCHEDULER and _SCHEDULER.running),
+        "jobs": jobs,
+    }
+
+
+def _send_ops_alert(
+    title: str,
+    detail: str,
+    severity: str = "warning",
+    dedupe_key: str | None = None,
+    min_interval_minutes: int | None = None,
+) -> dict:
+    key = dedupe_key or title
+    min_minutes = min_interval_minutes or OPS_ALERT_DEDUPE_MINUTES
+    now = datetime.now()
+
+    with _STATE_LOCK:
+        previous = _OPS_ALERTS.get(key, {})
+    previous_at = _parse_iso_datetime(previous.get("last_attempt_at"))
+    if previous_at and (now - previous_at).total_seconds() < min_minutes * 60:
+        return {"sent": False, "reason": "deduped", "dedupe_key": key}
+
+    sent = False
+    try:
+        from telegram_bot import send_error_alert
+
+        sent = bool(send_error_alert(title, detail, severity=severity))
+    except Exception:
+        sent = False
+
+    with _STATE_LOCK:
+        _OPS_ALERTS[key] = {
+            "title": title,
+            "severity": severity,
+            "last_attempt_at": now.isoformat(),
+            "last_sent": sent,
+            "detail": detail[:500],
+        }
+    _persist_ops_alerts()
+    return {"sent": sent, "dedupe_key": key}
+
+
+def _collect_data_health_tickers(tickers: list[str] | None = None) -> list[str]:
+    if tickers:
+        source = tickers
+    else:
+        source = []
+        try:
+            source.extend(_load_watchlist_files())
+        except Exception:
+            pass
+        source.extend(latest_results.keys())
+        try:
+            portfolio = get_portfolio_status()
+            positions = portfolio.get("positions") or {}
+            source.extend(positions.keys())
+        except Exception:
+            pass
+
+    result = []
+    seen = set()
+    for ticker in source:
+        t = str(ticker).upper().strip()
+        if t and t not in seen:
+            result.append(t)
+            seen.add(t)
+    return result
+
+
+def build_data_health(tickers: list[str] | None = None) -> dict:
+    """현재 캐시 기준 데이터 freshness SLO 스냅샷을 만든다."""
+    target_tickers = _collect_data_health_tickers(tickers)
+    cache_status = get_data_cache_status(target_tickers, period=DEFAULT_HISTORY_PERIOD)
+    news_status = get_news_cache_status(target_tickers)
+    stale_after_sec = DATA_HEALTH_ALERT_STALE_HOURS * 3600.0
+
+    rows = []
+    stale = []
+    degraded = []
+    for ticker in target_tickers:
+        market = (cache_status.get("tickers") or {}).get(ticker, {})
+        news = (news_status.get("tickers") or {}).get(ticker, {})
+        ohlcv = market.get("ohlcv") or {}
+        fundamentals = market.get("fundamentals") or {}
+
+        reasons = []
+        severity = "ok"
+
+        ohlcv_age = ohlcv.get("age_sec")
+        if not ohlcv.get("present"):
+            severity = "stale"
+            reasons.append("ohlcv_missing")
+        elif ohlcv.get("fresh") is False and (
+            ohlcv_age is None or ohlcv_age >= stale_after_sec
+        ):
+            severity = "stale"
+            reasons.append("ohlcv_stale")
+
+        fundamental_quality = fundamentals.get("data_quality")
+        if not fundamentals.get("present") or fundamental_quality in {"missing", "empty"}:
+            if severity != "stale":
+                severity = "degraded"
+            reasons.append("fundamentals_missing")
+        elif fundamentals.get("fresh") is False:
+            if severity != "stale":
+                severity = "degraded"
+            reasons.append("fundamentals_stale")
+
+        if not news.get("present"):
+            reasons.append("news_not_cached")
+        elif not news.get("fresh"):
+            reasons.append("news_stale")
+
+        row = {
+            "ticker": ticker,
+            "severity": severity,
+            "reasons": reasons,
+            "ohlcv_source": ohlcv.get("source"),
+            "ohlcv_fetched_at": ohlcv.get("fetched_at"),
+            "ohlcv_age_sec": ohlcv_age,
+            "ohlcv_latest_bar": ohlcv.get("latest_bar_date"),
+            "fundamental_source": fundamentals.get("source"),
+            "fundamental_quality": fundamental_quality,
+            "fundamental_fetched_at": fundamentals.get("fetched_at"),
+            "fundamental_age_sec": fundamentals.get("age_sec"),
+            "news_present": news.get("present", False),
+            "news_fresh": news.get("fresh", False),
+        }
+        rows.append(row)
+        if severity == "stale":
+            stale.append(row)
+        elif severity == "degraded":
+            degraded.append(row)
+
+    if not target_tickers:
+        status = "empty"
+    elif stale:
+        status = "stale"
+    elif degraded:
+        status = "degraded"
+    else:
+        status = "ok"
+
+    payload = {
+        "status": status,
+        "generated_at": datetime.now().isoformat(),
+        "ticker_count": len(target_tickers),
+        "ok_count": sum(1 for row in rows if row["severity"] == "ok"),
+        "stale_count": len(stale),
+        "degraded_count": len(degraded),
+        "stale": stale[:20],
+        "degraded": degraded[:20],
+        "rows": rows,
+        "cache": {
+            "market_data": cache_status,
+            "news": news_status,
+        },
+    }
+
+    with _STATE_LOCK:
+        _LAST_DATA_HEALTH.clear()
+        _LAST_DATA_HEALTH.update(payload)
+    _persist_data_health()
+    return payload
+
+
+def _ops_snapshot() -> dict:
+    return {
+        "scheduler": _scheduler_snapshot(),
+        "jobs": _job_status_snapshot(),
+        "data_health": _LAST_DATA_HEALTH or build_data_health(),
+        "alerts": dict(_OPS_ALERTS),
+    }
+
+
+def _restore_runtime_state() -> None:
+    """프로세스 재시작 후 알림 중복 억제에 필요한 상태를 복원한다."""
+    global _RUNTIME_STATE_RESTORED
+    try:
+        with _STATE_LOCK:
+            if _RUNTIME_STATE_RESTORED:
+                return
+            _RUNTIME_STATE_RESTORED = True
+        cooling = get_app_state(_STATE_COOLING_OFF, {}) or {}
+        latest = get_app_state(_STATE_LATEST_RESULTS, {}) or {}
+        history = get_app_state(_STATE_SCAN_HISTORY, []) or []
+        validation = get_app_state(_STATE_SIGNAL_VALIDATION, {}) or {}
+        job_status = get_app_state(_STATE_JOB_STATUS, {}) or {}
+        data_health = get_app_state(_STATE_DATA_HEALTH, {}) or {}
+        ops_alerts = get_app_state(_STATE_OPS_ALERTS, {}) or {}
+        with _STATE_LOCK:
+            if isinstance(cooling, dict):
+                cooling_off_state.clear()
+                cooling_off_state.update(cooling)
+            if isinstance(latest, dict):
+                latest_results.clear()
+                latest_results.update(latest)
+                _LATEST_SUMMARY_CACHE.clear()
+                _LATEST_SUMMARY_CACHE.update(
+                    {t: _compact_latest_entry(entry) for t, entry in latest.items()}
+                )
+            if isinstance(history, list):
+                scan_history.clear()
+                scan_history.extend(history[-100:])
+            if isinstance(validation, dict):
+                _LAST_SIGNAL_VALIDATION.clear()
+                _LAST_SIGNAL_VALIDATION.update(validation)
+            if isinstance(job_status, dict):
+                _JOB_STATUS.clear()
+                _JOB_STATUS.update(job_status)
+            if isinstance(data_health, dict):
+                _LAST_DATA_HEALTH.clear()
+                _LAST_DATA_HEALTH.update(data_health)
+            if isinstance(ops_alerts, dict):
+                _OPS_ALERTS.clear()
+                _OPS_ALERTS.update(ops_alerts)
+        print(
+            f"[상태 복원] cooling_off={len(cooling_off_state)}, "
+            f"latest={len(latest_results)}, history={len(scan_history)}, "
+            f"jobs={len(_JOB_STATUS)}"
+        )
+    except Exception as exc:
+        with _STATE_LOCK:
+            _RUNTIME_STATE_RESTORED = False
+        print(f"[상태 복원] 실패: {exc}")
+
+
+def _fetch_analysis_inputs(ticker: str):
+    """OHLCV와 보조 API를 병렬 수집한다. OHLCV만 필수 데이터로 취급한다."""
+    print(f"  [{ticker}] 데이터 병렬 수집...")
+    executor = ThreadPoolExecutor(max_workers=4)
+    futures = {
+        "ohlcv": executor.submit(fetch_ohlcv, ticker),
+        "fundamentals": executor.submit(fetch_fundamentals, ticker),
+        "options_pcr": executor.submit(fetch_options_pcr, ticker),
+        "insider_trades": executor.submit(fetch_insider_trades, ticker),
+    }
+    try:
+        df = futures["ohlcv"].result(timeout=_AUX_FETCH_TIMEOUT)
+        df = calculate_indicators(df)
+
+        defaults = {
+            "fundamentals": {},
+            "options_pcr": {},
+            "insider_trades": [],
+        }
+        values = {}
+        for name, default in defaults.items():
+            try:
+                values[name] = futures[name].result(timeout=_AUX_FETCH_TIMEOUT)
+            except FutureTimeoutError:
+                print(f"  [{ticker}] {name} 수집 시간 초과")
+                values[name] = default
+            except Exception as exc:
+                print(f"  [{ticker}] {name} 수집 실패: {exc}")
+                values[name] = default
+
+        return df, values["fundamentals"], values["options_pcr"], values["insider_trades"]
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -228,26 +783,7 @@ def format_alert_message(ticker: str, result: dict) -> str:
 def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
     """단일 종목 에이전트 분석"""
     try:
-        print(f"  [{ticker}] 데이터 수집...")
-        df = fetch_ohlcv(ticker)
-        df = calculate_indicators(df)
-
-        print(f"  [{ticker}] 펀더멘털/옵션/내부자 데이터 수집...")
-        fundamentals = {}
-        options_pcr = {}
-        insider_trades = []
-        try:
-            fundamentals = fetch_fundamentals(ticker)
-        except Exception as e:
-            print(f"  [{ticker}] 펀더멘털 수집 실패: {e}")
-        try:
-            options_pcr = fetch_options_pcr(ticker)
-        except Exception as e:
-            print(f"  [{ticker}] 옵션 PCR 수집 실패: {e}")
-        try:
-            insider_trades = fetch_insider_trades(ticker)
-        except Exception as e:
-            print(f"  [{ticker}] 내부자 거래 수집 실패: {e}")
+        df, fundamentals, options_pcr, insider_trades = _fetch_analysis_inputs(ticker)
 
         print(f"  [{ticker}] 분석 도구 실행...")
         agent = ChartAnalysisAgent(ticker, df)
@@ -277,6 +813,44 @@ def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
     except Exception as e:
         print(f"  [{ticker}] 분석 실패: {e}")
         return None
+
+
+def _default_benchmark_ticker(ticker: str) -> str:
+    """시장별 기본 벤치마크 티커."""
+    t = (ticker or "").upper()
+    if t.endswith((".KS", ".KQ")):
+        return "^KS11"
+    return "SPY"
+
+
+def analyze_quant_ticker(ticker: str, benchmark: str = "") -> dict:
+    """LLM/뉴스/공시를 제외한 퀀트 전용 분석."""
+    ticker = ticker.upper()
+    benchmark = (benchmark or _default_benchmark_ticker(ticker)).upper()
+    try:
+        print(f"  [{ticker}] 퀀트 지표 데이터 수집...")
+        df = fetch_ohlcv(ticker)
+        df = calculate_indicators(df)
+
+        benchmark_df = None
+        if benchmark:
+            try:
+                benchmark_df = fetch_ohlcv(benchmark)
+            except Exception as exc:
+                print(f"  [{ticker}] 벤치마크 {benchmark} 수집 실패: {exc}")
+
+        result = analyze_quant_indicators(ticker, df, benchmark_df=benchmark_df)
+        result["benchmark_ticker"] = benchmark if benchmark_df is not None else None
+        result["analyzed_at"] = datetime.now().isoformat()
+
+        latest_quant_results[ticker] = {
+            "result": result,
+            "timestamp": result["analyzed_at"],
+        }
+        return _sanitize(result)
+    except Exception as exc:
+        print(f"  [{ticker}] 퀀트 분석 실패: {exc}")
+        return {"ticker": ticker, "status": "error", "error": str(exc)}
 
 
 def check_alert_condition(ticker: str, result: dict) -> Optional[dict]:
@@ -312,12 +886,14 @@ def check_alert_condition(ticker: str, result: dict) -> Optional[dict]:
             return None
         else:
             del cooling_off_state[ticker]
+            _persist_cooling_off_state()
 
     if signal == "SELL":
         cooling_off_state[ticker] = {
             "signal": signal,
             "triggered_at": datetime.now().isoformat(),
         }
+        _persist_cooling_off_state()
 
     # 2) 중복 알림 억제 (동일 종목 + 동일 신호 → 1시간 내 1회만)
     COOLDOWN_SECONDS = 1 * 3600  # 1시간
@@ -388,6 +964,8 @@ def send_summary_alert(alerts: list):
             **latest_results.get(ticker, {}),
             "alert_sent_at": datetime.now().isoformat(),
         }
+        _stage_latest_result_summary(ticker)
+    _flush_latest_result_summaries()
 
 
 def _load_watchlist_files() -> list[str]:
@@ -418,7 +996,7 @@ def _save_watchlist_file(tickers: list[str]):
             f.write(f"{t.upper()}\n")
 
 
-def run_scheduled_scan(override_tickers: "list[str] | None" = None):
+def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
     """
     스케줄된 전체 종목 스캔.
 
@@ -478,6 +1056,7 @@ def run_scheduled_scan(override_tickers: "list[str] | None" = None):
                         "timestamp": datetime.now().isoformat(),
                         "alert_sent_at": latest_results.get(ticker, {}).get("alert_sent_at"),
                     }
+                    _stage_latest_result_summary(ticker)
                     scan_entry["results"][ticker] = {
                         "signal": result.get("final_signal"),
                         "score": result.get("composite_score"),
@@ -493,8 +1072,15 @@ def run_scheduled_scan(override_tickers: "list[str] | None" = None):
                 insert_scan(ticker, result, alert_sent=(alert is not None))
                 _try_insert_signal_outcome(ticker, result)
 
-    # ── 단계 3: 캐시 정리 ─────────────────────────────────────
-    clear_ohlcv_cache()
+    # ── 단계 3: warm 캐시에서 data_health 스냅샷 갱신 ──────────────
+    # 과거: 스캔 끝에 clear_ohlcv_cache() 로 캐시를 비워, 이후 data_health 가
+    #       빈 캐시를 읽고 전 종목 ohlcv_missing 오보(false-negative)를 냈다.
+    # 변경: 캐시를 warm 상태로 유지(다음 스캔 시작 시 clear 로 freshness 보장)하고
+    #       즉시 data_health 를 갱신해 모니터링이 실제 상태를 반영하게 한다.
+    try:
+        build_data_health()
+    except Exception as exc:
+        print(f"  [data_health] 스캔 후 갱신 실패: {exc}")
 
     elapsed = time.time() - t_scan_start
     avg = elapsed / len(tickers) if tickers else 0
@@ -512,31 +1098,215 @@ def run_scheduled_scan(override_tickers: "list[str] | None" = None):
     scan_history.append(scan_entry)
     if len(scan_history) > 100:
         scan_history.pop(0)
+    _flush_latest_result_summaries()
+    _persist_scan_history()
 
     print(f"\n  스캔 완료: {datetime.now().strftime('%H:%M')}")
     print(f"{'='*60}\n")
+    return {
+        "status": "completed",
+        "ticker_count": len(tickers),
+        "alert_count": len(pending_alerts),
+        "elapsed_sec": round(elapsed, 2),
+    }
+
+
+def run_scheduled_scan(override_tickers: "list[str] | None" = None):
+    """스케줄/수동 스캔 실행 wrapper: job 상태와 장애 알림을 기록한다."""
+    started_at = _record_job_start("watchlist_scan", _KNOWN_OPS_JOBS["watchlist_scan"])
+    try:
+        result = _run_scheduled_scan_impl(override_tickers)
+        _record_job_success("watchlist_scan", started_at, result)
+        return result
+    except Exception as exc:
+        _record_job_error("watchlist_scan", started_at, exc)
+        raise
+
+
+def _run_signal_validation_impl():
+    """일일 신호 사후 평가 + 신뢰도 칼리브레이션."""
+    started_at = datetime.now().isoformat()
+    print(f"\n{'='*60}")
+    print(f"  신호 사후 검증 시작: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"{'='*60}\n")
+    try:
+        from signal_tracker import run_daily_validation
+
+        result = run_daily_validation(days_back=45, limit=500, refit_calibrator=True)
+        payload = {
+            "status": "completed",
+            "started_at": started_at,
+            "finished_at": datetime.now().isoformat(),
+            "result": result,
+        }
+        with _STATE_LOCK:
+            _LAST_SIGNAL_VALIDATION.clear()
+            _LAST_SIGNAL_VALIDATION.update(payload)
+            set_app_state(_STATE_SIGNAL_VALIDATION, _LAST_SIGNAL_VALIDATION)
+        ev = result.get("evaluation", {})
+        print(
+            f"  신호 검증 완료: 처리 {ev.get('processed', 0)}건, "
+            f"업데이트 {ev.get('updated', 0)}건, 오류 {ev.get('errors', 0)}건"
+        )
+    except Exception as exc:
+        payload = {
+            "status": "error",
+            "started_at": started_at,
+            "finished_at": datetime.now().isoformat(),
+            "error": str(exc),
+        }
+        with _STATE_LOCK:
+            _LAST_SIGNAL_VALIDATION.clear()
+            _LAST_SIGNAL_VALIDATION.update(payload)
+            try:
+                set_app_state(_STATE_SIGNAL_VALIDATION, _LAST_SIGNAL_VALIDATION)
+            except Exception:
+                pass
+        print(f"  신호 검증 실패: {exc}")
+    print(f"{'='*60}\n")
+    return payload
+
+
+def run_signal_validation():
+    """일일 신호 사후 평가 wrapper: job 상태와 장애 알림을 기록한다."""
+    started_at = _record_job_start(
+        "daily_signal_validation",
+        _KNOWN_OPS_JOBS["daily_signal_validation"],
+    )
+    result = _run_signal_validation_impl()
+    if isinstance(result, dict) and result.get("status") == "error":
+        _record_job_error(
+            "daily_signal_validation",
+            started_at,
+            RuntimeError(result.get("error") or "signal validation failed"),
+        )
+    else:
+        _record_job_success("daily_signal_validation", started_at, result)
+    return result
+
+
+def run_corporate_action_adjustment(force: bool = False) -> dict:
+    """페이퍼 포지션의 액면분할/배당 조정을 실행하고 job 상태를 기록한다."""
+    started_at = _record_job_start("corporate_actions", _KNOWN_OPS_JOBS["corporate_actions"])
+    try:
+        result = adjust_corporate_actions(force=force)
+        if isinstance(result, dict):
+            payload = {"status": "completed", **result}
+        else:
+            payload = {"status": "completed", "result": result}
+        _record_job_success("corporate_actions", started_at, payload)
+        return payload
+    except Exception as exc:
+        _record_job_error("corporate_actions", started_at, exc)
+        return {"status": "error", "error": str(exc)}
+
+
+def run_data_health_check() -> dict:
+    """데이터 freshness SLO를 평가하고 stale/degraded 상태를 알린다."""
+    started_at = _record_job_start("data_health_check", _KNOWN_OPS_JOBS["data_health_check"])
+    try:
+        result = build_data_health()
+        if result.get("status") in {"stale", "degraded"}:
+            detail = (
+                f"status={result.get('status')}, "
+                f"tickers={result.get('ticker_count')}, "
+                f"stale={result.get('stale_count')}, "
+                f"degraded={result.get('degraded_count')}"
+            )
+            _send_ops_alert(
+                "Data freshness degraded",
+                detail,
+                severity="warning" if result.get("status") == "degraded" else "error",
+                dedupe_key=f"data_health:{result.get('status')}",
+            )
+        _record_job_success("data_health_check", started_at, result)
+        return result
+    except Exception as exc:
+        _record_job_error("data_health_check", started_at, exc)
+        return {"status": "error", "error": str(exc)}
+
+
+def _start_background_scheduler(run_initial_scan: bool = False) -> None:
+    """FastAPI 프로세스 내 백그라운드 스케줄러를 1회만 시작한다."""
+    global _SCHEDULER
+    if not SERVICE_SCHEDULER_ENABLED:
+        print("[스케줄러] SERVICE_SCHEDULER_ENABLED=false — 자동 작업 비활성화")
+        return
+    if _SCHEDULER is not None and _SCHEDULER.running:
+        return
+
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(
+        run_scheduled_scan,
+        'interval',
+        minutes=SCAN_INTERVAL_MINUTES,
+        id='watchlist_scan',
+        next_run_time=datetime.now() if run_initial_scan else None,
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        run_signal_validation,
+        'cron',
+        hour=SIGNAL_VALIDATION_HOUR,
+        minute=SIGNAL_VALIDATION_MINUTE,
+        id='daily_signal_validation',
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        run_corporate_action_adjustment,
+        'cron',
+        hour=CORPORATE_ACTION_CHECK_HOUR,
+        minute=CORPORATE_ACTION_CHECK_MINUTE,
+        id='corporate_actions',
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        run_data_health_check,
+        'interval',
+        minutes=DATA_HEALTH_CHECK_MINUTES,
+        id='data_health_check',
+        replace_existing=True,
+    )
+    scheduler.start()
+    _SCHEDULER = scheduler
+    print(f"[스케줄러] {SCAN_INTERVAL_MINUTES}분 간격 스캔 등록 완료")
+    print(
+        f"[스케줄러] 일일 신호 검증 등록 완료 "
+        f"({SIGNAL_VALIDATION_HOUR:02d}:{SIGNAL_VALIDATION_MINUTE:02d})\n"
+    )
+    print(
+        f"[스케줄러] Corporate Actions 등록 완료 "
+        f"({CORPORATE_ACTION_CHECK_HOUR:02d}:{CORPORATE_ACTION_CHECK_MINUTE:02d})"
+    )
+    print(f"[스케줄러] Data Health Check {DATA_HEALTH_CHECK_MINUTES}분 간격 등록 완료\n")
 
 
 def _sanitize(obj):
+    if obj is None or isinstance(obj, (str, bool, int)):
+        return obj
     if isinstance(obj, float):
         if math.isnan(obj) or math.isinf(obj):
             return None
         return obj
+    if isinstance(obj, datetime):
+        return obj.isoformat()
     if isinstance(obj, dict):
         return {k: _sanitize(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_sanitize(v) for v in obj]
-    try:
-        import numpy as np
-        if isinstance(obj, (np.integer,)):
-            return int(obj)
-        if isinstance(obj, (np.floating,)):
-            v = float(obj)
-            return None if math.isnan(v) or math.isinf(v) else v
-        if isinstance(obj, np.ndarray):
-            return _sanitize(obj.tolist())
-    except (ImportError, TypeError):
-        pass
+    if _np is not None:
+        try:
+            if isinstance(obj, (_np.bool_,)):
+                return bool(obj)
+            if isinstance(obj, (_np.integer,)):
+                return int(obj)
+            if isinstance(obj, (_np.floating,)):
+                v = float(obj)
+                return None if math.isnan(v) or math.isinf(v) else v
+            if isinstance(obj, _np.ndarray):
+                return _sanitize(obj.tolist())
+        except TypeError:
+            pass
     return obj
 
 
@@ -548,12 +1318,20 @@ app = FastAPI(
     title="Chart Analysis Agent",
     description="24개 분석 도구 + 진입 계획 차트 분석 에이전트 + 퀀트 시스템 API",
     version="1.0.0",
+    default_response_class=_DefaultJSONResponse,
 )
 
 
 # ── GlobalKillSwitch 미들웨어 ─────────────────────────────────────────
 
 app.add_middleware(KillSwitchASGIMiddleware)
+
+
+@app.on_event("startup")
+def _startup_restore_state():
+    init_db()
+    _restore_runtime_state()
+    _start_background_scheduler(run_initial_scan=_RUN_INITIAL_SCAN_ON_STARTUP)
 
 
 @app.get("/")
@@ -623,6 +1401,7 @@ def scan_ticker(ticker: str, ai_mode: str = "ollama"):
         "timestamp": datetime.now().isoformat(),
         "alert_sent_at": latest_results.get(ticker, {}).get("alert_sent_at"),
     }
+    _persist_latest_result_summary(ticker)
     alert = check_alert_condition(ticker, result)
     alert_sent = False
     if alert:
@@ -639,6 +1418,50 @@ def scan_all(ai_mode: str = "ollama", tickers: str = ""):
     override = [t.strip().upper() for t in tickers.split(",") if t.strip()] if tickers else None
     run_scheduled_scan(override_tickers=override)
     return {"status": "completed", "results": get_all_results()}
+
+
+@app.get("/quant/latest")
+def get_latest_quant_results(limit: int = 50):
+    """최근 퀀트 전용 분석 결과 요약."""
+    rows = []
+    for ticker, data in latest_quant_results.items():
+        r = data.get("result", {})
+        rows.append({
+            "ticker": ticker,
+            "quant_score": r.get("quant_score"),
+            "grade": r.get("grade"),
+            "signal": r.get("signal"),
+            "signal_label": r.get("signal_label"),
+            "confidence": r.get("confidence"),
+            "regime": r.get("regime"),
+            "current_price": r.get("current_price"),
+            "analyzed_at": data.get("timestamp"),
+        })
+    rows.sort(key=lambda row: row.get("analyzed_at") or "", reverse=True)
+    return {"count": len(rows[:limit]), "results": rows[:limit]}
+
+
+@app.get("/quant/{ticker}")
+def get_quant_ticker(ticker: str, benchmark: str = ""):
+    """단일 종목 퀀트 전용 분석."""
+    result = analyze_quant_ticker(ticker, benchmark=benchmark)
+    if result.get("status") == "error":
+        raise HTTPException(500, result.get("error", "퀀트 분석 실패"))
+    return JSONResponse(content=_sanitize(result))
+
+
+@app.post("/quant/run")
+def run_quant_batch(tickers: str = "", benchmark: str = ""):
+    """여러 종목 퀀트 전용 분석. tickers 미지정 시 watchlist 사용."""
+    targets = [t.strip().upper() for t in tickers.split(",") if t.strip()] if tickers else _load_watchlist_files()
+    results = {}
+    for ticker in targets:
+        results[ticker] = analyze_quant_ticker(ticker, benchmark=benchmark)
+    return JSONResponse(content=_sanitize({
+        "status": "completed",
+        "count": len(results),
+        "results": results,
+    }))
 
 
 @app.get("/history")
@@ -683,11 +1506,126 @@ def health():
         "cached_results": len(latest_results),
         "scan_count": len(scan_history),
         "uptime_scans": len(scan_history),
+        "scheduler_running": bool(_SCHEDULER and _SCHEDULER.running),
+        "last_signal_validation": _LAST_SIGNAL_VALIDATION,
+        "jobs": _job_status_snapshot(),
+        "data_health": _LAST_DATA_HEALTH or build_data_health(),
         "market_session": {
             "KRX": krx_session,
             "NYSE": nyse_session,
         },
     }
+
+
+@app.get("/system-monitor")
+def system_monitor():
+    """운영 관측용 통합 스냅샷."""
+    llm_status = {
+        "available": False,
+        "error": None,
+        "nodes": {},
+        "mac_studio_health": {},
+        "agent_performance": {},
+    }
+    try:
+        from dual_node_config import (
+            LLM_NODES,
+            mac_studio_health_snapshot,
+            node_capacity_snapshot,
+            performance_monitor,
+        )
+
+        node_capacity = node_capacity_snapshot()
+        llm_status.update(
+            {
+                "available": True,
+                "nodes": {
+                    node: {
+                        **metrics,
+                        "url": LLM_NODES.get(node, {}).get("url"),
+                        "description": LLM_NODES.get(node, {}).get("description"),
+                    }
+                    for node, metrics in node_capacity.items()
+                },
+                "mac_studio_health": mac_studio_health_snapshot(),
+                "agent_performance": performance_monitor.get_summary(),
+            }
+        )
+    except Exception as exc:
+        llm_status["error"] = str(exc)[:200]
+
+    try:
+        from signal_tracker import get_accuracy_stats, get_calibrator
+
+        signal_status = {
+            "accuracy_7d": get_accuracy_stats(horizon=7, days_back=180),
+            "calibrator": get_calibrator().status(),
+            "last_validation": _LAST_SIGNAL_VALIDATION or {"status": "never_run"},
+        }
+    except Exception as exc:
+        signal_status = {"error": str(exc)[:200]}
+
+    try:
+        portfolio = get_portfolio_status()
+        paper_status = {
+            "total_equity": portfolio.get("total_equity"),
+            "cash": portfolio.get("cash"),
+            "position_value": portfolio.get("position_value"),
+            "total_pnl": portfolio.get("total_pnl"),
+            "total_pnl_pct": portfolio.get("total_pnl_pct"),
+            "open_positions": portfolio.get("open_positions"),
+            "win_rate_pct": portfolio.get("win_rate_pct"),
+        }
+    except Exception as exc:
+        paper_status = {"error": str(exc)[:200]}
+
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "service": {
+            "status": "healthy",
+            "cached_results": len(latest_results),
+            "scan_count": len(scan_history),
+            "scheduler_running": bool(_SCHEDULER and _SCHEDULER.running),
+            "last_scan": scan_history[-1]["timestamp"] if scan_history else None,
+        },
+        "llm": llm_status,
+        "signals": signal_status,
+        "paper": paper_status,
+        "ops": _ops_snapshot(),
+    }
+
+
+@app.get("/ops/jobs")
+def ops_jobs():
+    """스케줄러와 운영 잡 상태 조회."""
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "scheduler": _scheduler_snapshot(),
+        "jobs": _job_status_snapshot(),
+    }
+
+
+@app.get("/ops/data-health")
+def ops_data_health(refresh: bool = False):
+    """데이터 freshness SLO 상태 조회."""
+    if refresh or not _LAST_DATA_HEALTH:
+        return build_data_health()
+    return _LAST_DATA_HEALTH
+
+
+@app.post("/ops/jobs/{job_id}/run")
+def ops_run_job(job_id: str, force: bool = False):
+    """운영 잡 수동 실행."""
+    normalized = job_id.strip().lower()
+    if normalized in {"watchlist_scan", "scan"}:
+        return run_scheduled_scan()
+    if normalized in {"daily_signal_validation", "signal_validation"}:
+        return run_signal_validation()
+    if normalized in {"corporate_actions", "corporate_action"}:
+        return run_corporate_action_adjustment(force=force)
+    if normalized in {"data_health_check", "data_health"}:
+        return run_data_health_check()
+    raise HTTPException(404, f"Unknown ops job: {job_id}")
 
 
 @app.get("/backtest/{ticker}")
@@ -962,6 +1900,13 @@ def api_update_prices():
     }
 
 
+@app.post("/paper/corporate-actions/adjust")
+def api_adjust_corporate_actions(force: bool = False):
+    """보유 포지션의 액면분할/배당 조정을 수동 실행."""
+    result = adjust_corporate_actions(force=force)
+    return JSONResponse(content=_sanitize(result))
+
+
 @app.post("/paper/auto")
 def paper_auto_trade():
     """최신 분석 결과 기반 자동 모의매매 실행"""
@@ -1118,7 +2063,7 @@ def api_watchlist_set(tickers: str):
 
 @app.get("/multi-agent/{ticker}")
 def get_multi_agent_analysis(ticker: str):
-    """Multi-Agent 분석 (V2.0) - 5개 에이전트 병렬 분석"""
+    """Multi-Agent 분석 (V2.0) - 7개 분석 에이전트 + Decision Maker"""
     ticker = ticker.upper()
 
     if MultiAgentOrchestrator is None:
@@ -1565,6 +2510,7 @@ def api_telegram_process_callbacks():
                 "signal": "MUTED",
                 "triggered_at": datetime.now().isoformat(),
             }
+            _persist_cooling_off_state()
             return f"🚫 {ticker} 당분간 무시됨"
         except Exception:
             return "설정 실패"
@@ -1618,7 +2564,9 @@ def api_screener_run(
     # 억원 → 원
     min_cap_100m = min_market_cap_bn if min_market_cap_bn is not None else min_market_cap_100m
     min_cap = float(min_cap_100m) * 1e8
-    return run_screener(min_market_cap=min_cap, top_n=int(top_n), save_db=True)
+    return JSONResponse(content=_sanitize(
+        run_screener(min_market_cap=min_cap, top_n=int(top_n), save_db=True)
+    ))
 
 
 @app.get("/screener/latest")
@@ -1655,12 +2603,14 @@ def api_screener_pipeline(
     from screener import run_screener_with_multiagent
     min_cap_100m = min_market_cap_bn if min_market_cap_bn is not None else min_market_cap_100m
     min_cap = float(min_cap_100m) * 1e8
-    return run_screener_with_multiagent(
-        min_market_cap=min_cap,
-        top_n=int(top_n),
-        analyze_top=int(analyze_top),
-        save_db=True,
-    )
+    return JSONResponse(content=_sanitize(
+        run_screener_with_multiagent(
+            min_market_cap=min_cap,
+            top_n=int(top_n),
+            analyze_top=int(analyze_top),
+            save_db=True,
+        )
+    ))
 
 
 # ─── 신호 정확도 / 칼리브레이션 (Sprint 2) ──────────────
@@ -1685,7 +2635,24 @@ def api_signal_accuracy(horizon: int = 7, min_confidence: float = 0.0,
 def api_signal_evaluate(days_back: int = 45, limit: int = 500):
     """과거 신호에 대한 실제 결과 평가를 수동 실행."""
     from signal_tracker import run_daily_validation
-    return run_daily_validation(days_back=days_back, limit=limit)
+    result = run_daily_validation(days_back=days_back, limit=limit)
+    payload = {
+        "status": "completed",
+        "started_at": datetime.now().isoformat(),
+        "finished_at": datetime.now().isoformat(),
+        "result": result,
+    }
+    with _STATE_LOCK:
+        _LAST_SIGNAL_VALIDATION.clear()
+        _LAST_SIGNAL_VALIDATION.update(payload)
+        set_app_state(_STATE_SIGNAL_VALIDATION, _LAST_SIGNAL_VALIDATION)
+    return result
+
+
+@app.get("/signal-accuracy/validation-status")
+def api_signal_validation_status():
+    """마지막 자동/수동 신호 검증 실행 결과."""
+    return _LAST_SIGNAL_VALIDATION or {"status": "never_run"}
 
 
 @app.get("/signal-accuracy/calibrator")
@@ -1717,6 +2684,7 @@ def restart_service():
 # ═══════════════════════════════════════════════════════════════
 
 def main():
+    global _RUN_INITIAL_SCAN_ON_STARTUP
     print(f"\n{'='*60}")
     print(f"  차트 분석 에이전트 서비스 시작")
     print(f"  API: http://{API_HOST}:{API_PORT}")
@@ -1728,18 +2696,8 @@ def main():
 
     # DB 초기화
     init_db()
-
-    # 스케줄러 시작
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(
-        run_scheduled_scan,
-        'interval',
-        minutes=SCAN_INTERVAL_MINUTES,
-        id='watchlist_scan',
-        next_run_time=datetime.now(),  # 시작 즉시 1회 실행
-    )
-    scheduler.start()
-    print(f"[스케줄러] {SCAN_INTERVAL_MINUTES}분 간격 스캔 등록 완료\n")
+    _restore_runtime_state()
+    _RUN_INITIAL_SCAN_ON_STARTUP = True
 
     # FastAPI 서버 시작
     uvicorn.run(app, host=API_HOST, port=API_PORT, log_level="info")

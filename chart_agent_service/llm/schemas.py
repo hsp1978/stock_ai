@@ -13,6 +13,28 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field, field_validator
 
 
+def _normalize_signal(v: object) -> str:
+    """
+    신호 정규화 — SSOT(decision_context.normalize_trade_signal)에 위임한다.
+
+    chart_agent_service 가 sys.path 에 있으면 항상 import 가능하다. 만약 import
+    가 불가능한 예외 상황이면, 동일 규칙의 최소 fallback 으로 degrade 한다.
+    """
+    try:
+        from decision_context import normalize_trade_signal
+
+        return normalize_trade_signal(v)
+    except Exception:
+        s = str(v or "").strip().replace("-", "_").replace(" ", "_").lower()
+        if s in ("buy", "strong_buy", "buy_now", "buy_on_dip", "accumulate",
+                 "bullish", "bull", "long", "매수", "강한_매수", "상승"):
+            return "buy"
+        if s in ("sell", "strong_sell", "reduce", "bearish", "bear", "short",
+                 "매도", "강한_매도", "하락"):
+            return "sell"
+        return "neutral"
+
+
 class AgentLLMResponse(BaseModel):
     """에이전트 LLM 공통 응답 스키마 — 환각 방지용 구조화 출력."""
 
@@ -32,14 +54,7 @@ class AgentLLMResponse(BaseModel):
     @field_validator("signal", mode="before")
     @classmethod
     def normalize_signal(cls, v: object) -> str:
-        if isinstance(v, str):
-            v = v.lower().strip()
-            if v in ("buy", "매수", "bullish"):
-                return "buy"
-            if v in ("sell", "매도", "bearish"):
-                return "sell"
-            return "neutral"
-        return str(v)
+        return _normalize_signal(v)
 
 
 class DecisionMakerResponse(BaseModel):
@@ -60,13 +75,7 @@ class DecisionMakerResponse(BaseModel):
     @field_validator("final_signal", mode="before")
     @classmethod
     def normalize_final_signal(cls, v: object) -> str:
-        if isinstance(v, str):
-            v = v.lower().strip()
-            if v in ("buy", "매수", "bullish"):
-                return "buy"
-            if v in ("sell", "매도", "bearish"):
-                return "sell"
-        return "neutral"
+        return _normalize_signal(v)
 
     @field_validator("reasoning", "consensus", "conflicts", mode="before")
     @classmethod

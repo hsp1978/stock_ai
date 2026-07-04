@@ -7,15 +7,44 @@
 
 import os
 import threading
+import time
+from contextlib import contextmanager
 from typing import Dict, Any
 
 import requests
 from requests.adapters import HTTPAdapter
 
+
+def _setting(name: str, default: str = "") -> str:
+    if name in os.environ:
+        return os.environ.get(name, "")
+    try:
+        from config import settings
+
+        configured = getattr(settings, name, default)
+        return str(configured) if configured is not None else default
+    except Exception:
+        return default
+
+
+def _int_setting(name: str, default: int) -> int:
+    try:
+        return int(_setting(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_setting(name: str, default: float) -> float:
+    try:
+        return float(_setting(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 # LLM 노드 설정
 LLM_NODES = {
     "rtx_5070": {
-        "url": "http://localhost:11434",
+        "url": _setting("OLLAMA_BASE_URL", "http://localhost:11434"),
         "models": {
             "qwen3_14b": "qwen3:14b-q4_K_M",  # 최신 Qwen3 - 2x 효율
             "qwen_14b": "qwen2.5:14b-instruct-q4_K_M",  # 폴백용
@@ -26,7 +55,7 @@ LLM_NODES = {
     },
     "mac_studio": {
         # MAC_STUDIO_URL 미설정 시 Tailscale hostname으로 시도 (실패하면 폴백 로직이 RTX 5070으로 라우팅)
-        "url": os.getenv("MAC_STUDIO_URL", "http://hsptest-macstudio:8080"),
+        "url": _setting("MAC_STUDIO_URL", "http://hsptest-macstudio:8080"),
         # Mac Studio M1 Max 32GB 통합 메모리 — 32B(q4_K_M, ~19GB)가 안전 한계.
         # 70B(~40GB)는 OOM 으로 로드 불가하므로 라우팅 매핑에서 제외.
         "models": {
@@ -137,6 +166,21 @@ def get_llm_config(agent_name: str) -> Dict[str, Any]:
 
 _session_lock = threading.Lock()
 _http_session: "requests.Session | None" = None
+_mac_health_lock = threading.Lock()
+_mac_health_cache: Dict[str, Any] = {
+    "checked_at": 0.0,
+    "available": False,
+    "failures": 0,
+    "last_error": None,
+    "last_status": None,
+}
+_node_lock = threading.Lock()
+_node_semaphores: Dict[str, threading.BoundedSemaphore] = {}
+_node_inflight: Dict[str, int] = {}
+_node_overloads: Dict[str, int] = {}
+_node_failures: Dict[str, int] = {}
+_node_cooldown_until: Dict[str, float] = {}
+_node_last_error: Dict[str, str | None] = {}
 
 
 def get_http_session() -> requests.Session:
@@ -146,22 +190,192 @@ def get_http_session() -> requests.Session:
         with _session_lock:
             if _http_session is None:
                 sess = requests.Session()
-                adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20)
+                # [수정] ThreadPoolExecutor가 여러 개 실행되며 좀비 스레드가 생길 경우
+                # Connection Pool 고갈로 인한 무한 블로킹 방지를 위해 pool_maxsize 대폭 증가
+                adapter = HTTPAdapter(pool_connections=20, pool_maxsize=100)
                 sess.mount("http://", adapter)
                 sess.mount("https://", adapter)
                 _http_session = sess
     return _http_session
 
 
-def is_mac_studio_available() -> bool:
-    """Mac Studio 연결 상태 확인"""
+def reset_mac_studio_health_cache() -> None:
+    """테스트/수동 복구용 Mac Studio health cache 초기화."""
+    with _mac_health_lock:
+        _mac_health_cache.update({
+            "checked_at": 0.0,
+            "available": False,
+            "failures": 0,
+            "last_error": None,
+            "last_status": None,
+        })
+
+
+def mac_studio_health_snapshot() -> Dict[str, Any]:
+    with _mac_health_lock:
+        return dict(_mac_health_cache)
+
+
+def is_mac_studio_available(force_refresh: bool = False) -> bool:
+    """Mac Studio 연결 상태 확인. 짧은 TTL 캐시와 연속 실패 기준으로 오진단을 줄인다."""
     mac_url = LLM_NODES["mac_studio"]["url"]
+    ttl = _float_setting("MAC_STUDIO_HEALTH_TTL_SECONDS", 10.0)
+    timeout = _float_setting("MAC_STUDIO_HEALTH_TIMEOUT", 7.0)
+    fail_threshold = max(1, _int_setting("MAC_STUDIO_HEALTH_FAILURE_THRESHOLD", 2))
+    now = time.monotonic()
+
+    with _mac_health_lock:
+        cache_age = now - float(_mac_health_cache.get("checked_at") or 0.0)
+        if not force_refresh and _mac_health_cache["checked_at"] and cache_age < ttl:
+            return bool(_mac_health_cache["available"])
 
     try:
-        response = get_http_session().get(f"{mac_url}/api/tags", timeout=2)
-        return response.status_code == 200
-    except Exception:
-        return False
+        response = get_http_session().get(f"{mac_url}/api/tags", timeout=timeout)
+        available = response.status_code == 200
+        with _mac_health_lock:
+            if available:
+                _mac_health_cache.update({
+                    "checked_at": now,
+                    "available": True,
+                    "failures": 0,
+                    "last_error": None,
+                    "last_status": response.status_code,
+                })
+            else:
+                failures = int(_mac_health_cache.get("failures") or 0) + 1
+                keep_previous = bool(_mac_health_cache.get("available")) and failures < fail_threshold
+                _mac_health_cache.update({
+                    "checked_at": now,
+                    "available": keep_previous,
+                    "failures": failures,
+                    "last_error": f"HTTP {response.status_code}",
+                    "last_status": response.status_code,
+                })
+            return bool(_mac_health_cache["available"])
+    except Exception as exc:
+        with _mac_health_lock:
+            failures = int(_mac_health_cache.get("failures") or 0) + 1
+            keep_previous = bool(_mac_health_cache.get("available")) and failures < fail_threshold
+            _mac_health_cache.update({
+                "checked_at": now,
+                "available": keep_previous,
+                "failures": failures,
+                "last_error": str(exc)[:200],
+                "last_status": None,
+            })
+            return bool(_mac_health_cache["available"])
+
+
+def _node_limit(node: str) -> int:
+    if node == "mac_studio":
+        return max(1, _int_setting("MAC_STUDIO_MAX_INFLIGHT", 4))
+    if node == "rtx_5070":
+        return max(1, _int_setting("RTX_5070_MAX_INFLIGHT", 2))
+    return max(1, _int_setting("LLM_NODE_MAX_INFLIGHT", 2))
+
+
+def _node_failure_threshold(node: str) -> int:
+    env_name = f"{node.upper()}_FAILURE_THRESHOLD"
+    return max(1, _int_setting(env_name, _int_setting("LLM_NODE_FAILURE_THRESHOLD", 2)))
+
+
+def _node_cooldown_seconds(node: str) -> float:
+    env_name = f"{node.upper()}_COOLDOWN_SECONDS"
+    return max(0.0, _float_setting(env_name, _float_setting("LLM_NODE_COOLDOWN_SECONDS", 90.0)))
+
+
+def _get_node_semaphore(node: str) -> threading.BoundedSemaphore:
+    with _node_lock:
+        sem = _node_semaphores.get(node)
+        if sem is None:
+            sem = threading.BoundedSemaphore(_node_limit(node))
+            _node_semaphores[node] = sem
+            _node_inflight.setdefault(node, 0)
+            _node_overloads.setdefault(node, 0)
+            _node_failures.setdefault(node, 0)
+            _node_cooldown_until.setdefault(node, 0.0)
+            _node_last_error.setdefault(node, None)
+        return sem
+
+
+def is_node_in_cooldown(node: str) -> bool:
+    with _node_lock:
+        return time.monotonic() < float(_node_cooldown_until.get(node) or 0.0)
+
+
+def record_node_failure(node: str | None, exc: Exception) -> None:
+    """Record node-level call failure and open a short cooldown after repeats."""
+    if not node:
+        return
+    now = time.monotonic()
+    with _node_lock:
+        failures = int(_node_failures.get(node) or 0) + 1
+        _node_failures[node] = failures
+        _node_last_error[node] = str(exc)[:200]
+        if failures >= _node_failure_threshold(node):
+            _node_cooldown_until[node] = now + _node_cooldown_seconds(node)
+
+
+def record_node_success(node: str | None) -> None:
+    if not node:
+        return
+    with _node_lock:
+        _node_failures[node] = 0
+        _node_cooldown_until[node] = 0.0
+        _node_last_error[node] = None
+
+
+def reset_node_cooldowns(node: str | None = None) -> None:
+    with _node_lock:
+        targets = [node] if node else list(set(LLM_NODES.keys()) | set(_node_failures.keys()))
+        for target in targets:
+            _node_failures[target] = 0
+            _node_cooldown_until[target] = 0.0
+            _node_last_error[target] = None
+
+
+@contextmanager
+def node_slot(node: str, block: bool = False):
+    """노드별 동시 LLM 요청 수를 제한한다."""
+    sem = _get_node_semaphore(node)
+    acquired = sem.acquire(blocking=block)
+    if not acquired:
+        with _node_lock:
+            _node_overloads[node] = _node_overloads.get(node, 0) + 1
+        yield False
+        return
+    with _node_lock:
+        _node_inflight[node] = _node_inflight.get(node, 0) + 1
+    try:
+        yield True
+    finally:
+        with _node_lock:
+            _node_inflight[node] = max(0, _node_inflight.get(node, 0) - 1)
+        sem.release()
+
+
+def node_load_snapshot() -> Dict[str, int]:
+    with _node_lock:
+        return dict(_node_inflight)
+
+
+def node_capacity_snapshot() -> Dict[str, Dict[str, Any]]:
+    with _node_lock:
+        nodes = set(LLM_NODES.keys()) | set(_node_inflight.keys()) | set(_node_overloads.keys())
+        now = time.monotonic()
+        return {
+            node: {
+                "inflight": int(_node_inflight.get(node, 0)),
+                "capacity": int(_node_limit(node)),
+                "available_slots": max(0, int(_node_limit(node)) - int(_node_inflight.get(node, 0))),
+                "overload_count": int(_node_overloads.get(node, 0)),
+                "failure_count": int(_node_failures.get(node, 0)),
+                "cooldown_remaining_sec": int(max(0.0, float(_node_cooldown_until.get(node) or 0.0) - now)),
+                "last_error": _node_last_error.get(node),
+            }
+            for node in sorted(nodes)
+        }
+
 
 def get_fallback_config(agent_name: str) -> Dict[str, Any]:
     """
@@ -177,7 +391,7 @@ def get_fallback_config(agent_name: str) -> Dict[str, Any]:
     rtx_config = LLM_NODES["rtx_5070"]
 
     # 폴백 timeout 도 MULTI_AGENT_LLM_TIMEOUT 과 정합 (기본 240s)
-    _fallback_timeout = int(os.getenv("MULTI_AGENT_LLM_TIMEOUT", "240"))
+    _fallback_timeout = _int_setting("MULTI_AGENT_LLM_TIMEOUT", 240)
 
     # 고성능 에이전트는 더 많은 시간 할당
     if agent_name in ["Technical Analyst", "Quant Analyst", "Decision Maker"]:
