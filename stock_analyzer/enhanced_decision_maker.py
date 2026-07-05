@@ -181,11 +181,15 @@ class EnhancedDecisionMaker:
                 for ev in result.evidence:
                     ml_result = ev.get("result", {})
                     if "ensemble" in ml_result:
-                        # 각 모델의 정확도 수집
+                        # 각 모델의 정확도 수집.
+                        # 키 이원화 주의: ml_pipeline_fix(주 경로)는 "accuracy",
+                        # 레거시 ml_predictor는 "test_accuracy"를 쓴다. 한쪽만 읽으면
+                        # ML 정확도 가중치 규칙이 사문화된다 (2026-07 감사에서 발견).
                         models = ml_result.get("models", {})
                         for model_data in models.values():
-                            if "test_accuracy" in model_data:
-                                ml_accuracies.append(model_data["test_accuracy"])
+                            acc = model_data.get("test_accuracy", model_data.get("accuracy"))
+                            if isinstance(acc, (int, float)) and acc > 0:
+                                ml_accuracies.append(float(acc))
             elif "Event" in result.agent_name:
                 event_scores.append(signed_confidence)
                 # 내부자 거래 신호 추출
@@ -695,13 +699,18 @@ class EnhancedDecisionMaker:
     def _check_volatility(self, agent_results) -> Dict:
         """고변동성 체크"""
         volatility_mentions = []
+        keywords = ["고변동성", "변동성 증가", "volatility high", "high volatility"]
+        negations = ["없", "않", "아니", "not ", "no ", "낮"]
 
         for result in agent_results:
             reasoning = result.reasoning.lower()
 
-            # 고변동성 키워드 체크
-            if any(keyword in reasoning for keyword in ["고변동성", "변동성 증가", "volatility high", "high volatility"]):
-                volatility_mentions.append(result.agent_name)
+            # 고변동성 키워드 체크 — 같은 문장에 부정어가 있으면 제외
+            # ("고변동성 우려는 없음" 같은 문장의 오탐 방지)
+            for sentence in reasoning.replace("!", ".").replace("?", ".").split("."):
+                if any(k in sentence for k in keywords) and not any(n in sentence for n in negations):
+                    volatility_mentions.append(result.agent_name)
+                    break
 
         is_high_volatility = len(volatility_mentions) >= 2  # 2개 이상 에이전트가 언급하면 고변동성
 
@@ -756,8 +765,11 @@ class EnhancedDecisionMaker:
             # ml_scores는 signal 방향을 반영한 signed confidence(-10~10)이다.
             ml_contribution = (ml_avg / 2.0) * ml_weight
 
-        # 내부자 거래 신호 강화 (2배 가중치)
-        insider_contribution = insider_score * 2.0
+        # 내부자 거래 신호 강화.
+        # 주의: Event 에이전트 confidence(내부자 정보가 이미 반영된 판단)가
+        # event_contribution으로 별도 가산되므로 완전 독립 신호가 아니다.
+        # 이중 반영을 감안해 과거 2.0배 → 1.5배로 하향 (2026-07 감사).
+        insider_contribution = insider_score * 1.5
 
         # 도구 점수로 직접 반영되지 않던 에이전트 도메인을 별도 contribution으로 반영
         risk_contribution = self._avg_signed_score(risk_scores) * 0.7
