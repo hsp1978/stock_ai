@@ -759,20 +759,23 @@ class AnalysisTools:
         nearest_support = max(support_levels.values()) if support_levels else low_price
         nearest_resistance = min(resistance_levels.values()) if resistance_levels else high_price
 
+        # [대칭 설계] 과거 버전은 가산 분기만 있어 점수 범위가 [0,+5]로
+        # sell 신호가 도달 불가였다 (구조적 매수 편향). 되돌림 깊이를
+        # 추세 손상 정도로 해석해 대칭화한다.
         score = 0
-        # 핵심 레벨(0.382, 0.500, 0.618) 근처면 반등 가능성
+        # 핵심 레벨(0.382, 0.500, 0.618) 근처면 지지 반등 가능성
         for key_level in [0.382, 0.500, 0.618]:
             level_price = high_price - diff * key_level
             if abs(price - level_price) / price < 0.02:  # 2% 이내
-                score += 2  # 지지 레벨 근접 = 매수 기회
+                score += 2  # 지지 레벨 근접 = 반등 기회
                 break
 
         if retracement_pct < 0.236:
-            score += 2  # 고점 근처 = 강세
+            score += 3  # 얕은 되돌림 = 강한 추세 지속
         elif retracement_pct > 0.786:
-            score += 3  # 저점 근처 = 반등 기대
+            score -= 3  # 되돌림 78.6% 초과 = 추세 붕괴 임박 (저점 매수 편향 제거)
         elif retracement_pct > 0.618:
-            score += 1
+            score -= 1  # 깊은 되돌림 = 추세 약화
 
         score = max(-10, min(10, score))
         signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
@@ -848,17 +851,22 @@ class AnalysisTools:
         atr_20 = float(atr.tail(20).mean())
         vol_trend = "expanding" if atr_5 > atr_20 * 1.1 else ("contracting" if atr_5 < atr_20 * 0.9 else "stable")
 
+        # [비방향성 도구] 변동성 체제는 매수/매도 방향의 근거가 아니다.
+        # 과거 buy/sell 분기는 점수 범위({-2,0,+2})상 도달 불가한 죽은 코드였다.
+        # 신호는 항상 neutral로 명시하고, 점수는 리스크 컨텍스트(고변동 감점,
+        # 저변동 수축 = 브레이크아웃 대비 가점)로만 총점에 기여한다.
         score = 0
         if regime == "low_volatility" and vol_trend == "contracting":
-            score += 2  # 저변동성 수축 = 폭발 예고
+            score += 2  # 저변동성 수축 = 변동성 폭발 예고 (방향 중립적 기회)
         elif regime == "high_volatility":
-            score -= 2  # 고변동성 = 위험
+            score -= 2  # 고변동성 = 위험 컨텍스트
 
         score = max(-10, min(10, score))
-        signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
+        signal = "neutral"  # 방향성 판단 도구가 아님
 
         result.update({
             "signal": signal,
+            "directional": False,
             "score": round(score, 1),
             "current_atr": round(current_atr, 2),
             "atr_pct": round(atr_pct, 2),
@@ -955,8 +963,8 @@ class AnalysisTools:
             score += 5  # 극단적 저평가
         elif avg_z < -mid_threshold:
             score += 3
-        elif abs(avg_z) < 0.5:
-            score += 1  # 평균 근처 = 안정
+        # NOTE: 과거 '|z|<0.5 → +1' 가점은 방향 근거 없는 상시 양(+) 드리프트로
+        # 퀀트 총점을 부풀렸다 (2026-07 감사). 평균 근처는 0점이 맞다.
 
         # 실적 후 모드에서 점수 가중치 적용
         if post_earnings_mode:
@@ -1470,10 +1478,10 @@ class AnalysisTools:
         rf_annual = float(os.getenv("ANNUAL_RISK_FREE_RATE", "0.0"))
         rf_daily = rf_annual / 252
         excess_returns = returns - rf_daily
-        sharpe = float(excess_returns.mean() / returns.std() * np.sqrt(252)) if returns.std() > 0 else 0
+        # Sharpe 분모는 초과수익률 표준편차 (rf가 상수라 값은 동일하지만 정의에 맞춤)
+        sharpe = float(excess_returns.mean() / excess_returns.std() * np.sqrt(252)) if excess_returns.std() > 0 else 0
 
         # [개선 #3] 켈리 50% 이내 규칙 엄격 적용
-        kelly_half = kelly_full / 2  # 켈리의 50%
         kelly_cap = MAX_POSITION_PCT / 2  # MAX_POSITION_PCT의 50% (10%)
 
         # 켈리 50% 규칙과 절대 상한 적용
@@ -1550,17 +1558,28 @@ class AnalysisTools:
         })
         return result
 
+    @staticmethod
+    def _beta_benchmark_symbol(ticker: str) -> str:
+        """시장에 맞는 베타 벤치마크 심볼 (한국 종목을 SPY 대비로 재지 않는다)."""
+        upper = (ticker or "").upper()
+        if upper.endswith(".KS"):
+            return "^KS11"   # KOSPI
+        if upper.endswith(".KQ"):
+            return "^KQ11"   # KOSDAQ
+        return "SPY"
+
     def beta_correlation_analysis(self) -> dict:
-        """[퀀트8] 베타/상관관계 분석 - SPY 대비 베타, 알파, 상관계수"""
+        """[퀀트8] 베타/상관관계 분석 - 시장 벤치마크 대비 베타, 알파, 상관계수"""
         result = {"tool": "beta_correlation_analysis", "name": "베타/상관관계 분석"}
 
+        benchmark_symbol = self._beta_benchmark_symbol(self.ticker)
         try:
-            spy = yf.Ticker("SPY").history(period=DEFAULT_HISTORY_PERIOD)
+            spy = yf.Ticker(benchmark_symbol).history(period=DEFAULT_HISTORY_PERIOD)
             if spy.empty:
-                result.update({"signal": "neutral", "score": 0, "detail": "SPY 데이터 없음"})
+                result.update({"signal": "neutral", "score": 0, "detail": f"{benchmark_symbol} 데이터 없음"})
                 return result
         except Exception as e:
-            result.update({"signal": "neutral", "score": 0, "detail": f"SPY 수집 실패: {e}"})
+            result.update({"signal": "neutral", "score": 0, "detail": f"{benchmark_symbol} 수집 실패: {e}"})
             return result
 
         common_idx = self.df.index.intersection(spy.index)
@@ -1612,8 +1631,11 @@ class AnalysisTools:
         elif beta > 1.5:
             score -= 1
 
+        # IR 대칭 반영 (과거엔 +0.5 초과 가점만 있었음)
         if info_ratio > 0.5:
             score += 1
+        elif info_ratio < -0.5:
+            score -= 1
 
         score = max(-10, min(10, score))
         signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
@@ -1628,8 +1650,8 @@ class AnalysisTools:
             "r_squared": round(r_squared, 3),
             "tracking_error_pct": round(tracking_error * 100, 2),
             "information_ratio": round(info_ratio, 3),
-            "benchmark": "SPY",
-            "detail": f"β={beta:.2f}(60d:{beta_60d:.2f}), α={alpha_annual:.1%}, "
+            "benchmark": benchmark_symbol,
+            "detail": f"β={beta:.2f}(60d:{beta_60d:.2f}, vs {benchmark_symbol}), α={alpha_annual:.1%}, "
                        f"상관={correlation:.2f}, IR={info_ratio:.2f}"
         })
         return result
