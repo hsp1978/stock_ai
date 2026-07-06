@@ -876,7 +876,11 @@ class AnalysisTools:
             "annualized_volatility": round(annualized_vol, 2),
             "daily_volatility": round(daily_vol_pct, 4),
             "vol_label": vol_label,
-            "detail": f"ATR%={atr_pct:.2f}%, 연환산={annualized_vol:.1f}% ({vol_label}), 체제={regime}, 추이={vol_trend}"
+            # 라벨 기준 명시: vol_label은 절대 기준(S&P 평균 15-20% 대비 연환산),
+            # regime은 상대 기준(자기 이력 ATR% 퍼센타일). 둘이 상충해 보일 수 있어
+            # ("고변동성"인데 "low_volatility") 기준을 표기한다.
+            "detail": f"ATR%={atr_pct:.2f}%, 연환산={annualized_vol:.1f}% (절대기준: {vol_label}), "
+                      f"체제={regime} (상대기준: 자기 이력 ATR 퍼센타일 {percentile:.0f}%), 추이={vol_trend}"
         })
         return result
 

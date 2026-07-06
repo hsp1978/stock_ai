@@ -80,6 +80,9 @@ def test_volatility_regime_is_explicitly_non_directional():
 
     assert result["signal"] == "neutral"
     assert result.get("directional") is False
+    # 절대(연환산) vs 상대(퍼센타일) 라벨 기준 명시 확인
+    assert "절대기준" in result["detail"]
+    assert "상대기준" in result["detail"]
 
 
 # ── 평균회귀 드리프트 제거 ───────────────────────────────────
