@@ -615,6 +615,13 @@ def build_data_health(tickers: list[str] | None = None) -> dict:
         elif severity == "degraded":
             degraded.append(row)
 
+    # signal_outcomes 추적 파이프라인 생존 체크 (2026-07 무기록 버그 재발 감지)
+    try:
+        from signal_tracker import get_tracking_health
+        signal_tracking = get_tracking_health()
+    except Exception as exc:
+        signal_tracking = {"status": "unknown", "error": str(exc)[:120]}
+
     if not target_tickers:
         status = "empty"
     elif stale:
@@ -623,6 +630,10 @@ def build_data_health(tickers: list[str] | None = None) -> dict:
         status = "degraded"
     else:
         status = "ok"
+
+    # 방향성 신호가 났는데 추적 기록이 0이면 데이터 헬스 강등
+    if signal_tracking.get("status") == "silent" and status == "ok":
+        status = "degraded"
 
     payload = {
         "status": status,
@@ -634,6 +645,7 @@ def build_data_health(tickers: list[str] | None = None) -> dict:
         "stale": stale[:20],
         "degraded": degraded[:20],
         "rows": rows,
+        "signal_tracking": signal_tracking,
         "cache": {
             "market_data": cache_status,
             "news": news_status,
