@@ -127,6 +127,51 @@ def _outcome_label(return_pct: float, signal: str) -> str:
     return "loss"
 
 
+def get_tracking_health(days_back: int = 7) -> Dict:
+    """signal_outcomes 기록 파이프라인 생존 확인.
+
+    2026-07 감사에서 83일간 무기록 버그(중첩 키·가격 부재)가 무음으로
+    방치된 재발 방지용. 방향성 신호(스캔 BUY/SELL)가 발생했는데 최근
+    outcomes가 0건이면 'silent'로 판정한다.
+
+    Returns:
+        {status: ok|silent|no_signals, outcomes_recent, directional_scans_recent, days_back}
+    """
+    import sqlite3
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
+    conn = _get_conn()
+    try:
+        outcomes = conn.execute(
+            "SELECT COUNT(*) FROM signal_outcomes WHERE issued_at >= ?", (cutoff,)
+        ).fetchone()[0]
+        try:
+            directional_scans = conn.execute(
+                "SELECT COUNT(*) FROM scan_log "
+                "WHERE UPPER(signal) IN ('BUY', 'SELL') AND scanned_at >= ?",
+                (cutoff,),
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            # scan_log 테이블이 없는 환경(테스트 등)에서는 판정 불가
+            directional_scans = None
+    finally:
+        conn.close()
+
+    if outcomes > 0:
+        status = "ok"
+    elif directional_scans:
+        status = "silent"  # 신호는 발생했는데 기록 0 → 추적 파이프라인 사망 의심
+    else:
+        status = "no_signals"  # 방향성 신호 자체가 없었음 (정상 가능)
+
+    return {
+        "status": status,
+        "outcomes_recent": outcomes,
+        "directional_scans_recent": directional_scans,
+        "days_back": days_back,
+    }
+
+
 def evaluate_past_signals(days_back: int = 45, limit: int = 500) -> Dict:
     """
     과거 signal_outcomes 레코드를 순회하여 실제 수익률을 갱신.
