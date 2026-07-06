@@ -1293,6 +1293,37 @@ def _run_multi_agent_batch_impl(tickers: "list[str] | None" = None) -> dict:
     return summary
 
 
+def _format_batch_summary(summary: dict) -> str:
+    """V2 배치 결과 텔레그램 요약 텍스트 (HTML)."""
+    signals = summary.get("signals") or {}
+    icon = {"buy": "🟢", "sell": "🔴", "neutral": "⚪"}
+    lines = [
+        f"<b>📊 Multi-Agent 일일 배치</b> ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
+        f"성공 {summary.get('succeeded', 0)} / 실패 {summary.get('failed', 0)}",
+        "",
+    ]
+    directional = []
+    neutral_tickers = []
+    for ticker, info in signals.items():
+        sig = (info.get("signal") or "neutral").lower()
+        conf = info.get("confidence")
+        conf_str = f"{conf:.1f}" if isinstance(conf, (int, float)) else "?"
+        if sig in ("buy", "sell"):
+            directional.append(f"{icon.get(sig, '⚪')} <b>{ticker}</b>: {sig.upper()} ({conf_str}/10)")
+        else:
+            neutral_tickers.append(ticker)
+    if directional:
+        lines.extend(directional)
+    else:
+        lines.append("방향성 신호 없음 — 전 종목 관망")
+    if neutral_tickers:
+        lines.append(f"⚪ 관망: {', '.join(neutral_tickers)}")
+    errors = summary.get("errors") or {}
+    if errors:
+        lines.append(f"⚠️ 실패: {', '.join(errors.keys())}")
+    return "\n".join(lines)
+
+
 def run_multi_agent_batch(tickers: "list[str] | None" = None) -> dict:
     """일일 멀티에이전트 배치 wrapper: job 상태와 장애 알림을 기록한다."""
     started_at = _record_job_start("multi_agent_batch", _KNOWN_OPS_JOBS["multi_agent_batch"])
@@ -1306,6 +1337,12 @@ def run_multi_agent_batch(tickers: "list[str] | None" = None) -> dict:
             )
         else:
             _record_job_success("multi_agent_batch", started_at, result)
+        # 아침 요약 알림 (텔레그램 미설정/전송 실패는 배치 결과에 영향 없음)
+        if isinstance(result, dict) and result.get("status") != "skipped":
+            try:
+                send_telegram(_format_batch_summary(result))
+            except Exception as exc:
+                print(f"  [batch] 텔레그램 요약 전송 실패: {exc}")
         return result
     except Exception as exc:
         _record_job_error("multi_agent_batch", started_at, exc)
