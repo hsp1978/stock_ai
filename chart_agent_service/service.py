@@ -91,21 +91,73 @@ except ImportError:
     print("[WARNING] Multi-Agent module not available")
 
 
+def _resolve_signal_price(ticker: str, *results: dict) -> float:
+    """신호 기록용 현재가 해석.
+
+    스캔/멀티에이전트 결과 dict에는 가격 키가 없는 경우가 대부분이라
+    (2026-07 감사: 이 때문에 83일간 signal_outcomes 0행), 결과 dict 탐색 후
+    OHLCV 캐시로 폴백한다 (분석 직후라 캐시가 따뜻함).
+    """
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        candidates = [result.get("current_price"), result.get("price")]
+        entry_plan = result.get("entry_plan") or {}
+        if isinstance(entry_plan, dict):
+            candidates.append(entry_plan.get("limit_price"))
+        for raw in candidates:
+            try:
+                value = float(raw or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+    try:
+        df = fetch_ohlcv(ticker)
+        if df is not None and len(df):
+            return float(df["Close"].iloc[-1])
+    except Exception:
+        pass
+    return 0.0
+
+
 def _try_insert_group_outcomes(ticker: str, result: dict) -> None:
-    """multi-agent 결과의 그룹별 신호를 signal_outcomes에 개별 row로 기록한다."""
-    group_results: dict = result.get("group_results") or {}
-    if not group_results:
-        return
-    price = float(
-        result.get("current_price")
-        or result.get("price")
-        or 0.0
-    )
+    """multi-agent 결과의 최종 신호 + 그룹별 신호를 signal_outcomes에 기록한다.
+
+    주의: group_results/regime/signal_std 등은 orchestrator 결과의 최상위가
+    아니라 final_decision 안에 중첩돼 있다. 과거 최상위 조회 + 가격 키 부재의
+    이중 버그로 83일간 한 건도 기록되지 않았다 (2026-07 감사).
+    """
+    fd = result.get("final_decision") or {}
+    group_results: dict = fd.get("group_results") or result.get("group_results") or {}
+
+    price = _resolve_signal_price(ticker, result, fd)
     if price <= 0:
+        print(f"  [{ticker}] signal_outcome 기록 불가: 가격 해석 실패")
         return
-    regime = result.get("regime")
-    signal_std = result.get("signal_std")
-    agreement_level = result.get("agreement_level")
+
+    regime = fd.get("regime") or result.get("regime")
+    signal_std = fd.get("signal_std", result.get("signal_std"))
+    agreement_level = fd.get("agreement_level") or result.get("agreement_level")
+
+    # V2 최종 신호 기록 — 60일 hit-rate 검증의 1차 대상 (과거엔 그룹만 기록돼
+    # 정작 매매 신호 자체가 추적되지 않았다)
+    final_signal = (fd.get("final_signal") or "neutral").lower()
+    if final_signal in ("buy", "sell"):
+        try:
+            insert_signal_outcome(
+                ticker=ticker,
+                signal_type=final_signal,
+                signal_source="multi_agent_final",
+                conviction=float(fd.get("final_confidence") or 0.0),
+                price_at_signal=price,
+                regime=regime,
+                signal_std=signal_std,
+                agreement_level=agreement_level,
+            )
+        except Exception as exc:
+            print(f"  [{ticker}] final_outcome insert 실패: {exc}")
+
     for group_name, gr in group_results.items():
         signal = gr.get("signal", "neutral")
         if signal not in ("buy", "sell"):
@@ -131,13 +183,9 @@ def _try_insert_signal_outcome(ticker: str, result: dict) -> None:
         signal = (result.get("final_signal") or "HOLD").upper()
         if signal not in ("BUY", "SELL"):
             return
-        price = float(
-            result.get("current_price")
-            or result.get("price")
-            or (result.get("entry_plan") or {}).get("limit_price")
-            or 0.0
-        )
+        price = _resolve_signal_price(ticker, result)
         if price <= 0:
+            print(f"  [{ticker}] signal_outcome 기록 불가: 가격 해석 실패")
             return
         insert_signal_outcome(
             ticker=ticker,
