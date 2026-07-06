@@ -85,8 +85,12 @@ class Settings(BaseSettings):
 
     WATCHLIST: str = ""
 
-    BUY_THRESHOLD: float = 5.0
-    SELL_THRESHOLD: float = -5.0
+    # 알림 임계값 — composite score는 '방향성 도구 평균' 스케일 (실효 ±3).
+    # 과거 ±5.0은 도구 점수 '합계' 스케일 기준이라 정규화 이후 도달 불가
+    # (83일 실측 [-1.4, +2.2], 알림 0건 — 2026-07 진단). 신호 결정 임계
+    # (BUY: avg>+2, SELL: avg<-2)보다 느슨하게 잡아 신호 결정이 binding이 되게 한다.
+    BUY_THRESHOLD: float = 1.5
+    SELL_THRESHOLD: float = -1.0
     MIN_CONFIDENCE: float = 5.0
 
     TRADING_STYLE: Literal["scalping", "swing", "longterm"] = "swing"
