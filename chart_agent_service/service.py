@@ -49,6 +49,7 @@ from config import (
     CORPORATE_ACTION_CHECK_HOUR, CORPORATE_ACTION_CHECK_MINUTE,
     DATA_HEALTH_CHECK_MINUTES, DATA_HEALTH_ALERT_STALE_HOURS,
     OPS_ALERT_DEDUPE_MINUTES, DEFAULT_HISTORY_PERIOD,
+    MULTI_AGENT_BATCH_ENABLED, MULTI_AGENT_BATCH_HOUR, MULTI_AGENT_BATCH_MINUTE,
 )
 from safety.kill_switch import KillSwitchASGIMiddleware
 from data_collector import (
@@ -237,6 +238,7 @@ _KNOWN_OPS_JOBS = {
     "daily_signal_validation": "Signal Validation",
     "corporate_actions": "Corporate Actions",
     "data_health_check": "Data Health Check",
+    "multi_agent_batch": "Multi-Agent Batch",
 }
 
 
@@ -1245,6 +1247,71 @@ def run_signal_validation():
     return result
 
 
+def _run_multi_agent_batch_impl(tickers: "list[str] | None" = None) -> dict:
+    """워치리스트 전 종목 멀티에이전트(V2) 분석 + signal_outcomes 기록.
+
+    signal_outcomes 표본 자동 축적용 일일 배치. 종목별 실패는 건너뛰고
+    계속 진행한다 (부분 실패가 전체 배치를 죽이지 않도록).
+    """
+    if MultiAgentOrchestrator is None:
+        return {"status": "skipped", "reason": "multi-agent module unavailable"}
+
+    targets = tickers or _load_watchlist_files()
+    summary: dict = {
+        "status": "completed",
+        "processed": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "signals": {},
+        "errors": {},
+    }
+    print(f"\n{'='*60}")
+    print(f"  Multi-Agent 배치 시작: {datetime.now().strftime('%Y-%m-%d %H:%M')} — {len(targets)}종목")
+    print(f"{'='*60}\n")
+
+    for ticker in targets:
+        summary["processed"] += 1
+        try:
+            orchestrator = MultiAgentOrchestrator()
+            result = orchestrator.analyze(ticker)
+            _try_insert_group_outcomes(ticker, result)
+            fd = result.get("final_decision") or {}
+            summary["signals"][ticker] = {
+                "signal": fd.get("final_signal"),
+                "confidence": fd.get("final_confidence"),
+            }
+            summary["succeeded"] += 1
+            print(f"  [{ticker}] V2 배치 완료: {fd.get('final_signal')} ({fd.get('final_confidence')})")
+        except Exception as exc:
+            summary["failed"] += 1
+            summary["errors"][ticker] = str(exc)[:200]
+            print(f"  [{ticker}] V2 배치 실패: {exc}")
+
+    if summary["failed"] and not summary["succeeded"]:
+        summary["status"] = "error"
+    print(f"\n  Multi-Agent 배치 종료: 성공 {summary['succeeded']} / 실패 {summary['failed']}\n")
+    return summary
+
+
+def run_multi_agent_batch(tickers: "list[str] | None" = None) -> dict:
+    """일일 멀티에이전트 배치 wrapper: job 상태와 장애 알림을 기록한다."""
+    started_at = _record_job_start("multi_agent_batch", _KNOWN_OPS_JOBS["multi_agent_batch"])
+    try:
+        result = _run_multi_agent_batch_impl(tickers)
+        if isinstance(result, dict) and result.get("status") == "error":
+            _record_job_error(
+                "multi_agent_batch",
+                started_at,
+                RuntimeError(f"multi-agent batch all failed: {result.get('errors')}"),
+            )
+        else:
+            _record_job_success("multi_agent_batch", started_at, result)
+        return result
+    except Exception as exc:
+        _record_job_error("multi_agent_batch", started_at, exc)
+        raise
+
+
 def run_corporate_action_adjustment(force: bool = False) -> dict:
     """페이퍼 포지션의 액면분할/배당 조정을 실행하고 job 상태를 기록한다."""
     started_at = _record_job_start("corporate_actions", _KNOWN_OPS_JOBS["corporate_actions"])
@@ -1327,6 +1394,15 @@ def _start_background_scheduler(run_initial_scan: bool = False) -> None:
         id='data_health_check',
         replace_existing=True,
     )
+    if MULTI_AGENT_BATCH_ENABLED:
+        scheduler.add_job(
+            run_multi_agent_batch,
+            'cron',
+            hour=MULTI_AGENT_BATCH_HOUR,
+            minute=MULTI_AGENT_BATCH_MINUTE,
+            id='multi_agent_batch',
+            replace_existing=True,
+        )
     scheduler.start()
     _SCHEDULER = scheduler
     print(f"[스케줄러] {SCAN_INTERVAL_MINUTES}분 간격 스캔 등록 완료")
@@ -1685,6 +1761,8 @@ def ops_run_job(job_id: str, force: bool = False):
         return run_corporate_action_adjustment(force=force)
     if normalized in {"data_health_check", "data_health"}:
         return run_data_health_check()
+    if normalized in {"multi_agent_batch", "multi_agent"}:
+        return run_multi_agent_batch()
     raise HTTPException(404, f"Unknown ops job: {job_id}")
 
 
