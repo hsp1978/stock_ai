@@ -96,6 +96,9 @@ class Settings(BaseSettings):
     TRADING_STYLE: Literal["scalping", "swing", "longterm"] = "swing"
 
     ACCOUNT_SIZE: float = Field(default=100000, gt=0)
+    # 한국(KRW) 종목용 계좌 규모 — ACCOUNT_SIZE(USD 스케일)를 KRW 종목에 그대로 쓰면
+    # 리스크 예산이 ~1,000원이 되어 고가 종목 백테스트 수량이 항상 0이 된다 (2026-07 진단).
+    ACCOUNT_SIZE_KRW: float = Field(default=100_000_000, gt=0)
     RISK_PER_TRADE_PCT: float = Field(default=1.0, ge=0, le=100)
     MAX_POSITION_PCT: float = Field(default=20.0, ge=0, le=100)
     TAKE_PROFIT_RR_RATIO: float = Field(default=2.0, gt=0)
@@ -291,6 +294,7 @@ MACD_SLOW = 26
 MACD_SIGNAL = 9
 
 ACCOUNT_SIZE = settings.ACCOUNT_SIZE
+ACCOUNT_SIZE_KRW = settings.ACCOUNT_SIZE_KRW
 RISK_PER_TRADE_PCT = settings.RISK_PER_TRADE_PCT
 MAX_POSITION_PCT = settings.MAX_POSITION_PCT
 TAKE_PROFIT_RR_RATIO = settings.TAKE_PROFIT_RR_RATIO
