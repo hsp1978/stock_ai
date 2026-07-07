@@ -11,13 +11,26 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 
 from config import (
-    SMA_PERIODS, RSI_PERIOD, ACCOUNT_SIZE,
+    SMA_PERIODS, RSI_PERIOD, ACCOUNT_SIZE, ACCOUNT_SIZE_KRW,
     RISK_PER_TRADE_PCT, ATR_STOP_MULTIPLIER, TAKE_PROFIT_RR_RATIO,
     BOLLINGER_PERIOD, BOLLINGER_STD,
     RSI_OVERSOLD, RSI_OVERBOUGHT,
 )
 from trading_costs import TradingCosts
 from tick_size import round_to_tick
+
+
+def _account_size_for(ticker: str) -> float:
+    """티커 통화에 맞는 계좌 규모.
+
+    ACCOUNT_SIZE(USD 스케일)를 KRW 종목에 그대로 쓰면 리스크 예산이 ~1,000원이
+    되어 호가 수만원대 종목의 수량이 항상 0으로 잘린다 (2026-07 진단: 워치리스트
+    KR 고가 4종목이 전 전략 무거래).
+    """
+    upper = (ticker or "").upper()
+    if upper.endswith(".KS") or upper.endswith(".KQ"):
+        return ACCOUNT_SIZE_KRW
+    return ACCOUNT_SIZE
 
 
 EXECUTION_MODEL_NOTE = (
@@ -202,7 +215,7 @@ def _run_long_only_state_machine(
     exit_flags = exit_signal.reindex(df.index, fill_value=False).to_numpy(dtype=bool, copy=False)
     index = df.index
 
-    cash = ACCOUNT_SIZE
+    cash = _account_size_for(ticker)
     position = 0
     entry_price = 0.0
     entry_date = None
@@ -341,7 +354,7 @@ def backtest_composite_signal(ticker: str, df: pd.DataFrame, tool_results: list,
 
     # tool_results는 현재 시점 1회 실행 결과다. 이를 과거 봉마다 재사용하면
     # 미래 정보를 과거에 주입하는 look-ahead bias가 되므로 거래 재현을 하지 않는다.
-    equity_series = pd.Series([ACCOUNT_SIZE] * len(df), index=df.index)
+    equity_series = pd.Series([_account_size_for(ticker)] * len(df), index=df.index)
     result = _compute_stats(equity_series, [], "Composite_Signal_CurrentOnly", ticker)
     result.trading_costs = costs.to_dict()
     result.notes.append(
