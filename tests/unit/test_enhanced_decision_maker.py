@@ -272,6 +272,73 @@ def test_group_direction_real_conflict_still_reported():
     assert tech_dir != quant_dir
 
 
+def _strength_dirs(tech_dir="neutral", quant_dir="neutral"):
+    return {
+        "technical": {"direction": tech_dir},
+        "quantitative": {"direction": quant_dir},
+    }
+
+
+def test_vote_conflict_reported_on_meaningful_split():
+    """매수/매도 표가 공존하고 소수 가중치가 유의미하면 충돌로 보고된다."""
+    dm = EnhancedDecisionMaker()
+    conflicts = dm._detect_vote_conflicts(
+        {"buy": 3, "sell": 2, "neutral": 1},
+        {"buy": 18.0, "sell": 11.0, "neutral": 4.0},
+        _strength_dirs(),
+    )
+    assert conflicts
+    assert "표결 분열" in conflicts[0]
+    assert "매수 3명" in conflicts[0] and "매도 2명" in conflicts[0]
+
+
+def test_lone_weak_dissenter_is_not_a_conflict():
+    """강한 다수 vs 약한 단일 반대(가중 비율 < 25%)는 충돌로 판정하지 않는다."""
+    dm = EnhancedDecisionMaker()
+    conflicts = dm._detect_vote_conflicts(
+        {"buy": 3, "sell": 1, "neutral": 0},
+        {"buy": 24.0, "sell": 3.0, "neutral": 0.0},  # 3/24 = 0.125 < 0.25
+        _strength_dirs(),
+    )
+    assert conflicts == []
+
+
+def test_strong_dissenter_is_a_conflict():
+    """소수라도 신뢰도가 높으면(가중 비율 >= 25%) 충돌로 본다."""
+    dm = EnhancedDecisionMaker()
+    conflicts = dm._detect_vote_conflicts(
+        {"buy": 2, "sell": 1, "neutral": 0},
+        {"buy": 10.0, "sell": 9.0, "neutral": 0.0},  # 9/10 = 0.9 >= 0.25
+        _strength_dirs(),
+    )
+    assert conflicts
+    assert "표결 분열" in conflicts[0]
+
+
+def test_no_conflict_when_one_direction_absent():
+    """한 방향(매도) 표가 없으면 도구 방향이 엇갈려도 충돌 아님 — 구 오탐 회귀 방지."""
+    dm = EnhancedDecisionMaker()
+    conflicts = dm._detect_vote_conflicts(
+        {"buy": 2, "sell": 0, "neutral": 3},
+        {"buy": 12.0, "sell": 0.0, "neutral": 6.0},
+        _strength_dirs(tech_dir="buy", quant_dir="sell"),  # 도구 부호는 엇갈리지만
+    )
+    assert conflicts == []
+
+
+def test_tech_quant_mismatch_attached_only_as_evidence():
+    """표결 충돌이 실재할 때만 기술 vs 퀀트 방향 불일치가 근거로 부기된다."""
+    dm = EnhancedDecisionMaker()
+    conflicts = dm._detect_vote_conflicts(
+        {"buy": 2, "sell": 2, "neutral": 0},
+        {"buy": 12.0, "sell": 11.0, "neutral": 0.0},
+        _strength_dirs(tech_dir="buy", quant_dir="sell"),
+    )
+    assert len(conflicts) == 2
+    assert "표결 분열" in conflicts[0]
+    assert "기술적(buy) vs 퀀트(sell)" in conflicts[1]
+
+
 def test_final_decision_includes_shared_decision_context(monkeypatch):
     dm = _quiet_dm(monkeypatch)
 
