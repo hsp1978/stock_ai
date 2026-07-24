@@ -728,13 +728,26 @@ class EnhancedDecisionMaker:
         fundamental_scores = fundamental_scores or []
         macro_scores = macro_scores or []
 
+        # 그룹 방향 판정 데드존 (±2). 개별 도구가 buy/sell로 전환되는 임계값(|score|>2,
+        # analysis_tools)과 동일하게 맞춘다. 데드존 없이 부호(>0/<0)만 쓰면 노이즈 수준의
+        # 미세 합계(예: 기술 +0.8 vs 퀀트 -0.5, 개별 도구는 전부 neutral)도 방향이
+        # buy/sell로 확정되어 "기술적 vs 퀀트 충돌"이 대부분의 분석에 상시 노출된다.
+        DEADZONE = 2.0
+
+        def _group_direction(total_score: float) -> str:
+            if total_score > DEADZONE:
+                return "buy"
+            if total_score < -DEADZONE:
+                return "sell"
+            return "neutral"
+
         # 기술적 분석 강도
         tech_strength = tech_analysis["avg_strength"]
-        tech_direction = "buy" if tech_analysis["total_score"] > 0 else "sell" if tech_analysis["total_score"] < 0 else "neutral"
+        tech_direction = _group_direction(tech_analysis["total_score"])
 
         # 퀀트 분석 강도
         quant_strength = quant_analysis["avg_strength"]
-        quant_direction = "buy" if quant_analysis["total_score"] > 0 else "sell" if quant_analysis["total_score"] < 0 else "neutral"
+        quant_direction = _group_direction(quant_analysis["total_score"])
 
         # ML 가중치 조정 (정확도 기반 - 50% 미만은 무시)
         ml_weight = 1.0  # 기본 가중치

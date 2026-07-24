@@ -211,6 +211,67 @@ def test_reflect_guard_downgrades_final_signal_on_three_group_conflict(monkeypat
     assert "REFLECT_INCONSISTENT_3_SELL_VS_FINAL_BUY" in output["reflect_flags"]
 
 
+def _tech_quant_directions(dm, tech_score, quant_score):
+    """Run _calculate_signal_strength with only tech/quant tool sums set."""
+    tech_analysis = {
+        "total_score": tech_score,
+        "buy_count": 0,
+        "sell_count": 0,
+        "neutral_count": 0,
+        "avg_strength": abs(tech_score),
+    }
+    quant_analysis = {
+        "total_score": quant_score,
+        "buy_count": 0,
+        "sell_count": 0,
+        "neutral_count": 0,
+        "avg_strength": abs(quant_score),
+    }
+    strength = dm._calculate_signal_strength(
+        tech_analysis, quant_analysis,
+        risk_scores=[], ml_scores=[], event_scores=[],
+    )
+    return strength["technical"]["direction"], strength["quantitative"]["direction"]
+
+
+def test_group_direction_deadzone_suppresses_noise_conflict():
+    """미세한 반대 부호(±2 이내)는 방향 neutral → 기술/퀀트 충돌로 판정되지 않는다."""
+    dm = EnhancedDecisionMaker()
+
+    # 개별 도구는 전부 neutral(|score|<=2)인데 합계만 미세하게 엇갈리는 상황
+    tech_dir, quant_dir = _tech_quant_directions(dm, tech_score=0.8, quant_score=-0.5)
+    assert tech_dir == "neutral"
+    assert quant_dir == "neutral"
+
+    conflicts = []
+    if tech_dir != quant_dir and tech_dir != "neutral" and quant_dir != "neutral":
+        conflicts.append("충돌")
+    assert conflicts == []
+
+
+def test_group_direction_deadzone_boundary_is_exclusive():
+    """정확히 ±2는 데드존 안(neutral), 초과해야 방향이 확정된다."""
+    dm = EnhancedDecisionMaker()
+
+    at_boundary_tech, at_boundary_quant = _tech_quant_directions(dm, 2.0, -2.0)
+    assert at_boundary_tech == "neutral"
+    assert at_boundary_quant == "neutral"
+
+    beyond_tech, beyond_quant = _tech_quant_directions(dm, 2.1, -2.1)
+    assert beyond_tech == "buy"
+    assert beyond_quant == "sell"
+
+
+def test_group_direction_real_conflict_still_reported():
+    """양쪽 모두 데드존 초과로 뚜렷이 엇갈리면 충돌은 그대로 유지된다."""
+    dm = EnhancedDecisionMaker()
+
+    tech_dir, quant_dir = _tech_quant_directions(dm, tech_score=8.0, quant_score=-7.0)
+    assert tech_dir == "buy"
+    assert quant_dir == "sell"
+    assert tech_dir != quant_dir
+
+
 def test_final_decision_includes_shared_decision_context(monkeypatch):
     dm = _quiet_dm(monkeypatch)
 
