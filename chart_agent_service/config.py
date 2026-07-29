@@ -163,7 +163,18 @@ class Settings(BaseSettings):
     OHLCV_RETRY_COUNT: int = Field(default=3, ge=1, le=10)
     YFINANCE_TIMEOUT: int = Field(default=8, ge=1, le=60)
     FUNDAMENTAL_TTL_HOURS: float = Field(default=12.0, ge=0)
-    NEWS_TTL_MINUTES: int = Field(default=30, ge=1)
+    # 뉴스 캐시의 유일한 정기 writer는 일 1회 multi_agent_batch다. TTL 30분은
+    # 배치 직후 30분만 fresh이고 나머지 23.5시간은 항상 stale로 잡혀 health
+    # 리포트가 상시 빨간불이었다. EOD 1일 1회 분석 주기에 맞춰 24시간으로 정렬.
+    NEWS_TTL_MINUTES: int = Field(default=1440, ge=1)
+
+    # ── 뉴스 감성 분석 예산 (LLM 폴백 시 무한 대기 방지) ──────────────
+    # Gemini 쿼터 소진 등으로 Ollama 폴백이 발생하면 호출당 200s+가 걸린다.
+    # 기사 15건 순차 처리 시 ~50분이 소요되어 /news 엔드포인트가 사실상
+    # 무응답이 되므로, 전체 예산·동시성·분석 건수로 상한을 건다.
+    NEWS_SENTIMENT_BUDGET_SEC: float = Field(default=90.0, ge=1.0, le=600.0)
+    NEWS_SENTIMENT_MAX_ARTICLES: int = Field(default=8, ge=1, le=50)
+    NEWS_SENTIMENT_WORKERS: int = Field(default=4, ge=1, le=16)
 
     # ── GlobalKillSwitch 임계값 ─────────────────────────────────────
     DAILY_LOSS_LIMIT_ALERT_PCT: float = Field(default=2.0, ge=0)

@@ -11,6 +11,7 @@ LiteLLM Router + circuit breaker + Structured output 단위 테스트 (Step 9)
 
 import os
 import sys
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,9 +19,12 @@ import pytest
 _AGENT_DIR = os.path.join(os.path.dirname(__file__), "../../chart_agent_service")
 if _AGENT_DIR not in sys.path:  # noqa: E402
     sys.path.insert(0, _AGENT_DIR)
+# stock_analyzer는 dual_node_config용으로만 필요하다. insert(0)으로 넣으면
+# 동명 모듈(news_analyzer)이 chart_agent_service 쪽을 가려 다른 테스트 파일이
+# 실행 순서에 따라 깨진다. 우선순위를 뺏지 않도록 뒤에 붙인다.
 _ANALYZER_DIR = os.path.join(os.path.dirname(__file__), "../../stock_analyzer")
 if _ANALYZER_DIR not in sys.path:  # noqa: E402
-    sys.path.insert(0, _ANALYZER_DIR)
+    sys.path.append(_ANALYZER_DIR)
 
 from llm.schemas import AgentLLMResponse, NewsSentimentResponse  # noqa: E402
 
@@ -185,7 +189,10 @@ def test_call_agent_llm_passes_timeout_to_router_completion():
         )
 
     assert result.signal == "buy"
-    assert mock_router.completion.call_args.kwargs["timeout"] == 3.2
+    # timeout_seconds는 호출 전체의 예산이므로 진입 시 고정한 deadline에서
+    # 남은 시간을 잘라 넘긴다. 예산을 넘지 않으면서 그에 근접해야 한다.
+    passed = mock_router.completion.call_args.kwargs["timeout"]
+    assert 3.0 < passed <= 3.2
 
 
 def test_call_agent_llm_caps_ollama_timeout(monkeypatch):
@@ -211,6 +218,46 @@ def test_call_agent_llm_caps_ollama_timeout(monkeypatch):
 
     assert result.signal == "buy"
     assert mock_router.completion.call_args.kwargs["timeout"] == 42
+
+
+def test_call_agent_llm_budget_not_multiplied_across_fallbacks():
+    """timeout_seconds는 호출 전체 예산 — 모델 폴백마다 다시 부여되지 않는다."""
+    import dual_node_config
+    from llm.router import call_agent_llm
+
+    dual_node_config.reset_node_cooldowns()
+
+    budget = 3.0
+    mock_router = MagicMock()
+    timeouts = []
+
+    def _completion(*args, **kwargs):
+        timeouts.append(kwargs.get("timeout"))
+        # 후보 모델마다 예산을 1초씩 소모하며 실패 → 다음 후보로 폴백
+        time.sleep(1.0)
+        raise RuntimeError("upstream unavailable")
+
+    mock_router.completion.side_effect = _completion
+
+    started = time.monotonic()
+    with patch(
+        "llm.router.call_with_breaker", side_effect=lambda fn, *a, **kw: fn(*a, **kw)
+    ):
+        call_agent_llm(
+            mock_router,
+            "Technical Analyst",
+            "analyze AAPL",
+            timeout_seconds=budget,
+        )
+    elapsed = time.monotonic() - started
+
+    assert len(timeouts) >= 2, "폴백이 최소 1회는 일어나야 의미 있는 검증"
+    # 핵심: 폴백마다 예산이 차감된다. 예전처럼 매번 budget을 그대로 주면
+    # timeouts가 [3.0, 3.0, 3.0]으로 평평해져 이 단조감소 검증에 걸린다.
+    assert timeouts == sorted(timeouts, reverse=True), timeouts
+    assert timeouts[0] > timeouts[-1], timeouts
+    assert all(t <= budget for t in timeouts), timeouts
+    assert elapsed < budget + 1.0, f"예산 {budget}s 대비 과다 소요: {elapsed:.2f}s"
 
 
 def test_call_agent_llm_respects_ollama_preference():
