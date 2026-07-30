@@ -11,14 +11,31 @@ _AGENT_DIR = os.path.join(os.path.dirname(__file__), "../../chart_agent_service"
 if _AGENT_DIR not in sys.path:  # noqa: E402
     sys.path.insert(0, _AGENT_DIR)
 
+import config  # noqa: E402
 import service  # noqa: E402
 
 
-def test_thresholds_are_reachable_on_composite_scale():
-    """임계값이 신호 결정 컷(BUY avg>+2 / SELL avg<-2)보다 느슨해야
-    신호 발생 시 알림 게이트가 차단하지 않는다."""
-    assert service.BUY_THRESHOLD <= 2.0, "BUY 알림 임계가 신호 결정 컷(+2)보다 엄격하면 알림 불가"
-    assert service.SELL_THRESHOLD >= -2.0, "SELL 알림 임계가 신호 결정 컷(-2)보다 엄격하면 알림 불가"
+def test_alert_thresholds_looser_than_signal_thresholds():
+    """알림 임계는 신호 판정 임계보다 느슨해야 한다 — 더 엄격하면
+    BUY/SELL로 판정된 신호가 통보 없이 사라진다 (하드코딩 금지: 상수 비교)."""
+    assert service.BUY_THRESHOLD <= config.SIGNAL_BUY_THRESHOLD, (
+        f"BUY 알림 임계({service.BUY_THRESHOLD})가 신호 판정 컷"
+        f"({config.SIGNAL_BUY_THRESHOLD})보다 엄격하면 알림 불가"
+    )
+    assert service.SELL_THRESHOLD >= config.SIGNAL_SELL_THRESHOLD, (
+        f"SELL 알림 임계({service.SELL_THRESHOLD})가 신호 판정 컷"
+        f"({config.SIGNAL_SELL_THRESHOLD})보다 엄격하면 알림 불가"
+    )
+
+
+def test_signal_thresholds_reachable_on_composite_scale():
+    """신호 판정 임계가 '도구 평균' 실측 범위 안에 있어야 한다.
+
+    2026-07-30 진단: ±2.0은 도구 점수 '합계' 스케일 잔재로, 실측
+    [-1.00, +2.04](26,041 스캔) 기준 BUY 40일 1건 / SELL 도달 불가였다.
+    """
+    assert config.SIGNAL_BUY_THRESHOLD <= 1.5, "BUY 판정 컷이 실측 p95(+1.37) 위면 사실상 무신호"
+    assert config.SIGNAL_SELL_THRESHOLD >= -1.0, "SELL 판정 컷이 실측 최솟값(-1.0) 밖이면 도달 불가"
 
 
 def test_buy_signal_now_passes_alert_gate(monkeypatch):

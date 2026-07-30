@@ -26,6 +26,7 @@ from config import (
     ATR_STOP_MULTIPLIER, ACCOUNT_SIZE, RISK_PER_TRADE_PCT,
     MAX_POSITION_PCT, TAKE_PROFIT_RR_RATIO, TRADING_STYLE, TIMEFRAME,
     COOLING_OFF_DAYS, DEFAULT_HISTORY_PERIOD,
+    SIGNAL_BUY_THRESHOLD, SIGNAL_SELL_THRESHOLD,
     RSI_OVERSOLD, RSI_OVERBOUGHT,
     POSITION_TRANCHE_1_PCT, POSITION_TRANCHE_2_PCT, POSITION_TRANCHE_3_PCT,
 )
@@ -2658,9 +2659,11 @@ class ChartAnalysisAgent:
         total = len(self.tool_results)
         directional_total = len(scores)
 
-        if avg_score > 2:
+        # 임계값은 '도구 평균' 스케일 기준 (config 주석 참조). 개별 도구 점수의
+        # ±2와 달라야 한다 — 평균은 분산 상쇄로 실측 [-1.0, +2.0]에 머문다.
+        if avg_score > SIGNAL_BUY_THRESHOLD:
             final_signal = "BUY"
-        elif avg_score < -2:
+        elif avg_score < SIGNAL_SELL_THRESHOLD:
             final_signal = "SELL"
         else:
             final_signal = "HOLD"
