@@ -92,12 +92,18 @@ class Settings(BaseSettings):
 
     WATCHLIST: str = ""
 
-    # 알림 임계값 — composite score는 '방향성 도구 평균' 스케일 (실효 ±3).
-    # 과거 ±5.0은 도구 점수 '합계' 스케일 기준이라 정규화 이후 도달 불가
-    # (83일 실측 [-1.4, +2.2], 알림 0건 — 2026-07 진단). 신호 결정 임계
-    # (BUY: avg>+2, SELL: avg<-2)보다 느슨하게 잡아 신호 결정이 binding이 되게 한다.
-    BUY_THRESHOLD: float = 1.5
-    SELL_THRESHOLD: float = -1.0
+    # 신호 판정 임계값 — composite score는 '방향성 도구 평균' 스케일.
+    # 개별 도구 점수는 [-6, +8] 범위지만 24개를 평균하면 분산이 상쇄돼
+    # 실측 [-1.00, +2.04] (p10 -0.19 / p50 +0.41 / p90 +1.14, 26,041 스캔,
+    # 2026-06-20~07-30)에 머문다. 과거 ±2.0은 도구 점수 '합계' 스케일 기준이라
+    # BUY는 40일간 1건, SELL은 관측 최솟값(-1.0) 밖이라 도달 불가였다 (2026-07-30 진단).
+    SIGNAL_BUY_THRESHOLD: float = 1.3
+    SIGNAL_SELL_THRESHOLD: float = -0.5
+
+    # 알림 임계값 — 신호 판정보다 느슨하게 잡아 신호 판정이 binding이 되게 한다.
+    # (알림이 더 엄격하면 BUY/SELL로 판정된 신호가 통보 없이 사라진다.)
+    BUY_THRESHOLD: float = 1.2
+    SELL_THRESHOLD: float = -0.4
     MIN_CONFIDENCE: float = 5.0
 
     TRADING_STYLE: Literal["scalping", "swing", "longterm"] = "swing"
@@ -213,6 +219,8 @@ MULTI_AGENT_BATCH_ENABLED = settings.MULTI_AGENT_BATCH_ENABLED
 MULTI_AGENT_BATCH_HOUR = settings.MULTI_AGENT_BATCH_HOUR
 MULTI_AGENT_BATCH_MINUTE = settings.MULTI_AGENT_BATCH_MINUTE
 WATCHLIST = settings.WATCHLIST
+SIGNAL_BUY_THRESHOLD = settings.SIGNAL_BUY_THRESHOLD
+SIGNAL_SELL_THRESHOLD = settings.SIGNAL_SELL_THRESHOLD
 BUY_THRESHOLD = settings.BUY_THRESHOLD
 SELL_THRESHOLD = settings.SELL_THRESHOLD
 MIN_CONFIDENCE = settings.MIN_CONFIDENCE
