@@ -1654,6 +1654,51 @@ def get_chart(ticker: str):
     raise HTTPException(404, f"{ticker}: 차트 없음")
 
 
+def _ollama_runtime_status() -> dict:
+    """Report whether loaded Ollama models sit on GPU or fell back to CPU.
+
+    /api/tags only proves the daemon answers; it says nothing about the
+    accelerator. A GPU fault (e.g. "GPU requires reset") makes Ollama silently
+    reload every model onto CPU, which is ~10x slower and turns every timed
+    LLM call into a timeout. That state ran unnoticed for a week, so surface it.
+    """
+    status: dict = {"status": "unknown", "models": []}
+    try:
+        resp = httpx.get(f"{OLLAMA_BASE_URL}/api/ps", timeout=3)
+        resp.raise_for_status()
+        models = resp.json().get("models") or []
+    except Exception as exc:
+        status["error"] = str(exc)[:120]
+        return status
+
+    cpu_only = []
+    for m in models:
+        name = m.get("name") or m.get("model") or "?"
+        size = int(m.get("size") or 0)
+        vram = int(m.get("size_vram") or 0)
+        on_gpu = vram > 0
+        if not on_gpu:
+            cpu_only.append(name)
+        status["models"].append(
+            {
+                "name": name,
+                "on_gpu": on_gpu,
+                "size_bytes": size,
+                "size_vram_bytes": vram,
+                "gpu_fraction": round(vram / size, 3) if size else None,
+            }
+        )
+
+    if not models:
+        status["status"] = "idle"          # 로드된 모델 없음 — 판정 불가
+    elif cpu_only:
+        status["status"] = "cpu_fallback"
+        status["cpu_only_models"] = cpu_only
+    else:
+        status["status"] = "gpu"
+    return status
+
+
 @app.get("/health")
 def health():
     """헬스 체크"""
@@ -1663,6 +1708,8 @@ def health():
         ollama_ok = resp.status_code == 200
     except Exception:
         pass
+
+    ollama_runtime = _ollama_runtime_status()
 
     # Step 11: market session 메타 추가
     krx_session = nyse_session = "unknown"
@@ -1676,6 +1723,7 @@ def health():
     return {
         "status": "healthy",
         "ollama": "connected" if ollama_ok else "disconnected",
+        "ollama_runtime": ollama_runtime,
         "cached_results": len(latest_results),
         "scan_count": len(scan_history),
         "uptime_scans": len(scan_history),

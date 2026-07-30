@@ -20,6 +20,7 @@ import yfinance as yf
 
 from config import (
     OPENAI_API_KEY, OLLAMA_BASE_URL, OLLAMA_MODEL, OUTPUT_DIR,
+    OLLAMA_NUM_CTX, OLLAMA_KEEP_ALIVE,
     BOLLINGER_PERIOD, BOLLINGER_STD, MACD_FAST, MACD_SLOW, MACD_SIGNAL,
     ADX_PERIOD, RSI_PERIOD, SMA_PERIODS,
     ATR_STOP_MULTIPLIER, ACCOUNT_SIZE, RISK_PER_TRADE_PCT,
@@ -2882,7 +2883,13 @@ class ChartAnalysisAgent:
                     "model": OLLAMA_MODEL,
                     "prompt": prompt,
                     "stream": False,
-                    "options": {"temperature": 0.2, "num_predict": 4096},
+                    "keep_alive": OLLAMA_KEEP_ALIVE,
+                    "options": {
+                        "temperature": 0.2,
+                        "num_predict": 4096,
+                        # num_ctx 미지정 시 4,096으로 잘려 앞쪽 도구 결과가 버려진다.
+                        "num_ctx": OLLAMA_NUM_CTX,
+                    },
                 },
                 timeout=180,
             )
