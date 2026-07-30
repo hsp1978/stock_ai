@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "qwen3:14b-q4_K_M"
     OLLAMA_NUM_PARALLEL: int = 3
+    # 종합 판단 프롬프트는 실측 4,700~5,000 토큰인데 Ollama 기본 컨텍스트는
+    # 4,096이라 조용히 잘려나갔다(2026-07-29 하루에만 978건). keep=4 규칙상
+    # 앞쪽 도구 분석 결과가 버려지고 뒤쪽 지시문만 남아 품질이 직접 훼손된다.
+    OLLAMA_NUM_CTX: int = Field(default=8192, ge=2048, le=131072)
+    # 기본 keep_alive 5분이면 30분 주기 스캔마다 모델을 내렸다 다시 올린다.
+    # 재로드마다 GPU 적재 판정을 새로 하므로 드라이버 상태에 취약해진다.
+    OLLAMA_KEEP_ALIVE: str = "1h"
     OPENAI_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.0-flash"
@@ -184,6 +191,8 @@ settings = Settings()
 OLLAMA_BASE_URL = settings.OLLAMA_BASE_URL
 OLLAMA_MODEL = settings.OLLAMA_MODEL
 OLLAMA_NUM_PARALLEL = settings.OLLAMA_NUM_PARALLEL
+OLLAMA_NUM_CTX = settings.OLLAMA_NUM_CTX
+OLLAMA_KEEP_ALIVE = settings.OLLAMA_KEEP_ALIVE
 OPENAI_API_KEY = settings.OPENAI_API_KEY
 GEMINI_API_KEY = settings.GEMINI_API_KEY
 GEMINI_MODEL = settings.GEMINI_MODEL
