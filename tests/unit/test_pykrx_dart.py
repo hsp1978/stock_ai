@@ -154,3 +154,188 @@ def test_new_tools_in_tool_map():
     agent = ChartAnalysisAgent("005930.KS", _make_ohlcv())
     assert "institutional_flow_analysis" in agent._tool_map
     assert "dart_disclosure_analysis" in agent._tool_map
+
+
+# ── fetch_recent_disclosures 자체 검증 (2026-07-30) ─────────────────
+#
+# 위 도구 테스트들은 fetch_recent_disclosures를 통째로 mock하기 때문에
+# 라이브러리 호출 규약이 틀려도 통과한다. 실제로 `odr.OpenDartReader(...)`가
+# 항상 AttributeError였고, 컨테이너에서는 라이브러리 자체가 없었는데도
+# 둘 다 빈 리스트('공시 없음')로 뭉개져 8주간 드러나지 않았다.
+
+
+class _FakeOpenDartReader:
+    """실제 패키지 규약 재현: sys.modules 항목이 '클래스'다.
+
+    따라서 `import OpenDartReader; OpenDartReader(key)`만 유효하고,
+    `odr.OpenDartReader(key)`는 AttributeError가 되어야 한다.
+    """
+
+    last_kwargs: dict = {}
+
+    def __init__(self, api_key):
+        assert api_key, "api_key 없이 생성되면 안 된다"
+        self.api_key = api_key
+
+    def list(self, code, start=None, end=None, kind=None):
+        type(self).last_kwargs = {"code": code, "start": start, "end": end, "kind": kind}
+        if kind == "A":
+            return pd.DataFrame()  # 정기공시 없음 → kind 없는 재조회로 폴백해야 한다
+        return pd.DataFrame(
+            [
+                {
+                    "rcept_no": "20260730000001",
+                    "rcept_dt": "20260730",
+                    "corp_name": "삼성전자",
+                    "report_nm": "자사주 취득 결정",
+                },
+                {
+                    "rcept_no": "20260730000002",
+                    "rcept_dt": "20260729",
+                    "corp_name": "삼성전자",
+                    "report_nm": "유상증자 결정",
+                },
+            ]
+        )
+
+
+def test_fetch_disclosures_uses_correct_library_contract():
+    """`import OpenDartReader` 결과를 그대로 호출해야 한다 (모듈 취급 금지)."""
+    import dart_client
+
+    with patch.dict(os.environ, {"DART_API_KEY": "dummy-key"}, clear=False), \
+            patch.dict(sys.modules, {"OpenDartReader": _FakeOpenDartReader}):
+        rows = dart_client.fetch_recent_disclosures("005930.KS", days_back=30)
+
+    assert len(rows) == 2, "정기공시 0건일 때 kind 없는 재조회로 폴백해야 한다"
+    assert rows[0]["classified"] == "positive"
+    assert rows[1]["classified"] == "negative"
+    assert _FakeOpenDartReader.last_kwargs["code"] == "005930", "'.KS' 접미사를 떼야 한다"
+
+
+def test_fetch_disclosures_raises_when_library_missing():
+    """라이브러리 미설치는 '공시 0건'이 아니라 DartUnavailable이어야 한다."""
+    import pytest
+
+    import dart_client
+
+    with patch.dict(os.environ, {"DART_API_KEY": "dummy-key"}, clear=False), \
+            patch.dict(sys.modules, {"OpenDartReader": None}):
+        with pytest.raises(dart_client.DartUnavailable, match="미설치"):
+            dart_client.fetch_recent_disclosures("005930.KS")
+
+
+def test_fetch_disclosures_raises_without_api_key():
+    import pytest
+
+    import dart_client
+
+    with patch.dict(os.environ, {"DART_API_KEY": ""}, clear=False):
+        with pytest.raises(dart_client.DartUnavailable, match="DART_API_KEY"):
+            dart_client.fetch_recent_disclosures("005930.KS")
+
+
+def test_tool_reports_unavailable_distinctly():
+    """도구 detail이 '조회 불가'와 '공시 없음'을 구분해야 한다."""
+    import dart_client
+
+    tools = AnalysisTools("005930.KS", _make_ohlcv())
+    with patch.dict(os.environ, {"DART_API_KEY": "dummy-key"}, clear=False), \
+            patch.object(
+                dart_client,
+                "fetch_recent_disclosures",
+                side_effect=dart_client.DartUnavailable("OpenDartReader 미설치"),
+            ):
+        result = tools.dart_disclosure_analysis()
+
+    assert result["unavailable"] is True
+    assert "조회 불가" in result["detail"]
+    assert result["score"] == 0
+
+    with patch.dict(os.environ, {"DART_API_KEY": "dummy-key"}, clear=False), \
+            patch.object(dart_client, "fetch_recent_disclosures", return_value=[]):
+        empty = tools.dart_disclosure_analysis()
+
+    assert empty.get("unavailable") is not True
+    assert empty["detail"] == "최근 30일 공시 없음"
+
+
+class _NotFoundDart:
+    """DART 기업목록에 없는 종목(ETF/ETN 등) — 라이브러리가 ValueError를 낸다."""
+
+    def __init__(self, api_key):
+        pass
+
+    def list(self, code, start=None, end=None, kind=None):
+        raise ValueError(f'could not find "{code}"')
+
+
+def test_unlisted_ticker_is_empty_not_unavailable():
+    """ETF 등 DART 미등록 종목은 '조회 불가'가 아니라 공시 0건이어야 한다.
+
+    영구 상태를 장애로 보고하면 매 스캔 경보가 떠 실제 장애를 가린다.
+    """
+    import dart_client
+
+    with patch.dict(os.environ, {"DART_API_KEY": "dummy-key"}, clear=False), \
+            patch.dict(sys.modules, {"OpenDartReader": _NotFoundDart}):
+        rows = dart_client.fetch_recent_disclosures("481050.KS")
+
+    assert rows == []
+
+
+class _AuthErrorDart:
+    def __init__(self, api_key):
+        pass
+
+    def list(self, code, start=None, end=None, kind=None):
+        raise ValueError("invalid api key")
+
+
+def test_other_value_errors_still_unavailable():
+    """'could not find'가 아닌 ValueError는 여전히 조회 불가로 올린다."""
+    import pytest
+
+    import dart_client
+
+    with patch.dict(os.environ, {"DART_API_KEY": "dummy-key"}, clear=False), \
+            patch.dict(sys.modules, {"OpenDartReader": _AuthErrorDart}):
+        with pytest.raises(dart_client.DartUnavailable, match="invalid api key"):
+            dart_client.fetch_recent_disclosures("005930.KS")
+
+
+def test_corp_code_cache_pruned(tmp_path, monkeypatch):
+    """docs_cache/의 날짜별 corpCode 스냅샷(약 8MB/일)이 무한 누적되면 안 된다."""
+    import dart_client
+
+    cache = tmp_path / "docs_cache"
+    cache.mkdir()
+    for day in ("20260725", "20260726", "20260727", "20260728", "20260729", "20260730"):
+        (cache / f"opendartreader_corp_codes_{day}.pkl").write_bytes(b"x")
+    (cache / "unrelated.pkl").write_bytes(b"x")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dart_client, "_cache_pruned", False)
+    dart_client._prune_corp_code_cache()
+
+    left = sorted(p.name for p in cache.glob("opendartreader_corp_codes_*.pkl"))
+    assert left == [
+        "opendartreader_corp_codes_20260729.pkl",
+        "opendartreader_corp_codes_20260730.pkl",
+    ], "최신 2개만 남아야 한다"
+    assert (cache / "unrelated.pkl").exists(), "무관한 파일은 건드리면 안 된다"
+
+
+def test_cache_prune_runs_once_per_process(tmp_path, monkeypatch):
+    """정리는 프로세스당 1회 — 스캔마다 디렉터리를 훑지 않는다."""
+    import dart_client
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dart_client, "_cache_pruned", False)
+    dart_client._prune_corp_code_cache()
+    assert dart_client._cache_pruned is True
+
+    calls = []
+    monkeypatch.setattr(dart_client.Path, "glob", lambda self, pat: calls.append(pat) or iter(()))
+    dart_client._prune_corp_code_cache()
+    assert calls == [], "두 번째 호출은 즉시 반환해야 한다"

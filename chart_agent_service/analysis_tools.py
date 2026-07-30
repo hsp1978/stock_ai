@@ -1895,12 +1895,25 @@ class AnalysisTools:
             result.update({"signal": "neutral", "score": 0, "detail": "한국 주식 전용 도구"})
             return result
         try:
-            from dart_client import compute_disclosure_score, fetch_recent_disclosures
-            disclosures = fetch_recent_disclosures(self.ticker, days_back=30, max_items=10)
+            from dart_client import (
+                DartUnavailable,
+                compute_disclosure_score,
+                fetch_recent_disclosures,
+            )
+            try:
+                disclosures = fetch_recent_disclosures(self.ticker, days_back=30, max_items=10)
+            except DartUnavailable as exc:
+                # 조회 불가는 '공시 없음'과 다르다 — 사유를 detail에 남긴다.
+                result.update({
+                    "signal": "neutral", "score": 0,
+                    "unavailable": True,
+                    "detail": f"DART 조회 불가: {str(exc)[:80]}",
+                })
+                return result
             if not disclosures:
                 result.update({
                     "signal": "neutral", "score": 0,
-                    "detail": "최근 30일 공시 없음 또는 DART_API_KEY 미설정",
+                    "detail": "최근 30일 공시 없음",
                 })
                 return result
 

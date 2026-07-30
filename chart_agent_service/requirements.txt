@@ -33,3 +33,10 @@ circuitbreaker>=2.1.0
 
 # ── 거래일 캘린더 (Step 11) ──
 pandas_market_calendars>=4.4.0
+
+# ── DART 공시 (P2) ──
+# CLAUDE.md §8에 P2 의존성으로 명시돼 있었지만 실제 선언이 누락돼
+# 컨테이너에서 dart_client가 ModuleNotFoundError로 조용히 폴백했다 (2026-07-30).
+# 상한 고정: 0.2.3은 Requires-Python >=3.13 — 본 프로젝트는 3.12 고정(§5.1).
+# 3.13 전환 시 이 핀을 함께 풀 것.
+opendartreader>=0.2.2,<0.2.3

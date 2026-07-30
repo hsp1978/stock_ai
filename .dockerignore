@@ -33,3 +33,6 @@ mac_studio_setup.sh
 
 # CI/CD
 .github/
+
+# OpenDartReader corpCode 캐시
+docs_cache/
