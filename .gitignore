@@ -23,3 +23,6 @@ test_artifacts/
 # improvements_test_<ticker>_<timestamp>.json 패턴
 improvements_test_*.json
 analysis_*.json
+
+# OpenDartReader corpCode 스냅샷 캐시 (약 8MB/일, dart_client가 자동 정리)
+docs_cache/
