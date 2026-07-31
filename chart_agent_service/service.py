@@ -77,7 +77,7 @@ from news_analyzer import fetch_news_with_sentiment, get_news_cache_status
 from chart_pattern import detect_chart_patterns
 from sector_compare import compare_sector
 from macro_context import fetch_macro_context
-from db import init_db, insert_scan, get_scan_logs, get_scan_logs_by_ticker, \
+from db import init_db, insert_scan, set_alert_sent, get_scan_logs, get_scan_logs_by_ticker, \
     get_scan_log_latest, get_scan_log_date_range, \
     get_weekly_summary, get_weekly_ticker, \
     get_app_state, set_app_state
@@ -761,6 +761,35 @@ def _fetch_analysis_inputs(ticker: str):
 #  텔레그램 알림
 # ═══════════════════════════════════════════════════════════════
 
+def _record_telegram_failure(reason: str) -> None:
+    """전송 실패를 telegram_bot의 단일 상태에 기록한다 (경로가 둘이라 SSOT 유지)."""
+    try:
+        from telegram_bot import _record_send_failure
+
+        _record_send_failure(reason)
+    except Exception:
+        print(f"[텔레그램 오류] {reason[:200]}")
+
+
+def _record_telegram_success() -> None:
+    try:
+        from telegram_bot import _record_send_success
+
+        _record_send_success()
+    except Exception:
+        pass
+
+
+def _telegram_delivery_status() -> dict:
+    """알림 전송 상태 — /health 노출용. 미발송을 green으로 덮지 않는다."""
+    try:
+        from telegram_bot import send_state_snapshot
+
+        return send_state_snapshot()
+    except Exception as exc:
+        return {"status": "unknown", "last_error": f"{type(exc).__name__}: {exc}"}
+
+
 def send_telegram(text: str, parse_mode: str = "HTML") -> bool:
     """텔레그램 메시지 전송"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -776,9 +805,15 @@ def send_telegram(text: str, parse_mode: str = "HTML") -> bool:
             },
             timeout=10,
         )
-        return resp.status_code == 200
+        if resp.status_code != 200:
+            # 사유 없이 False만 돌려주면 미발송이 '발송'과 구분되지 않는다.
+            # URL에는 봇 토큰이 들어 있으므로 절대 로그에 남기지 않는다.
+            _record_telegram_failure(f"HTTP {resp.status_code}: {resp.text[:200]}")
+            return False
+        _record_telegram_success()
+        return True
     except Exception as e:
-        print(f"[텔레그램 오류] {e}")
+        _record_telegram_failure(f"{type(e).__name__}: {e}")
         return False
 
 
@@ -979,14 +1014,19 @@ def check_alert_condition(ticker: str, result: dict) -> Optional[dict]:
     }
 
 
-def send_summary_alert(alerts: list):
+def send_summary_alert(alerts: list) -> bool:
     """스캔 완료 후 기준치 도달 종목을 요약 1건으로 텔레그램 전송.
 
     Sprint 3 업그레이드: 풍부한 포맷(telegram_bot.send_daily_digest) 사용.
+
+    Returns:
+        실제 전송 성공 여부. 호출자는 이 값으로 scan_log.alert_sent를 갱신한다 —
+        전송 실패를 '발송'으로 기록하면 장애가 정상으로 위장된다 (2026-07-30).
     """
     if not alerts:
-        return
+        return False
 
+    delivered = False
     try:
         from telegram_bot import send_daily_digest
 
@@ -1001,8 +1041,9 @@ def send_summary_alert(alerts: list):
                 "confidence": a.get("confidence", 0),
                 "entry_plan": r.get("entry_plan") or (r.get("final_decision") or {}).get("entry_plan"),
             })
-        send_daily_digest(digest_rows, top_n=10, min_confidence=0.0)
-    except Exception:
+        delivered = bool(send_daily_digest(digest_rows, top_n=10, min_confidence=0.0))
+    except Exception as exc:
+        print(f"  [알림] digest 포맷 실패 → 기본 포맷 폴백: {type(exc).__name__}: {exc}")
         # 새 모듈 실패 시 기본 포맷으로 폴백
         buy_alerts = [a for a in alerts if a["signal"] == "BUY"]
         sell_alerts = [a for a in alerts if a["signal"] == "SELL"]
@@ -1017,9 +1058,15 @@ def send_summary_alert(alerts: list):
             msg += "🔴 <b>매도 신호</b>\n"
             for a in sorted(sell_alerts, key=lambda x: x["score"]):
                 msg += f"  <b>{a['ticker']}</b>: {a['score']:+.1f}점 (신뢰도 {a['confidence']})\n"
-        send_telegram(msg)
+        delivered = bool(send_telegram(msg))
 
-    # 알림 발송 시간 기록 (중복 억제용)
+    if not delivered:
+        # 전송 실패 시 중복 억제 타임스탬프를 남기면 다음 1시간 알림까지 막힌다.
+        # 기록하지 않아 다음 스캔이 재시도하게 한다.
+        print("  ⚠️ [알림] 텔레그램 전송 실패 — scan_log.alert_sent=0, 다음 스캔에서 재시도")
+        return False
+
+    # 알림 발송 시간 기록 (중복 억제용) — 전송 성공 시에만
     for a in alerts:
         ticker = a["ticker"]
         latest_results[ticker] = {
@@ -1028,6 +1075,7 @@ def send_summary_alert(alerts: list):
         }
         _stage_latest_result_summary(ticker)
     _flush_latest_result_summaries()
+    return True
 
 
 def _load_watchlist_files() -> list[str]:
@@ -1093,6 +1141,7 @@ def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
         "alerts": [],
     }
     pending_alerts = []
+    alerted_row_ids: "list[int]" = []
     results_lock = __import__('threading').Lock()
 
     # ── 단계 2: 병렬 LLM 분석 ────────────────────────────────
@@ -1126,12 +1175,14 @@ def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
                     }
 
                 alert = check_alert_condition(ticker, result)
+                # alert_sent는 전송 성공을 뜻해야 하므로 일단 0으로 기록하고,
+                # 스캔 종료 후 실제 전송 결과로 갱신한다 (아래 send_summary_alert).
+                row_id = insert_scan(ticker, result, alert_sent=False)
                 if alert:
                     with results_lock:
                         pending_alerts.append(alert)
                         scan_entry["alerts"].append(ticker)
-
-                insert_scan(ticker, result, alert_sent=(alert is not None))
+                        alerted_row_ids.append(row_id)
                 _try_insert_signal_outcome(ticker, result)
 
     # ── 단계 3: warm 캐시에서 data_health 스냅샷 갱신 ──────────────
@@ -1152,7 +1203,12 @@ def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
     # 스캔 완료 후 기준치 도달 종목을 요약 1건으로 전송
     if pending_alerts:
         print(f"\n  📨 알림 대상: {len(pending_alerts)}개 종목")
-        send_summary_alert(pending_alerts)
+        delivered = send_summary_alert(pending_alerts)
+        try:
+            set_alert_sent(alerted_row_ids, delivered)
+        except Exception as exc:
+            print(f"  [알림] scan_log.alert_sent 갱신 실패: {exc}")
+        print(f"  📨 전송 결과: {'성공' if delivered else '실패'}")
     else:
         print(f"\n  알림 대상 없음")
 
@@ -1576,10 +1632,8 @@ def scan_ticker(ticker: str, ai_mode: str = "ollama"):
     }
     _persist_latest_result_summary(ticker)
     alert = check_alert_condition(ticker, result)
-    alert_sent = False
-    if alert:
-        send_summary_alert([alert])
-        alert_sent = True
+    # alert_sent는 게이트 통과가 아니라 실제 전송 성공을 뜻한다.
+    alert_sent = send_summary_alert([alert]) if alert else False
     insert_scan(ticker, result, alert_sent=alert_sent)
     _try_insert_signal_outcome(ticker, result)
     return result
@@ -1724,6 +1778,7 @@ def health():
         "status": "healthy",
         "ollama": "connected" if ollama_ok else "disconnected",
         "ollama_runtime": ollama_runtime,
+        "alert_delivery": _telegram_delivery_status(),
         "cached_results": len(latest_results),
         "scan_count": len(scan_history),
         "uptime_scans": len(scan_history),

@@ -309,8 +309,13 @@ def delete_app_state(key: str) -> None:
 # ─── 기록 ───────────────────────────────────────────────
 
 
-def insert_scan(ticker: str, result: dict, alert_sent: bool = False):
-    """스캔 결과 1건 DB 기록"""
+def insert_scan(ticker: str, result: dict, alert_sent: bool = False) -> int:
+    """스캔 결과 1건 DB 기록.
+
+    Returns:
+        삽입된 row id. 알림 전송은 스캔 루프가 끝난 뒤 일괄로 일어나므로,
+        호출자는 이 id로 set_alert_sent()를 불러 실제 전송 결과를 반영한다.
+    """
     dist = result.get("signal_distribution", {})
     # entry_price 추출 우선순위: 직접 필드 → entry_plan → current_price
     entry_price = (
@@ -320,7 +325,7 @@ def insert_scan(ticker: str, result: dict, alert_sent: bool = False):
         or result.get("price")
     )
     conn = _get_conn()
-    conn.execute(
+    cur = conn.execute(
         """INSERT INTO scan_log
            (ticker, signal, score, confidence,
             buy_count, sell_count, neutral_count,
@@ -339,8 +344,34 @@ def insert_scan(ticker: str, result: dict, alert_sent: bool = False):
             entry_price,
         ),
     )
+    row_id = cur.lastrowid
     conn.commit()
     conn.close()
+    return int(row_id or 0)
+
+
+def set_alert_sent(row_ids: "list[int]", delivered: bool) -> int:
+    """알림 실제 전송 결과를 scan_log에 반영한다.
+
+    alert_sent는 '알림 게이트 통과'가 아니라 '전송 성공'을 의미해야 한다 —
+    전송 실패를 1로 기록하면 장애가 정상으로 위장된다 (2026-07-30 진단:
+    chat_id 오류로 전송 0건인데 DB에는 4건 발송으로 남아 있었다).
+
+    Returns:
+        갱신된 row 수.
+    """
+    ids = [int(r) for r in row_ids if r]
+    if not ids:
+        return 0
+    placeholders = ",".join("?" * len(ids))
+    conn = _get_conn()
+    cur = conn.execute(
+        f"UPDATE scan_log SET alert_sent = ? WHERE id IN ({placeholders})",  # noqa: S608
+        [1 if delivered else 0, *ids],
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount or 0
 
 
 # ─── 조회: scan-log ────────────────────────────────────

@@ -14,6 +14,7 @@ httpx 직접 호출(python-telegram-bot 미필요)로 경량 구현.
 from __future__ import annotations
 
 import json as _json
+import logging
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -22,9 +23,56 @@ import httpx
 
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
+logger = logging.getLogger(__name__)
+
 
 def _api_url(method: str) -> str:
     return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+
+
+# 전송 상태 — /health가 읽어 미발송을 드러낸다 (2026-07-30).
+# chat_id 오류로 전송이 0건이었는데 DB에는 '발송'으로 남고 로그도 없었다.
+_SEND_STATE: Dict[str, Any] = {
+    "last_success_at": None,
+    "last_failure_at": None,
+    "last_error": None,
+    "consecutive_failures": 0,
+    "total_success": 0,
+    "total_failure": 0,
+}
+
+
+def _record_send_failure(reason: str) -> None:
+    _SEND_STATE["last_failure_at"] = datetime.now().isoformat()
+    _SEND_STATE["last_error"] = reason[:300]
+    _SEND_STATE["consecutive_failures"] += 1
+    _SEND_STATE["total_failure"] += 1
+    logger.error("텔레그램 전송 실패 (연속 %d회): %s",
+                 _SEND_STATE["consecutive_failures"], reason[:300])
+
+
+def _record_send_success() -> None:
+    _SEND_STATE["last_success_at"] = datetime.now().isoformat()
+    _SEND_STATE["last_error"] = None
+    _SEND_STATE["consecutive_failures"] = 0
+    _SEND_STATE["total_success"] += 1
+
+
+def send_state_snapshot() -> Dict[str, Any]:
+    """전송 상태 스냅샷 — /health 노출용."""
+    configured = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+    snap = dict(_SEND_STATE)
+    if not configured:
+        status = "unconfigured"
+    elif snap["consecutive_failures"] > 0:
+        status = "failing"
+    elif snap["total_success"] > 0:
+        status = "ok"
+    else:
+        status = "untested"
+    snap["status"] = status
+    snap["configured"] = configured
+    return snap
 
 
 def _is_kr_ticker(ticker: str) -> bool:
@@ -60,8 +108,15 @@ def send_telegram_html(text: str, reply_markup: Optional[Dict] = None) -> bool:
         if reply_markup:
             payload["reply_markup"] = _json.dumps(reply_markup)
         resp = httpx.post(_api_url("sendMessage"), json=payload, timeout=10)
-        return resp.status_code == 200
-    except Exception:
+        if resp.status_code != 200:
+            # 사유를 남기지 않으면 미발송이 '발송'과 구분되지 않는다.
+            # URL에는 봇 토큰이 들어 있으므로 절대 로그에 남기지 않는다.
+            _record_send_failure(f"HTTP {resp.status_code}: {resp.text[:200]}")
+            return False
+        _record_send_success()
+        return True
+    except Exception as exc:
+        _record_send_failure(f"{type(exc).__name__}: {exc}")
         return False
 
 
