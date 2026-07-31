@@ -139,3 +139,56 @@ def test_summary_silent_when_kr_normal():
         kr_stress="normal", kospi_1d=0.3,
     )
     assert "급락" not in text
+
+
+# ── 실행 가능성 판정 (2026-07-31 회귀 수정) ──────────────────────
+#
+# PR #19는 aggregate() 안에서 execution_ready를 판정했다. 그런데 orchestrator는
+# aggregate() 반환 뒤에 entry_plan을 붙이므로(multi_agent 4단계), 판정 시점에는
+# 계획이 항상 없었다 → 모든 매수·매도의 신뢰도가 5.0으로 깎였다.
+
+
+def test_ready_when_plan_complete():
+    d = EnhancedDecisionMaker.apply_execution_readiness({
+        "final_signal": "buy", "final_confidence": 8.2,
+        "entry_plan": {"limit_price": 36.06, "stop_loss": 33.29},
+    })
+    assert d["execution_ready"] is True
+    assert d["final_confidence"] == 8.2, "완비된 계획인데 신뢰도가 깎였다"
+    assert "NO_ENTRY_PLAN_NOT_EXECUTABLE" not in (d.get("warnings") or [])
+
+
+def test_not_ready_when_stop_missing():
+    """진입가만 있고 손절이 없으면 실행 불가 — 실제로 ATR 부재 시 발생한다."""
+    d = EnhancedDecisionMaker.apply_execution_readiness({
+        "final_signal": "buy", "final_confidence": 8.2,
+        "entry_plan": {"limit_price": 36.06, "stop_loss": None},
+    })
+    assert d["execution_ready"] is False
+    assert d["final_confidence"] == 5.0
+    assert "NO_ENTRY_PLAN_NOT_EXECUTABLE" in d["warnings"]
+
+
+def test_neutral_not_capped():
+    """관망은 실행 대상이 아니므로 상한을 걸지 않는다."""
+    d = EnhancedDecisionMaker.apply_execution_readiness({
+        "final_signal": "neutral", "final_confidence": 8.2, "entry_plan": None,
+    })
+    assert d["final_confidence"] == 8.2
+
+
+def test_warning_not_duplicated_on_repeat_call():
+    d = {"final_signal": "buy", "final_confidence": 8.2, "entry_plan": {}}
+    EnhancedDecisionMaker.apply_execution_readiness(d)
+    EnhancedDecisionMaker.apply_execution_readiness(d)
+    assert d["warnings"].count("NO_ENTRY_PLAN_NOT_EXECUTABLE") == 1
+
+
+def test_aggregate_does_not_decide_readiness():
+    """aggregate()는 execution_ready를 확정하지 않는다 — 회귀 방지."""
+    import inspect
+
+    src = inspect.getsource(EnhancedDecisionMaker.aggregate)
+    assert "execution_ready" not in src, (
+        "aggregate() 안에서 판정하면 entry_plan이 아직 없어 항상 False가 된다"
+    )

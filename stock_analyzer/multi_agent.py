@@ -2228,6 +2228,15 @@ class MultiAgentOrchestrator:
                 final_decision["entry_plan"] = None
                 final_decision["entry_plan_error"] = "진입 계획 생성 실패"
 
+            # 4.5. 실행 가능성 판정 — 진입 계획이 붙은 뒤여야 한다.
+            # aggregate() 안에서 판정하면 entry_plan이 아직 없어 항상 False가 된다.
+            try:
+                from enhanced_decision_maker import EnhancedDecisionMaker as _EDM
+
+                _EDM.apply_execution_readiness(final_decision)
+            except Exception:
+                final_decision.setdefault("execution_ready", None)
+
             total_time = (datetime.now() - start_time).total_seconds()
 
             # 결과 구성
