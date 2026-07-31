@@ -19,6 +19,11 @@ MACRO_TICKERS = {
     "oil_wti": "CL=F",
     "sp500": "^GSPC",
     "gold": "GC=F",
+    # 한국 지수 — 2026-07-30 감사에서 누락 확인. 미국 지표만 보고 있어
+    # KOSPI 폭락장(7/28 -10.84%, 7/29 -5.98%, 월중 8,303→5,594 = -32.6%)에도
+    # 국내 종목 분석의 macro 기여가 0이었다.
+    "kospi": "^KS11",
+    "kosdaq": "^KQ11",
 }
 
 
@@ -34,8 +39,13 @@ def _fetch_indicator(symbol: str, period: str = "1mo") -> Optional[Dict]:
         week_ago = float(close.iloc[-5]) if len(close) >= 5 else month_ago
         pct_1m = round((current / month_ago - 1) * 100, 2)
         pct_1w = round((current / week_ago - 1) * 100, 2)
+        # 일간 변동률 — 급락은 1개월 추세에 묻힌다. -10%대 하루가
+        # pct_1m 기준으로는 'stable'로 보일 수 있다.
+        prev = float(close.iloc[-2]) if len(close) >= 2 else current
+        pct_1d = round((current / prev - 1) * 100, 2) if prev else 0.0
         return {
             "value": round(current, 2),
+            "pct_1d": pct_1d,
             "pct_1w": pct_1w,
             "pct_1m": pct_1m,
         }
@@ -114,6 +124,35 @@ def _sp500_trend(pct_1m: Optional[float]) -> str:
     return "neutral"
 
 
+def _kr_market_stress(
+    pct_1d: Optional[float],
+    pct_1w: Optional[float],
+    pct_1m: Optional[float] = None,
+) -> str:
+    """국내 지수 스트레스 판정.
+
+    KRX 서킷브레이커 1단계가 -8%(1분 이상 지속)이므로 일간 -8%를 crash 기준으로
+    쓴다. 주간/월간 낙폭은 며칠에 걸친 붕괴를 잡는다.
+
+    스트레스 판정이 melt_up보다 우선한다 — 급락장의 반등일에 melt_up으로 읽으면
+    가장 위험한 날에 경고가 사라진다 (2026-07-31: 일간 +13.95%였지만 월간 -24.8%).
+    일간 ±8%는 방향과 무관하게 정상 국면이 아니다.
+    """
+    if pct_1d is None and pct_1w is None and pct_1m is None:
+        return "unknown"
+    d = pct_1d if pct_1d is not None else 0.0
+    w = pct_1w if pct_1w is not None else 0.0
+    m = pct_1m if pct_1m is not None else 0.0
+
+    if d <= -8.0 or w <= -15.0 or m <= -20.0 or abs(d) >= 12.0:
+        return "crash"
+    if d <= -3.0 or w <= -7.0 or m <= -10.0 or abs(d) >= 8.0:
+        return "stressed"
+    if d >= 3.0 or w >= 7.0:
+        return "melt_up"
+    return "normal"
+
+
 def _market_regime(vix_sig: str, us10y_sig: str, sp500_tr: str) -> str:
     if vix_sig == "risk_on" and sp500_tr == "bullish":
         return "risk_on"
@@ -123,7 +162,8 @@ def _market_regime(vix_sig: str, us10y_sig: str, sp500_tr: str) -> str:
 
 
 def _build_summary(
-    vix_val, vix_sig, us10y_val, us10y_sig, dxy_sig, oil_sig, regime
+    vix_val, vix_sig, us10y_val, us10y_sig, dxy_sig, oil_sig, regime,
+    kr_stress: str = "unknown", kospi_1d: Optional[float] = None,
 ) -> str:
     parts = []
     if vix_val:
@@ -137,6 +177,9 @@ def _build_summary(
     if oil_sig != "neutral":
         parts.append(f"유가({'상승압력' if oil_sig == 'inflationary' else '하락'})")
 
+    if kospi_1d is not None:
+        parts.append(f"KOSPI {kospi_1d:+.2f}%(일간)")
+
     if regime == "risk_on":
         mood = "위험자산 선호 환경. 주식·성장주 유리."
     elif regime == "risk_off":
@@ -144,8 +187,17 @@ def _build_summary(
     else:
         mood = "중립적 환경. 종목별 선별 대응 필요."
 
+    # 국내 지수 스트레스는 미국 기반 regime과 별개로 명시한다 —
+    # 한국 종목 판단에서 이게 빠지면 폭락장에서 매수 신호가 나온다.
+    kr_note = {
+        "crash": " ⚠️ 국내 증시 급락 국면(서킷브레이커 수준). 국내 종목 신규 매수 부적합.",
+        "stressed": " ⚠️ 국내 증시 약세 국면. 국내 종목 진입 신중.",
+        "melt_up": " 국내 증시 급등 국면. 추격 매수 주의.",
+    }.get(kr_stress, "")
+
     prefix = ", ".join(parts)
-    return f"{prefix}. {mood}" if prefix else mood
+    body = f"{prefix}. {mood}" if prefix else mood
+    return body + kr_note
 
 
 # ── 메인 함수 ────────────────────────────────────────────────────
@@ -160,6 +212,10 @@ def fetch_macro_context() -> Dict:
     def _extract(key):
         d = raw.get(key)
         return (d["value"] if d else None, d["pct_1m"] if d else None)
+
+    def _extract_full(key):
+        d = raw.get(key) or {}
+        return (d.get("value"), d.get("pct_1d"), d.get("pct_1w"), d.get("pct_1m"))
 
     vix_val, vix_pct = _extract("vix")
     us10y_val, us10y_pct = _extract("us10y")
@@ -179,6 +235,10 @@ def fetch_macro_context() -> Dict:
     oil_sig = _oil_signal(oil_trend)
     sp500_tr = _sp500_trend(sp500_pct)
     regime = _market_regime(vix_sig, us10y_sig, sp500_tr)
+
+    kospi_val, kospi_1d, kospi_1w, kospi_1m = _extract_full("kospi")
+    kosdaq_val, kosdaq_1d, kosdaq_1w, kosdaq_1m = _extract_full("kosdaq")
+    kr_stress = _kr_market_stress(kospi_1d, kospi_1w, kospi_1m)
 
     return {
         "vix": {
@@ -214,10 +274,24 @@ def fetch_macro_context() -> Dict:
             "value": gold_val,
             "pct_1m": gold_pct,
         },
+        "kospi": {
+            "value": kospi_val,
+            "pct_1d": kospi_1d,
+            "pct_1w": kospi_1w,
+            "pct_1m": kospi_1m,
+        },
+        "kosdaq": {
+            "value": kosdaq_val,
+            "pct_1d": kosdaq_1d,
+            "pct_1w": kosdaq_1w,
+            "pct_1m": kosdaq_1m,
+        },
+        "kr_market_stress": kr_stress,
         "sp500_trend": sp500_tr,
         "market_regime": regime,
         "summary": _build_summary(
-            vix_val, vix_sig, us10y_val, us10y_sig, dxy_sig, oil_sig, regime
+            vix_val, vix_sig, us10y_val, us10y_sig, dxy_sig, oil_sig, regime,
+            kr_stress=kr_stress, kospi_1d=kospi_1d,
         ),
         "updated_at": datetime.now(tz=timezone.utc).isoformat(),
     }

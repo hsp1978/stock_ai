@@ -10,7 +10,7 @@
 """
 
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 from signal_normalizer import SignalNormalizer, normalize_signal
 
@@ -74,6 +74,50 @@ class EnhancedDecisionMaker:
     @staticmethod
     def _avg_signed_score(scores: List[float]) -> float:
         return sum(scores) / len(scores) if scores else 0.0
+
+    # 손익비 하한 — 이 아래에서는 방향이 맞아도 기대값이 성립하지 않는다.
+    MIN_RISK_REWARD = 0.8
+
+    def _min_risk_reward(self, agent_results) -> Optional[float]:
+        """에이전트 evidence에서 지지/저항 기준 R/R 최솟값을 뽑는다.
+
+        여러 에이전트가 같은 도구를 돌리면 보수적으로 최솟값을 쓴다.
+        """
+        values: List[float] = []
+        for result in agent_results:
+            if getattr(result, "error", None):
+                continue
+            for ev in (result.evidence or []):
+                if ev.get("tool") != "support_resistance_analysis":
+                    continue
+                rr = (ev.get("result") or {}).get("risk_reward_ratio")
+                if isinstance(rr, (int, float)) and rr > 0:
+                    values.append(float(rr))
+        return min(values) if values else None
+
+    def _apply_risk_reward_gate(self, final_decision: Dict, rr: Optional[float]) -> Dict:
+        """R/R 하한 미달이면 매수를 관망으로 강등한다.
+
+        기존에는 `_collect_agent_risks`가 "손익비 불리: R/R 0.20 < 0.8" 문자열만
+        만들고 신호를 막지 못했다 (2026-07-30 감사). R/R 0.20은 잠재 손실이
+        잠재 수익의 5배라는 뜻이라, 방향 판단과 무관하게 진입 부적격이다.
+        """
+        if rr is None or rr >= self.MIN_RISK_REWARD:
+            return final_decision
+        if (final_decision.get("signal") or "").lower() != "buy":
+            return final_decision
+
+        gated = dict(final_decision)
+        gated["signal"] = "neutral"
+        gated["confidence"] = min(float(gated.get("confidence", 0) or 0), 3.0)
+        gated["rr_downgraded"] = True
+        msg = f"손익비 하한 미달(R/R {rr:.2f} < {self.MIN_RISK_REWARD}) vs 매수 신호"
+        prev = gated.get("conflicts")
+        gated["conflicts"] = f"{prev}, {msg}" if prev and prev != "없음" else msg
+        gated["reasoning"] = (
+            f"{gated.get('reasoning', '')} / R/R {rr:.2f}로 진입 부적격 → 관망 전환"
+        ).strip()
+        return gated
 
     def _apply_reflect_guard(self, final_decision: Dict, reflect_flags: List[str]) -> Dict:
         """
@@ -352,8 +396,35 @@ class EnhancedDecisionMaker:
                 f"{prev_conflict}, {kelly_msg}" if prev_conflict and prev_conflict != "없음" else kelly_msg
             )
 
+        # 6.7. [R/R 하드 게이트] 손익비 하한 미달이면 매수를 관망으로 강등.
+        # 경고 문자열만으로는 신호가 그대로 나가 실행 가능한 것처럼 보인다.
+        min_rr = self._min_risk_reward(agent_results)
+        rr_blocked = (
+            min_rr is not None
+            and min_rr < self.MIN_RISK_REWARD
+            and final_decision["signal"] == "buy"
+        )
+        if rr_blocked:
+            final_decision = self._apply_risk_reward_gate(final_decision, min_rr)
+
+        # 6.8. [실행 가능성] 매매 파라미터 없는 방향성 신호를 표시한다.
+        # V2 경로는 entry_plan을 생성하지 않으므로 신호를 뒤집지는 않는다 —
+        # 뒤집으면 모든 V2 매수가 사라진다. 대신 실행 불가임을 명시하고
+        # 신뢰도 상한을 걸어 '바로 실행 가능한 신호'로 읽히지 않게 한다.
+        entry_plan = final_decision.get("entry_plan") or {}
+        execution_ready = bool(
+            entry_plan.get("limit_price") is not None
+            and entry_plan.get("stop_loss") is not None
+        )
+        if final_decision["signal"] in ("buy", "sell") and not execution_ready:
+            final_decision["confidence"] = min(float(final_decision["confidence"]), 5.0)
+
         # 7. 경고 메시지 수집
         warnings = []
+        if rr_blocked:
+            warnings.append(f"RR_BELOW_MIN_{self.MIN_RISK_REWARD}")
+        if final_decision["signal"] in ("buy", "sell") and not execution_ready:
+            warnings.append("NO_ENTRY_PLAN_NOT_EXECUTABLE")
         if kelly_no_bet and final_decision["signal"] == "buy":
             warnings.append("KELLY_NEGATIVE_NO_BET")
         if not is_valid and fixed_ticker:
@@ -379,6 +450,11 @@ class EnhancedDecisionMaker:
         # reflect 강등 시 보너스가 더해져도 cap(3.0)을 넘지 않도록 최종 재적용.
         if final_decision.get("reflect_downgraded"):
             final_confidence = min(final_confidence, 3.0)
+        # R/R 강등도 동일 — 보너스로 cap이 무력화되면 게이트가 사문화된다.
+        if final_decision.get("rr_downgraded"):
+            final_confidence = min(final_confidence, 3.0)
+        if final_decision["signal"] in ("buy", "sell") and not execution_ready:
+            final_confidence = min(final_confidence, 5.0)
         decision_context = self._build_decision_context(
             final_decision["signal"],
             final_confidence,
@@ -413,6 +489,10 @@ class EnhancedDecisionMaker:
             "currency": currency,
             "market_info": market_info,
             "signal_strength": signal_strength,
+            # 실행 가능성 — 소비자(텔레그램/주문 라우터)가 '바로 실행 가능한 신호'와
+            # '방향 의견'을 구분할 수 있어야 한다.
+            "execution_ready": execution_ready,
+            "min_risk_reward": min_rr,
             "volatility_status": volatility_check,
             "technical_analysis": tech_analysis,
             "quant_analysis": quant_analysis,
