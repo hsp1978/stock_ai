@@ -95,6 +95,33 @@ class EnhancedDecisionMaker:
                     values.append(float(rr))
         return min(values) if values else None
 
+    # 강도 사다리 — 낮은 순. 내부자 특수 라벨은 'strong' 티어로 취급한다.
+    _STRENGTH_LADDER = ("very_weak", "weak", "moderate", "strong", "very_strong")
+    _INSIDER_LEVELS = ("strong_sell_signal", "strong_buy_signal")
+    # 이 신뢰도 아래에서는 '강한 신호'라고 표기할 수 없다.
+    STRENGTH_CAP_CONFIDENCE = 5.0
+
+    @classmethod
+    def cap_strength_by_confidence(cls, strength_level: str, confidence: float) -> str:
+        """신뢰도가 낮으면 강도 라벨을 낮춘다.
+
+        strength_level은 abs(total_score)만 보고, confidence는 의견 일치도에서
+        따로 나온다. 그래서 "신뢰도 4.55 / 강도 strong"처럼 서로 모순되는 조합이
+        그대로 출력됐다 (2026-07-30 감사). 둘 중 어느 쪽을 믿어야 하는지
+        사용자가 알 수 없으므로, 낮은 신뢰도에서는 강도를 눌러 표기를 일치시킨다.
+        """
+        if confidence >= cls.STRENGTH_CAP_CONFIDENCE:
+            return strength_level
+
+        cap = "weak"
+        if strength_level in cls._INSIDER_LEVELS:
+            return cap
+        if strength_level not in cls._STRENGTH_LADDER:
+            return strength_level
+        if cls._STRENGTH_LADDER.index(strength_level) <= cls._STRENGTH_LADDER.index(cap):
+            return strength_level
+        return cap
+
     @staticmethod
     def apply_execution_readiness(decision: Dict) -> Dict:
         """진입 계획 부착 후 실행 가능성을 판정한다 (in-place 갱신).
@@ -471,6 +498,16 @@ class EnhancedDecisionMaker:
         # R/R 강등도 동일 — 보너스로 cap이 무력화되면 게이트가 사문화된다.
         if final_decision.get("rr_downgraded"):
             final_confidence = min(final_confidence, 3.0)
+
+        # 강도 라벨을 최종 신뢰도와 일치시킨다. 강도는 abs(total_score)만 보고
+        # 산출되므로 여기(신뢰도 확정 후)에서만 정합을 맞출 수 있다.
+        raw_strength = signal_strength.get("strength_level")
+        capped_strength = self.cap_strength_by_confidence(raw_strength, final_confidence)
+        if capped_strength != raw_strength:
+            signal_strength["strength_level_raw"] = raw_strength
+            signal_strength["strength_level"] = capped_strength
+            signal_strength["strength_capped_by_confidence"] = True
+
         decision_context = self._build_decision_context(
             final_decision["signal"],
             final_confidence,
