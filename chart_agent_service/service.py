@@ -17,7 +17,7 @@ import os
 import sys
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -26,7 +26,7 @@ import math
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from apscheduler.schedulers.background import BackgroundScheduler
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 try:
     import numpy as _np
@@ -222,6 +222,10 @@ _STATE_SIGNAL_VALIDATION = "service.signal_validation.last_result"
 _STATE_JOB_STATUS = "service.ops.job_status"
 _STATE_DATA_HEALTH = "service.ops.data_health.last_result"
 _STATE_OPS_ALERTS = "service.ops.alerts"
+# GPU 일시 해제 — 다른 서비스가 GPU를 잠깐 쓸 때 LLM 작업을 멈추고 VRAM을 비운다.
+# DB에 두어 재시작에도 유지되고, 만료 시각을 함께 저장해 '풀어놓고 잊는' 사고를 막는다.
+_STATE_GPU_PAUSE = "service.ops.gpu_pause_until"
+GPU_PAUSE_MAX_MINUTES = 240
 _STATE_LOCK = threading.RLock()
 _RUNTIME_STATE_RESTORED = False
 _AUX_FETCH_TIMEOUT = ANALYSIS_AUX_FETCH_TIMEOUT
@@ -232,6 +236,87 @@ _LAST_DATA_HEALTH: dict = {}
 _OPS_ALERTS: dict = {}
 _SCHEDULER: BackgroundScheduler | None = None
 _RUN_INITIAL_SCAN_ON_STARTUP = False
+
+class GpuPausedError(RuntimeError):
+    """GPU 일시 해제 중이라 LLM 작업을 수행할 수 없음."""
+
+
+def _gpu_pause_until() -> Optional[datetime]:
+    """GPU 일시 해제 만료 시각. 해제 중이 아니면 None (만료분은 자동 정리)."""
+    raw = get_app_state(_STATE_GPU_PAUSE, None)
+    if not raw:
+        return None
+    try:
+        until = datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        set_app_state(_STATE_GPU_PAUSE, None)
+        return None
+    if until <= datetime.now():
+        # 만료 → 자동 복귀. 사용자가 복구를 잊어도 서비스가 살아난다.
+        set_app_state(_STATE_GPU_PAUSE, None)
+        return None
+    return until
+
+
+def is_gpu_paused() -> bool:
+    return _gpu_pause_until() is not None
+
+
+def _loaded_model_names() -> list:
+    """현재 적재된 모델 목록 (/api/ps)."""
+    try:
+        resp = httpx.get(f"{OLLAMA_BASE_URL}/api/ps", timeout=5)
+        if resp.status_code != 200:
+            return []
+        return [m.get("name") for m in (resp.json().get("models") or [])]
+    except Exception:
+        return []
+
+
+def _unload_ollama_model(verify_seconds: float = 10.0) -> bool:
+    """keep_alive=0으로 언로드하고 VRAM 반환을 '실측으로' 확인한다.
+
+    keep_alive는 반드시 문자열 "0s"여야 한다. 정수 0을 보내면 응답은
+    done_reason="unload"로 성공처럼 오는데 모델은 그대로 남는다
+    (Ollama 0.20 실측, 2026-08-03). 응답을 성공으로 읽지 말고 /api/ps로 검증한다.
+    """
+    targets = _loaded_model_names() or [OLLAMA_MODEL]
+    for name in targets:
+        for path, payload in (
+            ("/api/generate", {"model": name, "keep_alive": "0s"}),
+            ("/api/chat", {"model": name, "messages": [], "keep_alive": "0s"}),
+        ):
+            try:
+                httpx.post(f"{OLLAMA_BASE_URL}{path}", json=payload, timeout=20)
+            except Exception as exc:
+                print(f"  [GPU] 언로드 요청 실패({path}): {type(exc).__name__}: {exc}")
+
+    deadline = time.time() + verify_seconds
+    while time.time() < deadline:
+        if not _loaded_model_names():
+            return True
+        time.sleep(1.0)
+
+    remaining = _loaded_model_names()
+    print(f"  [GPU] 언로드 후에도 적재 유지: {remaining}")
+    return False
+
+
+def gpu_pause_status() -> dict:
+    """/health 및 WebUI용 상태 스냅샷."""
+    until = _gpu_pause_until()
+    runtime = _ollama_runtime_status()
+    loaded = [m for m in (runtime.get("models") or []) if m.get("on_gpu")]
+    vram_bytes = sum(int(m.get("size_vram_bytes") or 0) for m in loaded)
+    return {
+        "paused": until is not None,
+        "until": until.isoformat() if until else None,
+        "remaining_seconds": int((until - datetime.now()).total_seconds()) if until else 0,
+        "ollama_runtime": runtime.get("status"),
+        "vram_bytes": vram_bytes,
+        "models_on_gpu": [m.get("name") for m in loaded],
+    }
+
 
 _KNOWN_OPS_JOBS = {
     "watchlist_scan": "Watchlist Scan",
@@ -879,6 +964,14 @@ def format_alert_message(ticker: str, result: dict) -> str:
 
 def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
     """단일 종목 에이전트 분석"""
+    # GPU 일시 해제 중에는 LLM을 호출하지 않는다 — 호출하면 모델이 재적재되어
+    # 해제 목적이 무너진다. 수동 스캔도 동일하게 막는다.
+    until = _gpu_pause_until()
+    if until:
+        raise GpuPausedError(
+            f"GPU 일시 해제 중 — {until.strftime('%H:%M')}에 자동 복귀합니다. "
+            "지금 필요하면 WebUI에서 '지금 복구'를 누르세요."
+        )
     try:
         df, fundamentals, options_pcr, insider_trades = _fetch_analysis_inputs(ticker)
 
@@ -1118,6 +1211,13 @@ def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
     SCAN_PARALLEL_WORKERS 환경변수로 병렬 수 조정 (기본 3).
     Ollama OLLAMA_NUM_PARALLEL도 동일하게 설정 권장.
     """
+    # GPU 일시 해제 중이면 건너뛴다. 그냥 돌리면 모델이 다시 적재되어
+    # VRAM을 도로 점유하고, LLM 호출은 타임아웃으로 실패한다.
+    until = _gpu_pause_until()
+    if until:
+        print(f"  [GPU] 일시 해제 중 — 스캔 건너뜀 (복귀 예정 {until.strftime('%H:%M')})")
+        return {"status": "skipped", "reason": "gpu_paused", "resume_at": until.isoformat()}
+
     tickers = override_tickers if override_tickers else _load_watchlist_files()
     max_workers = int(_os.getenv("SCAN_PARALLEL_WORKERS", "3"))
 
@@ -1311,6 +1411,11 @@ def _run_multi_agent_batch_impl(tickers: "list[str] | None" = None) -> dict:
     """
     if MultiAgentOrchestrator is None:
         return {"status": "skipped", "reason": "multi-agent module unavailable"}
+
+    until = _gpu_pause_until()
+    if until:
+        print(f"  [GPU] 일시 해제 중 — V2 배치 건너뜀 (복귀 예정 {until.strftime('%H:%M')})")
+        return {"status": "skipped", "reason": "gpu_paused", "resume_at": until.isoformat()}
 
     targets = tickers or _load_watchlist_files()
     summary: dict = {
@@ -1621,7 +1726,11 @@ def get_ticker_result(ticker: str):
 def scan_ticker(ticker: str, ai_mode: str = "ollama"):
     """단일 종목 즉시 분석"""
     ticker = ticker.upper()
-    result = analyze_ticker(ticker, ai_mode)
+    try:
+        result = analyze_ticker(ticker, ai_mode)
+    except GpuPausedError as exc:
+        # 409: 일시적 상태 충돌 — 재시도하면 되는 상황이지 분석 실패가 아니다.
+        raise HTTPException(409, str(exc)) from exc
     if not result:
         raise HTTPException(500, f"{ticker}: 분석 실패")
 
@@ -1643,7 +1752,11 @@ def scan_ticker(ticker: str, ai_mode: str = "ollama"):
 def scan_all(ai_mode: str = "ollama", tickers: str = ""):
     """전체 watchlist 즉시 스캔. tickers 쿼리로 종목 지정 가능 (콤마 구분)."""
     override = [t.strip().upper() for t in tickers.split(",") if t.strip()] if tickers else None
-    run_scheduled_scan(override_tickers=override)
+    outcome = run_scheduled_scan(override_tickers=override) or {}
+    # 반환값을 버리고 'completed'를 고정 응답하면 GPU 해제로 건너뛴 스캔이
+    # 정상 완료로 보고된다.
+    if outcome.get("status") == "skipped":
+        return {**outcome, "results": get_all_results()}
     return {"status": "completed", "results": get_all_results()}
 
 
@@ -1778,6 +1891,7 @@ def health():
         "status": "healthy",
         "ollama": "connected" if ollama_ok else "disconnected",
         "ollama_runtime": ollama_runtime,
+        "gpu_pause": gpu_pause_status(),
         "alert_delivery": _telegram_delivery_status(),
         "cached_results": len(latest_results),
         "scan_count": len(scan_history),
@@ -1791,6 +1905,47 @@ def health():
             "NYSE": nyse_session,
         },
     }
+
+
+class GpuPauseRequest(BaseModel):
+    minutes: int = Field(default=60, ge=1, le=GPU_PAUSE_MAX_MINUTES)
+
+
+@app.get("/gpu/status")
+def gpu_status():
+    """GPU 점유/일시 해제 상태."""
+    return gpu_pause_status()
+
+
+@app.post("/gpu/pause")
+def gpu_pause(body: GpuPauseRequest):
+    """LLM 작업을 멈추고 모델을 언로드해 VRAM을 반환한다.
+
+    만료 시각을 함께 저장해, 복구를 잊어도 지정 시간 뒤 자동으로 돌아온다.
+    """
+    until = datetime.now() + timedelta(minutes=body.minutes)
+    set_app_state(_STATE_GPU_PAUSE, until.isoformat())
+    unloaded = _unload_ollama_model()
+    print(
+        f"  [GPU] 일시 해제 {body.minutes}분 — 복귀 예정 {until.strftime('%H:%M')} "
+        f"(VRAM 반환 {'성공' if unloaded else '실패'})"
+    )
+    status = gpu_pause_status()
+    status["unloaded"] = unloaded
+    if not unloaded:
+        status["warning"] = (
+            "LLM 작업은 중지됐지만 VRAM이 반환되지 않았습니다. "
+            "호스트에서 `ollama stop` 또는 Ollama 재시작이 필요할 수 있습니다."
+        )
+    return status
+
+
+@app.post("/gpu/resume")
+def gpu_resume():
+    """즉시 복구. 다음 스캔부터 모델이 다시 적재된다."""
+    set_app_state(_STATE_GPU_PAUSE, None)
+    print("  [GPU] 일시 해제 종료 — 다음 스캔부터 정상 동작")
+    return gpu_pause_status()
 
 
 @app.get("/system-monitor")
