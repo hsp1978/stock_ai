@@ -95,6 +95,34 @@ class EnhancedDecisionMaker:
                     values.append(float(rr))
         return min(values) if values else None
 
+    @staticmethod
+    def apply_execution_readiness(decision: Dict) -> Dict:
+        """진입 계획 부착 후 실행 가능성을 판정한다 (in-place 갱신).
+
+        aggregate() 안에서는 판정할 수 없다 — orchestrator가 aggregate() 반환
+        뒤에 entry_plan을 붙이기 때문이다. 여기서 하지 않으면 execution_ready가
+        항상 False가 되어 모든 방향성 신호의 신뢰도가 상한에 걸린다.
+
+        진입 계획 생성이 실패했을 때만(손절 미산출 등) 신호를 유지한 채
+        실행 불가임을 표시하고 신뢰도 상한을 건다.
+        """
+        signal = (decision.get("final_signal") or decision.get("signal") or "").lower()
+        plan = decision.get("entry_plan") or {}
+        ready = bool(
+            plan.get("limit_price") is not None and plan.get("stop_loss") is not None
+        )
+        decision["execution_ready"] = ready
+
+        if signal in ("buy", "sell") and not ready:
+            warns = list(decision.get("warnings") or [])
+            if "NO_ENTRY_PLAN_NOT_EXECUTABLE" not in warns:
+                warns.append("NO_ENTRY_PLAN_NOT_EXECUTABLE")
+            decision["warnings"] = warns
+            for key in ("final_confidence", "confidence"):
+                if isinstance(decision.get(key), (int, float)):
+                    decision[key] = min(float(decision[key]), 5.0)
+        return decision
+
     def _apply_risk_reward_gate(self, final_decision: Dict, rr: Optional[float]) -> Dict:
         """R/R 하한 미달이면 매수를 관망으로 강등한다.
 
@@ -407,24 +435,14 @@ class EnhancedDecisionMaker:
         if rr_blocked:
             final_decision = self._apply_risk_reward_gate(final_decision, min_rr)
 
-        # 6.8. [실행 가능성] 매매 파라미터 없는 방향성 신호를 표시한다.
-        # V2 경로는 entry_plan을 생성하지 않으므로 신호를 뒤집지는 않는다 —
-        # 뒤집으면 모든 V2 매수가 사라진다. 대신 실행 불가임을 명시하고
-        # 신뢰도 상한을 걸어 '바로 실행 가능한 신호'로 읽히지 않게 한다.
-        entry_plan = final_decision.get("entry_plan") or {}
-        execution_ready = bool(
-            entry_plan.get("limit_price") is not None
-            and entry_plan.get("stop_loss") is not None
-        )
-        if final_decision["signal"] in ("buy", "sell") and not execution_ready:
-            final_decision["confidence"] = min(float(final_decision["confidence"]), 5.0)
+        # 6.8. [실행 가능성] entry_plan은 orchestrator가 aggregate() 반환 뒤에
+        # 붙이므로 여기서는 판정할 수 없다. apply_execution_readiness()를
+        # 진입 계획 생성 직후에 호출한다 (multi_agent).
 
         # 7. 경고 메시지 수집
         warnings = []
         if rr_blocked:
             warnings.append(f"RR_BELOW_MIN_{self.MIN_RISK_REWARD}")
-        if final_decision["signal"] in ("buy", "sell") and not execution_ready:
-            warnings.append("NO_ENTRY_PLAN_NOT_EXECUTABLE")
         if kelly_no_bet and final_decision["signal"] == "buy":
             warnings.append("KELLY_NEGATIVE_NO_BET")
         if not is_valid and fixed_ticker:
@@ -453,8 +471,6 @@ class EnhancedDecisionMaker:
         # R/R 강등도 동일 — 보너스로 cap이 무력화되면 게이트가 사문화된다.
         if final_decision.get("rr_downgraded"):
             final_confidence = min(final_confidence, 3.0)
-        if final_decision["signal"] in ("buy", "sell") and not execution_ready:
-            final_confidence = min(final_confidence, 5.0)
         decision_context = self._build_decision_context(
             final_decision["signal"],
             final_confidence,
@@ -491,7 +507,6 @@ class EnhancedDecisionMaker:
             "signal_strength": signal_strength,
             # 실행 가능성 — 소비자(텔레그램/주문 라우터)가 '바로 실행 가능한 신호'와
             # '방향 의견'을 구분할 수 있어야 한다.
-            "execution_ready": execution_ready,
             "min_risk_reward": min_rr,
             "volatility_status": volatility_check,
             "technical_analysis": tech_analysis,
