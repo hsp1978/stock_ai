@@ -4064,10 +4064,19 @@ def render_multi_agent():
 - **판단 근거**: {agent['reasoning'][:200]}...
 """
 
+            # 매매 파라미터 — 화면에는 있는데 export에만 없어서 "매수 신호인데
+            # 진입/손절 전무"한 리포트가 나갔다 (2026-08-03 수정).
+            from report_format import (
+                format_entry_plan_markdown,
+                format_execution_status_markdown,
+            )
+
+            markdown_report += "\n" + format_entry_plan_markdown(ticker, final_decision)
+
             markdown_report += f"""
 ## 🎯 최종 판단 근거
 {final_decision.get('reasoning', 'N/A')}
-
+{format_execution_status_markdown(final_decision)}
 ## ⚠️ 핵심 리스크
 """
             for risk in final_decision.get('key_risks', []):
