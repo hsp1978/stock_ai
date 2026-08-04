@@ -1141,16 +1141,47 @@ def load_watchlist() -> list[str]:
 
 
 def save_watchlist(tickers: list[str]):
+    """워치리스트를 파일에 기록하고 반영을 재확인한다.
+
+    2026-08-03: 삭제가 UI에서는 반영된 듯 보이는데 파일은 그대로여서
+    새로고침하면 종목이 되살아나는 일이 있었다(사용자 액션 로그에는 remove가
+    남았지만 파일 mtime은 그 이전). 쓰기 실패를 조용히 넘기면 원인 추적이
+    불가능하므로, 기록 후 되읽어 검증하고 불일치면 예외를 올린다.
+    """
     header = (
         "# 관심 종목 리스트 (SSOT: WebUI/백엔드/배치 스크립트 공용)\n"
         "# 한 줄에 하나, #은 주석, 빈 줄은 무시됨\n"
         "# 편집 권장 방법: WebUI 사이드바 → 관심 종목 관리\n"
         "# 직접 편집 시 WebUI 재시작 또는 새로고침 필요\n\n"
     )
+    expected = sorted({t.strip().upper() for t in tickers if t and t.strip()})
     with open(WATCHLIST_PATH, "w", encoding="utf-8") as f:
         f.write(header)
-        for t in sorted(tickers):  # 알파벳 순으로 정렬하여 저장
+        for t in expected:
             f.write(f"{t}\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+    persisted = sorted(
+        line.strip().upper()
+        for line in open(WATCHLIST_PATH, encoding="utf-8")
+        if line.strip() and not line.startswith("#")
+    )
+    if persisted != expected:
+        raise IOError(
+            f"워치리스트 저장 검증 실패: 기대 {len(expected)}종목 / 실제 {len(persisted)}종목 "
+            f"({WATCHLIST_PATH})"
+        )
+
+
+def clear_watchlist() -> tuple[bool, str]:
+    """워치리스트 전체 비우기."""
+    removed = len(load_watchlist())
+    if removed == 0:
+        return False, "이미 비어 있습니다"
+    save_watchlist([])
+    log_action("watchlist_edit", metadata={"op": "clear", "removed": removed})
+    return True, f"{removed}개 종목을 모두 삭제했습니다"
 
 
 _TICKER_VALIDATION_CACHE: Dict[str, Tuple[bool, str]] = {}
@@ -1347,7 +1378,10 @@ def add_to_watchlist(ticker: str) -> tuple[bool, str]:
         return False, f"⚠️ {resolved_ticker}는 이미 Watchlist에 있습니다"
 
     current.append(resolved_ticker)
-    save_watchlist(current)
+    try:
+        save_watchlist(current)
+    except OSError as exc:
+        return False, f"❌ {resolved_ticker} 추가 실패 — 파일 저장 오류: {exc}"
     log_action("watchlist_edit", ticker=resolved_ticker, metadata={"op": "add"})
 
     # 성공 메시지에 회사명 포함
@@ -1363,7 +1397,11 @@ def remove_from_watchlist(ticker: str) -> tuple[bool, str]:
     if ticker not in current:
         return False, f"{ticker} not found"
     current.remove(ticker)
-    save_watchlist(current)
+    try:
+        save_watchlist(current)
+    except OSError as exc:
+        # 저장 실패를 성공으로 보고하면 새로고침 때 종목이 되살아나 혼란만 남는다.
+        return False, f"❌ {ticker} 삭제 실패 — 파일 저장 오류: {exc}"
     log_action("watchlist_edit", ticker=ticker, metadata={"op": "remove"})
     return True, f"{ticker} removed"
 
@@ -1681,6 +1719,49 @@ def render_home():
             wl_chips = " ".join(_home_chip(t) for t in filtered)
             st.markdown(f'<div style="line-height:2.2;">{wl_chips}</div>', unsafe_allow_html=True)
             st.caption(f"표시 {len(filtered)}개 / 전체 {len(watchlist)}개")
+
+            # 종목 삭제 — 선택 삭제 + 전체 삭제
+            rm_col, clear_col = st.columns([3, 1])
+            with rm_col:
+                rm_targets = st.multiselect(
+                    "삭제할 종목",
+                    options=filtered,
+                    format_func=lambda t: f"{_market_flag(t)} {get_ticker_display_name(t)} ({t})",
+                    key="home_wl_remove",
+                    placeholder="삭제할 종목 선택 (복수 선택 가능)",
+                    label_visibility="collapsed",
+                )
+                if rm_targets and st.button(
+                    f"🗑 선택 {len(rm_targets)}개 삭제", key="home_wl_rm_btn",
+                    use_container_width=True,
+                ):
+                    failed = []
+                    for t in rm_targets:
+                        ok, msg = remove_from_watchlist(t)
+                        if not ok:
+                            failed.append(msg)
+                    if failed:
+                        for m in failed:
+                            st.error(m)
+                    else:
+                        st.success(f"{len(rm_targets)}개 종목을 삭제했습니다")
+                        st.rerun()
+            with clear_col:
+                # 전체 삭제는 되돌릴 수 없으므로 체크박스로 한 번 더 확인받는다.
+                confirm_clear = st.checkbox("전체 삭제 확인", key="home_wl_clear_confirm")
+                if st.button(
+                    "🗑 전체 삭제", key="home_wl_clear_btn",
+                    disabled=not confirm_clear, use_container_width=True,
+                ):
+                    try:
+                        ok, msg = clear_watchlist()
+                    except OSError as exc:
+                        ok, msg = False, f"❌ 전체 삭제 실패 — 파일 저장 오류: {exc}"
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.warning(msg)
         else:
             st.caption(f"'{market_filter}' 필터에 해당하는 종목 없음")
     else:
