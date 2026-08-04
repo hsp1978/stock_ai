@@ -242,8 +242,16 @@ class GpuPausedError(RuntimeError):
 
 
 def _gpu_pause_until() -> Optional[datetime]:
-    """GPU 일시 해제 만료 시각. 해제 중이 아니면 None (만료분은 자동 정리)."""
-    raw = get_app_state(_STATE_GPU_PAUSE, None)
+    """GPU 일시 해제 만료 시각. 해제 중이 아니면 None (만료분은 자동 정리).
+
+    상태 저장소를 못 읽으면(테이블 미생성 등) '해제 아님'으로 본다 — fail-open.
+    상태를 못 읽는다는 이유로 스캔·배치를 막으면 장애가 전파된다.
+    """
+    try:
+        raw = get_app_state(_STATE_GPU_PAUSE, None)
+    except Exception as exc:
+        print(f"  [GPU] 해제 상태 조회 실패 — 정상 동작으로 간주: {type(exc).__name__}: {exc}")
+        return None
     if not raw:
         return None
     try:

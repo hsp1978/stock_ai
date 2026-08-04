@@ -149,3 +149,18 @@ def test_pause_minutes_must_be_positive():
 
 def test_pause_default_is_one_hour():
     assert service.GpuPauseRequest().minutes == 60
+
+
+def test_state_store_failure_fails_open(monkeypatch):
+    """상태를 못 읽는다고 스캔·배치를 막으면 장애가 전파된다 (CI에서 실제 발생).
+
+    app_state 테이블이 없는 환경에서 get_app_state가 OperationalError를 냈고,
+    V2 배치 테스트가 통째로 실패했다.
+    """
+    import sqlite3
+
+    def _boom(*a, **k):
+        raise sqlite3.OperationalError("no such table: app_state")
+
+    monkeypatch.setattr(service, "get_app_state", _boom)
+    assert service.is_gpu_paused() is False
