@@ -194,3 +194,34 @@ def test_command_bar_exists():
     src = _webui()
     assert "def render_command_bar" in src
     assert "render_command_bar(api_get(\"/health\")" in src
+
+
+# ── TickerChip · DataTable (DS §05, 3단계) ──────────────────────
+
+
+def test_ticker_chip_puts_ticker_first():
+    """회사 명칭을 칩 본문에 넣으면 폭이 들쭉날쭉해진다 — 명칭은 툴팁."""
+    src = _webui()
+    assert "def ticker_chip_html" in src
+    fn = src[src.index("def ticker_chip_html"):]
+    fn = fn[: fn.index("\n\ndef ")]
+    assert 'title="{title}"' in fn, "명칭 툴팁 없음"
+    assert "{ticker}</span>" in fn, "티커가 칩 본문에 없음"
+
+
+def test_ticker_chip_has_market_badge():
+    src = _webui()
+    fn = src[src.index("def ticker_chip_html"):]
+    fn = fn[: fn.index("\n\ndef ")]
+    assert '"KR" if is_kr else "US"' in fn
+
+
+def test_ticker_chip_spec_dimensions():
+    css = _css()
+    assert "height: 28px" in css, "TickerChip h28 규격 불일치"
+    assert ".wl-chip .tc-badge" in css, "시장 배지 스타일 없음"
+
+
+def test_datatable_row_height():
+    """DS §05 DataTable: 행 h44."""
+    assert "row_height=44" in _webui()

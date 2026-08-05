@@ -487,12 +487,24 @@ st.markdown("""
         font-size: 0.75rem; color: var(--outline); line-height: 1.9;
     }
     .sidebar-info span { color: var(--on-surface-variant); }
+    /* ── TickerChip (DS §05) — h28 · r4 · 티커 우선, 시장 코드는 색 배지로 분리.
+       회사 정식 명칭을 넣으면 칩 폭이 들쭉날쭉해져 스캔이 느려진다 (명칭은 툴팁). */
     .wl-chip {
-        display: inline-block; background: var(--L2); border-radius: 6px;
-        padding: 3px 10px; margin: 2px;
-        font-family: 'JetBrains Mono'; font-size: 0.7rem; font-weight: 500;
-        color: var(--on-surface-variant);
+        display: inline-flex; align-items: center; gap: var(--sp-2);
+        height: 28px; padding: 0 var(--sp-2) 0 var(--sp-1);
+        margin: 2px; border-radius: var(--r-tag);
+        background: var(--bg-raised); border: 1px solid var(--border-subtle);
+        font-family: var(--font-num); font-size: 12px; font-weight: 500;
+        color: var(--text-hi); font-variant-numeric: tabular-nums;
+        cursor: default;
     }
+    .wl-chip .tc-badge {
+        display: inline-flex; align-items: center;
+        height: 18px; padding: 0 5px; border-radius: var(--r-tag);
+        font-size: 10px; font-weight: 600; letter-spacing: .06em;
+    }
+    .wl-chip .tc-badge.kr { background: rgba(76,184,245,.16); color: var(--info); }
+    .wl-chip .tc-badge.us { background: var(--accent-soft); color: var(--accent); }
 
     /* ── Expander — No-Line: L1 on L0 ── */
     .stExpander {
@@ -1892,14 +1904,7 @@ def render_home():
             filtered = watchlist
 
         if filtered:
-            def _home_chip(t):
-                name = get_ticker_display_name(t)
-                flag = _market_flag(t)
-                if name and name != t:
-                    # tooltip으로 티커 노출
-                    return f'<span class="wl-chip" title="{t}">{flag} {name}</span>'
-                return f'<span class="wl-chip">{flag} {t}</span>'
-            wl_chips = " ".join(_home_chip(t) for t in filtered)
+            wl_chips = " ".join(ticker_chip_html(t) for t in filtered)
             st.markdown(f'<div style="line-height:2.2;">{wl_chips}</div>', unsafe_allow_html=True)
             st.caption(f"표시 {len(filtered)}개 / 전체 {len(watchlist)}개")
 
@@ -2238,6 +2243,21 @@ def render_index_chart(symbol: str, label: str, decimals: int):
     c1.metric("현재", f"{last:,.{decimals}f}", f"{change_pct:+.2f}%")
     c2.metric("기간 최고", f"{hi:,.{decimals}f}")
     c3.metric("기간 최저", f"{lo:,.{decimals}f}")
+
+
+def ticker_chip_html(ticker: str) -> str:
+    """TickerChip (DS §05) — 티커 우선 + 시장 배지. 회사 명칭은 툴팁.
+
+    명칭을 칩 본문에 넣으면 폭이 들쭉날쭉해져 목록을 훑는 속도가 떨어진다.
+    """
+    is_kr = _is_korean_ticker(ticker)
+    badge = "KR" if is_kr else "US"
+    name = get_ticker_display_name(ticker) or ticker
+    title = name if name != ticker else ticker
+    return (
+        f'<span class="wl-chip" title="{title}">'
+        f'<span class="tc-badge {"kr" if is_kr else "us"}">{badge}</span>{ticker}</span>'
+    )
 
 
 def render_stat_row(items: "list[tuple[str, int]]", empty_hint: str = "—"):
@@ -3653,7 +3673,7 @@ def render_quant_indicators():
     tab_summary, tab_details, tab_risk, tab_json = st.tabs(["Factor Table", "Indicator Detail", "Risk", "JSON"])
     with tab_summary:
         if not comp_df.empty:
-            st.dataframe(comp_df, use_container_width=True, hide_index=True)
+            st.dataframe(comp_df, use_container_width=True, row_height=44, hide_index=True)
         cols = st.columns(2)
         with cols[0]:
             st.markdown("**Strengths**")
@@ -4271,7 +4291,7 @@ def render_multi_agent():
                             "진입가": price_str,
                             "트리거": s.get("trigger", ""),
                         })
-                    st.dataframe(split_rows, use_container_width=True, hide_index=True)
+                    st.dataframe(split_rows, use_container_width=True, row_height=44, hide_index=True)
 
                 # 기타 정보
                 col_a, col_b = st.columns(2)
@@ -4537,7 +4557,7 @@ def render_system_monitor():
                     "Overloads": metrics.get("overload_count", 0),
                     "URL": metrics.get("url", ""),
                 })
-            st.dataframe(node_rows, use_container_width=True, hide_index=True)
+            st.dataframe(node_rows, use_container_width=True, row_height=44, hide_index=True)
 
             chart_df = pd.DataFrame(node_rows)
             fig = go.Figure()
@@ -4586,7 +4606,7 @@ def render_system_monitor():
                     ),
                 })
             perf_df = pd.DataFrame(rows).sort_values("Avg Seconds", ascending=False)
-            st.dataframe(perf_df, use_container_width=True, hide_index=True)
+            st.dataframe(perf_df, use_container_width=True, row_height=44, hide_index=True)
 
             fig = go.Figure(go.Bar(
                 x=perf_df["Avg Seconds"],
@@ -4649,7 +4669,7 @@ def render_system_monitor():
                     "Duration Sec": job.get("last_duration_sec"),
                     "Last Error": job.get("last_error") or "",
                 })
-            st.dataframe(job_rows, use_container_width=True, hide_index=True)
+            st.dataframe(job_rows, use_container_width=True, row_height=44, hide_index=True)
         else:
             st.info("No ops job state yet.")
 
@@ -4697,7 +4717,7 @@ def render_system_monitor():
                 severity_order = {"STALE": 0, "DEGRADED": 1, "OK": 2}
                 df_fresh["_order"] = df_fresh["Severity"].map(severity_order).fillna(9)
                 df_fresh = df_fresh.sort_values(["_order", "Ticker"]).drop(columns=["_order"])
-                st.dataframe(df_fresh, use_container_width=True, hide_index=True)
+                st.dataframe(df_fresh, use_container_width=True, row_height=44, hide_index=True)
 
                 chart_df = df_fresh.groupby("Severity").size().reset_index(name="Count")
                 fig = go.Figure(go.Bar(
@@ -4911,7 +4931,7 @@ def render_signal_accuracy():
                     "평균 수익": f"{b['avg_return_pct']:+.2f}%",
                 })
         if band_table:
-            st.dataframe(band_table, use_container_width=True, hide_index=True)
+            st.dataframe(band_table, use_container_width=True, row_height=44, hide_index=True)
 
             # 차트: bar chart - 신뢰도별 적중률
             try:
@@ -5126,7 +5146,7 @@ def render_screener():
             "현재가": _fmt_price(r.get('current_price', 0), ticker),
         })
     df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df, use_container_width=True, row_height=44, hide_index=True)
 
     # ── 파이프라인 뷰 (스크리너 + Multi-Agent 합의도) ──
     combined = data.get("combined_view")
@@ -5190,7 +5210,7 @@ def render_screener():
                     "Entry": entry_str,
                 })
 
-        st.dataframe(pipe_rows, use_container_width=True, hide_index=True)
+        st.dataframe(pipe_rows, use_container_width=True, row_height=44, hide_index=True)
 
         # 🟢🟢 강한 일치만 별도 하이라이트
         strong = [e for e in combined if (e.get("agreement") or {}).get("level") == "strong_match"]
@@ -5465,7 +5485,7 @@ def render_trading():
                 "P&L": _fmt_price(p.get("unrealized_pnl"), ticker),
                 "P&L %": f"{p.get('unrealized_pnl_pct', 0):+.2f}%",
             })
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, use_container_width=True, row_height=44, hide_index=True)
 
     st.divider()
 
@@ -5525,7 +5545,7 @@ def render_trading():
                 "가격": _fmt_price(limit_price, ticker) if limit_price else "—",
                 "결과": f"{status_icon} {o.get('result_status') or o.get('safety_reason', '?')}",
             })
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, use_container_width=True, row_height=44, hide_index=True)
 
     # 통계
     stats = api_get("/trading/orders/stats?days_back=7")
@@ -5887,7 +5907,7 @@ def render_virtual_trade():
                 "사유": t.get("reason", "")[:40],
                 "청산일": (t.get("exit_date", "") or "")[:10],
             })
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, use_container_width=True, row_height=44, hide_index=True)
     else:
         st.caption("아직 청산된 거래 없음")
 
@@ -6037,7 +6057,7 @@ def render_scan_log():
                         "Alerts": t.get("alerts", 0),
                     })
                 wt_df = pd.DataFrame(wt_rows)
-                st.dataframe(wt_df, use_container_width=True, hide_index=True)
+                st.dataframe(wt_df, use_container_width=True, row_height=44, hide_index=True)
 
             # Top BUY / Top SELL
             col_buy, col_sell = st.columns(2)
