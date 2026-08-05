@@ -8,6 +8,7 @@ Mac Studio 에이전트 API 연동 + 전체 리포트 대시보드
 """
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from typing import Dict, Tuple
@@ -74,39 +75,77 @@ st.set_page_config(
 # ── Kinetic Terminal Design System CSS ──────────────────────────
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap');
+    @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css');
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 
+    /* ── Stock AI 디자인 시스템 v1.0 토큰 ──
+       원칙: 숫자가 주인공 / 색은 신호일 때만 / 면 대신 선 / 4px 배수 밀도 */
     :root {
-        --L0: #0b0e14;
-        --L1: #1d2026;
-        --L2: #32353c;
-        --surface-low: #191c22;
-        --surface-bright: #363940;
-        --outline: #8d909e;
-        --outline-variant: #424752;
-        --ghost: rgba(66,71,82,0.20);
-        --on-bg: #e1e2eb;
-        --on-surface: #e1e2eb;
-        --on-surface-variant: #c3c6d4;
-        --primary: #aec6ff;
-        --primary-ctr: #5d8ef1;
-        --buy: #02d4a1;
-        --buy-bright: #46f1bc;
-        --sell: #fd526f;
-        --sell-bright: #ffb2b8;
-        --hold: #ffb347;
+        /* surface */
+        --bg-canvas: #0A0C11;
+        --bg-surface: #11151C;
+        --bg-raised: #171D26;
+        --bg-inset: #06080C;
+        /* text */
+        --text-hi: #EDF1F7;
+        --text-mid: #9BA6B5;
+        --text-low: #6A7482;
+        /* border */
+        --border-subtle: #1F2733;
+        --border-strong: #2C3745;
+        /* semantic — 상승/하락/액션 3가지 의미에만 색을 쓴다 */
+        --accent: #6D7CFF;
+        --accent-soft: rgba(109,124,255,.16);
+        --up: #2BD98A;
+        --down: #FF6B6B;
+        --warn: #F5B14C;
+        --info: #4CB8F5;
+        /* type */
+        --font-ui: 'Pretendard Variable', Pretendard, -apple-system, BlinkMacSystemFont, sans-serif;
+        --font-num: 'JetBrains Mono', monospace;
+        /* space (4px base) */
+        --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px; --sp-4: 16px;
+        --sp-5: 24px; --sp-6: 40px; --sp-7: 64px;
+        /* radius */
+        --r-tag: 4px; --r-ctl: 6px; --r-card: 10px; --r-pill: 999px;
+        /* control height */
+        --h-sm: 32px; --h-md: 36px; --h-lg: 40px;
+        /* motion */
+        --dur: 120ms; --ease: cubic-bezier(.2,.6,.2,1);
+
+        /* ── 레거시 별칭 ──
+           webui.py는 5,100 라인 단일 파일이라 CSS를 한 번에 치환하지 않는다
+           (CLAUDE.md #10). 기존 규칙이 그대로 동작하도록 새 토큰에 매핑만 한다. */
+        --L0: var(--bg-canvas);
+        --L1: var(--bg-surface);
+        --L2: var(--border-strong);
+        --surface-low: var(--bg-inset);
+        --surface-bright: var(--bg-raised);
+        --outline: var(--text-low);
+        --outline-variant: var(--border-subtle);
+        --ghost: rgba(31,39,51,0.35);
+        --on-bg: var(--text-hi);
+        --on-surface: var(--text-hi);
+        --on-surface-variant: var(--text-mid);
+        --primary: var(--accent);
+        --primary-ctr: var(--accent);
+        --buy: var(--up);
+        --buy-bright: var(--up);
+        --sell: var(--down);
+        --sell-bright: var(--down);
+        --hold: var(--warn);
     }
 
     /* ── Base ── */
     .stApp {
         background: var(--L0) !important;
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+        font-family: var(--font-ui);
         color: var(--on-bg);
     }
     ::-webkit-scrollbar { width: 4px; height: 4px; }
     ::-webkit-scrollbar-track { background: var(--L0); }
     ::-webkit-scrollbar-thumb { background: var(--L2); border-radius: 10px; }
-    h1, h2, h3 { font-family: 'Inter', sans-serif !important; letter-spacing: -0.02em; color: var(--on-surface) !important; }
+    h1, h2, h3 { font-family: var(--font-ui) !important; letter-spacing: -0.02em; color: var(--on-surface) !important; }
 
     /* ── Sidebar — No-Line: tonal shift only ── */
     div[data-testid="stSidebar"] {
@@ -128,35 +167,148 @@ st.markdown("""
     }
 
     /* ── Ticker bar — No-Line: L1 card on L0, no border ── */
-    .ticker-expanded {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    /* ── IndexTile (DS §05) — h76 · pad 14/16 · r10 · gap 12 · 좌측 정렬
+       라벨 12 / 가격 19 / 등락 12 3단 구조. 클릭 가능해야 하므로 st.button을
+       타일 형태로 스타일링한다 (Streamlit은 HTML에 콜백을 붙일 수 없다). */
+    .idx-grid div[data-testid="stButton"] > button {
+        height: 76px;
+        width: 100%;
+        padding: 14px 16px;
+        border-radius: var(--r-card);
+        background: var(--bg-surface);
+        border: 1px solid var(--border-subtle);
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        justify-content: center;
         gap: 2px;
-        background: var(--L1);
-        border-radius: 12px;
-        padding: 4px;
-        margin-bottom: 24px;
+        transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
     }
-    .ticker-cell {
-        padding: 12px 8px; text-align: center;
-        border-radius: 10px; transition: background 0.2s;
+    .idx-grid div[data-testid="stButton"] > button:hover {
+        background: var(--bg-raised);
+        border-color: var(--border-strong);
     }
-    .ticker-cell:hover { background: var(--surface-bright); }
-    .ticker-cell .tc-name {
-        font-family: 'Inter'; font-size: 0.625rem; font-weight: 700;
-        color: var(--on-surface-variant); text-transform: uppercase;
-        letter-spacing: 0.5px; margin-bottom: 4px;
+    .idx-grid div[data-testid="stButton"] > button[kind="primary"] {
+        background: var(--accent-soft);
+        border-color: var(--accent);
     }
-    .ticker-cell .tc-price {
-        font-family: 'JetBrains Mono'; font-size: 0.9rem; font-weight: 700;
-        color: var(--on-surface); letter-spacing: -0.03em;
+    .idx-grid div[data-testid="stButton"] > button p {
+        text-align: left;
+        line-height: 1.25;
+        margin: 0;
+        font-family: var(--font-num);
+        font-size: 19px;
+        font-weight: 600;
+        color: var(--text-hi);
+        font-variant-numeric: tabular-nums;
     }
-    .ticker-cell .tc-change {
-        font-family: 'JetBrains Mono'; font-size: 0.7rem; font-weight: 600; margin-top: 2px;
+    /* 첫 줄 = 지수명 라벨 (11/600 · 대문자 · text-low) */
+    .idx-grid div[data-testid="stButton"] > button p::first-line {
+        font-family: var(--font-ui);
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--text-low);
+        letter-spacing: .1em;
     }
-    .ts-up { color: var(--buy); }
-    .ts-down { color: var(--sell); }
-    .ts-flat { color: var(--outline); }
+    /* 마지막 줄 = 등락률 (12px). 방향은 색만이 아니라 ▲/▼ 기호로도 전달한다. */
+    .idx-grid div[data-testid="stButton"] > button p em {
+        font-size: 12px;
+        font-style: normal;
+        font-weight: 600;
+    }
+    .idx-grid div[data-testid="stButton"] > button p em.up { color: var(--up); }
+    .idx-grid div[data-testid="stButton"] > button p em.down { color: var(--down); }
+    .idx-grid div[data-testid="stButton"] > button p em.flat { color: var(--text-low); }
+
+    /* ── SidebarNav (DS §05) — 이동 전용. 항목 h36 · 라벨 13/500
+       선택 = accent-soft 배경 + 좌측 2px accent 바 (색만으로 표현하지 않음) */
+    section[data-testid="stSidebar"] { width: 264px !important; }
+    section[data-testid="stSidebar"] div[data-testid="stButton"] > button {
+        height: var(--h-md);
+        justify-content: flex-start;
+        text-align: left;
+        padding: 0 var(--sp-3);
+        border: none;
+        border-left: 2px solid transparent;
+        border-radius: var(--r-ctl);
+        background: transparent;
+        color: var(--text-mid);
+        font-family: var(--font-ui);
+        font-size: 13px;
+        font-weight: 500;
+        transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+    }
+    section[data-testid="stSidebar"] div[data-testid="stButton"] > button:hover {
+        background: var(--bg-raised);
+        color: var(--text-hi);
+    }
+    section[data-testid="stSidebar"] div[data-testid="stButton"] > button[kind="primary"] {
+        background: var(--accent-soft);
+        border-left-color: var(--accent);
+        color: var(--text-hi);
+        font-weight: 600;
+    }
+    /* 그룹 헤더 — 11px mono 대문자 */
+    section[data-testid="stSidebar"] div[class*="st-key-navgrp_"] > button {
+        height: 28px;
+        margin-top: var(--sp-3);
+        color: var(--text-low) !important;
+        font-family: var(--font-num) !important;
+        font-size: 11px !important;
+        font-weight: 600 !important;
+        letter-spacing: .1em;
+        background: transparent !important;
+        border-left-color: transparent !important;
+    }
+
+    /* ── CommandBar (DS §06) — 사이드바에서 분리한 조작 패널 ── */
+    .status-badge {
+        display: inline-flex; align-items: center; gap: var(--sp-2);
+        height: 24px; padding: 0 var(--sp-3); border-radius: var(--r-pill);
+        font-family: var(--font-num); font-size: 11px; font-weight: 600;
+        letter-spacing: .08em; background: var(--bg-raised); color: var(--text-mid);
+    }
+    .status-badge .sb-dot {
+        width: 6px; height: 6px; border-radius: var(--r-pill); background: var(--text-low);
+    }
+    .status-badge.ok { color: var(--up); }
+    .status-badge.ok .sb-dot { background: var(--up); }
+    .status-badge.err { color: var(--down); }
+    .status-badge.err .sb-dot { background: var(--down); }
+
+    /* ── StatCell (DS §05) — 카드 대신 1px 분할 행 ── */
+    .statcell-row {
+        display: grid;
+        grid-template-columns: repeat(6, 1fr);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--r-card);
+        background: var(--bg-surface);
+        margin-bottom: var(--sp-5);
+        overflow: hidden;
+    }
+    .statcell {
+        padding: var(--sp-3) var(--sp-4);
+        border-left: 1px solid var(--border-subtle);
+    }
+    .statcell:first-child { border-left: none; }
+    .statcell .sc-label {
+        font-family: var(--font-num); font-size: 11px; font-weight: 600;
+        letter-spacing: .1em; text-transform: uppercase; color: var(--text-low);
+        margin-bottom: var(--sp-1);
+    }
+    .statcell .sc-value {
+        font-family: var(--font-num); font-size: 26px; font-weight: 600;
+        color: var(--text-hi); font-variant-numeric: tabular-nums; line-height: 1.1;
+    }
+    .statcell .sc-value.empty { color: var(--text-low); font-size: 15px; }
+    @media (max-width: 1280px) {
+        .statcell-row { grid-template-columns: repeat(3, 1fr); }
+        .statcell:nth-child(4) { border-left: none; }
+    }
+
+    .ts-up { color: var(--up); }
+    .ts-down { color: var(--down); }
+    .ts-flat { color: var(--text-low); }
 
     /* ── Summary Cards — No-Line: L1 on L0, progress bar ── */
     .summary-grid {
@@ -174,7 +326,7 @@ st.markdown("""
         font-size: 32px; opacity: 0.06;
     }
     .summary-card .sc-label {
-        font-family: 'Inter'; font-size: 0.625rem; font-weight: 700;
+        font-family: var(--font-ui); font-size: 0.625rem; font-weight: 700;
         color: var(--on-surface-variant); text-transform: uppercase;
         letter-spacing: 1.2px; margin-bottom: 12px;
     }
@@ -183,7 +335,7 @@ st.markdown("""
         line-height: 1;
     }
     .summary-card .sc-sub {
-        font-family: 'Inter'; font-size: 0.7rem;
+        font-family: var(--font-ui); font-size: 0.7rem;
         color: var(--on-surface-variant); margin-top: 4px;
     }
     .summary-card .sc-bar {
@@ -200,7 +352,7 @@ st.markdown("""
         margin: 28px 0 14px 0;
     }
     .section-title {
-        font-family: 'Inter'; font-size: 1.1rem; font-weight: 700;
+        font-family: var(--font-ui); font-size: 1.1rem; font-weight: 700;
         color: var(--on-surface); letter-spacing: -0.01em;
     }
     .section-subtitle {
@@ -241,7 +393,7 @@ st.markdown("""
         padding: 16px 18px !important;
     }
     div[data-testid="stMetric"] label {
-        font-family: 'Inter' !important;
+        font-family: var(--font-ui) !important;
         font-size: 0.625rem !important;
         font-weight: 700 !important;
         color: var(--on-surface-variant) !important;
@@ -312,7 +464,7 @@ st.markdown("""
         letter-spacing: 1.5px; opacity: 0.7;
     }
     .sidebar-section-label {
-        font-family: 'Inter'; font-size: 0.625rem; font-weight: 700;
+        font-family: var(--font-ui); font-size: 0.625rem; font-weight: 700;
         color: var(--on-surface-variant); text-transform: uppercase;
         letter-spacing: 1px; margin-bottom: 8px;
     }
@@ -322,7 +474,7 @@ st.markdown("""
         padding: 10px 6px; text-align: center;
     }
     .sidebar-status-item .ssi-label {
-        font-family: 'Inter'; font-size: 0.55rem; font-weight: 700;
+        font-family: var(--font-ui); font-size: 0.55rem; font-weight: 700;
         color: var(--outline); text-transform: uppercase; letter-spacing: 0.5px;
     }
     .sidebar-status-item .ssi-value {
@@ -383,7 +535,16 @@ MARKET_INDICES = {
         "items": [
             ("^KS11", "KOSPI", 2),
             ("^KQ11", "KOSDAQ", 2),
+        ],
+    },
+    # 환율 — 수출 비중이 큰 국내 종목 판단에 원화뿐 아니라 엔/위안 흐름도 참고된다.
+    # 표기는 모두 'USD 기준 1달러당' (JPY=X, CNY=X는 yfinance에서 USD/JPY, USD/CNY).
+    "fx": {
+        "title": "FX",
+        "items": [
             ("USDKRW=X", "USD/KRW", 2),
+            ("JPY=X", "USD/JPY", 2),
+            ("CNY=X", "USD/CNY", 4),
         ],
     },
     "commodities": {
@@ -1416,11 +1577,11 @@ def _plotly_base_layout(**overrides) -> dict:
     base = dict(
         template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="#0b0e14",
-        font=dict(family="Inter, sans-serif", color="#c3c6d4", size=12),
+        plot_bgcolor="#06080C",
+        font=dict(family="JetBrains Mono, monospace", color="#9BA6B5", size=12),
         margin=dict(l=0, r=0, t=0, b=0),
-        xaxis=dict(gridcolor="rgba(66,71,82,0.12)", zerolinecolor="rgba(66,71,82,0.18)"),
-        yaxis=dict(gridcolor="rgba(66,71,82,0.12)", zerolinecolor="rgba(66,71,82,0.18)"),
+        xaxis=dict(gridcolor="#161C25", zerolinecolor="#161C25"),
+        yaxis=dict(gridcolor="#161C25", zerolinecolor="#161C25"),
     )
     base.update(overrides)
     return base
@@ -1436,191 +1597,92 @@ def _signal_pill_html(signal: str) -> str:
 #  사이드바
 # ═══════════════════════════════════════════════════════════════
 
-with st.sidebar:
+# ── 내비게이션 정의 (DS §05 SidebarNav) ──
+# 사이드바는 이동 전용. 스캔·GPU·모델 설정 등 조작 패널은 상단 커맨드바로 분리한다.
+NAV_GROUPS = {
+    "ANALYSIS": [
+        "Home", "Dashboard", "Detail", "Multi-Agent",
+        "Quant Indicators", "Screener", "Signal Accuracy", "ML Predict", "Backtest",
+    ],
+    "OPERATIONS": ["Scan Log", "System Monitor", "History", "Ranking"],
+    "TRADING": ["Trading", "Virtual Trade", "Paper Trade", "Portfolio"],
+}
+_NAV_PAGES = [p for items in NAV_GROUPS.values() for p in items]
+
+
+def render_sidebar_nav() -> str:
+    """사이드바 내비게이션 — 3그룹, 항목 h36, 선택 시 accent 좌측 바.
+
+    라디오 목록 대신 진짜 내비게이션 항목으로 렌더한다. 그룹은 접을 수 있고
+    접힘 상태는 session_state에 남겨 클릭할 때마다 초기화되지 않게 한다.
+    """
+    if st.session_state.get("nav_page") not in _NAV_PAGES:
+        st.session_state.nav_page = "Home"
+    current = st.session_state.nav_page
+
     st.markdown('<div class="sidebar-brand">Stock AI</div>', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-label">Precision Terminal</div>', unsafe_allow_html=True)
 
-    health = api_get("/health")
-    if health:
-        ollama_status = health.get("ollama", "disconnected")
-        cached = health.get("cached_results", 0)
-        scans = health.get("scan_count", 0)
-        status_color = "#02d4a1" if ollama_status == "connected" else "#fd526f"
-        st.markdown(f"""
-        <div class="sidebar-status-grid">
-            <div class="sidebar-status-item">
-                <div class="ssi-label">Ollama</div>
-                <div class="ssi-value" style="color:{status_color};">{'Online' if ollama_status == 'connected' else 'Offline'}</div>
-            </div>
-            <div class="sidebar-status-item">
-                <div class="ssi-label">Cached</div>
-                <div class="ssi-value">{cached}</div>
-            </div>
-            <div class="sidebar-status-item">
-                <div class="ssi-label">Scans</div>
-                <div class="ssi-value">{scans}</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.error(f"Agent Offline: {AGENT_API_URL}")
-
-    info = api_get("/")
-    if info:
-        last_scan = info.get("last_scan", "")
-        thresholds = info.get("thresholds", {})
-        buy_th = thresholds.get("buy", "?")
-        sell_th = thresholds.get("sell", "?")
-        model_name = info.get("model", "?")
-        scan_interval = info.get("scan_interval", "?")
-        last_line = f'<br>Last: <span>{last_scan[:16]}</span>' if last_scan else ""
-        st.markdown(f"""
-        <div class="sidebar-info">
-            Model: <span>{model_name}</span><br>
-            Interval: <span>{scan_interval}</span><br>
-            Buy &ge; <span style="color:#02d4a1;">{buy_th}</span>
-            &nbsp; Sell &le; <span style="color:#fd526f;">{sell_th}</span>
-            {last_line}
-        </div>
-        """, unsafe_allow_html=True)
-
-    st.divider()
-
-    # ── GPU 일시 해제 ────────────────────────────────────────────
-    # 다른 서비스가 GPU를 잠깐 써야 할 때 LLM 작업을 멈추고 VRAM을 반환한다.
-    # 만료 시각이 서버에 저장되어, 복구를 잊어도 자동으로 돌아온다.
-    st.markdown('<div class="sidebar-section-label">GPU</div>', unsafe_allow_html=True)
-    gpu = api_get("/gpu/status") or {}
-
-    if gpu.get("paused"):
-        remaining = max(0, int(gpu.get("remaining_seconds") or 0))
-        mins, secs = divmod(remaining, 60)
-        st.warning(f"⏸ GPU 해제 중 · 자동 복귀까지 {mins}분 {secs}초")
-        if st.button("▶ 지금 복구", use_container_width=True, type="primary"):
-            if api_post("/gpu/resume", timeout=30) is not None:
-                st.success("복구했습니다. 다음 스캔부터 정상 동작합니다.")
-                st.rerun()
-    else:
-        vram_gb = (gpu.get("vram_bytes") or 0) / 1e9
-        runtime = gpu.get("ollama_runtime") or "unknown"
-        st.caption(f"사용 중 · {vram_gb:.1f}GB · {runtime}")
-        hold_min = st.selectbox(
-            "해제 시간", [30, 60, 90, 120], index=1,
-            format_func=lambda m: f"{m}분", label_visibility="collapsed",
-        )
-        if st.button("⏸ GPU 사용 중지", use_container_width=True):
-            res = api_post("/gpu/pause", timeout=60, json_body={"minutes": int(hold_min)})
-            if res is not None:
-                st.success(f"{hold_min}분간 해제했습니다. 스캔·V2 배치는 그동안 건너뜁니다.")
-                st.rerun()
-            else:
-                st.error("해제 실패 — agent-api 응답 없음")
-
-    st.divider()
-
-    st.markdown('<div class="sidebar-section-label">Manual Scan</div>', unsafe_allow_html=True)
-    scan_ticker = st.text_input("Ticker", placeholder="AAPL or 애플", label_visibility="collapsed")
-    if st.button("Scan", use_container_width=True):
-        if scan_ticker:
-            resolved, hint = resolve_ticker(scan_ticker)
-            if hint:
-                st.info(hint)
-            if resolved:
-                log_action(
-                    "manual_scan",
-                    page="sidebar",
-                    ticker=resolved,
-                    query=scan_ticker,
-                )
-                with st.spinner(f"Analyzing {resolved}..."):
-                    result = api_post(f"/scan/{resolved}")
-                    if result:
-                        st.success(f"{resolved}: {result.get('final_signal')} ({result.get('composite_score', 0):+.1f})")
-                        st.rerun()
-
-    st.divider()
-
-    st.markdown('<div class="sidebar-section-label">Watchlist · 통합</div>', unsafe_allow_html=True)
-    watchlist = load_watchlist()
-
-    if watchlist:
-        # 시장 플래그 + 종목명 (캐시됨) + 티커
-        def _wl_chip(t):
-            name = get_ticker_display_name(t)
-            flag = _market_flag(t)
-            if name and name != t:
-                return f'<span class="wl-chip" title="{t}">{flag} {name}</span>'
-            return f'<span class="wl-chip">{flag} {t}</span>'
-        wl_chips = " ".join(_wl_chip(t) for t in watchlist)
-        st.markdown(f'<div style="margin-bottom:8px; line-height:2;">{wl_chips}</div>', unsafe_allow_html=True)
-        kr_count = sum(1 for t in watchlist if _is_korean_ticker(t))
-        us_count = len(watchlist) - kr_count
-        st.caption(f"{len(watchlist)} tickers — 🇺🇸 {us_count} · 🇰🇷 {kr_count}")
-    else:
-        st.caption("No tickers in watchlist")
-
-    # 카운터 기반 동적 key — Add 성공 시 key를 변경하여 입력창을 초기화
-    if "wl_add_counter" not in st.session_state:
-        st.session_state.wl_add_counter = 0
-    add_ticker = st.text_input(
-        "Add ticker",
-        placeholder="AAPL · 005930.KS · 삼성전자 — 미국/한국 구분 없이",
-        label_visibility="collapsed",
-        key=f"wl_add_{st.session_state.wl_add_counter}",
-    )
-    wl_col1, wl_col2 = st.columns(2)
-    if wl_col1.button("Add", use_container_width=True, key="wl_add_btn"):
-        if add_ticker:
-            resolved, hint = resolve_ticker(add_ticker)
-            if hint:
-                st.info(hint)
-            if resolved:
-                ok, msg = add_to_watchlist(resolved)
-                if ok:
-                    st.success(msg)
-                    # 새 key로 widget 재생성 → 입력창 비워짐
-                    st.session_state.wl_add_counter += 1
-                    st.rerun()
-                else:
-                    st.warning(msg)
-
-    if watchlist:
-        remove_target = wl_col2.selectbox("Remove", watchlist, label_visibility="collapsed", key="wl_remove")
-        if wl_col2.button("Remove", use_container_width=True, key="wl_rm_btn"):
-            ok, msg = remove_from_watchlist(remove_target)
-            if ok:
-                st.success(msg)
-                st.rerun()
-            else:
-                st.warning(msg)
-
-    if st.button("Scan All", use_container_width=True, key="scan_all_btn"):
-        wl = load_watchlist()
-        if wl:
-            import os as _os_scan
-            workers = int(_os_scan.getenv("SCAN_PARALLEL_WORKERS", "3"))
-            import math as _math_scan
-            est_rounds = _math_scan.ceil(len(wl) / workers)
-            # 배치 다운로드 ~15s + 병렬 LLM 라운드 × 65s 예상
-            est_sec = 15 + est_rounds * 65
-            est_min, est_s = divmod(int(est_sec), 60)
-            est_str = f"{est_min}분 {est_s}초" if est_min else f"{est_s}초"
-
-            tickers_param = ",".join(wl)
-            with st.spinner(
-                f"🔄 {len(wl)}개 종목 병렬 스캔 중 (워커 {workers}개, 예상 {est_str})..."
-            ):
-                result = api_post(f"/scan?tickers={tickers_param}", timeout=900)
-                if result:
-                    st.success(f"✅ 완료! {len(wl)}개 종목 스캔")
+    for group, items in NAV_GROUPS.items():
+        collapse_key = f"nav_collapsed_{group}"
+        collapsed = st.session_state.get(collapse_key, False)
+        caret = "▸" if collapsed else "▾"
+        if st.button(
+            f"{caret}  {group}",
+            key=f"navgrp_{group}",
+            use_container_width=True,
+        ):
+            st.session_state[collapse_key] = not collapsed
             st.rerun()
-        else:
-            st.warning("Watchlist is empty")
+        if collapsed:
+            continue
+        for item in items:
+            selected = item == current
+            if st.button(
+                item,
+                key=f"nav_{_css_key(item)}",
+                use_container_width=True,
+                type="primary" if selected else "secondary",
+            ):
+                st.session_state.nav_page = item
+                st.rerun()
 
-    st.divider()
+    return current
 
-    st.markdown('<div class="sidebar-section-label">Agent Control</div>', unsafe_allow_html=True)
-    if st.button("Restart Agent", use_container_width=True, type="secondary"):
+
+def _render_system_status(health: dict | None, info: dict | None):
+    """시스템 상태 — 사이드바에서 분리해 커맨드바 팝오버로 제공."""
+    if not health:
+        st.error(f"Agent Offline: {AGENT_API_URL}")
+        return
+    ollama_status = health.get("ollama", "disconnected")
+    online = ollama_status == "connected"
+    st.markdown(
+        f'<span class="status-badge {"ok" if online else "err"}">'
+        f'<span class="sb-dot"></span>{"AGENT ONLINE" if online else "AGENT OFFLINE"}</span>',
+        unsafe_allow_html=True,
+    )
+    render_stat_row([
+        ("CACHED", health.get("cached_results", 0)),
+        ("SCANS", health.get("scan_count", 0)),
+        ("JOBS", len(health.get("jobs") or [])),
+    ], empty_hint="—")
+
+    runtime = (health.get("ollama_runtime") or {}).get("status", "unknown")
+    delivery = (health.get("alert_delivery") or {}).get("status", "unknown")
+    if info:
+        thresholds = info.get("thresholds", {})
+        st.markdown(
+            f'<div class="sidebar-info">'
+            f'Model: <span>{info.get("model", "?")}</span><br>'
+            f'Interval: <span>{info.get("scan_interval", "?")}</span><br>'
+            f'Runtime: <span>{runtime}</span> &nbsp; Alerts: <span>{delivery}</span><br>'
+            f'Buy &ge; <span style="color:var(--up);">{thresholds.get("buy", "?")}</span>'
+            f'&nbsp; Sell &le; <span style="color:var(--down);">{thresholds.get("sell", "?")}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    if st.button("Restart Agent", use_container_width=True, key="cmd_restart"):
         with st.spinner("Restarting agent service..."):
             resp = api_post("/restart", timeout=5)
             if resp and resp.get("status") == "restarting":
@@ -1631,9 +1693,94 @@ with st.sidebar:
             else:
                 st.error("Restart failed. Agent may be offline.")
 
-    st.divider()
 
-    page = st.radio("Navigation", ["Home", "Dashboard", "Detail", "Multi-Agent", "Quant Indicators", "Scan Log", "System Monitor", "Signal Accuracy", "Screener", "Trading", "Virtual Trade", "Backtest", "ML Predict", "Portfolio", "Ranking", "Paper Trade", "History"], label_visibility="collapsed")
+def _render_gpu_control():
+    """GPU 일시 해제 — 다른 서비스에 GPU를 잠깐 양보할 때."""
+    gpu = api_get("/gpu/status") or {}
+    if gpu.get("paused"):
+        remaining = max(0, int(gpu.get("remaining_seconds") or 0))
+        mins, secs = divmod(remaining, 60)
+        st.warning(f"⏸ GPU 해제 중 · 자동 복귀까지 {mins}분 {secs}초")
+        if st.button("▶ 지금 복구", use_container_width=True, type="primary", key="cmd_gpu_resume"):
+            if api_post("/gpu/resume", timeout=30) is not None:
+                st.success("복구했습니다.")
+                st.rerun()
+    else:
+        vram_gb = (gpu.get("vram_bytes") or 0) / 1e9
+        st.caption(f"사용 중 · {vram_gb:.1f}GB · {gpu.get('ollama_runtime') or 'unknown'}")
+        hold_min = st.segmented_control(
+            "해제 시간", [30, 60, 90, 120], default=60,
+            format_func=lambda m: f"{m}분", key="cmd_gpu_minutes",
+            label_visibility="collapsed",
+        ) or 60
+        if st.button("⏸ GPU 사용 중지", use_container_width=True, key="cmd_gpu_pause"):
+            res = api_post("/gpu/pause", timeout=60, json_body={"minutes": int(hold_min)})
+            if res is not None:
+                st.success(f"{hold_min}분간 해제했습니다.")
+                st.rerun()
+            else:
+                st.error("해제 실패 — agent-api 응답 없음")
+
+
+def render_command_bar(health: dict | None, info: dict | None):
+    """상단 커맨드바 — 검색·스캔·GPU·시스템 상태 (DS §06: 사이드바에서 분리)."""
+    c_search, c_scan, c_all, c_gpu, c_sys = st.columns([4, 1.1, 1.1, 1.2, 1.2])
+
+    with c_search:
+        scan_ticker = st.text_input(
+            "검색", placeholder="AAPL · 005930.KS · 삼성전자 검색",
+            label_visibility="collapsed", key="cmd_search",
+        )
+    with c_scan:
+        do_scan = st.button("Scan", use_container_width=True, key="cmd_scan")
+    with c_all:
+        do_scan_all = st.button("Scan All", use_container_width=True, key="cmd_scan_all")
+    with c_gpu:
+        with st.popover("GPU", use_container_width=True):
+            _render_gpu_control()
+    with c_sys:
+        with st.popover("시스템", use_container_width=True):
+            _render_system_status(health, info)
+
+    if do_scan and scan_ticker:
+        resolved, hint = resolve_ticker(scan_ticker)
+        if hint:
+            st.info(hint)
+        if resolved:
+            log_action("manual_scan", page="command_bar", ticker=resolved, query=scan_ticker)
+            with st.spinner(f"Analyzing {resolved}..."):
+                result = api_post(f"/scan/{resolved}")
+                if result:
+                    st.success(
+                        f"{resolved}: {result.get('final_signal')} "
+                        f"({result.get('composite_score', 0):+.1f})"
+                    )
+                    st.rerun()
+
+    if do_scan_all:
+        wl = load_watchlist()
+        if not wl:
+            st.warning("Watchlist is empty")
+        else:
+            import math as _math_scan
+            import os as _os_scan
+            workers = int(_os_scan.getenv("SCAN_PARALLEL_WORKERS", "3"))
+            est_rounds = _math_scan.ceil(len(wl) / workers)
+            # 배치 다운로드 ~15s + 병렬 LLM 라운드 × 65s 예상
+            est_sec = 15 + est_rounds * 65
+            est_min, est_s = divmod(int(est_sec), 60)
+            est_str = f"{est_min}분 {est_s}초" if est_min else f"{est_s}초"
+            with st.spinner(
+                f"🔄 {len(wl)}개 종목 병렬 스캔 중 (워커 {workers}개, 예상 {est_str})..."
+            ):
+                result = api_post(f"/scan?tickers={','.join(wl)}", timeout=900)
+                if result:
+                    st.success(f"✅ 완료! {len(wl)}개 종목 스캔")
+            st.rerun()
+
+
+with st.sidebar:
+    page = render_sidebar_nav()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1665,13 +1812,11 @@ def render_home():
     us_results = {k: v for k, v in results.items() if not _is_korean_ticker(k)}
     kr_results = {k: v for k, v in results.items() if _is_korean_ticker(k)}
 
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Total", str(total))
-    m2.metric("Buy", str(buy_count))
-    m3.metric("Sell", str(sell_count))
-    m4.metric("Hold", str(hold_count))
-    m5.metric("🇺🇸 US", str(len(us_results)))
-    m6.metric("🇰🇷 KR", str(len(kr_results)))
+    # DS §05 StatCell — 값 0인 카드 6개가 빈 공간처럼 보이던 것을 1px 분할 행으로 통합.
+    render_stat_row([
+        ("TOTAL", total), ("BUY", buy_count), ("SELL", sell_count),
+        ("HOLD", hold_count), ("US", len(us_results)), ("KR", len(kr_results)),
+    ], empty_hint="스캔 없음")
 
     # ── 3. 시스템 상태 ──
     health = api_get("/health")
@@ -1856,7 +2001,7 @@ def render_home():
             df = pd.DataFrame(rows)
             st.dataframe(
                 df.style.map(
-                    lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+                    lambda v: "color: #2BD98A" if v == "BUY" else ("color: #FF6B6B" if v == "SELL" else "color: #F5B14C"),
                     subset=["Signal"],
                 ),
                 use_container_width=True, hide_index=True,
@@ -2027,6 +2172,95 @@ def _deprecated_render_korean_market_home():
 #  대시보드 페이지
 # ═══════════════════════════════════════════════════════════════
 
+@st.cache_data(ttl=300)
+def fetch_index_history(symbol: str, period: str = "6mo") -> "pd.DataFrame | None":
+    """지수/환율 차트용 OHLC 이력."""
+    try:
+        hist = yf.Ticker(symbol).history(period=period)
+        if hist is None or hist.empty:
+            return None
+        return hist
+    except Exception:
+        return None
+
+
+_INDEX_PERIODS = {"1개월": "1mo", "3개월": "3mo", "6개월": "6mo", "1년": "1y", "5년": "5y"}
+
+
+def _css_key(symbol: str) -> str:
+    """Streamlit 위젯 key는 `.st-key-<key>` 클래스가 되므로 CSS-safe하게 만든다.
+
+    `^GSPC`, `USDKRW=X`처럼 `^`·`=`가 든 심볼을 그대로 쓰면 선택자가 깨진다.
+    """
+    return re.sub(r"[^A-Za-z0-9_-]", "_", symbol)
+
+
+def render_index_chart(symbol: str, label: str, decimals: int):
+    """선택한 지수의 추이 차트."""
+    # DS §05: 기간 선택은 라디오 대신 세그먼트 컨트롤 (클릭 타깃 확대)
+    period_label = st.segmented_control(
+        "기간",
+        list(_INDEX_PERIODS.keys()),
+        default="6개월",
+        key=f"idx_period_{symbol}",
+        label_visibility="collapsed",
+    ) or "6개월"
+    hist = fetch_index_history(symbol, _INDEX_PERIODS[period_label])
+    if hist is None or hist.empty:
+        st.warning(f"{label} 이력을 불러오지 못했습니다 ({symbol})")
+        return
+
+    close = hist["Close"].dropna()
+    first, last = float(close.iloc[0]), float(close.iloc[-1])
+    change_pct = (last / first - 1) * 100 if first else 0.0
+    line_color = "#2BD98A" if change_pct >= 0 else "#FF6B6B"
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=close.index, y=close.values, mode="lines", name=label,
+        line=dict(color=line_color, width=2),
+        fill="tozeroy", fillcolor=f"rgba({'2,212,161' if change_pct >= 0 else '253,82,111'},0.08)",
+        hovertemplate=f"%{{x|%Y-%m-%d}}<br>{label} %{{y:,.{decimals}f}}<extra></extra>",
+    ))
+    fig.update_layout(**_plotly_base_layout(
+        height=320,
+        margin=dict(l=10, r=10, t=30, b=10),
+        showlegend=False,
+        title=dict(text=f"{label} · {period_label} {change_pct:+.2f}%", font=dict(size=14)),
+    ))
+    # 지수/환율은 0부터 그리면 변동이 안 보인다 — 실제 범위에 여백만 준다.
+    lo, hi = float(close.min()), float(close.max())
+    pad = (hi - lo) * 0.08 or (hi * 0.01 or 1)
+    fig.update_yaxes(range=[lo - pad, hi + pad])
+    st.plotly_chart(fig, use_container_width=True, key=f"idx_chart_{symbol}")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("현재", f"{last:,.{decimals}f}", f"{change_pct:+.2f}%")
+    c2.metric("기간 최고", f"{hi:,.{decimals}f}")
+    c3.metric("기간 최저", f"{lo:,.{decimals}f}")
+
+
+def render_stat_row(items: "list[tuple[str, int]]", empty_hint: str = "—"):
+    """StatCell 분할 행 (DS §05) — 카드 대신 1px 구분선 6열.
+
+    전부 0이면 큰 숫자를 반복하지 않고 안내 문구로 대체한다.
+    """
+    all_zero = all(not v for _, v in items)
+    cells = []
+    for label, value in items:
+        if all_zero:
+            val_html = f'<div class="sc-value empty">{empty_hint}</div>'
+        else:
+            val_html = f'<div class="sc-value">{value:,}</div>'
+        cells.append(f'<div class="statcell"><div class="sc-label">{label}</div>{val_html}</div>')
+    # 열 수는 항목 수에 맞춘다 — 6열 고정이면 3개짜리 행에 빈 칸이 생긴다.
+    st.markdown(
+        f'<div class="statcell-row" style="grid-template-columns:repeat({len(items)},1fr);">'
+        f'{"".join(cells)}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def render_market_ticker_bar():
     indices, market_updated_at = fetch_market_indices()
     if not indices:
@@ -2034,29 +2268,61 @@ def render_market_ticker_bar():
 
     st.markdown(f'<div class="ts-meta">Updated {market_updated_at}</div>', unsafe_allow_html=True)
 
-    cells = []
-    for group_key, group in MARKET_INDICES.items():
-        for sym, name, decimals in group["items"]:
+    # 클릭 가능해야 하므로 HTML 셀 대신 버튼을 쓴다. Streamlit은 순수 HTML에
+    # 콜백을 붙일 수 없어, 표시와 선택을 한 위젯으로 합친다.
+    entries = [
+        (sym, name, decimals)
+        for group in MARKET_INDICES.values()
+        for sym, name, decimals in group["items"]
+    ]
+
+    selected = st.session_state.get("selected_index")
+    per_row = 6
+    dir_rules = []
+
+    st.markdown('<div class="idx-grid">', unsafe_allow_html=True)
+    for row_start in range(0, len(entries), per_row):
+        row = entries[row_start:row_start + per_row]
+        cols = st.columns(per_row, gap="small")
+        for col, (sym, name, decimals) in zip(cols, row):
             info = indices.get(sym)
+            key = f"idx_btn_{_css_key(sym)}"
+            # 라벨 / 가격 / 등락 3단. 등락 줄은 마크다운 이탤릭(*..*)으로 감싸
+            # CSS(em)에서 크기를 주고, 방향 색은 위젯 key 클래스로 지정한다 —
+            # 버튼 라벨은 줄별 스타일을 직접 지정할 수 없기 때문이다.
             if info:
                 pct = info["change_pct"]
-                css = "ts-up" if pct > 0 else ("ts-down" if pct < 0 else "ts-flat")
-                arrow = "+" if pct > 0 else ""
-                cells.append(f"""
-                <div class="ticker-cell">
-                    <div class="tc-name">{info['name']}</div>
-                    <div class="tc-price">{info['price']:,.{info['decimals']}f}</div>
-                    <div class="tc-change {css}">{arrow}{pct:.2f}%</div>
-                </div>""")
+                token = "up" if pct > 0 else ("down" if pct < 0 else "text-low")
+                arrow = "▲" if pct > 0 else ("▼" if pct < 0 else "―")
+                label = (
+                    f"{name}  \n{info['price']:,.{info['decimals']}f}  \n"
+                    f"*{arrow} {abs(pct):.2f}%*"
+                )
             else:
-                cells.append(f"""
-                <div class="ticker-cell">
-                    <div class="tc-name">{name}</div>
-                    <div class="tc-price" style="color:var(--outline);">--</div>
-                    <div class="tc-change ts-flat">N/A</div>
-                </div>""")
+                token = "text-low"
+                label = f"{name}  \n— —  \n*데이터 없음*"
+            dir_rules.append(f".st-key-{key} button p em{{color:var(--{token});}}")
 
-    st.markdown(f'<div class="ticker-expanded">{"".join(cells)}</div>', unsafe_allow_html=True)
+            with col:
+                if st.button(
+                    label,
+                    key=key,
+                    use_container_width=True,
+                    type="primary" if selected == sym else "secondary",
+                    help=f"{name} ({sym}) 추이 차트",
+                ):
+                    # 같은 항목을 다시 누르면 차트를 접는다.
+                    st.session_state.selected_index = None if selected == sym else sym
+                    st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown(f"<style>{''.join(dir_rules)}</style>", unsafe_allow_html=True)
+
+    selected = st.session_state.get("selected_index")
+    if selected:
+        meta = next(((s, n, d) for s, n, d in entries if s == selected), None)
+        if meta:
+            with st.container(border=True):
+                render_index_chart(*meta)
 
 
 def render_dashboard():
@@ -2177,24 +2443,24 @@ def render_dashboard():
         st.markdown('<div class="section-title">Signal Score Matrix</div>', unsafe_allow_html=True)
 
         fig = go.Figure()
-        bar_colors = ["#02d4a1" if s > 0 else "#fd526f" if s < 0 else "#32353c" for s in df["score"]]
+        bar_colors = ["#2BD98A" if s > 0 else "#FF6B6B" if s < 0 else "#2C3745" for s in df["score"]]
         fig.add_trace(go.Bar(
             x=df["score"], y=df["ticker"], orientation='h',
             marker=dict(color=bar_colors, line=dict(width=0)),
             text=[f"{s:+.1f}" for s in df["score"]],
             textposition="outside",
-            textfont=dict(color="#8d909e", size=11, family="JetBrains Mono"),
+            textfont=dict(color="#6A7482", size=11, family="JetBrains Mono"),
         ))
         fig.update_layout(**_plotly_base_layout(
             height=max(280, len(df) * 52),
-            xaxis=dict(range=[-10, 10], title="", gridcolor="rgba(66,71,82,0.15)", zerolinecolor="rgba(66,71,82,0.25)"),
+            xaxis=dict(range=[-10, 10], title="", gridcolor="#161C25", zerolinecolor="#161C25"),
             yaxis=dict(
                 autorange="reversed", gridcolor="rgba(0,0,0,0)",
-                tickfont=dict(family="JetBrains Mono", size=12, color="#e1e2eb"),
+                tickfont=dict(family="JetBrains Mono", size=12, color="#EDF1F7"),
             ),
             margin=dict(l=70, r=60, t=8, b=8),
         ))
-        fig.add_vline(x=0, line_color="rgba(66,71,82,0.3)", line_width=1)
+        fig.add_vline(x=0, line_color="#1F2733", line_width=1)
         st.plotly_chart(fig, use_container_width=True)
 
     with col_table:
@@ -2205,7 +2471,7 @@ def render_dashboard():
         })
         st.dataframe(
             display_df.style.map(
-                lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+                lambda v: "color: #2BD98A" if v == "BUY" else ("color: #FF6B6B" if v == "SELL" else "color: #F5B14C"),
                 subset=["Signal"],
             ),
             use_container_width=True, hide_index=True,
@@ -2444,7 +2710,7 @@ def _render_tool_detail_card(td: dict, ticker: str = ""):
     sig = td.get("signal", "neutral")
     sc = td.get("score", 0)
     detail_text = td.get("detail", "")
-    sig_color = "#02d4a1" if sig == "buy" else ("#fd526f" if sig == "sell" else "#ffb347")
+    sig_color = "#2BD98A" if sig == "buy" else ("#FF6B6B" if sig == "sell" else "#F5B14C")
 
     st.markdown(f"**{name}**")
     st.markdown(
@@ -2665,7 +2931,7 @@ def render_detail():
 
         names = [s["name"] for s in summaries]
         scores = [s["score"] for s in summaries]
-        bar_colors = ["#02d4a1" if s > 0 else "#fd526f" if s < 0 else "#32353c" for s in scores]
+        bar_colors = ["#2BD98A" if s > 0 else "#FF6B6B" if s < 0 else "#2C3745" for s in scores]
 
         fig = go.Figure()
         fig.add_trace(go.Bar(
@@ -2673,18 +2939,18 @@ def render_detail():
             marker=dict(color=bar_colors, line=dict(width=0)),
             text=[f"{s:+.1f}" for s in scores],
             textposition="outside",
-            textfont=dict(color="#8d909e", size=11, family="JetBrains Mono"),
+            textfont=dict(color="#6A7482", size=11, family="JetBrains Mono"),
         ))
         fig.update_layout(**_plotly_base_layout(
             height=max(400, len(summaries) * 38),
-            xaxis=dict(range=[-10, 10], title="", gridcolor="rgba(66,71,82,0.15)", zerolinecolor="rgba(66,71,82,0.25)"),
+            xaxis=dict(range=[-10, 10], title="", gridcolor="#161C25", zerolinecolor="#161C25"),
             yaxis=dict(
                 autorange="reversed", gridcolor="rgba(0,0,0,0)",
-                tickfont=dict(family="Inter, sans-serif", size=11, color="#c3c6d4"),
+                tickfont=dict(family="JetBrains Mono, monospace", size=11, color="#9BA6B5"),
             ),
             margin=dict(l=200, r=60, t=8, b=8),
         ))
-        fig.add_vline(x=0, line_color="rgba(66,71,82,0.3)", line_width=1)
+        fig.add_vline(x=0, line_color="#1F2733", line_width=1)
         st.plotly_chart(fig, use_container_width=True)
 
     tool_details = detail.get("tool_details", [])
@@ -2967,7 +3233,7 @@ def render_history():
             hdf = pd.DataFrame(h_rows)
             st.dataframe(
                 hdf.style.map(
-                    lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+                    lambda v: "color: #2BD98A" if v == "BUY" else ("color: #FF6B6B" if v == "SELL" else "color: #F5B14C"),
                     subset=["Signal"],
                 ),
                 use_container_width=True, hide_index=True,
@@ -3066,7 +3332,7 @@ def render_ml_predict():
                 st.warning(f"{name}: {m['error']}")
                 continue
 
-            signal_color = "#02d4a1" if m.get("signal") == "buy" else ("#fd526f" if m.get("signal") == "sell" else "#ffb347")
+            signal_color = "#2BD98A" if m.get("signal") == "buy" else ("#FF6B6B" if m.get("signal") == "sell" else "#F5B14C")
 
             with st.expander(f"**{m.get('name', name)}** — {m.get('prediction', '?')} ({m.get('up_probability', 0):.1%})", expanded=True):
                 c1, c2, c3, c4 = st.columns(4)
@@ -3082,7 +3348,7 @@ def render_ml_predict():
                         x=[f["importance"] for f in top_feat],
                         y=[f["name"] for f in top_feat],
                         orientation="h",
-                        marker_color="#aec6ff",
+                        marker_color="#6D7CFF",
                     ))
                     fig.update_layout(**_plotly_base_layout(
                         height=300, margin=dict(l=140, r=10, t=10, b=10),
@@ -3145,8 +3411,8 @@ def render_portfolio():
                     labels=[r["Ticker"] for r in alloc_rows],
                     values=[r["Weight %"] for r in alloc_rows],
                     hole=0.4,
-                    marker=dict(colors=["#aec6ff", "#02d4a1", "#fd526f", "#ffb347", "#c3c6d4", "#5d8ef1"]),
-                    textfont=dict(color="#e1e2eb"),
+                    marker=dict(colors=["#6D7CFF", "#2BD98A", "#FF6B6B", "#F5B14C", "#9BA6B5", "#6D7CFF"]),
+                    textfont=dict(color="#EDF1F7"),
                 ))
                 fig.update_layout(**_plotly_base_layout(height=350))
                 st.plotly_chart(fig, use_container_width=True)
@@ -3362,7 +3628,7 @@ def render_quant_indicators():
     if component_rows:
         comp_df = pd.DataFrame(component_rows)
         colors = [
-            "#02d4a1" if d == "buy" else "#fd526f" if d == "sell" else "#ffb347"
+            "#2BD98A" if d == "buy" else "#FF6B6B" if d == "sell" else "#F5B14C"
             for d in comp_df["Direction"]
         ]
         fig = go.Figure(go.Bar(
@@ -3480,7 +3746,7 @@ def render_ranking():
     df = pd.DataFrame(rows)
     st.dataframe(
         df.style.map(
-            lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+            lambda v: "color: #2BD98A" if v == "BUY" else ("color: #FF6B6B" if v == "SELL" else "color: #F5B14C"),
             subset=["Signal"],
         ).background_gradient(
             subset=["Factor Score"], cmap="RdYlGn", vmin=-5, vmax=5
@@ -3492,7 +3758,7 @@ def render_ranking():
         fig = go.Figure()
         tickers = [r["ticker"] for r in ranking]
         factors = ["factor_momentum", "factor_trend", "factor_value", "factor_volume"]
-        colors = ["#aec6ff", "#02d4a1", "#ffb347", "#fd526f"]
+        colors = ["#6D7CFF", "#2BD98A", "#F5B14C", "#FF6B6B"]
         for factor, color in zip(factors, colors):
             fig.add_trace(go.Bar(
                 name=factor.replace("factor_", "").title(),
@@ -3503,7 +3769,7 @@ def render_ranking():
         fig.update_layout(**_plotly_base_layout(
             height=350, barmode="group",
             margin=dict(l=50, r=10, t=30, b=60),
-            legend=dict(font=dict(color="#c3c6d4")),
+            legend=dict(font=dict(color="#9BA6B5")),
         ))
         st.plotly_chart(fig, use_container_width=True)
 
@@ -3527,7 +3793,7 @@ def render_paper_trade():
 
     c1, c2, c3, c4, c5 = st.columns(5)
     total_pnl = status.get("total_pnl", 0)
-    pnl_color = "#02d4a1" if total_pnl >= 0 else "#fd526f"
+    pnl_color = "#2BD98A" if total_pnl >= 0 else "#FF6B6B"
     c1.metric("Total Equity", f"${status.get('total_equity', 0):,.0f}")
     c2.metric("Cash", f"${status.get('cash', 0):,.0f}")
     c3.metric("P&L", f"${total_pnl:+,.0f}")
@@ -4470,7 +4736,7 @@ def render_system_monitor():
                     text=[f"n={n}" for n in band_df["total"]],
                     marker_color="#10b981",
                 ))
-                fig.add_hline(y=50, line_dash="dash", line_color="#8d909e")
+                fig.add_hline(y=50, line_dash="dash", line_color="#6A7482")
                 fig.update_layout(**_plotly_base_layout(
                     height=330,
                     yaxis_title="Win rate %",
@@ -5692,7 +5958,7 @@ def render_scan_log():
             lt_df = pd.DataFrame(lt_rows)
             st.dataframe(
                 lt_df.style.map(
-                    lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+                    lambda v: "color: #2BD98A" if v == "BUY" else ("color: #FF6B6B" if v == "SELL" else "color: #F5B14C"),
                     subset=["Signal"],
                 ),
                 use_container_width=True, hide_index=True,
@@ -5722,7 +5988,7 @@ def render_scan_log():
             rc_df = pd.DataFrame(rc_rows)
             st.dataframe(
                 rc_df.style.map(
-                    lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+                    lambda v: "color: #2BD98A" if v == "BUY" else ("color: #FF6B6B" if v == "SELL" else "color: #F5B14C"),
                     subset=["Signal"],
                 ),
                 use_container_width=True, hide_index=True,
@@ -5810,15 +6076,15 @@ def render_scan_log():
                             x=dt_df["day"], y=dt_df["avg_score"],
                             mode="lines+markers",
                             name="Avg Score",
-                            line=dict(color="#5d8ef1", width=3),
-                            marker=dict(size=10, color="#5d8ef1"),
+                            line=dict(color="#6D7CFF", width=3),
+                            marker=dict(size=10, color="#6D7CFF"),
                         ))
-                        fig.add_hline(y=0, line_color="rgba(66,71,82,0.3)", line_width=1)
+                        fig.add_hline(y=0, line_color="#1F2733", line_width=1)
                         fig.update_layout(**_plotly_base_layout(
                             height=280,
                             margin=dict(l=40, r=10, t=10, b=40),
-                            xaxis=dict(gridcolor="rgba(66,71,82,0.12)"),
-                            yaxis=dict(title="Score", gridcolor="rgba(66,71,82,0.12)"),
+                            xaxis=dict(gridcolor="#161C25"),
+                            yaxis=dict(title="Score", gridcolor="#161C25"),
                         ))
                         st.plotly_chart(fig, use_container_width=True)
 
@@ -5860,7 +6126,7 @@ def render_scan_log():
                         sr_df = pd.DataFrame(sr_rows)
                         st.dataframe(
                             sr_df.style.map(
-                                lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+                                lambda v: "color: #2BD98A" if v == "BUY" else ("color: #FF6B6B" if v == "SELL" else "color: #F5B14C"),
                                 subset=["Signal"],
                             ),
                             use_container_width=True, hide_index=True,
@@ -5900,24 +6166,24 @@ def render_scan_log():
                     fig.add_trace(go.Scatter(
                         x=h_df["scanned_at"], y=h_df["score"],
                         mode="lines+markers",
-                        line=dict(color="#5d8ef1", width=2),
+                        line=dict(color="#6D7CFF", width=2),
                         marker=dict(
                             size=8,
                             color=[
-                                "#02d4a1" if s == "BUY" else "#fd526f" if s == "SELL" else "#ffb347"
+                                "#2BD98A" if s == "BUY" else "#FF6B6B" if s == "SELL" else "#F5B14C"
                                 for s in h_df["signal"]
                             ],
-                            line=dict(width=1, color="#0b0e14"),
+                            line=dict(width=1, color="#06080C"),
                         ),
                         text=[f"{s} ({sc:+.1f})" for s, sc in zip(h_df["signal"], h_df["score"])],
                         hovertemplate="%{text}<br>%{x}<extra></extra>",
                     ))
-                    fig.add_hline(y=0, line_color="rgba(66,71,82,0.3)", line_width=1)
+                    fig.add_hline(y=0, line_color="#1F2733", line_width=1)
                     fig.update_layout(**_plotly_base_layout(
                         height=300,
                         margin=dict(l=50, r=10, t=10, b=40),
-                        xaxis=dict(gridcolor="rgba(66,71,82,0.12)"),
-                        yaxis=dict(title="Score", gridcolor="rgba(66,71,82,0.12)"),
+                        xaxis=dict(gridcolor="#161C25"),
+                        yaxis=dict(title="Score", gridcolor="#161C25"),
                     ))
                     st.plotly_chart(fig, use_container_width=True)
 
@@ -5938,7 +6204,7 @@ def render_scan_log():
                     th_df = pd.DataFrame(th_rows)
                     st.dataframe(
                         th_df.style.map(
-                            lambda v: "color: #02d4a1" if v == "BUY" else ("color: #fd526f" if v == "SELL" else "color: #ffb347"),
+                            lambda v: "color: #2BD98A" if v == "BUY" else ("color: #FF6B6B" if v == "SELL" else "color: #F5B14C"),
                             subset=["Signal"],
                         ),
                         use_container_width=True, hide_index=True,
@@ -5948,6 +6214,9 @@ def render_scan_log():
 # ═══════════════════════════════════════════════════════════════
 #  라우팅
 # ═══════════════════════════════════════════════════════════════
+
+# 커맨드바는 모든 페이지 상단에 고정 — 사이드바에서 분리한 조작 패널이다.
+render_command_bar(api_get("/health"), api_get("/"))
 
 if page == "Home":
     render_home()
