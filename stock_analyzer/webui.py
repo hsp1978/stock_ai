@@ -654,7 +654,13 @@ def _agent_api_candidates() -> list[str]:
 
 def _force_http_api(path: str) -> bool:
     # Paper/Virtual Trade 상태는 agent-api의 mounted output을 단일 소스로 쓴다.
-    return path.startswith("/paper") or path.startswith("/trading/")
+    # GPU 제어는 스케줄러와 Ollama 연결을 소유한 agent-api 프로세스에서 실행해야
+    # 한다 — in-proc으로 돌면 webui 프로세스가 언로드를 쏘게 되어 소유권이 갈린다.
+    return (
+        path.startswith("/paper")
+        or path.startswith("/trading/")
+        or path.startswith("/gpu")
+    )
 
 
 def api_get(path: str, timeout: int = 10):
@@ -1439,6 +1445,38 @@ with st.sidebar:
             {last_line}
         </div>
         """, unsafe_allow_html=True)
+
+    st.divider()
+
+    # ── GPU 일시 해제 ────────────────────────────────────────────
+    # 다른 서비스가 GPU를 잠깐 써야 할 때 LLM 작업을 멈추고 VRAM을 반환한다.
+    # 만료 시각이 서버에 저장되어, 복구를 잊어도 자동으로 돌아온다.
+    st.markdown('<div class="sidebar-section-label">GPU</div>', unsafe_allow_html=True)
+    gpu = api_get("/gpu/status") or {}
+
+    if gpu.get("paused"):
+        remaining = max(0, int(gpu.get("remaining_seconds") or 0))
+        mins, secs = divmod(remaining, 60)
+        st.warning(f"⏸ GPU 해제 중 · 자동 복귀까지 {mins}분 {secs}초")
+        if st.button("▶ 지금 복구", use_container_width=True, type="primary"):
+            if api_post("/gpu/resume", timeout=30) is not None:
+                st.success("복구했습니다. 다음 스캔부터 정상 동작합니다.")
+                st.rerun()
+    else:
+        vram_gb = (gpu.get("vram_bytes") or 0) / 1e9
+        runtime = gpu.get("ollama_runtime") or "unknown"
+        st.caption(f"사용 중 · {vram_gb:.1f}GB · {runtime}")
+        hold_min = st.selectbox(
+            "해제 시간", [30, 60, 90, 120], index=1,
+            format_func=lambda m: f"{m}분", label_visibility="collapsed",
+        )
+        if st.button("⏸ GPU 사용 중지", use_container_width=True):
+            res = api_post("/gpu/pause", timeout=60, json_body={"minutes": int(hold_min)})
+            if res is not None:
+                st.success(f"{hold_min}분간 해제했습니다. 스캔·V2 배치는 그동안 건너뜁니다.")
+                st.rerun()
+            else:
+                st.error("해제 실패 — agent-api 응답 없음")
 
     st.divider()
 
