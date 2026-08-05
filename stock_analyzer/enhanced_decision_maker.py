@@ -78,6 +78,11 @@ class EnhancedDecisionMaker:
     # 손익비 하한 — 이 아래에서는 방향이 맞아도 기대값이 성립하지 않는다.
     MIN_RISK_REWARD = 0.8
 
+    # 정량 근거가 상쇄돼 0에 가까울 때 정성 판단에 허용하는 최대 기여.
+    # 강도 임계(>10 moderate)보다 낮게 둬서, 서술만으로는 '강한 신호'가
+    # 만들어지지 않게 한다.
+    NARRATIVE_FLOOR = 5.0
+
     def _min_risk_reward(self, agent_results) -> Optional[float]:
         """에이전트 evidence에서 지지/저항 기준 R/R 최솟값을 뽑는다.
 
@@ -247,6 +252,7 @@ class EnhancedDecisionMaker:
         macro_scores = []
         insider_signal = None  # 내부자 거래 신호
         insider_score = 0
+        tool_agent_verdicts: Dict[str, str] = {}  # Technical/Quant 에이전트 자체 판단
 
         for result in agent_results:
             if result.error:
@@ -268,10 +274,15 @@ class EnhancedDecisionMaker:
             signed_confidence = self._signed_confidence(normalized_signal, result.confidence)
 
             # 에이전트별 점수 분류
+            # Technical/Quant는 '도구 점수'로만 집계된다 — 에이전트 자신의
+            # 판단은 총점에 들어가지 않으므로, 최종 신호와 반대일 때 드러나도록
+            # 별도로 기록한다 (2026-08 감사: Quant sell 6.5가 소리 없이 사라졌다).
             if "Technical" in result.agent_name:
                 technical_scores.append(self._extract_scores(result))
+                tool_agent_verdicts[result.agent_name] = normalized_signal
             elif "Quant" in result.agent_name:
                 quant_scores.append(self._extract_scores(result))
+                tool_agent_verdicts[result.agent_name] = normalized_signal
             elif "Risk" in result.agent_name:
                 risk_scores.append(signed_confidence)
             elif "ML" in result.agent_name:
@@ -466,8 +477,26 @@ class EnhancedDecisionMaker:
         # 붙이므로 여기서는 판정할 수 없다. apply_execution_readiness()를
         # 진입 계획 생성 직후에 호출한다 (multi_agent).
 
+        # 6.9. [도구 에이전트 판단 충돌] Technical/Quant의 자체 판단은 총점에
+        # 들어가지 않으므로, 최종 신호와 정면 충돌하면 경고로 드러낸다.
+        final_sig = (final_decision.get("signal") or "").lower()
+        opposed = [
+            name for name, verdict in tool_agent_verdicts.items()
+            if verdict in ("buy", "sell") and final_sig in ("buy", "sell")
+            and verdict != final_sig
+        ]
+        if opposed:
+            final_decision["confidence"] = min(float(final_decision["confidence"]), 6.0)
+            msg = f"{', '.join(sorted(opposed))} 판단이 최종 신호({final_sig})와 반대"
+            prev = final_decision.get("conflicts")
+            final_decision["conflicts"] = (
+                f"{prev}, {msg}" if prev and prev != "없음" else msg
+            )
+
         # 7. 경고 메시지 수집
         warnings = []
+        if opposed:
+            warnings.append("TOOL_AGENT_VERDICT_CONFLICT")
         if rr_blocked:
             warnings.append(f"RR_BELOW_MIN_{self.MIN_RISK_REWARD}")
         if kelly_no_bet and final_decision["signal"] == "buy":
@@ -545,6 +574,7 @@ class EnhancedDecisionMaker:
             # 실행 가능성 — 소비자(텔레그램/주문 라우터)가 '바로 실행 가능한 신호'와
             # '방향 의견'을 구분할 수 있어야 한다.
             "min_risk_reward": min_rr,
+            "tool_agent_verdicts": tool_agent_verdicts,
             "volatility_status": volatility_check,
             "technical_analysis": tech_analysis,
             "quant_analysis": quant_analysis,
@@ -909,15 +939,31 @@ class EnhancedDecisionMaker:
         fundamental_contribution = self._avg_signed_score(fundamental_scores) * 0.7
         macro_contribution = self._avg_signed_score(macro_scores) * 0.5
 
-        # 전체 점수 (기술 + 퀀트 + ML조정 + 내부자 + 누락 도메인)
-        total_score = (tech_analysis["total_score"] +
-                      quant_analysis["total_score"] +
-                      ml_contribution +
-                      insider_contribution +
-                      risk_contribution +
-                      event_contribution +
-                      fundamental_contribution +
-                      macro_contribution)
+        # ── 정량 vs 정성 비중 정합 (2026-08 감사) ──────────────────
+        # 기술·퀀트는 '도구 점수'로, Risk/Event/Value/Macro는 'LLM 판단
+        # (signed confidence)'으로 들어간다. 검증 가능한 쪽이 아니라 검증이
+        # 어려운 쪽이 총점을 지배할 수 있었다 — 111770.KS 실측에서 도메인
+        # 보정이 총점의 59%였다.
+        #
+        # 원칙: 정성 판단은 정량 근거를 넘지 못한다. 도구·ML·내부자 합계의
+        # 절댓값을 상한으로 쓰고, 정량이 0에 가까울 때만 바닥값을 허용한다
+        # (바닥값을 0으로 두면 도구가 상쇄된 종목에서 신호가 전부 사라진다).
+        quantitative_contribution = (
+            tech_analysis["total_score"]
+            + quant_analysis["total_score"]
+            + ml_contribution
+            + insider_contribution
+        )
+        narrative_raw = (
+            risk_contribution + event_contribution
+            + fundamental_contribution + macro_contribution
+        )
+        narrative_cap = max(abs(quantitative_contribution), self.NARRATIVE_FLOOR)
+        narrative_contribution = max(-narrative_cap, min(narrative_cap, narrative_raw))
+        narrative_capped = abs(narrative_raw) > narrative_cap
+
+        # 전체 점수 (정량 + 상한이 걸린 정성)
+        total_score = quantitative_contribution + narrative_contribution
 
         # 신호 강도 분류 (개선된 기준)
         # 기술 6개 + 퀀트 6개 = 12개 도구, 각 ±10점 범위
@@ -971,6 +1017,13 @@ class EnhancedDecisionMaker:
                 "score": insider_score,
                 "contribution": insider_contribution
             },
+            # 정량/정성 내역 — 총점이 무엇으로 만들어졌는지 리포트에서 확인 가능해야
+            # 한다. narrative_capped가 True면 정성 판단이 상한에 걸린 것이다.
+            "quantitative_contribution": round(quantitative_contribution, 2),
+            "narrative_raw": round(narrative_raw, 2),
+            "narrative_contribution": round(narrative_contribution, 2),
+            "narrative_cap": round(narrative_cap, 2),
+            "narrative_capped": narrative_capped,
             "total_score": total_score,
             "strength_level": strength_level
         }
