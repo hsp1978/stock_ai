@@ -164,3 +164,49 @@ def test_state_store_failure_fails_open(monkeypatch):
 
     monkeypatch.setattr(service, "get_app_state", _boom)
     assert service.is_gpu_paused() is False
+
+
+# ── 해제 연장 ───────────────────────────────────────────────────
+
+
+def test_extend_adds_to_remaining(_clear_pause, monkeypatch):
+    """'지금부터 N분'이 아니라 '만료 시각 + N분' — 남은 시간을 잃지 않는다."""
+    until = datetime.now() + timedelta(minutes=20)
+    _clear_pause[service._STATE_GPU_PAUSE] = until.isoformat()
+    monkeypatch.setattr(service, "gpu_pause_status", lambda: {})
+
+    service.gpu_extend(service.GpuPauseRequest(minutes=30))
+
+    new_until = datetime.fromisoformat(_clear_pause[service._STATE_GPU_PAUSE])
+    delta = (new_until - until).total_seconds() / 60
+    assert 29.9 < delta < 30.1, f"연장분이 더해지지 않음: {delta}"
+
+
+def test_extend_capped_at_max(_clear_pause, monkeypatch):
+    """연장을 반복해 서비스가 무기한 멈추는 것을 막는다."""
+    until = datetime.now() + timedelta(minutes=service.GPU_PAUSE_MAX_MINUTES - 10)
+    _clear_pause[service._STATE_GPU_PAUSE] = until.isoformat()
+    monkeypatch.setattr(service, "gpu_pause_status", lambda: {})
+
+    out = service.gpu_extend(service.GpuPauseRequest(minutes=120))
+
+    new_until = datetime.fromisoformat(_clear_pause[service._STATE_GPU_PAUSE])
+    remaining = (new_until - datetime.now()).total_seconds() / 60
+    assert remaining <= service.GPU_PAUSE_MAX_MINUTES + 0.1
+    assert out["capped"] is True
+    assert "상한" in out["warning"]
+
+
+def test_extend_rejected_when_not_paused(_clear_pause):
+    """해제 중이 아닐 때 연장하면 상태가 조용히 생기면 안 된다."""
+    import fastapi
+
+    with pytest.raises(fastapi.HTTPException) as exc:
+        service.gpu_extend(service.GpuPauseRequest(minutes=30))
+    assert exc.value.status_code == 409
+    assert _clear_pause.get(service._STATE_GPU_PAUSE) is None
+
+
+def test_extend_respects_request_bounds():
+    with pytest.raises(Exception):
+        service.GpuPauseRequest(minutes=service.GPU_PAUSE_MAX_MINUTES + 1)

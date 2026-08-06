@@ -1742,10 +1742,29 @@ def _render_gpu_control():
     if gpu.get("paused"):
         remaining = max(0, int(gpu.get("remaining_seconds") or 0))
         mins, secs = divmod(remaining, 60)
-        st.warning(f"⏸ GPU 해제 중 · 자동 복귀까지 {mins}분 {secs}초")
+        until = (gpu.get("until") or "")[11:16]
+        st.warning(f"⏸ GPU 해제 중 · 자동 복귀까지 {mins}분 {secs}초 ({until})")
         if st.button("▶ 지금 복구", use_container_width=True, type="primary", key="cmd_gpu_resume"):
             if api_post("/gpu/resume", timeout=30) is not None:
                 st.success("복구했습니다.")
+                st.rerun()
+
+        # 연장 — 작업이 예상보다 길어질 때 남은 시간에 더한다.
+        st.caption("작업이 길어지면 연장")
+        add_min = st.segmented_control(
+            "연장", [15, 30, 60], default=30,
+            format_func=lambda m: f"+{m}분", key="cmd_gpu_extend_minutes",
+            label_visibility="collapsed",
+        ) or 30
+        if st.button(f"⏱ {add_min}분 연장", use_container_width=True, key="cmd_gpu_extend"):
+            res = api_post("/gpu/extend", timeout=30, json_body={"minutes": int(add_min)})
+            if res is None:
+                st.error("연장 실패 — agent-api 응답 없음")
+            else:
+                if res.get("warning"):
+                    st.warning(res["warning"])
+                else:
+                    st.success(f"{add_min}분 연장했습니다.")
                 st.rerun()
     else:
         vram_gb = (gpu.get("vram_bytes") or 0) / 1e9

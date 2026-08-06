@@ -1948,6 +1948,39 @@ def gpu_pause(body: GpuPauseRequest):
     return status
 
 
+@app.post("/gpu/extend")
+def gpu_extend(body: GpuPauseRequest):
+    """해제 중인 GPU를 더 오래 붙잡는다 — 남은 시간에 더한다.
+
+    '지금부터 N분'이 아니라 '만료 시각 + N분'이다. 작업이 예상보다 길어질 때
+    남은 시간을 잃지 않고 늘리는 것이 목적이기 때문이다.
+    총 대기는 지금 기준 GPU_PAUSE_MAX_MINUTES를 넘지 않는다 — 상한이 없으면
+    연장을 반복해 서비스가 무기한 멈춘 채 방치될 수 있다.
+    """
+    until = _gpu_pause_until()
+    if until is None:
+        raise HTTPException(409, "GPU 해제 중이 아닙니다. 먼저 /gpu/pause를 호출하세요.")
+
+    hard_limit = datetime.now() + timedelta(minutes=GPU_PAUSE_MAX_MINUTES)
+    new_until = min(until + timedelta(minutes=body.minutes), hard_limit)
+    capped = new_until < until + timedelta(minutes=body.minutes)
+    set_app_state(_STATE_GPU_PAUSE, new_until.isoformat())
+    print(
+        f"  [GPU] 해제 연장 +{body.minutes}분 — 복귀 예정 "
+        f"{until.strftime('%H:%M')} → {new_until.strftime('%H:%M')}"
+        f"{' (상한 적용)' if capped else ''}"
+    )
+
+    status = gpu_pause_status()
+    status["extended_by_minutes"] = body.minutes
+    status["capped"] = capped
+    if capped:
+        status["warning"] = (
+            f"총 대기가 상한({GPU_PAUSE_MAX_MINUTES}분)을 넘어 잘렸습니다."
+        )
+    return status
+
+
 @app.post("/gpu/resume")
 def gpu_resume():
     """즉시 복구. 다음 스캔부터 모델이 다시 적재된다."""
