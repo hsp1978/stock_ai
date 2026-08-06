@@ -112,6 +112,15 @@ def test_index_tile_height_and_radius():
     assert "padding: 14px 16px" in css, "IndexTile 패딩 14/16 규격 불일치"
 
 
+def test_index_tile_css_scoped_to_widget_key():
+    """`.idx-grid` 래퍼는 DOM에서 버튼을 감싸지 못한다 — st.markdown이 만든
+    div는 즉시 닫히고 버튼은 형제로 붙는다. 위젯 key 클래스로 스코프해야 한다.
+    실제로 이 스코프 오류 때문에 타일 CSS가 전혀 적용되지 않았다 (2026-08-06)."""
+    css = _css()
+    assert "idx-grid" not in css, "감싸지 못하는 래퍼 클래스 잔존"
+    assert '[class*="st-key-idx_btn_"] button' in css
+
+
 def test_statcell_row_is_six_columns():
     assert "grid-template-columns: repeat(6, 1fr)" in _css()
 
@@ -272,3 +281,14 @@ def test_sidebar_helpers_defined_before_execution():
     assert not late, (
         f"사이드바 실행({exec_line}행)보다 늦게 정의된 헬퍼: {late} — NameError로 앱이 죽는다"
     )
+
+
+def test_sidebar_nav_labels_left_aligned():
+    """DS §05: 내비 항목은 좌측 정렬. Streamlit 기본은 가운데라 라벨(<p>)까지
+    돌려야 한다 — 버튼의 justify-content만으로는 라벨이 가운데에 남는다."""
+    css = _css()
+    marker = 'section[data-testid="stSidebar"] div[data-testid="stButton"] > button p'
+    assert marker in css, "사이드바 버튼 라벨 정렬 규칙 없음"
+    rule = css[css.index(marker):]
+    rule = rule[: rule.index("}")]
+    assert "text-align: left" in rule
