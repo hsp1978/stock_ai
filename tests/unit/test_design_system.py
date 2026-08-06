@@ -225,3 +225,50 @@ def test_ticker_chip_spec_dimensions():
 def test_datatable_row_height():
     """DS §05 DataTable: 행 h44."""
     assert "row_height=44" in _webui()
+
+
+# ── 모듈 실행 순서 (2026-08-05 회귀) ────────────────────────────
+#
+# Streamlit 스크립트는 위에서 아래로 실행된다. `with st.sidebar:`가 호출하는
+# 헬퍼가 그 아래에 정의돼 있으면 NameError로 앱 전체가 죽는다.
+# 실제로 _css_key가 사이드바보다 아래에 있어 화면이 뜨지 않았다.
+
+
+def _module_level_exec_line(src: str, marker: str) -> int:
+    for i, line in enumerate(src.splitlines(), start=1):
+        if line.startswith(marker):
+            return i
+    raise AssertionError(f"{marker} 없음")
+
+
+def test_sidebar_helpers_defined_before_execution():
+    import ast as _ast
+
+    src = _webui()
+    exec_line = _module_level_exec_line(src, "with st.sidebar:")
+    tree = _ast.parse(src)
+
+    defs = {
+        node.name: node.lineno
+        for node in tree.body
+        if isinstance(node, _ast.FunctionDef)
+    }
+
+    target = next(
+        (n for n in tree.body
+         if isinstance(n, _ast.FunctionDef) and n.name == "render_sidebar_nav"),
+        None,
+    )
+    assert target, "render_sidebar_nav 정의 없음"
+
+    called = {
+        n.func.id for n in _ast.walk(target)
+        if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)
+    }
+    late = {
+        name: defs[name] for name in called
+        if name in defs and defs[name] > exec_line
+    }
+    assert not late, (
+        f"사이드바 실행({exec_line}행)보다 늦게 정의된 헬퍼: {late} — NameError로 앱이 죽는다"
+    )

@@ -1609,6 +1609,14 @@ def _signal_pill_html(signal: str) -> str:
 #  사이드바
 # ═══════════════════════════════════════════════════════════════
 
+def _css_key(symbol: str) -> str:
+    """Streamlit 위젯 key는 `.st-key-<key>` 클래스가 되므로 CSS-safe하게 만든다.
+
+    `^GSPC`, `USDKRW=X`처럼 `^`·`=`가 든 심볼을 그대로 쓰면 선택자가 깨진다.
+    """
+    return re.sub(r"[^A-Za-z0-9_-]", "_", symbol)
+
+
 # ── 내비게이션 정의 (DS §05 SidebarNav) ──
 # 사이드바는 이동 전용. 스캔·GPU·모델 설정 등 조작 패널은 상단 커맨드바로 분리한다.
 NAV_GROUPS = {
@@ -2190,14 +2198,6 @@ def fetch_index_history(symbol: str, period: str = "6mo") -> "pd.DataFrame | Non
 
 
 _INDEX_PERIODS = {"1개월": "1mo", "3개월": "3mo", "6개월": "6mo", "1년": "1y", "5년": "5y"}
-
-
-def _css_key(symbol: str) -> str:
-    """Streamlit 위젯 key는 `.st-key-<key>` 클래스가 되므로 CSS-safe하게 만든다.
-
-    `^GSPC`, `USDKRW=X`처럼 `^`·`=`가 든 심볼을 그대로 쓰면 선택자가 깨진다.
-    """
-    return re.sub(r"[^A-Za-z0-9_-]", "_", symbol)
 
 
 def render_index_chart(symbol: str, label: str, decimals: int):
