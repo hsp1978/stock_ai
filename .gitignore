@@ -26,3 +26,6 @@ analysis_*.json
 
 # OpenDartReader corpCode 스냅샷 캐시 (약 8MB/일, dart_client가 자동 정리)
 docs_cache/
+
+# 디자인 명세 원본 (4.1MB 폰트 임베드 번들) — 요약은 docs/DESIGN_SYSTEM.md
+Stock AI 디자인 시스템*.html

@@ -178,7 +178,18 @@ make help
 - ML 라벨 회귀화
 - CPCV 백테스트
 
-현재 단계: paper trading 운영 + signal_outcomes 누적 (60일 hit-rate 검증).
+### 2026-08 신호 품질 정비 (완료)
+- 신호 판정 임계 `±2` → `1.3/-0.5` (도구 평균 스케일 정합)
+- R/R < 0.8 하드 게이트 — 매수를 관망으로 강등
+- KOSPI/KOSDAQ 거시 반영 (`macro_context`가 미국 지표만 보던 문제)
+- 정성(LLM 서술) 기여가 정량(도구) 기여를 넘지 못하도록 상한
+- 신뢰도 5.0 미만이면 강도 라벨을 `weak` 이하로 절하
+
+**현재 단계**: paper trading 운영 + signal_outcomes 누적.
+**60일 hit-rate 검증 시계 = 2026-08-06 시작, 10-05 만료.**
+그 이전 창들은 무효다 — signal_outcomes 무기록(~07-05), 임계값 도달 불가(~07-30),
+신호 로직 연속 변경(~08-05). 표본은 60일에 40~90건 수준이라 **방향성 점검 용도**이고
+승률 신뢰구간 판단에는 부족하다.
 
 ---
 
@@ -191,7 +202,7 @@ make help
 | `circuitbreaker` | 회로 차단 | Step 9 |
 | `pandas_market_calendars` | 휴장일 | Step 11 |
 | `pykrx` | 한국 KRX 데이터 | P2 |
-| `OpenDartReader` | DART 공시 | P2 |
+| `OpenDartReader` | DART 공시 | P2 (`>=0.2.2,<0.2.3` — 0.2.3은 Python 3.13 요구) |
 | `hmmlearn` | HMM regime | P3 |
 | `PyPortfolioOpt` | Black-Litterman | P3 |
 | `prometheus-fastapi-instrumentator` | 메트릭 | 시스템 보고서 P1 |
@@ -245,17 +256,40 @@ PR 머지 시:
 
 | # | 안티패턴 | 처리 단계 |
 |---|---|---|
-| 1 | God file (`webui.py` 5,136 라인) | P2 |
-| 2 | Dual call path (in-proc + HTTP) | P2 (HTTP 단일화) |
+| 1 | God file (`webui.py` **6,379 라인**) | P2 — 포맷 로직은 `report_format.py`로 분리 시작 |
+| 2 | Dual call path (in-proc + HTTP) | P2 (HTTP 단일화). `/paper`·`/trading`·`/gpu`는 강제 HTTP |
 | 3 | `print()` 기반 로깅 | 시스템 P1 |
 | 4 | `paper_state.json` 무락 | 시스템 P0 |
 | 5 | 양방향 sys.path 주입 | P2 |
 | 6 | 모델 버전 미핀 (`qwen3:14b-q4_K_M`) | P2 |
 | 7 | 매직 포트 8080 (3곳 흩어짐) | P2 |
-| 8 | ~~CI 부재~~ ✅ GitHub Actions 도입 (`.github/workflows/ci.yml`: test + dep smoke, 2026-05-19) | 완료 |
+| 8 | ~~CI 부재~~ ✅ GitHub Actions (`.github/workflows/ci.yml`: lint + test + dep smoke, 2026-05-19) | 완료 |
 | 9 | 차트 PNG 무한 누적 | 시스템 P1 |
 | 10 | README ↔ 코드 라우팅 불일치 | P2 |
 | 11 | 프롬프트 인젝션 표면 | Step 9 (structured output) |
+| 12 | **실패 은폐** — 광범위 `except`가 사유를 버리고, '조건 충족'을 '결과 성공'으로 기록 | 2026-08 다수 수정, 아래 §13 참조 |
+
+---
+
+## 13. 실패 은폐 패턴 (2026-08 감사)
+
+한 세션에서 같은 계열의 결함이 6건 나왔다. 공통 형태는 **장애가 정상으로 보고되는 것**이다.
+
+| 증상 | 실제 | 수정 |
+|---|---|---|
+| `/health` ollama connected | CPU 폴백 중 (추론 156~405초) | `ollama_runtime` 추가 (#15) |
+| 신호 "관망" | 임계 `±2`가 도달 불가 스케일 | `1.3/-0.5` 정합 (#16) |
+| "최근 30일 공시 없음" | 라이브러리 미설치 + 잘못된 호출 | `DartUnavailable` 분리 (#17) |
+| `alert_sent=1` | 텔레그램 400, 실제 도착 0건 | 전송 결과 반영 (#18) |
+| R/R 0.20 경고 + 매수 신호 | 경고가 신호를 못 막음 | 하드 게이트 (#19) |
+| 워치리스트 "삭제됨" | 파일에 안 써짐 (ro 마운트) | 되읽기 검증 (#24) |
+
+**작업 시 원칙**:
+1. `except`에서 사유를 버리지 말 것. 최소한 로그에 남긴다.
+2. **'조건 충족'과 '결과 성공'을 같은 필드에 쓰지 말 것.** 전송·저장은 결과를 확인하고 기록한다.
+3. 응답 코드 200을 성공으로 읽지 말 것 — Ollama 언로드, 텔레그램 전송 모두 200과 실패가 공존한다.
+4. 미검증 상태를 성공으로 덮지 말 것 (`untested` ≠ `ok`).
+5. 화면 변경은 브라우저로 확인할 것. Streamlit은 스크립트가 죽어도, CSS가 안 먹어도 HTTP 200이다.
 
 ---
 
@@ -264,8 +298,14 @@ PR 머지 시:
 - `docs/CONSULTING_BRIEF.md` — 사용자 작성 도메인 브리프
 - `docs/ARCHITECTURE_BRIEF.md` — 사용자 작성 시스템 브리프
 - `docs/BACKTEST_ASSUMPTIONS.md` — Slippage/수수료/rf 가정 (Step 10)
-- `docs/USER_MANUAL.md` — WebUI 사용법
+- `docs/USER_MANUAL.md` — WebUI 사용법 (사이드바=이동 전용, 커맨드바=조작, GPU 해제)
 - `docs/PHASE_1_MAC_STUDIO.md` / `PHASE_3_OPERATION.md` — 듀얼 노드 셋업/운영
+- `docs/DESIGN_SYSTEM.md` — 화면 토큰·컴포넌트 규격 v1.0 + Streamlit 구현 함정.
+  `:root` 토큰은 `webui.py`에 이식돼 있고 `tests/unit/test_design_system.py`가 정합을 고정한다.
+  (원본 HTML 4.1MB는 폰트 임베드 번들이라 gitignore)
+
+> 위 브리프·PHASE 문서는 **작성 시점 기록**이다. 현재 동작은 코드와
+> `tests/`를 우선한다.
 
 ---
 
