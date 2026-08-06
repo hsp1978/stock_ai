@@ -32,32 +32,35 @@ def _symbols():
 # ── 신규 환율 ───────────────────────────────────────────────────
 
 
-def test_jpy_included():
-    assert "JPY=X" in _symbols(), "엔화 환율 누락"
-
-
-def test_cny_included():
-    assert "CNY=X" in _symbols(), "위안화 환율 누락"
-
-
-def test_krw_still_present():
-    """기존 원달러가 사라지면 안 된다."""
-    assert "USDKRW=X" in _symbols()
-
-
-def test_fx_group_holds_currencies():
+def test_fx_is_krw_based():
+    """국내 사용자 관점 — '1달러가 몇 원'으로 읽어야 한다."""
     indices = _literal("MARKET_INDICES")
     fx = indices.get("fx")
     assert fx, "FX 그룹 없음"
     syms = [s for s, _, _ in fx["items"]]
-    assert syms == ["USDKRW=X", "JPY=X", "CNY=X"]
+    assert syms == ["KRW:USD", "KRW:JPY", "KRW:CNY"]
+    names = [n for _, n, _ in fx["items"]]
+    assert names == ["원/달러", "원/100엔", "원/위안"]
 
 
-def test_cny_uses_finer_decimals():
-    """USD/CNY는 7.x 대라 소수 2자리면 변동이 뭉갠다."""
-    decimals = {sym: d for sym, _, d in _all_items()}
-    assert decimals["CNY=X"] >= 3
-    assert decimals["JPY=X"] == 2
+def test_jpy_uses_100_yen_convention():
+    """국내 관례는 100엔 기준 — 1엔(약 9원)으로 표기하면 읽기 어렵다."""
+    cross = _literal("KRW_CROSS")
+    assert cross["KRW:JPY"]["mult"] == 100
+    assert cross["KRW:CNY"]["mult"] == 1
+
+
+def test_krw_cross_uses_usd_pairs():
+    """원화 직접 페어는 못 쓴다 — CNYKRW=X는 1봉뿐이라 등락·차트가 불가하다."""
+    cross = _literal("KRW_CROSS")
+    bases = {t for spec in cross.values() for t in (spec["num"], spec["den"]) if t}
+    assert bases == {"USDKRW=X", "JPY=X", "CNY=X"}
+    assert not any("KRW=X" in str(b) and b != "USDKRW=X" for b in bases)
+
+
+def test_usd_krw_needs_no_denominator():
+    cross = _literal("KRW_CROSS")
+    assert cross["KRW:USD"]["den"] is None
 
 
 def test_kr_indices_intact():

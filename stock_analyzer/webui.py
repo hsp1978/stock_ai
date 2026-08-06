@@ -576,9 +576,9 @@ MARKET_INDICES = {
     "fx": {
         "title": "FX",
         "items": [
-            ("USDKRW=X", "USD/KRW", 2),
-            ("JPY=X", "USD/JPY", 2),
-            ("CNY=X", "USD/CNY", 4),
+            ("KRW:USD", "원/달러", 2),
+            ("KRW:JPY", "원/100엔", 2),
+            ("KRW:CNY", "원/위안", 2),
         ],
     },
     "commodities": {
@@ -593,14 +593,52 @@ MARKET_INDICES = {
 }
 
 
+# 원화 기준 환율 — 국내 사용자 관점에서 "1달러가 몇 원인가"로 읽는다.
+# yfinance의 원화 직접 페어는 쓸 수 없다: JPYKRW=X는 봉이 성기고
+# CNYKRW=X는 1봉뿐이라 등락률·차트를 만들 수 없다 (2026-08-06 실측).
+# USD 페어에서 교차 계산한다 — 직접 티커와 값이 일치함을 확인했다
+# (원/위안 교차 210.61 vs 직접 210.66).
+# 엔은 국내 관례대로 100엔 기준으로 표기한다.
+KRW_CROSS = {
+    "KRW:USD": {"num": "USDKRW=X", "den": None, "mult": 1},
+    "KRW:JPY": {"num": "USDKRW=X", "den": "JPY=X", "mult": 100},
+    "KRW:CNY": {"num": "USDKRW=X", "den": "CNY=X", "mult": 1},
+}
+
+
+def _krw_cross_series(close_of, symbol: str):
+    """교차 환율 시계열. close_of(base_symbol) → Series 를 받아 계산한다."""
+    spec = KRW_CROSS[symbol]
+    num = close_of(spec["num"])
+    if num is None or len(num) == 0:
+        return None
+    if spec["den"] is None:
+        series = num
+    else:
+        den = close_of(spec["den"])
+        if den is None or len(den) == 0:
+            return None
+        joined = pd.concat([num, den], axis=1, join="inner").dropna()
+        if joined.empty:
+            return None
+        series = joined.iloc[:, 0] / joined.iloc[:, 1]
+    return (series * spec["mult"]).dropna()
+
+
 @st.cache_data(ttl=300)
 def fetch_market_indices() -> tuple[dict, str]:
     results = {}
     fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 교차 환율은 원 심볼 대신 계산에 필요한 base 티커를 받아온다.
     all_tickers = []
     for group in MARKET_INDICES.values():
         for sym, name, decimals in group["items"]:
-            all_tickers.append(sym)
+            if sym in KRW_CROSS:
+                spec = KRW_CROSS[sym]
+                all_tickers.extend(t for t in (spec["num"], spec["den"]) if t)
+            else:
+                all_tickers.append(sym)
+    all_tickers = list(dict.fromkeys(all_tickers))
 
     try:
         data = yf.download(
@@ -610,10 +648,23 @@ def fetch_market_indices() -> tuple[dict, str]:
     except Exception:
         return results, fetched_at
 
+    def _close_of(ticker: str):
+        try:
+            return data['Close'].dropna() if len(all_tickers) == 1 else data['Close'][ticker].dropna()
+        except Exception:
+            return None
+
     for group_key, group in MARKET_INDICES.items():
         for sym, name, decimals in group["items"]:
             try:
-                close_series = data['Close'] if len(all_tickers) == 1 else data['Close'][sym]
+                if sym in KRW_CROSS:
+                    close_series = _krw_cross_series(_close_of, sym)
+                    if close_series is None:
+                        continue
+                else:
+                    close_series = _close_of(sym)
+                    if close_series is None:
+                        continue
                 close_series = close_series.dropna()
                 if len(close_series) < 2:
                     continue
@@ -2228,8 +2279,22 @@ def _deprecated_render_korean_market_home():
 
 @st.cache_data(ttl=300)
 def fetch_index_history(symbol: str, period: str = "6mo") -> "pd.DataFrame | None":
-    """지수/환율 차트용 OHLC 이력."""
+    """지수/환율 차트용 이력. 원화 교차 환율은 base 페어에서 계산한다."""
     try:
+        if symbol in KRW_CROSS:
+            spec = KRW_CROSS[symbol]
+            bases = [t for t in (spec["num"], spec["den"]) if t]
+            closes = {}
+            for t in bases:
+                h = yf.Ticker(t).history(period=period)
+                if h is None or h.empty:
+                    return None
+                closes[t] = h["Close"].dropna()
+            series = _krw_cross_series(lambda t: closes.get(t), symbol)
+            if series is None or series.empty:
+                return None
+            return pd.DataFrame({"Close": series})
+
         hist = yf.Ticker(symbol).history(period=period)
         if hist is None or hist.empty:
             return None
