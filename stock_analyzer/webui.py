@@ -170,7 +170,7 @@ st.markdown("""
     /* ── IndexTile (DS §05) — h76 · pad 14/16 · r10 · gap 12 · 좌측 정렬
        라벨 12 / 가격 19 / 등락 12 3단 구조. 클릭 가능해야 하므로 st.button을
        타일 형태로 스타일링한다 (Streamlit은 HTML에 콜백을 붙일 수 없다). */
-    .idx-grid div[data-testid="stButton"] > button {
+    [class*="st-key-idx_btn_"] button {
         height: 76px;
         width: 100%;
         padding: 14px 16px;
@@ -184,18 +184,21 @@ st.markdown("""
         gap: 2px;
         transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
     }
-    .idx-grid div[data-testid="stButton"] > button:hover {
+    [class*="st-key-idx_btn_"] button:hover {
         background: var(--bg-raised);
         border-color: var(--border-strong);
     }
-    .idx-grid div[data-testid="stButton"] > button[kind="primary"] {
+    [class*="st-key-idx_btn_"] button[kind="primary"] {
         background: var(--accent-soft);
         border-color: var(--accent);
     }
-    .idx-grid div[data-testid="stButton"] > button p {
+    [class*="st-key-idx_btn_"] button p {
         text-align: left;
         line-height: 1.25;
         margin: 0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
         font-family: var(--font-num);
         font-size: 19px;
         font-weight: 600;
@@ -203,7 +206,7 @@ st.markdown("""
         font-variant-numeric: tabular-nums;
     }
     /* 첫 줄 = 지수명 라벨 (11/600 · 대문자 · text-low) */
-    .idx-grid div[data-testid="stButton"] > button p::first-line {
+    [class*="st-key-idx_btn_"] button p::first-line {
         font-family: var(--font-ui);
         font-size: 11px;
         font-weight: 600;
@@ -211,14 +214,14 @@ st.markdown("""
         letter-spacing: .1em;
     }
     /* 마지막 줄 = 등락률 (12px). 방향은 색만이 아니라 ▲/▼ 기호로도 전달한다. */
-    .idx-grid div[data-testid="stButton"] > button p em {
+    [class*="st-key-idx_btn_"] button p em {
         font-size: 12px;
         font-style: normal;
         font-weight: 600;
     }
-    .idx-grid div[data-testid="stButton"] > button p em.up { color: var(--up); }
-    .idx-grid div[data-testid="stButton"] > button p em.down { color: var(--down); }
-    .idx-grid div[data-testid="stButton"] > button p em.flat { color: var(--text-low); }
+    [class*="st-key-idx_btn_"] button p em.up { color: var(--up); }
+    [class*="st-key-idx_btn_"] button p em.down { color: var(--down); }
+    [class*="st-key-idx_btn_"] button p em.flat { color: var(--text-low); }
 
     /* ── SidebarNav (DS §05) — 이동 전용. 항목 h36 · 라벨 13/500
        선택 = accent-soft 배경 + 좌측 2px accent 바 (색만으로 표현하지 않음) */
@@ -237,6 +240,13 @@ st.markdown("""
         font-size: 13px;
         font-weight: 500;
         transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+    }
+    /* Streamlit이 버튼 라벨(<p>)을 가운데 정렬하므로 내부까지 좌측으로 돌린다.
+       버튼 자체의 justify-content만으로는 라벨이 가운데에 남는다. */
+    section[data-testid="stSidebar"] div[data-testid="stButton"] > button p {
+        width: 100%;
+        margin: 0;
+        text-align: left;
     }
     section[data-testid="stSidebar"] div[data-testid="stButton"] > button:hover {
         background: var(--bg-raised);
@@ -275,6 +285,18 @@ st.markdown("""
     .status-badge.ok .sb-dot { background: var(--up); }
     .status-badge.err { color: var(--down); }
     .status-badge.err .sb-dot { background: var(--down); }
+
+    /* Streamlit은 버튼 라벨을 중간 flex 컨테이너로 감싸 가운데 정렬한다.
+       버튼의 justify-content만으로는 라벨 박스가 가운데에 남으므로 내부까지 편다. */
+    section[data-testid="stSidebar"] div[data-testid="stButton"] > button > div,
+    section[data-testid="stSidebar"] div[data-testid="stButton"] > button > div > span,
+    [class*="st-key-idx_btn_"] button > div,
+    [class*="st-key-idx_btn_"] button > div > span,
+    [class*="st-key-idx_btn_"] button [data-testid="stMarkdownContainer"],
+    [class*="st-key-idx_btn_"] button p {
+        justify-content: flex-start !important;
+        width: 100% !important;
+    }
 
     /* ── StatCell (DS §05) — 카드 대신 1px 분할 행 ── */
     .statcell-row {
@@ -2297,10 +2319,10 @@ def render_market_ticker_bar():
     ]
 
     selected = st.session_state.get("selected_index")
-    per_row = 6
+    # DS §04: 타일 최소폭 180px. 6열로 잡으면 가격(19px mono)이 줄바꿈된다.
+    per_row = 4
     dir_rules = []
 
-    st.markdown('<div class="idx-grid">', unsafe_allow_html=True)
     for row_start in range(0, len(entries), per_row):
         row = entries[row_start:row_start + per_row]
         cols = st.columns(per_row, gap="small")
@@ -2334,7 +2356,6 @@ def render_market_ticker_bar():
                     # 같은 항목을 다시 누르면 차트를 접는다.
                     st.session_state.selected_index = None if selected == sym else sym
                     st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
     st.markdown(f"<style>{''.join(dir_rules)}</style>", unsafe_allow_html=True)
 
     selected = st.session_state.get("selected_index")
