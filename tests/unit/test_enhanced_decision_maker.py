@@ -211,6 +211,134 @@ def test_reflect_guard_downgrades_final_signal_on_three_group_conflict(monkeypat
     assert "REFLECT_INCONSISTENT_3_SELL_VS_FINAL_BUY" in output["reflect_flags"]
 
 
+def _tech_quant_directions(dm, tech_score, quant_score):
+    """Run _calculate_signal_strength with only tech/quant tool sums set."""
+    tech_analysis = {
+        "total_score": tech_score,
+        "buy_count": 0,
+        "sell_count": 0,
+        "neutral_count": 0,
+        "avg_strength": abs(tech_score),
+    }
+    quant_analysis = {
+        "total_score": quant_score,
+        "buy_count": 0,
+        "sell_count": 0,
+        "neutral_count": 0,
+        "avg_strength": abs(quant_score),
+    }
+    strength = dm._calculate_signal_strength(
+        tech_analysis, quant_analysis,
+        risk_scores=[], ml_scores=[], event_scores=[],
+    )
+    return strength["technical"]["direction"], strength["quantitative"]["direction"]
+
+
+def test_group_direction_deadzone_suppresses_noise_conflict():
+    """미세한 반대 부호(±2 이내)는 방향 neutral → 기술/퀀트 충돌로 판정되지 않는다."""
+    dm = EnhancedDecisionMaker()
+
+    # 개별 도구는 전부 neutral(|score|<=2)인데 합계만 미세하게 엇갈리는 상황
+    tech_dir, quant_dir = _tech_quant_directions(dm, tech_score=0.8, quant_score=-0.5)
+    assert tech_dir == "neutral"
+    assert quant_dir == "neutral"
+
+    conflicts = []
+    if tech_dir != quant_dir and tech_dir != "neutral" and quant_dir != "neutral":
+        conflicts.append("충돌")
+    assert conflicts == []
+
+
+def test_group_direction_deadzone_boundary_is_exclusive():
+    """정확히 ±2는 데드존 안(neutral), 초과해야 방향이 확정된다."""
+    dm = EnhancedDecisionMaker()
+
+    at_boundary_tech, at_boundary_quant = _tech_quant_directions(dm, 2.0, -2.0)
+    assert at_boundary_tech == "neutral"
+    assert at_boundary_quant == "neutral"
+
+    beyond_tech, beyond_quant = _tech_quant_directions(dm, 2.1, -2.1)
+    assert beyond_tech == "buy"
+    assert beyond_quant == "sell"
+
+
+def test_group_direction_real_conflict_still_reported():
+    """양쪽 모두 데드존 초과로 뚜렷이 엇갈리면 충돌은 그대로 유지된다."""
+    dm = EnhancedDecisionMaker()
+
+    tech_dir, quant_dir = _tech_quant_directions(dm, tech_score=8.0, quant_score=-7.0)
+    assert tech_dir == "buy"
+    assert quant_dir == "sell"
+    assert tech_dir != quant_dir
+
+
+def _strength_dirs(tech_dir="neutral", quant_dir="neutral"):
+    return {
+        "technical": {"direction": tech_dir},
+        "quantitative": {"direction": quant_dir},
+    }
+
+
+def test_vote_conflict_reported_on_meaningful_split():
+    """매수/매도 표가 공존하고 소수 가중치가 유의미하면 충돌로 보고된다."""
+    dm = EnhancedDecisionMaker()
+    conflicts = dm._detect_vote_conflicts(
+        {"buy": 3, "sell": 2, "neutral": 1},
+        {"buy": 18.0, "sell": 11.0, "neutral": 4.0},
+        _strength_dirs(),
+    )
+    assert conflicts
+    assert "표결 분열" in conflicts[0]
+    assert "매수 3명" in conflicts[0] and "매도 2명" in conflicts[0]
+
+
+def test_lone_weak_dissenter_is_not_a_conflict():
+    """강한 다수 vs 약한 단일 반대(가중 비율 < 25%)는 충돌로 판정하지 않는다."""
+    dm = EnhancedDecisionMaker()
+    conflicts = dm._detect_vote_conflicts(
+        {"buy": 3, "sell": 1, "neutral": 0},
+        {"buy": 24.0, "sell": 3.0, "neutral": 0.0},  # 3/24 = 0.125 < 0.25
+        _strength_dirs(),
+    )
+    assert conflicts == []
+
+
+def test_strong_dissenter_is_a_conflict():
+    """소수라도 신뢰도가 높으면(가중 비율 >= 25%) 충돌로 본다."""
+    dm = EnhancedDecisionMaker()
+    conflicts = dm._detect_vote_conflicts(
+        {"buy": 2, "sell": 1, "neutral": 0},
+        {"buy": 10.0, "sell": 9.0, "neutral": 0.0},  # 9/10 = 0.9 >= 0.25
+        _strength_dirs(),
+    )
+    assert conflicts
+    assert "표결 분열" in conflicts[0]
+
+
+def test_no_conflict_when_one_direction_absent():
+    """한 방향(매도) 표가 없으면 도구 방향이 엇갈려도 충돌 아님 — 구 오탐 회귀 방지."""
+    dm = EnhancedDecisionMaker()
+    conflicts = dm._detect_vote_conflicts(
+        {"buy": 2, "sell": 0, "neutral": 3},
+        {"buy": 12.0, "sell": 0.0, "neutral": 6.0},
+        _strength_dirs(tech_dir="buy", quant_dir="sell"),  # 도구 부호는 엇갈리지만
+    )
+    assert conflicts == []
+
+
+def test_tech_quant_mismatch_attached_only_as_evidence():
+    """표결 충돌이 실재할 때만 기술 vs 퀀트 방향 불일치가 근거로 부기된다."""
+    dm = EnhancedDecisionMaker()
+    conflicts = dm._detect_vote_conflicts(
+        {"buy": 2, "sell": 2, "neutral": 0},
+        {"buy": 12.0, "sell": 11.0, "neutral": 0.0},
+        _strength_dirs(tech_dir="buy", quant_dir="sell"),
+    )
+    assert len(conflicts) == 2
+    assert "표결 분열" in conflicts[0]
+    assert "기술적(buy) vs 퀀트(sell)" in conflicts[1]
+
+
 def test_final_decision_includes_shared_decision_context(monkeypatch):
     dm = _quiet_dm(monkeypatch)
 

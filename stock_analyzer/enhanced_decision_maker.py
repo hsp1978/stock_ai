@@ -890,13 +890,26 @@ class EnhancedDecisionMaker:
         fundamental_scores = fundamental_scores or []
         macro_scores = macro_scores or []
 
+        # 그룹 방향 판정 데드존 (±2). 개별 도구가 buy/sell로 전환되는 임계값(|score|>2,
+        # analysis_tools)과 동일하게 맞춘다. 데드존 없이 부호(>0/<0)만 쓰면 노이즈 수준의
+        # 미세 합계(예: 기술 +0.8 vs 퀀트 -0.5, 개별 도구는 전부 neutral)도 방향이
+        # buy/sell로 확정되어 "기술적 vs 퀀트 충돌"이 대부분의 분석에 상시 노출된다.
+        DEADZONE = 2.0
+
+        def _group_direction(total_score: float) -> str:
+            if total_score > DEADZONE:
+                return "buy"
+            if total_score < -DEADZONE:
+                return "sell"
+            return "neutral"
+
         # 기술적 분석 강도
         tech_strength = tech_analysis["avg_strength"]
-        tech_direction = "buy" if tech_analysis["total_score"] > 0 else "sell" if tech_analysis["total_score"] < 0 else "neutral"
+        tech_direction = _group_direction(tech_analysis["total_score"])
 
         # 퀀트 분석 강도
         quant_strength = quant_analysis["avg_strength"]
-        quant_direction = "buy" if quant_analysis["total_score"] > 0 else "sell" if quant_analysis["total_score"] < 0 else "neutral"
+        quant_direction = _group_direction(quant_analysis["total_score"])
 
         # ML 가중치 조정 (정확도 기반 - 50% 미만은 무시)
         ml_weight = 1.0  # 기본 가중치
@@ -1028,6 +1041,45 @@ class EnhancedDecisionMaker:
             "strength_level": strength_level
         }
 
+    # 소수 측 신뢰도 가중표가 다수 측의 이 비율 이상일 때만 유의미한 충돌로 본다.
+    # (예: 매수 가중 20 vs 매도 가중 3 → 0.15 < 0.25 → 약한 단일 반대는 충돌 아님)
+    VOTE_CONFLICT_MIN_RATIO = 0.25
+
+    def _detect_vote_conflicts(self, signal_counts, weighted_votes, signal_strength) -> List[str]:
+        """의견 충돌을 에이전트 표결/신뢰도 가중표 기준으로 판정한다.
+
+        도구 휴리스틱 부호가 아니라 실제 에이전트(전문가) 의견의 방향 분열을 충돌로
+        본다. buy/sell 표가 공존하고, 소수 측 가중치가 무시할 수준이 아닐 때만 충돌로
+        보고한다. 기술 vs 퀀트 방향 불일치는 트리거가 아니라, 이미 표결 충돌이 있을 때
+        그 근거로만 첨부한다.
+        """
+        conflicts: List[str] = []
+        buy_n = signal_counts.get("buy", 0)
+        sell_n = signal_counts.get("sell", 0)
+        # buy/sell 한쪽 표가 없으면 방향 충돌 아님 (전원 한 방향 or 중립 혼재).
+        if buy_n == 0 or sell_n == 0:
+            return conflicts
+
+        w_buy = float(weighted_votes.get("buy", 0.0))
+        w_sell = float(weighted_votes.get("sell", 0.0))
+        majority_w = max(w_buy, w_sell)
+        minority_w = min(w_buy, w_sell)
+        if majority_w <= 0 or (minority_w / majority_w) < self.VOTE_CONFLICT_MIN_RATIO:
+            return conflicts
+
+        conflicts.append(
+            f"에이전트 표결 분열: 매수 {buy_n}명(가중 {w_buy:.1f}) vs "
+            f"매도 {sell_n}명(가중 {w_sell:.1f})"
+        )
+
+        # 표결 충돌이 실재할 때만, 기술 vs 퀀트 방향 불일치를 근거로 부기한다.
+        tech_dir = signal_strength.get("technical", {}).get("direction", "neutral")
+        quant_dir = signal_strength.get("quantitative", {}).get("direction", "neutral")
+        if tech_dir != quant_dir and tech_dir != "neutral" and quant_dir != "neutral":
+            conflicts.append(f"기술적({tech_dir}) vs 퀀트({quant_dir}) 방향 불일치")
+
+        return conflicts
+
     def _make_final_decision(self, signal_counts, signal_strength,
                             volatility_check, tech_analysis, quant_analysis, currency,
                             fundamental_risks=None, weighted_votes=None) -> Dict:
@@ -1139,13 +1191,10 @@ class EnhancedDecisionMaker:
                     "risks": ["고변동성 리스크", "약한 신호 강도", "방향성 불명확"]
                 }
 
-        # 4. 기술적 vs 퀀트 충돌 체크
-        tech_dir = signal_strength["technical"]["direction"]
-        quant_dir = signal_strength["quantitative"]["direction"]
-
-        conflicts = []
-        if tech_dir != quant_dir and tech_dir != "neutral" and quant_dir != "neutral":
-            conflicts.append(f"기술적({tech_dir}) vs 퀀트({quant_dir}) 충돌")
+        # 4. 의견 충돌 판정 — 에이전트 표결/신뢰도 가중표 기준
+        # (도구 휴리스틱 부호가 아니라 전문가 의견의 실제 방향 분열을 충돌로 본다.
+        #  기술 vs 퀀트 방향 불일치는 트리거가 아니라 부기 근거로만 첨부된다.)
+        conflicts = self._detect_vote_conflicts(signal_counts, weighted_votes, signal_strength)
 
         # 5. 신뢰도 계산 (strength_level 기반으로 개선)
         # 신호 강도에 따른 신뢰도 범위 설정
