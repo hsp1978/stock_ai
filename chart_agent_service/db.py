@@ -9,6 +9,8 @@ import os
 import sqlite3
 import threading
 import atexit
+import weakref
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -18,7 +20,13 @@ DB_PATH = os.path.join(OUTPUT_DIR, "scan_log.db")
 _CONNECT_TIMEOUT_SECONDS = 30.0
 _BUSY_TIMEOUT_MS = 30_000
 _DB_LOCAL = threading.local()
-_DB_CONNECTIONS: list[sqlite3.Connection] = []
+# 스레드 객체를 키로 잡는다. 스레드가 죽으면 항목이 사라지고, 그 커넥션의 마지막
+# 강한 참조가 없어지면서 GC가 닫아 준다. 예전처럼 list로 들고 있으면 죽은 스레드의
+# fd가 영구히 남아 프로세스 전체가 fd를 고갈시킨다(2026-08-18 장애).
+# sqlite3.Connection 자체는 weakref 대상이 못 되므로 값이 아니라 키를 약참조한다.
+_DB_CONNECTIONS: "weakref.WeakKeyDictionary[threading.Thread, sqlite3.Connection]" = (
+    weakref.WeakKeyDictionary()
+)
 _DB_CONNECTIONS_LOCK = threading.Lock()
 
 _CREATE_TABLE = """
@@ -179,7 +187,7 @@ def _open_sqlite_connection() -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
     with _DB_CONNECTIONS_LOCK:
-        _DB_CONNECTIONS.append(conn)
+        _DB_CONNECTIONS[threading.current_thread()] = conn
     return conn
 
 
@@ -204,13 +212,29 @@ def close_thread_connection() -> None:
         try:
             conn.close()
         finally:
+            with _DB_CONNECTIONS_LOCK:
+                _DB_CONNECTIONS.pop(threading.current_thread(), None)
             _DB_LOCAL.conn = None
             _DB_LOCAL.path = None
 
 
+@contextmanager
+def worker_connection_scope():
+    """Close this thread's SQLite connection when a pool task finishes.
+
+    ThreadPoolExecutor workers are short-lived: the pool is recreated per scan or
+    per screener run and its threads die at shutdown. Without this the connection
+    is only reclaimed whenever GC gets to it, so wrap pool task bodies with it.
+    """
+    try:
+        yield
+    finally:
+        close_thread_connection()
+
+
 def close_all_connections() -> None:
     with _DB_CONNECTIONS_LOCK:
-        conns = list(_DB_CONNECTIONS)
+        conns = list(_DB_CONNECTIONS.values())
         _DB_CONNECTIONS.clear()
     for conn in conns:
         try:

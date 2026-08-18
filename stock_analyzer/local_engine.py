@@ -15,8 +15,30 @@ import math
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional
+
+
+@contextmanager
+def _db_worker_scope():
+    """Release this worker thread's SQLite connection if the db module is reachable.
+
+    Pools here are created per request and their threads die holding a connection.
+    Import is soft because this module also runs where the service dir is absent.
+    """
+    try:
+        from db import worker_connection_scope
+    except Exception:
+        yield
+        return
+    with worker_connection_scope():
+        yield
+
+
+def _fetch_in_worker_scope(fetch_fn, ticker: str):
+    with _db_worker_scope():
+        return fetch_fn(ticker)
 
 # ═══════════════════════════════════════════════════════════════
 #  .env 로드 (chart_agent_service 모듈 import 전에 실행)
@@ -251,10 +273,10 @@ def _fetch_analysis_inputs(ticker: str):
     print(f"  [{ticker}] 데이터 병렬 수집...")
     executor = ThreadPoolExecutor(max_workers=4)
     futures = {
-        "ohlcv": executor.submit(fetch_ohlcv, ticker),
-        "fundamentals": executor.submit(fetch_fundamentals, ticker),
-        "options_pcr": executor.submit(fetch_options_pcr, ticker),
-        "insider_trades": executor.submit(fetch_insider_trades, ticker),
+        "ohlcv": executor.submit(_fetch_in_worker_scope, fetch_ohlcv, ticker),
+        "fundamentals": executor.submit(_fetch_in_worker_scope, fetch_fundamentals, ticker),
+        "options_pcr": executor.submit(_fetch_in_worker_scope, fetch_options_pcr, ticker),
+        "insider_trades": executor.submit(_fetch_in_worker_scope, fetch_insider_trades, ticker),
     }
     try:
         df = futures["ohlcv"].result(timeout=_AUX_FETCH_TIMEOUT)
@@ -796,7 +818,8 @@ def engine_scan_all(tickers: Optional[list] = None) -> dict:
     lock = threading.Lock()
 
     def _scan_one(ticker):
-        return ticker, engine_scan_ticker(ticker, persist_state=False)
+        with _db_worker_scope():
+            return ticker, engine_scan_ticker(ticker, persist_state=False)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_scan_one, t): t for t in tickers}

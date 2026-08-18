@@ -871,6 +871,8 @@ def run_screener_with_multiagent(
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    from db import worker_connection_scope
+
     # ── 1단계: 스크리너 ──────────────────────
     print(f"\n[파이프라인] 1단계: 스크리너 실행")
     screener_result = run_screener(
@@ -897,21 +899,22 @@ def run_screener_with_multiagent(
 
     def _run_ma(candidate):
         ticker = candidate["ticker"]
-        try:
-            # 기존 analyze_ticker 또는 Multi-Agent 경로
-            # multi_agent.MultiAgentOrchestrator 사용
-            import sys as _sys, os as _os
-            proj = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-            analyzer = _os.path.join(proj, "stock_analyzer")
-            if analyzer not in _sys.path:
-                _sys.path.insert(0, analyzer)
+        with worker_connection_scope():
+            try:
+                # 기존 analyze_ticker 또는 Multi-Agent 경로
+                # multi_agent.MultiAgentOrchestrator 사용
+                import sys as _sys, os as _os
+                proj = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+                analyzer = _os.path.join(proj, "stock_analyzer")
+                if analyzer not in _sys.path:
+                    _sys.path.insert(0, analyzer)
 
-            from multi_agent import MultiAgentOrchestrator
-            orchestrator = MultiAgentOrchestrator()
-            ma_result = orchestrator.analyze(ticker)
-            return ticker, ma_result
-        except Exception as e:
-            return ticker, {"error": f"Multi-Agent 실행 실패: {str(e)[:100]}"}
+                from multi_agent import MultiAgentOrchestrator
+                orchestrator = MultiAgentOrchestrator()
+                ma_result = orchestrator.analyze(ticker)
+                return ticker, ma_result
+            except Exception as e:
+                return ticker, {"error": f"Multi-Agent 실행 실패: {str(e)[:100]}"}
 
     # 병렬 실행 (max_workers는 Ollama 병렬 수와 맞춤)
     max_workers = int(_os.getenv("SCAN_PARALLEL_WORKERS", "2"))

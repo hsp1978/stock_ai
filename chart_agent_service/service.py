@@ -80,7 +80,7 @@ from macro_context import fetch_macro_context
 from db import init_db, insert_scan, set_alert_sent, get_scan_logs, get_scan_logs_by_ticker, \
     get_scan_log_latest, get_scan_log_date_range, \
     get_weekly_summary, get_weekly_ticker, \
-    get_app_state, set_app_state
+    get_app_state, set_app_state, worker_connection_scope
 from signal_tracker import insert_signal_outcome
 
 # Multi-Agent import
@@ -815,15 +815,25 @@ def _restore_runtime_state() -> None:
         print(f"[상태 복원] 실패: {exc}")
 
 
+def _fetch_in_worker_scope(fetch_fn, ticker: str):
+    """수집 함수를 워커 스레드에서 실행하고 그 스레드의 DB 커넥션을 회수한다.
+
+    타임아웃 시 executor를 wait=False로 내리기 때문에 워커가 뒤늦게 끝나며 죽는다.
+    이때 커넥션을 닫지 않으면 fd가 남는다.
+    """
+    with worker_connection_scope():
+        return fetch_fn(ticker)
+
+
 def _fetch_analysis_inputs(ticker: str):
     """OHLCV와 보조 API를 병렬 수집한다. OHLCV만 필수 데이터로 취급한다."""
     print(f"  [{ticker}] 데이터 병렬 수집...")
     executor = ThreadPoolExecutor(max_workers=4)
     futures = {
-        "ohlcv": executor.submit(fetch_ohlcv, ticker),
-        "fundamentals": executor.submit(fetch_fundamentals, ticker),
-        "options_pcr": executor.submit(fetch_options_pcr, ticker),
-        "insider_trades": executor.submit(fetch_insider_trades, ticker),
+        "ohlcv": executor.submit(_fetch_in_worker_scope, fetch_ohlcv, ticker),
+        "fundamentals": executor.submit(_fetch_in_worker_scope, fetch_fundamentals, ticker),
+        "options_pcr": executor.submit(_fetch_in_worker_scope, fetch_options_pcr, ticker),
+        "insider_trades": executor.submit(_fetch_in_worker_scope, fetch_insider_trades, ticker),
     }
     try:
         df = futures["ohlcv"].result(timeout=_AUX_FETCH_TIMEOUT)
@@ -1255,7 +1265,8 @@ def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
     # ── 단계 2: 병렬 LLM 분석 ────────────────────────────────
     def _scan_one(ticker: str):
         """단일 종목 스캔 — ThreadPoolExecutor 워커 함수."""
-        result = analyze_ticker(ticker)
+        with worker_connection_scope():
+            result = analyze_ticker(ticker)
         return ticker, result
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
