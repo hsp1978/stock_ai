@@ -926,6 +926,47 @@ class GeopoliticalAnalyst(BaseAgent):
     def _context_available(context: Dict[str, Any]) -> bool:
         return bool(context) and not context.get("error") and not context.get("disabled")
 
+    # 매출이 어느 통화로 들어오는지가 환노출을 정한다. 상장 시장은 무관하다.
+    # yfinance는 지역별 매출 비중을 주지 않으므로 섹터/산업으로 근사한다 —
+    # 정밀값이 아니라 방향성 구분이 목적이다.
+    _DOMESTIC_SECTORS = {
+        "Financial Services", "Utilities", "Real Estate", "Healthcare",
+        "Communication Services", "Consumer Defensive",
+    }
+    _EXPORT_SECTORS = {
+        "Technology", "Basic Materials", "Energy", "Industrials",
+        "Consumer Cyclical",
+    }
+    # 섹터가 내수여도 산업이 수출형이면 뒤집는다 (예: 조선/방산).
+    _EXPORT_INDUSTRY_HINTS = (
+        "semiconductor", "shipbuilding", "aerospace", "defense", "auto",
+        "chemical", "steel", "shipping", "electronic",
+    )
+
+    @classmethod
+    def _estimate_fx_exposure(
+        cls, currency: str, sector: str, industry: str
+    ) -> tuple[str, str]:
+        """(노출도, 근거) 반환.
+
+        기존 구현은 티커 접미사(.KS/.KQ 등)만 보고 무조건 HIGH를 매겼다.
+        그 결과 국내 손해보험사(005830.KS)와 수출 OEM(111770.KS)이 같은
+        '높은 환율 노출'로 분류됐다 (2026-08 감사).
+        """
+        sector = sector or "Unknown"
+        industry_l = (industry or "").lower()
+
+        if currency == "USD":
+            return "LOW", "USD 기준 매출 — 환산 노출 없음"
+
+        if any(h in industry_l for h in cls._EXPORT_INDUSTRY_HINTS):
+            return "HIGH", f"수출 비중이 큰 산업({industry}) — 외화 매출 노출"
+        if sector in cls._EXPORT_SECTORS:
+            return "MEDIUM", f"{sector} 섹터 — 수출·원자재 수입에 따른 환율 민감도"
+        if sector in cls._DOMESTIC_SECTORS:
+            return "LOW", f"{sector} 섹터 — 매출 대부분이 {currency} 기반 내수"
+        return "MEDIUM", f"{sector} 섹터 — 환노출 판별 근거 부족, 중립 가정"
+
     def analyze(self, ticker: str, analysis_tools: AnalysisTools) -> AgentResult:
         """지정학적 리스크 및 환율 영향 분석"""
         start_time = datetime.now()
@@ -941,21 +982,20 @@ class GeopoliticalAnalyst(BaseAgent):
             currency = info.get('currency', 'USD')
             country = info.get('country', 'Unknown')
             sector = info.get('sector', 'Unknown')
+            industry = info.get('industry', '') or ''
 
             # 2. 지정학적 리스크 평가
             geopolitical_risks = []
-            fx_exposure = "LOW"
 
-            # 한국/중국/일본 종목 - 환율 리스크
-            if ticker.endswith(('.KS', '.KQ', '.T', '.SS', '.SZ', '.HK')):
-                fx_exposure = "HIGH"
-                geopolitical_risks.append("동아시아 지정학적 긴장 (한반도, 대만)")
-                geopolitical_risks.append("USD/KRW 환율 변동성")
-
-            # 미국 외 종목 - 일반 환율 리스크
-            elif currency != 'USD':
-                fx_exposure = "MEDIUM"
-                geopolitical_risks.append(f"{currency} 환율 변동 리스크")
+            # 환노출은 매출 통화 기준으로 추정한다. 상장 시장(.KS/.KQ)은
+            # 노출도의 근거가 못 된다 — 국내 금융주까지 HIGH로 묶였다.
+            fx_exposure, fx_reason = self._estimate_fx_exposure(
+                currency, sector, industry
+            )
+            if fx_exposure == "HIGH":
+                geopolitical_risks.append(f"{currency} 환율 변동 리스크 — {fx_reason}")
+            elif fx_exposure == "MEDIUM" and currency != "USD":
+                geopolitical_risks.append(f"{currency} 환율 부분 노출 — {fx_reason}")
 
             # 섹터별 지정학적 리스크 (None 체크 추가)
             if sector is not None and sector in ['Energy', 'Materials']:
@@ -964,6 +1004,15 @@ class GeopoliticalAnalyst(BaseAgent):
                 geopolitical_risks.append("미중 기술 패권 경쟁")
             elif sector is not None and sector in ['Consumer Cyclical', 'Consumer Defensive']:
                 geopolitical_risks.append("글로벌 소비 심리, 무역 정책 변화")
+
+            # 역내 지정학 리스크는 공급망이 실제로 걸린 종목에만 붙인다.
+            # 과거엔 .KS/.KQ 전 종목에 같은 문장이 붙어 종목 구분이 사라졌다.
+            if ticker.upper().endswith(('.KS', '.KQ', '.T', '.SS', '.SZ', '.HK')):
+                industry_l = industry.lower()
+                if any(h in industry_l for h in ("semiconductor", "electronic", "auto", "shipbuilding")):
+                    geopolitical_risks.append(
+                        f"동아시아 공급망 긴장 노출 ({industry})"
+                    )
 
             # 국가별 특수 리스크 (None 체크 추가)
             if country is not None and country in ['China', 'Hong Kong']:
@@ -1022,7 +1071,9 @@ class GeopoliticalAnalyst(BaseAgent):
                     "currency": currency,
                     "country": country,
                     "sector": sector,
+                    "industry": industry,
                     "fx_exposure": fx_exposure,
+                    "fx_exposure_basis": fx_reason,
                     "risks": geopolitical_risks,
                     "risk_count": len(geopolitical_risks),
                     "analysis_mode": analysis_mode,
@@ -1046,7 +1097,8 @@ class GeopoliticalAnalyst(BaseAgent):
 - 국가: {country}
 - 통화: {currency}
 - 섹터: {sector}
-- 환율 노출도: {fx_exposure}
+- 산업: {industry or '미상'}
+- 환율 노출도: {fx_exposure} ({fx_reason})
 - 분석 모드: {analysis_mode}
 
 ## 식별된 지정학적 리스크
@@ -1069,7 +1121,10 @@ class GeopoliticalAnalyst(BaseAgent):
 - 리스크가 3개 이상이거나 HIGH 환율 노출이면 → 보수적 판단 (매도 or 중립)
 - 리스크가 적고 안정적이면 → 긍정적 신호 가능
 - 환율이 유리하게 움직이는 구간이면 언급
-- 분석 모드가 static_exposure_with_unavailable_context이면 실시간 이벤트 판단이 제한됨을 근거에 명시"""
+- 분석 모드가 static_exposure_with_unavailable_context이면 실시간 이벤트 판단이 제한됨을 근거에 명시
+- 위 '환율 노출도'와 '산업'에 근거해 이 종목에 실제로 해당하는 사유만 쓸 것.
+  상장 국가만 보고 일반적인 역내 긴장을 서술하지 말 것 — 내수 기반 기업에
+  수출 기업의 환리스크를 적용하는 것은 오판이다."""
 
             response = self._call_llm(prompt)
             signal, confidence, reasoning = self._parse_response(response)

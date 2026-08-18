@@ -83,6 +83,10 @@ class EnhancedDecisionMaker:
     # 만들어지지 않게 한다.
     NARRATIVE_FLOOR = 5.0
 
+    # 실적 발표 직전 블랙아웃. 이 안에서는 방향 판단과 무관하게 진입을 막는다
+    # (실적은 가격 갭을 만들고 손절이 성립하지 않는다).
+    EARNINGS_BLACKOUT_DAYS = 3
+
     def _min_risk_reward(self, agent_results) -> Optional[float]:
         """에이전트 evidence에서 지지/저항 기준 R/R 최솟값을 뽑는다.
 
@@ -176,6 +180,31 @@ class EnhancedDecisionMaker:
         gated["conflicts"] = f"{prev}, {msg}" if prev and prev != "없음" else msg
         gated["reasoning"] = (
             f"{gated.get('reasoning', '')} / R/R {rr:.2f}로 진입 부적격 → 관망 전환"
+        ).strip()
+        return gated
+
+    def _apply_earnings_gate(
+        self, final_decision: Dict, days_to_earnings: Optional[float]
+    ) -> Dict:
+        """실적 발표 임박이면 매수를 관망으로 강등한다.
+
+        R/R 게이트와 같은 이유다. 실적은 갭으로 가격을 옮기기 때문에 손절가가
+        지켜진다는 전제가 깨진다. 방향이 맞아도 진입 타이밍이 부적격이다.
+        """
+        if days_to_earnings is None or days_to_earnings > self.EARNINGS_BLACKOUT_DAYS:
+            return final_decision
+        if (final_decision.get("signal") or "").lower() != "buy":
+            return final_decision
+
+        gated = dict(final_decision)
+        gated["signal"] = "neutral"
+        gated["confidence"] = min(float(gated.get("confidence", 0) or 0), 3.0)
+        gated["earnings_downgraded"] = True
+        msg = f"실적 발표 D-{days_to_earnings:.0f} 임박 vs 매수 신호"
+        prev = gated.get("conflicts")
+        gated["conflicts"] = f"{prev}, {msg}" if prev and prev != "없음" else msg
+        gated["reasoning"] = (
+            f"{gated.get('reasoning', '')} / 실적 D-{days_to_earnings:.0f}로 진입 보류 → 관망 전환"
         ).strip()
         return gated
 
@@ -473,6 +502,16 @@ class EnhancedDecisionMaker:
         if rr_blocked:
             final_decision = self._apply_risk_reward_gate(final_decision, min_rr)
 
+        # 6.75. [실적 블랙아웃] 발표 직전에는 갭 때문에 손절가가 성립하지 않는다.
+        days_to_earnings = (fundamental_risks or {}).get("days_to_earnings")
+        earnings_blocked = (
+            days_to_earnings is not None
+            and days_to_earnings <= self.EARNINGS_BLACKOUT_DAYS
+            and final_decision["signal"] == "buy"
+        )
+        if earnings_blocked:
+            final_decision = self._apply_earnings_gate(final_decision, days_to_earnings)
+
         # 6.8. [실행 가능성] entry_plan은 orchestrator가 aggregate() 반환 뒤에
         # 붙이므로 여기서는 판정할 수 없다. apply_execution_readiness()를
         # 진입 계획 생성 직후에 호출한다 (multi_agent).
@@ -581,7 +620,15 @@ class EnhancedDecisionMaker:
             "fundamental_risks": fundamental_risks,
             "warnings": warnings if warnings else None,
             "regime": current_regime.value if current_regime else None,
-            "regime_weighted_score": regime_weighted_score,
+            # 그룹 신호를 regime 가중치로 합산한 별도 지표. total_score와 스케일이
+            # 다르다(Σ signal×confidence×weight, 대략 ±30). 어디에서도 판정에
+            # 쓰이지 않는 진단용 값이라, 총점으로 오독되지 않게 스케일을 명시한다.
+            "regime_weighted_score": {
+                "value": regime_weighted_score,
+                "scale": "sum(signal x confidence x regime_weight)",
+                "comparable_to_total_score": False,
+                "used_in_decision": False,
+            } if regime_weighted_score is not None else None,
             "group_results": {k.value: v.to_dict() for k, v in group_results.items()},
             "reflect_flags": reflect_flags,
             "signal_std": signal_std,
@@ -679,31 +726,72 @@ class EnhancedDecisionMaker:
                     warnings.append(f"52주 고점 대비 {decline_pct:.1f}% 하락")
 
             # 실적 발표일 체크 (시장 시간대 기준)
-            earnings_date = info.get('earningsTimestamp')
-            if earnings_date:
-                from datetime import datetime, timezone
-                # earningsTimestamp는 UTC unix timestamp
-                earnings_dt = datetime.fromtimestamp(earnings_date, tz=timezone.utc)
-                # 시장 기준 현재 시각: 한국 종목은 KST, 그 외는 ET
-                tz_name = "Asia/Seoul" if (ticker.upper().endswith(".KS") or ticker.upper().endswith(".KQ")) else "America/New_York"
-                try:
-                    from zoneinfo import ZoneInfo
-                    market_tz = ZoneInfo(tz_name)
-                except Exception:
-                    market_tz = timezone.utc
-                now_market = datetime.now(tz=market_tz)
-                days_to_earnings = (earnings_dt.astimezone(market_tz) - now_market).days
+            #
+            # [2026-08 수정] 과거엔 earningsTimestamp 하나만 봤다. 이 필드는
+            # yfinance에서 '직전' 실적일이라, '실적 N일 전' 분기는 사실상 죽은
+            # 코드였고 임박한 실적을 한 번도 잡지 못했다. 다음 실적일은
+            # earningsTimestampStart/End에 따로 들어온다.
+            #
+            # 또 timedelta.days는 음수에서 바닥으로 내림한다(-5.05일 → -6).
+            # 005830.KS 실측에서 5.05일 경과가 "6일 경과"로 표기된 원인이다.
+            from datetime import datetime, timezone
 
-                if 0 <= days_to_earnings <= 7:
-                    warnings.append(f"실적 발표 {days_to_earnings}일 전: 변동성 급증 예상")
-                elif -7 <= days_to_earnings < 0:
-                    warnings.append(f"실적 발표 {abs(days_to_earnings)}일 경과")
+            tz_name = (
+                "Asia/Seoul"
+                if (ticker.upper().endswith(".KS") or ticker.upper().endswith(".KQ"))
+                else "America/New_York"
+            )
+            try:
+                from zoneinfo import ZoneInfo
+                market_tz = ZoneInfo(tz_name)
+            except Exception:
+                market_tz = timezone.utc
+            now_market = datetime.now(tz=market_tz)
+
+            def _days_from_now(ts) -> Optional[float]:
+                """실수 일수. 내림 대신 실제 경과/잔여 일수를 반환한다."""
+                if not ts:
+                    return None
+                try:
+                    dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+                except (TypeError, ValueError, OSError):
+                    return None
+                return (dt.astimezone(market_tz) - now_market).total_seconds() / 86400.0
+
+            # 다음 실적일 후보 중 미래인 것들의 최솟값
+            future_days = [
+                d
+                for d in (
+                    _days_from_now(info.get("earningsTimestampStart")),
+                    _days_from_now(info.get("earningsTimestampEnd")),
+                    _days_from_now(info.get("earningsTimestamp")),
+                )
+                if d is not None and d >= 0
+            ]
+            days_to_earnings = min(future_days) if future_days else None
+
+            past_days = _days_from_now(info.get("earningsTimestamp"))
+            days_since_earnings = -past_days if past_days is not None and past_days < 0 else None
+
+            if days_to_earnings is not None and days_to_earnings <= 7:
+                warnings.append(
+                    f"실적 발표 D-{days_to_earnings:.0f}: 변동성 급증 예상"
+                )
+                # 임박 실적은 방향 판단과 무관하게 진입 부적격이다.
+                if days_to_earnings <= self.EARNINGS_BLACKOUT_DAYS:
+                    critical_risks.append(
+                        f"실적 발표 D-{days_to_earnings:.0f} 임박 — 진입 보류"
+                    )
+            elif days_since_earnings is not None and days_since_earnings <= 7:
+                warnings.append(f"실적 발표 {days_since_earnings:.0f}일 경과")
 
             return {
                 "beta": beta,
                 "pe_trailing": pe_trailing,
                 "pe_forward": pe_forward,
                 "week52_decline": decline_pct if 'decline_pct' in locals() else None,
+                "days_to_earnings": days_to_earnings,
+                "days_since_earnings": days_since_earnings,
                 "warnings": warnings,
                 "critical_risks": critical_risks
             }
@@ -714,6 +802,8 @@ class EnhancedDecisionMaker:
                 "pe_trailing": None,
                 "pe_forward": None,
                 "week52_decline": None,
+                "days_to_earnings": None,
+                "days_since_earnings": None,
                 "warnings": ["Fundamental 데이터 수집 실패"],
                 "critical_risks": []
             }
@@ -1207,11 +1297,23 @@ class EnhancedDecisionMaker:
         insider_contribution = float(signal_strength.get("insider", {}).get("contribution", 0) or 0)
         domain = signal_strength.get("domain_contributions", {})
         domain_total = sum(float(v or 0) for v in domain.values())
+        # [산술 정합] 총점에 실제로 더해진 값은 상한이 걸린 narrative_contribution이다.
+        # 원값(domain_total)을 표기하면 독자가 재검산했을 때 합이 맞지 않는다
+        # (005830.KS 실측: 표기 16.5, 실제 반영 5.0, 총점 5.0).
+        narrative_used = float(
+            signal_strength.get("narrative_contribution", domain_total) or 0
+        )
         reasoning_parts.append(
             f"종합 점수: {total_score:+.1f} = 기술 {tech_analysis['total_score']:+.1f} "
             f"+ 퀀트 {quant_analysis['total_score']:+.1f} + ML {ml_contribution:+.1f} "
-            f"+ 내부자 {insider_contribution:+.1f} + 도메인 {domain_total:+.1f}"
+            f"+ 내부자 {insider_contribution:+.1f} + 도메인 {narrative_used:+.1f}"
         )
+        if signal_strength.get("narrative_capped"):
+            reasoning_parts.append(
+                f"도메인 상한 적용: 원값 {domain_total:+.1f} → "
+                f"{narrative_used:+.1f} (상한 {float(signal_strength.get('narrative_cap', 0) or 0):.1f} "
+                "= 정량 기여 절댓값과 바닥값 중 큰 쪽)"
+            )
         if any(abs(float(v or 0)) > 0 for v in domain.values()):
             reasoning_parts.append(
                 "도메인 보정: "

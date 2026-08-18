@@ -47,8 +47,11 @@ class GroupResult:
     signal: Literal["buy", "sell", "neutral"]
     confidence: float
     member_count: int
-    member_results: list[str]  # 참여 에이전트 이름
-    error_count: int
+    member_results: list[str]  # 집계에 참여한 에이전트 이름
+    error_count: int  # 실제 오류로 실패한 수
+    # 오류는 없지만 집계에서 빠진 수 (confidence 0 — 예: 정확도 미달로 무시된 ML).
+    # '실패'와 같은 필드에 담으면 정상 동작이 장애로 보고된다 (CLAUDE.md §13-2).
+    excluded_count: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -58,6 +61,9 @@ class GroupResult:
             "member_count": self.member_count,
             "member_results": self.member_results,
             "error_count": self.error_count,
+            "excluded_count": self.excluded_count,
+            # member_count = len(member_results) + error_count + excluded_count
+            "counted_in_vote": len(self.member_results),
         }
 
 
@@ -74,6 +80,9 @@ def _signal_score(s: str) -> float:
 def _weighted_vote(group: AgentGroup, members: list[AgentResult]) -> GroupResult:
     """그룹 내 유효 에이전트의 confidence-weighted 다수결."""
     valid = [r for r in members if not r.error and r.confidence > 0]
+    # 오류로 실패한 것과, 오류 없이 confidence 0이라 빠진 것을 구분한다.
+    errored = [r for r in members if r.error]
+    excluded = [r for r in members if not r.error and r.confidence <= 0]
     if not valid:
         return GroupResult(
             group=group,
@@ -81,7 +90,8 @@ def _weighted_vote(group: AgentGroup, members: list[AgentResult]) -> GroupResult
             confidence=0.0,
             member_count=len(members),
             member_results=[],
-            error_count=len(members),
+            error_count=len(errored),
+            excluded_count=len(excluded),
         )
 
     weighted_sum = sum(_signal_score(r.signal) * r.confidence for r in valid)
@@ -98,7 +108,8 @@ def _weighted_vote(group: AgentGroup, members: list[AgentResult]) -> GroupResult
         confidence=avg_conf,
         member_count=len(members),
         member_results=[r.agent_name for r in valid],
-        error_count=len(members) - len(valid),
+        error_count=len(errored),
+        excluded_count=len(excluded),
     )
 
 

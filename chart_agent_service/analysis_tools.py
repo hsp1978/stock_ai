@@ -1622,15 +1622,21 @@ class AnalysisTools:
             var_60 = float(sp_60.var())
             beta_60d = cov_60 / var_60 if var_60 > 0 else beta
 
+        # [알파 신뢰도] 베타가 0에 가깝거나 R²가 낮으면 회귀 설명력이 없고,
+        # 그 회귀에서 나온 알파는 잔차 노이즈다. 실측에서 β=0.25/R²≈0인 종목에
+        # α=20.7%가 붙어 매수 근거로 쓰였다 (005830.KS). 노이즈에 점수를 주지 않는다.
+        alpha_reliable = abs(beta) >= 0.3 and r_squared >= 0.1
+
         score = 0
-        if alpha_annual > 0.10:
-            score += 3
-        elif alpha_annual > 0.05:
-            score += 1
-        elif alpha_annual < -0.10:
-            score -= 3
-        elif alpha_annual < -0.05:
-            score -= 1
+        if alpha_reliable:
+            if alpha_annual > 0.10:
+                score += 3
+            elif alpha_annual > 0.05:
+                score += 1
+            elif alpha_annual < -0.10:
+                score -= 3
+            elif alpha_annual < -0.05:
+                score -= 1
 
         if beta < 0.8:
             score += 1
@@ -1638,10 +1644,12 @@ class AnalysisTools:
             score -= 1
 
         # IR 대칭 반영 (과거엔 +0.5 초과 가점만 있었음)
-        if info_ratio > 0.5:
-            score += 1
-        elif info_ratio < -0.5:
-            score -= 1
+        # IR도 알파에서 파생되므로 같은 게이트를 적용한다.
+        if alpha_reliable:
+            if info_ratio > 0.5:
+                score += 1
+            elif info_ratio < -0.5:
+                score -= 1
 
         score = max(-10, min(10, score))
         signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
@@ -1656,9 +1664,12 @@ class AnalysisTools:
             "r_squared": round(r_squared, 3),
             "tracking_error_pct": round(tracking_error * 100, 2),
             "information_ratio": round(info_ratio, 3),
+            "alpha_reliable": alpha_reliable,
             "benchmark": benchmark_symbol,
             "detail": f"β={beta:.2f}(60d:{beta_60d:.2f}, vs {benchmark_symbol}), α={alpha_annual:.1%}, "
                        f"상관={correlation:.2f}, IR={info_ratio:.2f}"
+                       + ("" if alpha_reliable
+                          else f" — 베타 설명력 부족(R²={r_squared:.2f}) → α/IR 점수 미반영")
         })
         return result
 
