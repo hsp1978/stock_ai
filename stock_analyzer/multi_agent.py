@@ -22,6 +22,7 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import contextmanager
 import traceback
 
 # 프로젝트 경로 설정
@@ -1762,6 +1763,28 @@ def _build_decision_maker(llm_provider: str):
 # Orchestrator - 병렬 실행 관리
 # ============================================
 
+@contextmanager
+def _db_worker_scope():
+    """Release this worker thread's SQLite connection if the db module is reachable.
+
+    Agents touch the scan DB (signal_tracker calibration), and this pool is torn
+    down per analysis, so its threads die holding a connection. webui can import
+    this module without chart_agent_service on sys.path, hence the soft import.
+    """
+    try:
+        from db import worker_connection_scope
+    except Exception:
+        yield
+        return
+    with worker_connection_scope():
+        yield
+
+
+def _analyze_in_worker_scope(agent, ticker, tools):
+    with _db_worker_scope():
+        return agent.analyze(ticker, tools)
+
+
 class MultiAgentOrchestrator:
     """멀티에이전트 오케스트레이터 - 병렬 실행 및 결과 집계"""
 
@@ -2173,7 +2196,7 @@ class MultiAgentOrchestrator:
 
                 # 각 에이전트에 작업 제출
                 futures = {
-                    executor.submit(agent.analyze, ticker, tools): agent
+                    executor.submit(_analyze_in_worker_scope, agent, ticker, tools): agent
                     for agent in self.agents
                 }
 

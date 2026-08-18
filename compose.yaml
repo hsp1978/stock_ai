@@ -38,6 +38,20 @@ services:
       # 죽는다 (2026-08-03 확인). webui와 동일한 파일을 가리킨다.
       - ./stock_analyzer/watchlist.txt:/app/stock_analyzer/watchlist.txt
     restart: unless-stopped
+    # Docker 기본 nofile 1024 는 SQLite WAL(파일당 fd 2개) + 병렬 수집 소켓이
+    # 겹치면 쉽게 닿는다. 2026-08-18 fd 고갈로 accept() 가 전면 실패한 적 있음.
+    # 누수 자체는 db.py 에서 고쳤고 이건 여유 마진.
+    ulimits:
+      nofile:
+        soft: 16384
+        hard: 65536
+    # 무제한 json 로그가 같은 장애를 증폭시켰다: accept() 실패 스택트레이스가
+    # 초당 수 MB씩 쌓여 7일 만에 241GB, 디스크를 100% 채워 모든 쓰기를 막았다.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
     healthcheck:
       test: ["CMD", "python", "-c", "import os,httpx; httpx.get(f'http://localhost:{os.environ.get(\"API_PORT\",\"8100\")}/health', timeout=2).raise_for_status()"]
       interval: 30s
@@ -57,6 +71,15 @@ services:
     volumes:
       - ./stock_analyzer/watchlist.txt:/app/stock_analyzer/watchlist.txt
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 16384
+        hard: 65536
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
     depends_on:
       agent-api:
         condition: service_healthy
