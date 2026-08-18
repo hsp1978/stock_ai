@@ -635,6 +635,21 @@ class EnhancedDecisionMaker:
             "agreement_level": agreement_level,
         }
 
+        # [불변식] 리포트가 스스로와 모순되면 실행 가능한 신호가 될 수 없다.
+        # 각 함수는 자기 일을 정확히 해도 결과물의 합이 안 맞을 수 있다 —
+        # 그 층을 검사하는 곳이 여기까지 없었다 (2026-08-18 감사).
+        try:
+            from report_invariants import enforce_report_invariants
+
+            result = enforce_report_invariants(result)
+        except ValueError:
+            raise  # strict 모드의 의도된 실패는 그대로 올린다
+        except Exception as exc:
+            # 검사기 자체의 실패가 리포트를 막아서는 안 되지만, 조용히 넘기면
+            # '검사했다'는 착시가 생긴다. 미검증 상태를 명시한다.
+            result["invariant_violations"] = [f"CHECKER_FAILED: {exc}"]
+            print(f"[report_invariants] 검사기 실패: {exc}")
+
         return result
 
     def _check_fundamental_risks(self, ticker: str) -> Dict:
