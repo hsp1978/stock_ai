@@ -28,7 +28,7 @@
 | ML | 5모델 앙상블 (RF/GBM/LightGBM/XGBoost/LSTM) + SHAP + Optuna + Walk-Forward |
 | 코드 규모 | 프로덕션 Python 53,834 라인 / 최대 파일 `webui.py` 6,379 라인 |
 | API | FastAPI 엔드포인트 83개 (`chart_agent_service/service.py`, 3,192 라인) |
-| 테스트 | 52 파일 / 531 test, CI(GitHub Actions) 최근 실행 전부 success |
+| 테스트 | 52 파일 / 538 test, CI(GitHub Actions) 최근 실행 전부 success |
 | 데이터 축적 | `scan_log` 69,341행 (2026-04-14~), `signal_outcomes` 5,018행 — 평가 완료 4,272 / 종결 53 / 대기 0 |
 | 이미지 | agent-api 8.0GB / webui 1.97GB |
 
@@ -366,7 +366,7 @@ entry_plan → OrderRequest → TradingSafety.require_all_checks → 모드별 �
 
 ## 12. 품질 인프라
 
-- **테스트**: `tests/unit/` 52 파일 / 531 test. LLM·외부 API는 mock(`respx`), 실호출 금지.
+- **테스트**: `tests/unit/` 52 파일 / 538 test. LLM·외부 API는 mock(`respx`), 실호출 금지.
   테스트는 "함수가 무엇을 반환하는가" 층 외에 **리포트 자기 정합성 / 출력 필드 레지스트리 /
   임계값 도달 가능성 / 알림 전송 관측성** 같은 회귀 방지 층이 별도로 있다.
 - **CI**: `.github/workflows/ci.yml` — ruff(bug-class만: F601/F811/F821/F823/E9) +
@@ -409,8 +409,10 @@ entry_plan → OrderRequest → TradingSafety.require_all_checks → 모드별 �
 칼리브레이터 표본 812→4,272. 이후 런은 `candidates 0 / backlog clear / status completed`.
 회귀 테스트 10건(`tests/unit/test_signal_eval_queue.py`)이 아사 조건을 고정한다.
 
-**남은 것**: `057050.KS` 53건은 yfinance에 없는 심볼이라 종결됐다. 이 티커로 신호가 적립된
-경위(접미사 해석 `.KS` vs `.KQ`)는 별건으로 남아 있다.
+**후속 (같은 날 처리)**: 평가 가격 조회를 `data_collector` 다중 소스 체인으로 통일했고
+(`reset_unresolved=true`로 종결분 재시도 포함), `.env`의 `DATA_SOURCE` 이중 선언을 정리하고
+기동 시 중복 키 경고를 추가했다. `057050.KS` 53건은 세 소스 모두 2026-07-16 이후 데이터가
+없어(거래 중단) 영구 평가 불가로 확정 — 종결 상태가 맞다. §13.3 참조.
 
 ### 13.2 구조적 부채 (기존 인식)
 
@@ -435,12 +437,14 @@ entry_plan → OrderRequest → TradingSafety.require_all_checks → 모드별 �
 - KRX 펀더멘털은 로그인 필수, KDR(9xxxxx)은 KRX 미제공으로 yfinance 폴백.
 - 뉴스는 Google News RSS + 네이버 금융 크롤링 — 구조 변경에 취약. 거시는 yfinance(^VIX, ^KS11 등) + FRED.
 - 외부 무료 API 의존도가 높아 rate limit·스키마 변경이 조용한 품질 저하로 이어질 수 있다.
-- **`.env`에 `DATA_SOURCE`가 두 번 선언돼 있다** (`yfinance` → `toss`). dotenv는 뒤를 채택하므로
-  실효 값은 `toss`인데, 파일을 위에서 읽는 사람은 `yfinance`로 읽는다. 실측 `/ops/data-health`의
-  `ohlcv_source`는 `toss`다.
-- **사후 평가만 설정된 데이터 소스를 우회한다** — `signal_tracker`는 `yfinance`를 직접 호출한다.
-  종결된 `057050.KS` 53건이 이 불일치의 결과다(Toss에는 있고 yfinance에는 없다).
-  평가 경로를 `data_sources/factory`로 통일하면 사라질 문제다.
+- ✅ **`.env`의 `DATA_SOURCE` 이중 선언 정리** (`yfinance` → `toss`, 뒤가 실효값이었다).
+  실효 소스는 `toss`(`/data-source` 실측: configured=active=toss, health ok).
+  기동 시 `config.find_duplicate_env_keys()`가 중복 키를 **이름만** 경고한다.
+- ✅ **평가 가격 조회를 `data_collector` 체인으로 통일** (2026-09-10). 종전에는 사후 평가만
+  yfinance를 직접 호출해, 다른 경로는 Toss·pykrx로 받는 종목이 평가에서만 404로 죽었다.
+  통일 후 `057050.KS` 프리페치는 성공했지만 53건은 여전히 평가 불가 — yfinance·Toss·pykrx
+  **세 소스 모두 2026-07-16 이후 데이터가 없다**(거래 중단). 영구 평가 불가로 확정됐다.
+  단, 기존 평가값은 yfinance 가격이고 앞으로는 Toss라 **provenance가 혼재**한다.
 - **`/ops/data-health`가 상시 `stale`이다** (실측 24종목 중 17 stale). stale 목록은 전부
   현재 워치리스트에 없는 과거 종목·페이퍼 포지션이라 아무도 데이터를 채우지 않는다.
   현 워치리스트 7종목은 모두 `ok`. 항상 켜져 있는 빨간불이라 §14의 관점에서 정리 대상이다.
@@ -548,6 +552,7 @@ curl -s http://localhost:8100/ops/jobs | jq          # 5개 잡 마지막 성공
 curl -s http://localhost:8100/signal-accuracy | jq   # hit-rate 실측
 curl -s http://localhost:8100/signal-accuracy/validation-status | jq .backlog   # 평가 큐 잔량
 curl -sX POST 'http://localhost:8100/signal-accuracy/evaluate?limit=2000' | jq  # 수동 평가
+curl -s http://localhost:8100/data-source | jq        # 실효 데이터 소스 + 헬스
 open http://localhost:8501                           # WebUI (17페이지)
 
 # Mac Studio 폴백 판정
