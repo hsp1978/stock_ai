@@ -3159,18 +3159,22 @@ def api_screener_pipeline(
 # ─── 신호 정확도 / 칼리브레이션 (Sprint 2) ──────────────
 @app.get("/signal-accuracy")
 def api_signal_accuracy(horizon: int = 7, min_confidence: float = 0.0,
-                         signal: str = None, days_back: int = 180):
+                         signal: str = None, days_back: int = 180,
+                         dedupe: str = "ticker_day"):
     """
     신호 정확도 통계 조회.
     - horizon: 7, 14, 30 (평가 기간 일수)
     - min_confidence: 이 값 이상만 집계 (0~10)
     - signal: "buy"|"sell"|"neutral" (선택)
     - days_back: 최근 N일 데이터만 대상
+    - dedupe: 표본 단위. ticker_day(기본) | ticker_horizon | none
+      30분 스캔이 같은 종목·같은 날을 반복 기록하므로 none 은 독립 표본이 아니다.
+      응답의 sampling·independent_blocks·win_rate_ci95 를 함께 볼 것.
     """
     from signal_tracker import get_accuracy_stats
     return get_accuracy_stats(
         horizon=horizon, min_confidence=min_confidence,
-        signal=signal, days_back=days_back
+        signal=signal, days_back=days_back, dedupe=dedupe
     )
 
 

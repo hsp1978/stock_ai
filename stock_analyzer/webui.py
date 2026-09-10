@@ -4907,7 +4907,7 @@ def render_signal_accuracy():
     """, unsafe_allow_html=True)
 
     # ── 컨트롤 ─────────────────────────────────────
-    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+    col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
     with col1:
         horizon = st.selectbox("평가 기간", [7, 14, 30], index=0, help="신호 후 N일 수익률 기준")
     with col2:
@@ -4917,6 +4917,17 @@ def render_signal_accuracy():
     with col4:
         days_back = st.selectbox("조회 기간", [30, 90, 180, 365], index=2,
                                   format_func=lambda x: f"최근 {x}일")
+    with col5:
+        dedupe = st.selectbox(
+            "표본 단위", ["ticker_day", "ticker_horizon", "none"], index=0,
+            format_func=lambda x: {
+                "ticker_day": "종목·일 1건",
+                "ticker_horizon": "종목·구간 1건",
+                "none": "원시 행 전부",
+            }[x],
+            help="30분 스캔은 같은 종목·같은 날을 최대 48회 기록한다. "
+                 "'원시 행 전부'는 독립 표본이 아니라 진단용이다.",
+        )
 
     sig_param = None if signal_filter == "전체" else signal_filter
 
@@ -4930,14 +4941,21 @@ def render_signal_accuracy():
         if st.button("⚡ 과거 신호 재평가 실행", use_container_width=True,
                      help="아직 평가 안 된 과거 스캔의 결과를 지금 계산"):
             with st.spinner("평가 중..."):
-                eval_result = api_post("/signal-accuracy/evaluate?days_back=45&limit=500")
+                # 파라미터를 넘기지 않는다 — 창/배치 크기는 config가 SSOT.
+                # (과거 이 버튼은 days_back=45&limit=500 을 박아 보내 큐 아사 조건을
+                #  그대로 재현했다.)
+                eval_result = api_post("/signal-accuracy/evaluate")
                 if eval_result and isinstance(eval_result, dict):
                     ev = eval_result.get("evaluation", {})
                     st.success(
                         f"✓ 처리: {ev.get('processed', 0)}건, "
                         f"업데이트: {ev.get('updated', 0)}건, "
-                        f"엔트리 없음: {ev.get('skipped_no_entry', 0)}건"
+                        f"남은 대기: {ev.get('pending_due', 0)}건"
                     )
+                    if ev.get("unresolved_total"):
+                        st.caption(
+                            f"시세 없어 종결된 신호 {ev['unresolved_total']}건은 집계에서 제외됩니다."
+                        )
                     calib = eval_result.get("calibrator")
                     if calib:
                         st.info(
@@ -4952,7 +4970,7 @@ def render_signal_accuracy():
     # ── 통계 조회 ──────────────────────────────────
     url = (
         f"/signal-accuracy?horizon={horizon}&min_confidence={min_conf}"
-        f"&days_back={days_back}"
+        f"&days_back={days_back}&dedupe={dedupe}"
     )
     if sig_param:
         url += f"&signal={sig_param}"
@@ -4976,21 +4994,46 @@ def render_signal_accuracy():
     wins = data.get("win_count", 0)
     losses = data.get("loss_count", 0)
 
+    sampling = data.get("sampling") or {}
+    rows_raw = sampling.get("rows_raw", total)
+    blocks = data.get("independent_blocks", 0)
+    ci = data.get("win_rate_ci95") or []
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("평가 건수", f"{total:,}")
+        collapsed = rows_raw - total
+        st.metric(
+            "평가 건수(표본)", f"{total:,}",
+            delta=(f"원시 {rows_raw:,}건에서 {collapsed:,}건 접음" if collapsed > 0 else "접힘 없음"),
+            delta_color="off",
+        )
     with c2:
         delta = "" if wins == 0 else f"{wins}승 / {losses}패"
         st.metric("적중률", f"{win_rate:.1f}%", delta=delta, delta_color="off")
     with c3:
-        color = "normal" if avg_return >= 0 else "inverse"
         st.metric("평균 수익", f"{avg_return:+.2f}%")
     with c4:
-        # 간단한 baseline 비교: 랜덤(33%)보다 얼마나 나은지
-        edge = win_rate - 33.3
-        st.metric("랜덤 대비 엣지", f"{edge:+.1f}%p",
-                  delta="우수" if edge > 10 else ("보통" if edge > 0 else "부진"),
-                  delta_color="normal" if edge > 0 else "inverse")
+        # 신뢰구간은 독립 블록 수로 계산한다 — 행 수로 계산하면 거짓으로 좁아진다.
+        st.metric(
+            "적중률 95% 구간",
+            f"{ci[0]:.0f}~{ci[1]:.0f}%" if len(ci) == 2 else "—",
+            delta=f"독립 블록 {blocks:,}건",
+            delta_color="off",
+        )
+
+    if sampling:
+        dom = sampling.get("dominant_source")
+        dom_share = sampling.get("dominant_source_share_pct", 0)
+        st.caption(
+            f"표본 단위: {sampling.get('mode')} · 원시 {rows_raw:,}행 → 표본 {total:,}건 "
+            f"(압축 {sampling.get('collapse_ratio', 1)}x) · 독립 블록 {blocks:,}건"
+            + (f" · 최다 소스 {dom} {dom_share}%" if dom else "")
+        )
+        if dom_share >= 70:
+            st.warning(
+                f"표본의 {dom_share}%가 `{dom}` 한 소스에서 나왔다. "
+                "이 지표는 그 소스의 성격을 주로 반영하며, 다른 경로의 성능이 아니다."
+            )
 
     # ── 신호별 분포 ─────────────────────────────
     st.markdown("### 신호별 적중률")

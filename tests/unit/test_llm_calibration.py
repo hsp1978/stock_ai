@@ -35,6 +35,7 @@ def _make_calibration_db(tmp: str, n: int = 60) -> str:
     conn.executescript("""
         CREATE TABLE signal_outcomes (
             signal_id TEXT PRIMARY KEY,
+            ticker TEXT,
             signal_source TEXT,
             conviction REAL,
             return_7d REAL,
@@ -58,6 +59,8 @@ def _make_calibration_db(tmp: str, n: int = 60) -> str:
         rows.append(
             (
                 f"sig-{i}",
+                # 표본 단위가 (종목, 소스, 발행일)이므로 날짜가 다 다르면 60건 그대로 남는다.
+                "PLTR",
                 "scan_agent",
                 conviction,
                 return_7d,
@@ -66,7 +69,7 @@ def _make_calibration_db(tmp: str, n: int = 60) -> str:
             )
         )
 
-    conn.executemany("INSERT INTO signal_outcomes VALUES (?,?,?,?,?,?)", rows)
+    conn.executemany("INSERT INTO signal_outcomes VALUES (?,?,?,?,?,?,?)", rows)
     conn.commit()
     conn.close()
     return db
@@ -82,7 +85,7 @@ def test_fit_insufficient_data():
         conn = sqlite3.connect(db)
         conn.execute("""
             CREATE TABLE signal_outcomes (
-                signal_id TEXT, signal_source TEXT,
+                signal_id TEXT, ticker TEXT, signal_source TEXT,
                 conviction REAL, return_7d REAL,
                 issued_at TEXT, evaluated_at TEXT
             )

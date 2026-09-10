@@ -614,176 +614,271 @@ def evaluate_past_signals(
     }
 
 
+# ── 표본 단위 (독립성) ──────────────────────────────────────────────
+#
+# `signal_outcomes` 는 30분 주기 스캔이 종목당 하루 최대 48행을 남긴다. 그 행들은
+# 같은 날 같은 종목의 같은 정보이고, 7일 horizon 이면 연속된 날짜끼리도 수익률
+# 구간이 겹친다. 그대로 세면 n=3,030 처럼 보이지만 독립 관측은 수백 건 수준이라
+# 승률·신뢰구간·칼리브레이션 가중이 전부 과대평가된다 (2026-09-10 진단).
+#
+#   ticker_day     : (종목, 소스, 발행일) 당 1행 — 하루 안의 반복 스캔을 접는다.
+#                    대표는 그날 마지막 행(EOD 상태에 가장 가깝다).
+#   ticker_horizon : (종목, 소스, horizon 블록) 당 1행 — 수익률 구간이 겹치지 않는다.
+#                    가장 보수적이고 표본이 가장 적다.
+#   none           : 원시 행 그대로 (진단·비교용).
+SAMPLE_MODES = ("ticker_day", "ticker_horizon", "none")
+DEFAULT_SAMPLE_MODE = "ticker_day"
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_JULIAN_EPOCH = 2440587.5  # 1970-01-01T00:00Z 의 julian day
+
+
+def _sample_bucket_sql(dedupe: str, horizon: int) -> Optional[str]:
+    """표본 대표를 고를 때 쓸 PARTITION 키. none 이면 표본화하지 않는다."""
+    if dedupe == "ticker_day":
+        return "substr(issued_at, 1, 10)"
+    if dedupe == "ticker_horizon":
+        # `_horizon_block()` 과 **같은 경계**를 써야 한다. julianday 를 그대로 나누면
+        # 기준점이 기원전 4713년 정오라 블록 경계가 UTC 자정과 어긋나고,
+        # 표본 수가 독립 블록 수보다 많아지는 모순이 생긴다 (실측 358 vs 320).
+        # 2440587.5 = 1970-01-01T00:00Z 의 julian day.
+        return (
+            f"CAST((julianday(issued_at) - {_JULIAN_EPOCH}) / {int(horizon)} AS INTEGER)"
+        )
+    return None
+
+
+def _horizon_block(issued_at: str, horizon: int) -> Optional[int]:
+    """수익률 구간이 겹치지 않는 블록 인덱스."""
+    parsed = _as_utc(issued_at)
+    if parsed is None:
+        return None
+    return int((parsed - _EPOCH).days // max(horizon, 1))
+
+
+def _wilson_ci(wins: int, n: int, z: float = 1.96) -> List[float]:
+    """Wilson 95% 신뢰구간 (%). n 은 **독립 표본 수**를 넣어야 의미가 있다."""
+    if n <= 0:
+        return [0.0, 0.0]
+    p = wins / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    margin = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / denom
+    return [round(max(0.0, center - margin) * 100, 1), round(min(1.0, center + margin) * 100, 1)]
+
+
+def load_sampled_outcomes(
+    conn, horizon: int, days_back: int, dedupe: str = DEFAULT_SAMPLE_MODE
+) -> Tuple[List, int]:
+    """평가 완료 행에서 표본 대표만 뽑는다. (표본 행, 표본화 전 행 수)"""
+    ret_col = f"return_{horizon}d"
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
+    base_where = f"{ret_col} IS NOT NULL AND issued_at >= ?"
+    raw_total = conn.execute(
+        f"SELECT COUNT(*) FROM signal_outcomes WHERE {base_where}", (cutoff,)
+    ).fetchone()[0]
+
+    columns = (
+        "signal_id, ticker, signal_source, signal_type, conviction, issued_at, "
+        f"{ret_col} AS ret"
+    )
+    bucket = _sample_bucket_sql(dedupe, horizon)
+    if bucket is None:
+        rows = conn.execute(
+            f"SELECT {columns} FROM signal_outcomes WHERE {base_where}", (cutoff,)
+        ).fetchall()
+        return rows, int(raw_total or 0)
+
+    rows = conn.execute(
+        f"""
+        WITH ranked AS (
+            SELECT {columns},
+                   ROW_NUMBER() OVER (
+                       PARTITION BY ticker, signal_source, {bucket}
+                       ORDER BY issued_at DESC
+                   ) AS rn
+            FROM signal_outcomes
+            WHERE {base_where}
+        )
+        SELECT * FROM ranked WHERE rn = 1
+        """,
+        (cutoff,),
+    ).fetchall()
+    return rows, int(raw_total or 0)
+
+
+def _outcome_of(signal_type: str, ret: float) -> str:
+    threshold = OUTCOME_THRESHOLD_PCT / 100.0
+    sig = (signal_type or "").lower()
+    if sig == "buy":
+        return "win" if ret > threshold else ("loss" if ret < -threshold else "neutral")
+    if sig == "sell":
+        return "win" if ret < -threshold else ("loss" if ret > threshold else "neutral")
+    return "win" if abs(ret) <= threshold else "loss"
+
+
+def _tally(rows: List) -> Dict:
+    total = len(rows)
+    wins = sum(1 for r in rows if _outcome_of(r["signal_type"], r["ret"]) == "win")
+    losses = sum(1 for r in rows if _outcome_of(r["signal_type"], r["ret"]) == "loss")
+    avg = (sum(r["ret"] for r in rows) / total * 100.0) if total else 0.0
+    return {
+        "total": total,
+        "wins": wins,
+        "losses": losses,
+        "neutrals": total - wins - losses,
+        "win_rate_pct": round((wins / total * 100) if total else 0, 1),
+        "avg_return_pct": round(avg, 3),
+    }
+
+
 def get_accuracy_stats(
     horizon: int = 7,
     min_confidence: float = 0.0,
     signal: Optional[str] = None,
     days_back: int = 180,
+    dedupe: str = DEFAULT_SAMPLE_MODE,
 ) -> Dict:
     """
     신뢰도·신호 조합별 정확도 집계.
 
+    `dedupe` 기본값 때문에 반환되는 건수는 원시 행 수보다 작다 — 30분 스캔이
+    같은 날 같은 종목을 반복 기록하기 때문이다. 원시 수는 `sampling.rows_raw`로
+    함께 반환하니 두 값을 같이 보라.
+
     Returns: {
       "horizon_days": int,
-      "total_evaluated": int,
+      "total_evaluated": int,           # 표본화 후
       "win_count": int, "loss_count": int, "neutral_count": int,
-      "win_rate_pct": float,
+      "win_rate_pct": float, "win_rate_ci95": [lo, hi],
       "avg_return_pct": float,
-      "by_signal": {"buy": {...}, "sell": {...}, "neutral": {...}},
-      "by_confidence_band": [{"band": "7.0-8.0", ...}, ...],
+      "by_signal": {...}, "by_confidence_band": [...], "by_source": {...},
       "sample_size": int,
+      "independent_blocks": int,        # horizon 겹침까지 제거한 수
+      "sampling": {...},                # 표본화 진단
     }
     """
     if horizon not in HORIZONS:
         horizon = 7
-
-    ret_col = f"return_{horizon}d"
-    threshold = OUTCOME_THRESHOLD_PCT / 100.0
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
+    if dedupe not in SAMPLE_MODES:
+        dedupe = DEFAULT_SAMPLE_MODE
 
     conn = _get_conn()
+    sampled, raw_total = load_sampled_outcomes(conn, horizon, days_back, dedupe)
+    conn.close()
 
-    # 기본 필터
-    where_parts = [
-        f"{ret_col} IS NOT NULL",
-        "conviction >= ?",
-        "issued_at >= ?",
-    ]
-    params: List = [min_confidence, cutoff]
-    if signal:
-        where_parts.append("signal_type = ?")
-        params.append(signal.lower())
-    where = " AND ".join(where_parts)
-    outcome_case = f"""
-        CASE
-          WHEN signal_type='buy' AND {ret_col} > {threshold} THEN 'win'
-          WHEN signal_type='buy' AND {ret_col} < -{threshold} THEN 'loss'
-          WHEN signal_type='buy' THEN 'neutral'
-          WHEN signal_type='sell' AND {ret_col} < -{threshold} THEN 'win'
-          WHEN signal_type='sell' AND {ret_col} > {threshold} THEN 'loss'
-          WHEN signal_type='sell' THEN 'neutral'
-          WHEN ABS({ret_col}) <= {threshold} THEN 'win'
-          ELSE 'loss'
-        END
-    """
+    sig_filter = (signal or "").lower() or None
 
-    # 전체 집계
-    row = conn.execute(
-        f"""
-        SELECT
-          COUNT(*) AS total,
-          SUM(CASE WHEN ({outcome_case})='win' THEN 1 ELSE 0 END) AS wins,
-          SUM(CASE WHEN ({outcome_case})='loss' THEN 1 ELSE 0 END) AS losses,
-          SUM(CASE WHEN ({outcome_case})='neutral' THEN 1 ELSE 0 END) AS neutrals,
-          AVG({ret_col}) * 100.0 AS avg_return
-        FROM signal_outcomes
-        WHERE {where}
-        """,
-        params,
-    ).fetchone()
+    def _select(rows, *, min_conf=None, conf_band=None, use_signal_filter=True):
+        out = []
+        for r in rows:
+            conviction = r["conviction"] if r["conviction"] is not None else 0.0
+            if min_conf is not None and conviction < min_conf:
+                continue
+            if conf_band is not None and not (conf_band[0] <= conviction < conf_band[1]):
+                continue
+            if use_signal_filter and sig_filter and (r["signal_type"] or "").lower() != sig_filter:
+                continue
+            out.append(r)
+        return out
 
-    total = row["total"] or 0
-    wins = row["wins"] or 0
-    losses = row["losses"] or 0
-    neutrals = row["neutrals"] or 0
-    win_rate_pct = (wins / total * 100) if total else 0
-    avg_return = row["avg_return"] or 0
+    scoped = _select(sampled, min_conf=min_confidence)
+    overall = _tally(scoped)
 
-    # 신호별
+    # 독립 블록 수 — 신뢰구간은 이 수로 계산한다 (행 수로 계산하면 구간이 거짓으로 좁아진다)
+    blocks = {
+        (r["ticker"], r["signal_source"], _horizon_block(r["issued_at"], horizon))
+        for r in scoped
+    }
+    independent_blocks = len(blocks)
+    block_wins_ratio = overall["wins"] / overall["total"] if overall["total"] else 0.0
+    ci = _wilson_ci(round(block_wins_ratio * independent_blocks), independent_blocks)
+
+    # 신호별 (신호 필터와 무관하게 3종 모두 — 종전 동작 유지)
     by_signal: Dict[str, Dict] = {}
     for sig in ("buy", "sell", "neutral"):
-        r = conn.execute(
-            f"""
-            SELECT
-              COUNT(*) AS total,
-              SUM(CASE WHEN ({outcome_case})='win' THEN 1 ELSE 0 END) AS wins,
-              AVG({ret_col}) * 100.0 AS avg_return
-            FROM signal_outcomes
-            WHERE {ret_col} IS NOT NULL
-              AND signal_type = ?
-              AND conviction >= ?
-              AND issued_at >= ?
-            """,
-            (sig, min_confidence, cutoff),
-        ).fetchone()
-        t = r["total"] or 0
-        w = r["wins"] or 0
+        rows = [
+            r
+            for r in _select(sampled, min_conf=min_confidence, use_signal_filter=False)
+            if (r["signal_type"] or "").lower() == sig
+        ]
+        t = _tally(rows)
         by_signal[sig] = {
-            "total": t,
-            "wins": w,
-            "win_rate_pct": round((w / t * 100) if t else 0, 1),
-            "avg_return_pct": round(r["avg_return"] or 0, 3),
+            "total": t["total"],
+            "wins": t["wins"],
+            "win_rate_pct": t["win_rate_pct"],
+            "avg_return_pct": t["avg_return_pct"],
         }
 
-    # 신뢰도 구간별 (0~2, 2~4, 4~6, 6~8, 8~10)
+    # 신뢰도 구간별 (종전과 동일하게 min_confidence·signal 필터를 적용하지 않는다)
     bands: List[Dict] = []
     for lo, hi in [(0, 2), (2, 4), (4, 6), (6, 8), (8, 10.1)]:
-        r = conn.execute(
-            f"""
-            SELECT
-              COUNT(*) AS total,
-              SUM(CASE WHEN ({outcome_case})='win' THEN 1 ELSE 0 END) AS wins,
-              AVG({ret_col}) * 100.0 AS avg_return
-            FROM signal_outcomes
-            WHERE {ret_col} IS NOT NULL
-              AND conviction >= ? AND conviction < ?
-              AND issued_at >= ?
-            """,
-            (lo, hi, cutoff),
-        ).fetchone()
-        t = r["total"] or 0
-        w = r["wins"] or 0
+        t = _tally(_select(sampled, conf_band=(lo, hi), use_signal_filter=False))
         bands.append(
             {
                 "band": f"{lo:.1f}-{min(hi, 10.0):.1f}",
-                "total": t,
-                "wins": w,
-                "win_rate_pct": round((w / t * 100) if t else 0, 1),
-                "avg_return_pct": round(r["avg_return"] or 0, 3),
+                "total": t["total"],
+                "wins": t["wins"],
+                "win_rate_pct": t["win_rate_pct"],
+                "avg_return_pct": t["avg_return_pct"],
             }
         )
 
     by_source: Dict[str, Dict] = {}
-    source_rows = conn.execute(
-        f"""
-        SELECT
-          signal_source,
-          COUNT(*) AS total,
-          SUM(CASE WHEN ({outcome_case})='win' THEN 1 ELSE 0 END) AS wins,
-          AVG({ret_col}) * 100.0 AS avg_return
-        FROM signal_outcomes
-        WHERE {where}
-        GROUP BY signal_source
-        ORDER BY total DESC
-        """,
-        params,
-    ).fetchall()
-    for r in source_rows:
-        t = r["total"] or 0
-        w = r["wins"] or 0
-        by_source[r["signal_source"] or "unknown"] = {
-            "total": t,
-            "wins": w,
-            "win_rate_pct": round((w / t * 100) if t else 0, 1),
-            "avg_return_pct": round(r["avg_return"] or 0, 3),
+    source_names = {r["signal_source"] or "unknown" for r in scoped}
+    for name in source_names:
+        rows = [r for r in scoped if (r["signal_source"] or "unknown") == name]
+        t = _tally(rows)
+        by_source[name] = {
+            "total": t["total"],
+            "wins": t["wins"],
+            "win_rate_pct": t["win_rate_pct"],
+            "avg_return_pct": t["avg_return_pct"],
         }
+    by_source = dict(
+        sorted(by_source.items(), key=lambda kv: kv[1]["total"], reverse=True)
+    )
 
-    conn.close()
+    dominant = max(by_source.items(), key=lambda kv: kv[1]["total"], default=None)
+    dominant_share = (
+        round(dominant[1]["total"] / overall["total"] * 100, 1)
+        if dominant and overall["total"]
+        else 0.0
+    )
 
     return {
         "horizon_days": horizon,
         "min_confidence_filter": min_confidence,
         "days_back": days_back,
-        "total_evaluated": total,
-        "win_count": wins,
-        "loss_count": losses,
-        "neutral_count": neutrals,
-        "win_rate_pct": round(win_rate_pct, 1),
-        "avg_return_pct": round(avg_return, 3),
+        "total_evaluated": overall["total"],
+        "win_count": overall["wins"],
+        "loss_count": overall["losses"],
+        "neutral_count": overall["neutrals"],
+        "win_rate_pct": overall["win_rate_pct"],
+        "win_rate_ci95": ci,
+        "avg_return_pct": overall["avg_return_pct"],
         "by_signal": by_signal,
         "by_confidence_band": bands,
         "by_source": by_source,
-        "sample_size": total,
+        "sample_size": overall["total"],
+        "independent_blocks": independent_blocks,
+        "sampling": {
+            "mode": dedupe,
+            "rows_raw": raw_total,
+            "rows_sampled": len(sampled),
+            "rows_scoped": overall["total"],
+            "collapse_ratio": (
+                round(raw_total / len(sampled), 2) if sampled else 0.0
+            ),
+            "independent_blocks": independent_blocks,
+            "dominant_source": dominant[0] if dominant else None,
+            "dominant_source_share_pct": dominant_share,
+            "note": (
+                "30분 스캔이 같은 종목·같은 날을 반복 기록하므로 원시 행 수는 독립 표본이 "
+                "아니다. win_rate_ci95 는 independent_blocks(수익률 구간이 겹치지 않는 "
+                "블록 수) 기준이다."
+            ),
+        },
     }
 
 
