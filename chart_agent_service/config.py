@@ -92,6 +92,16 @@ class Settings(BaseSettings):
 
     WATCHLIST: str = ""
 
+    # ── 신호 사후 평가 큐 ─────────────────────────────────────────────
+    # days_back 45 + limit 500 + issued_at DESC 조합이 백로그를 영구 아사시켰다:
+    # 하루 100건 이상 적립되는 규모에서 매 런이 최신 500건(전부 미도래)만 집어
+    # 4,201건이 대기하고 08-06 이후 평가가 0건이었다 (2026-09-10 진단).
+    # 30일 horizon이 도래한 뒤에도 여유를 갖도록 창을 넓게 둔다.
+    SIGNAL_EVAL_DAYS_BACK: int = Field(default=90, ge=31)
+    SIGNAL_EVAL_BATCH_LIMIT: int = Field(default=2000, ge=1)
+    # 잔량이 이 값을 넘으면 ops 알림 — '완료'로 보고되는 무동작 런을 드러낸다.
+    SIGNAL_EVAL_BACKLOG_ALERT: int = Field(default=500, ge=0)
+
     # 신호 판정 임계값 — composite score는 '방향성 도구 평균' 스케일.
     # 개별 도구 점수는 [-6, +8] 범위지만 24개를 평균하면 분산이 상쇄돼
     # 실측 [-1.00, +2.04] (p10 -0.19 / p50 +0.41 / p90 +1.14, 26,041 스캔,
@@ -219,6 +229,9 @@ MULTI_AGENT_BATCH_ENABLED = settings.MULTI_AGENT_BATCH_ENABLED
 MULTI_AGENT_BATCH_HOUR = settings.MULTI_AGENT_BATCH_HOUR
 MULTI_AGENT_BATCH_MINUTE = settings.MULTI_AGENT_BATCH_MINUTE
 WATCHLIST = settings.WATCHLIST
+SIGNAL_EVAL_DAYS_BACK = settings.SIGNAL_EVAL_DAYS_BACK
+SIGNAL_EVAL_BATCH_LIMIT = settings.SIGNAL_EVAL_BATCH_LIMIT
+SIGNAL_EVAL_BACKLOG_ALERT = settings.SIGNAL_EVAL_BACKLOG_ALERT
 SIGNAL_BUY_THRESHOLD = settings.SIGNAL_BUY_THRESHOLD
 SIGNAL_SELL_THRESHOLD = settings.SIGNAL_SELL_THRESHOLD
 BUY_THRESHOLD = settings.BUY_THRESHOLD

@@ -73,6 +73,8 @@ def test_evaluate_past_signals_updates_current_signal_outcomes_schema(signal_db)
     with (
         patch("signal_tracker._get_conn", lambda: _conn_for(signal_db)),
         patch("signal_tracker._latest_close_for", side_effect=_mock_price),
+        # 배치 프리페치가 실제 yfinance를 타지 않게 한다 (테스트는 외부 호출 금지).
+        patch("signal_tracker._fetch_history", lambda *a, **k: None),
     ):
         from signal_tracker import evaluate_past_signals
 

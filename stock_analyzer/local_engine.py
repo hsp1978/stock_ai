@@ -1534,7 +1534,7 @@ def engine_signal_accuracy(
         return {"error": str(e)}
 
 
-def engine_signal_validation(days_back: int = 45, limit: int = 500) -> dict:
+def engine_signal_validation(days_back: int | None = None, limit: int | None = None) -> dict:
     try:
         from signal_tracker import run_daily_validation
 
