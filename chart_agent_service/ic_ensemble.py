@@ -40,13 +40,24 @@ def _load_signal_outcomes(
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     conn = sqlite3.connect(db_path)
     try:
+        # (종목, 소스, 발행일)당 1행. 소스별 IC 를 계산하는데 30분 스캔만 하루 48행씩
+        # 쌓이면 scan_agent 의 IC 가 표본 수로 다른 소스를 압도한다 (2026-09-10).
         df = pd.read_sql_query(
-            """SELECT signal_source, conviction, return_7d, issued_at
-               FROM signal_outcomes
-               WHERE evaluated_at IS NOT NULL
-                 AND return_7d IS NOT NULL
-                 AND conviction IS NOT NULL
-                 AND issued_at >= ?
+            """WITH ranked AS (
+                   SELECT signal_source, conviction, return_7d, issued_at,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY ticker, signal_source,
+                                           substr(issued_at, 1, 10)
+                              ORDER BY issued_at DESC
+                          ) AS rn
+                   FROM signal_outcomes
+                   WHERE evaluated_at IS NOT NULL
+                     AND return_7d IS NOT NULL
+                     AND conviction IS NOT NULL
+                     AND issued_at >= ?
+               )
+               SELECT signal_source, conviction, return_7d, issued_at
+               FROM ranked WHERE rn = 1
                ORDER BY issued_at DESC""",
             conn,
             params=(cutoff,),

@@ -63,13 +63,24 @@ class LLMCalibrator:
         ).isoformat()
         conn = sqlite3.connect(self._db_path)
         try:
+            # (종목, 소스, 발행일)당 1행 — 30분 스캔의 하루 48회 반복을 접는다.
+            # 접지 않으면 isotonic 이 반복 기록된 종목·날짜에 과적합되고 ECE 가
+            # 실제보다 좋게 나온다 (2026-09-10 표본 독립성 진단).
             df = pd.read_sql_query(
-                """SELECT conviction, return_7d
-                   FROM signal_outcomes
-                   WHERE evaluated_at IS NOT NULL
-                     AND return_7d IS NOT NULL
-                     AND conviction IS NOT NULL
-                     AND issued_at >= ?""",
+                """WITH ranked AS (
+                       SELECT conviction, return_7d,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY ticker, signal_source,
+                                               substr(issued_at, 1, 10)
+                                  ORDER BY issued_at DESC
+                              ) AS rn
+                       FROM signal_outcomes
+                       WHERE evaluated_at IS NOT NULL
+                         AND return_7d IS NOT NULL
+                         AND conviction IS NOT NULL
+                         AND issued_at >= ?
+                   )
+                   SELECT conviction, return_7d FROM ranked WHERE rn = 1""",
                 conn,
                 params=(cutoff,),
             )
