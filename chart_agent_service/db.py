@@ -74,15 +74,27 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
 """
 
 _CREATE_SIGNAL_PERF_VIEW = """
+-- 방향 보정: 매수는 +return, 매도는 -return. 원시값으로 hit_rate 를 재면
+-- 매도 신호는 **맞을 때마다 실패**로 집계된다 (2026-09-10 감사).
+-- 정의가 바뀌었으므로 init_db 에서 DROP 후 재생성한다 (CREATE VIEW IF NOT EXISTS
+-- 만으로는 기존 DB 의 옛 정의가 그대로 남는다).
 CREATE VIEW IF NOT EXISTS signal_performance_summary AS
 SELECT
     signal_source,
     signal_type,
     regime,
     COUNT(*) AS n,
-    AVG(CASE WHEN return_7d > 0 THEN 1.0 ELSE 0.0 END) AS hit_rate_7d,
-    AVG(return_7d)  AS expectancy_7d,
-    AVG(return_30d) AS expectancy_30d,
+    AVG(CASE
+          WHEN signal_type = 'sell' THEN (CASE WHEN return_7d < 0 THEN 1.0 ELSE 0.0 END)
+          WHEN signal_type = 'buy'  THEN (CASE WHEN return_7d > 0 THEN 1.0 ELSE 0.0 END)
+          ELSE (CASE WHEN ABS(return_7d) <= 0.02 THEN 1.0 ELSE 0.0 END)
+        END) AS hit_rate_7d,
+    AVG(CASE WHEN signal_type = 'sell' THEN -return_7d ELSE return_7d END)
+        AS signed_expectancy_7d,
+    AVG(CASE WHEN signal_type = 'sell' THEN -return_30d ELSE return_30d END)
+        AS signed_expectancy_30d,
+    AVG(return_7d)  AS raw_expectancy_7d,
+    AVG(return_30d) AS raw_expectancy_30d,
     AVG(max_drawdown_30d) AS avg_max_dd
 FROM signal_outcomes
 WHERE evaluated_at IS NOT NULL
@@ -278,6 +290,8 @@ def init_db():
     conn.execute(_CREATE_TABLE)
     _migrate_signal_outcomes(conn)
     conn.execute(_CREATE_OUTCOMES_TABLE)
+    # VIEW 정의가 바뀌어도 IF NOT EXISTS 는 옛 정의를 남긴다 — 매번 재생성한다.
+    conn.execute("DROP VIEW IF EXISTS signal_performance_summary")
     conn.executescript(_CREATE_SIGNAL_PERF_VIEW)
     conn.execute(_CREATE_SCREENER_TABLE)
     conn.execute(_CREATE_USER_ACTION_TABLE)

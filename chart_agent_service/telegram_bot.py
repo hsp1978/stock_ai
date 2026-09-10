@@ -228,7 +228,8 @@ def send_rich_signal_alert(
         if by_sig.get("total", 0) >= 10:
             lines.append(
                 f"\n📈 <b>과거 적중률</b>: {by_sig['win_rate_pct']:.0f}% "
-                f"(n={by_sig['total']}, 평균수익 {by_sig['avg_return_pct']:+.2f}%)"
+                f"(n={by_sig['total']}, 방향보정 기대값 "
+                f"{by_sig['avg_signed_return_pct']:+.2f}%)"
             )
 
     lines.append(f"\n🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}")

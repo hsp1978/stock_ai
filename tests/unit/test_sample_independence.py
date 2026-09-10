@@ -128,7 +128,7 @@ def test_last_row_of_the_day_represents_the_day(db):
 
     assert stats["total_evaluated"] == 1
     assert stats["loss_count"] == 1               # 마지막(23시) 행이 뽑혔다
-    assert stats["avg_return_pct"] == -10.0
+    assert stats["avg_signed_return_pct"] == -10.0   # 매수 신호라 부호 그대로
 
 
 def test_dedupe_none_reproduces_the_raw_inflated_count(db):

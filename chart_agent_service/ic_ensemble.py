@@ -44,7 +44,7 @@ def _load_signal_outcomes(
         # 쌓이면 scan_agent 의 IC 가 표본 수로 다른 소스를 압도한다 (2026-09-10).
         df = pd.read_sql_query(
             """WITH ranked AS (
-                   SELECT signal_source, conviction, return_7d, issued_at,
+                   SELECT signal_source, conviction, return_7d, signal_type, issued_at,
                           ROW_NUMBER() OVER (
                               PARTITION BY ticker, signal_source,
                                            substr(issued_at, 1, 10)
@@ -56,7 +56,7 @@ def _load_signal_outcomes(
                      AND conviction IS NOT NULL
                      AND issued_at >= ?
                )
-               SELECT signal_source, conviction, return_7d, issued_at
+               SELECT signal_source, conviction, return_7d, signal_type, issued_at
                FROM ranked WHERE rn = 1
                ORDER BY issued_at DESC""",
             conn,
@@ -82,13 +82,33 @@ def compute_ic_per_source(df: pd.DataFrame) -> dict[str, float]:
     """
     from scipy.stats import spearmanr  # type: ignore[import-untyped]
 
+    # conviction 은 '이 방향을 얼마나 확신하는가'다. 원시 수익률과 상관을 재면
+    # 매도 신호가 맞을수록 IC 가 음수로 잡혀, 잘 맞추는 소스의 가중치가 0이 된다
+    # (2026-09-10 방향 보정 감사). 방향 보정 수익률과의 상관을 쓴다.
+    scored = _with_signed_return(df)
+
     ic_map: dict[str, float] = {}
-    for source, grp in df.groupby("signal_source"):
+    for source, grp in scored.groupby("signal_source"):
         if len(grp) < _MIN_SAMPLES:
             continue
-        rho, pval = spearmanr(grp["conviction"], grp["return_7d"])
+        rho, pval = spearmanr(grp["conviction"], grp["signed_return"])
         ic_map[str(source)] = float(rho) if not np.isnan(rho) else 0.0
     return ic_map
+
+
+def _with_signed_return(df: pd.DataFrame) -> pd.DataFrame:
+    """방향 보정 수익률 컬럼 추가. 방향이 없는 neutral 행은 제외한다."""
+    if df.empty:
+        return df
+    if "signal_type" not in df.columns:
+        # 구 스키마 호출부 — 부호를 알 수 없으면 조용히 원시값을 쓰지 않는다.
+        raise KeyError("signal_type 없이는 IC 방향 보정을 할 수 없다")
+    from signal_tracker import signed_return
+
+    signed = df.apply(
+        lambda r: signed_return(r.get("signal_type"), r["return_7d"]), axis=1
+    )
+    return df.assign(signed_return=signed).dropna(subset=["signed_return"])
 
 
 def compute_ic_weights(
@@ -196,21 +216,61 @@ def apply_ic_weights(
     return final_signal, round(final_conviction, 3)
 
 
+def _inactive_reason(df: pd.DataFrame, weights: dict[str, float]) -> Optional[str]:
+    """가중치가 비어 있는 이유. 빈 dict 를 '전부 0'으로 보이게 두지 않기 위함."""
+    if weights:
+        return None
+    if df.empty:
+        return "signal_outcomes 데이터 없음"
+    try:
+        span = (
+            pd.to_datetime(df["issued_at"].max()) - pd.to_datetime(df["issued_at"].min())
+        ).days
+        if span < _MIN_DAYS:
+            return f"누적 {span}일 < 최소 {_MIN_DAYS}일 — 균등 가중으로 폴백"
+    except Exception:
+        pass
+    return "모든 소스 IC ≤ 0 — 균등 가중으로 폴백"
+
+
 def get_ic_summary(db_path: Optional[str] = None, days: int = 90) -> dict:
-    """IC 현황 요약 (디버깅·모니터링용)."""
+    """IC 현황 요약 (디버깅·모니터링용).
+
+    `weight` 를 항상 숫자로 내면 비활성 상태가 '모든 소스 가중치 0'으로 읽힌다.
+    실제로는 `compute_ic_weights()` 가 빈 dict 를 돌려주는 폴백 상태이고, 그건
+    '이 소스를 제외한다'와 완전히 다른 뜻이다 (2026-09-10 감사). 비활성이면
+    weight 를 None 으로 두고 사유를 함께 낸다.
+    """
     df = _load_signal_outcomes(db_path, days)
     if df.empty:
-        return {"status": "no_data", "sources": {}, "total_rows": 0}
+        return {
+            "status": "no_data",
+            "sources": {},
+            "total_rows": 0,
+            "active": False,
+            "inactive_reason": "signal_outcomes 데이터 없음",
+            "applied_in_decisions": False,
+        }
 
     ic_map = compute_ic_per_source(df)
     weights = compute_ic_weights(db_path=db_path, days=days)
+    active = bool(weights)
 
     return {
         "status": "ok",
         "total_rows": len(df),
         "days_range": days,
+        "active": active,
+        "inactive_reason": _inactive_reason(df, weights),
+        "min_days_required": _MIN_DAYS,
+        # IC 가중은 계산만 되고 판정 경로에 연결돼 있지 않다 (apply_ic_weights 호출부 없음).
+        # 있는 것처럼 보이는 지표가 실제로 아무 데도 쓰이지 않는 상태를 명시한다.
+        "applied_in_decisions": False,
         "sources": {
-            src: {"ic": round(ic, 4), "weight": weights.get(src, 0.0)}
+            src: {
+                "ic": round(ic, 4),
+                "weight": (weights.get(src, 0.0) if active else None),
+            }
             for src, ic in ic_map.items()
         },
     }

@@ -4849,7 +4849,8 @@ def render_system_monitor():
             a1, a2, a3, a4 = st.columns(4)
             a1.metric("7D Evaluated", f"{accuracy.get('total_evaluated', 0):,}")
             a2.metric("7D Win Rate", f"{accuracy.get('win_rate_pct', 0):.1f}%")
-            a3.metric("Avg Return", f"{accuracy.get('avg_return_pct', 0):+.2f}%")
+            # 방향 보정본을 쓴다 — 원시 평균은 매도가 맞을수록 내려간다.
+            a3.metric("방향보정 기대값", f"{accuracy.get('avg_signed_return_pct', 0):+.2f}%")
             a4.metric("Samples", f"{accuracy.get('sample_size', 0):,}")
 
             bands = [b for b in accuracy.get("by_confidence_band", []) if b.get("total", 0) > 0]
@@ -4990,7 +4991,8 @@ def render_signal_accuracy():
     # ── 핵심 지표 카드 ───────────────────────────
     total = data.get("total_evaluated", 0)
     win_rate = data.get("win_rate_pct", 0)
-    avg_return = data.get("avg_return_pct", 0)
+    avg_return = data.get("avg_signed_return_pct", 0)
+    avg_raw = data.get("avg_raw_return_pct", 0)
     wins = data.get("win_count", 0)
     losses = data.get("loss_count", 0)
 
@@ -5011,7 +5013,14 @@ def render_signal_accuracy():
         delta = "" if wins == 0 else f"{wins}승 / {losses}패"
         st.metric("적중률", f"{win_rate:.1f}%", delta=delta, delta_color="off")
     with c3:
-        st.metric("평균 수익", f"{avg_return:+.2f}%")
+        # 매수는 +수익률, 매도는 -수익률. 원시 평균은 매도가 맞을수록 내려가므로
+        # 성과 지표로 쓸 수 없다 (진단용으로 delta 에만 남긴다).
+        st.metric(
+            "방향보정 기대값", f"{avg_return:+.2f}%",
+            delta=f"원시 {avg_raw:+.2f}%", delta_color="off",
+            help="매수는 +수익률, 매도는 −수익률로 부호를 맞춘 평균. "
+                 "원시 평균은 매도 신호가 맞을수록 내려가 성과 지표가 되지 못한다.",
+        )
     with c4:
         # 신뢰구간은 독립 블록 수로 계산한다 — 행 수로 계산하면 거짓으로 좁아진다.
         st.metric(
@@ -5044,7 +5053,7 @@ def render_signal_accuracy():
         with sig_cols[i]:
             n = s.get("total", 0)
             wr = s.get("win_rate_pct", 0)
-            avg_r = s.get("avg_return_pct", 0)
+            avg_r = s.get("avg_signed_return_pct", 0)
             icon = {"buy": "🟢", "sell": "🔴", "neutral": "⚪"}.get(sig, "")
             if n > 0:
                 st.markdown(f"""
@@ -5052,7 +5061,7 @@ def render_signal_accuracy():
                     <div style="font-size:0.7rem; color:var(--on-surface-variant);">{icon} {sig.upper()}</div>
                     <div style="font-size:1.8rem; font-weight:700;">{wr:.1f}%</div>
                     <div style="font-size:0.8rem; color:var(--on-surface-variant);">
-                        n={n} · 평균수익 {avg_r:+.2f}%
+                        n={n} · 방향보정 {avg_r:+.2f}%
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -5076,7 +5085,7 @@ def render_signal_accuracy():
                     "건수": b["total"],
                     "적중": b["wins"],
                     "적중률": f"{b['win_rate_pct']:.1f}%",
-                    "평균 수익": f"{b['avg_return_pct']:+.2f}%",
+                    "방향보정 기대값": f"{b['avg_signed_return_pct']:+.2f}%",
                 })
         if band_table:
             st.dataframe(band_table, use_container_width=True, row_height=44, hide_index=True)

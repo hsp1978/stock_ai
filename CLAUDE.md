@@ -185,6 +185,16 @@ make help
 - 정성(LLM 서술) 기여가 정량(도구) 기여를 넘지 못하도록 상한
 - 신뢰도 5.0 미만이면 강도 라벨을 `weak` 이하로 절하
 
+### 2026-09 방향 보정 (완료)
+- `return_7d`는 가격 변화다 — 매도는 내려가야 적중. 부호를 무시하던 지표 4곳 수정:
+  `/signal-accuracy`(키를 `avg_signed_return_pct`/`avg_raw_return_pct`로 분리, 옛
+  `avg_return_pct` 삭제), `llm_calibrator`(hit 라벨), `ic_ensemble`(IC 상관),
+  `signal_performance_summary` VIEW(hit_rate·expectancy, init_db에서 DROP 후 재생성)
+- 실측: scan_agent 매도 1,371건 hit_rate 0.249 → 0.751
+- IC 앙상블은 누적 59일 < 60일 요건이라 **켜진 적이 없다**. `/ic-weights`가 이를
+  '모든 소스 weight 0'으로 보고하던 것을 `active`/`inactive_reason`/
+  `applied_in_decisions`로 명시. `apply_ic_weights()`는 호출부 없음(연결 안 됨)
+
 ### 2026-09 표본 독립성 (완료)
 - 통계·칼리브레이션 표본 단위 도입: 기본 `ticker_day`(종목·소스·발행일 1건, 그날 마지막 행)
 - 신뢰구간은 **독립 블록 수** 기준 Wilson (`win_rate_ci95`, `independent_blocks`)
@@ -302,6 +312,8 @@ PR 머지 시:
 | 워치리스트 "삭제됨" | 파일에 안 써짐 (ro 마운트) | 되읽기 검증 (#24) |
 | 신호검증 잡 `completed` | 후보 선정이 최신순+미도래라 40일간 평가 0건 | 도래분 오래된 순 + 잔량 노출 (2026-09-10) |
 | 승률 44.9% (n=4,272) | 하루 48회 반복 기록을 독립 표본으로 셈 | 표본 단위 `ticker_day` + 블록 기준 CI (2026-09-10) |
+| 평균수익 −0.35% | 매도가 맞을수록 내려가는 원시 평균 | 방향 보정 키 분리 (2026-09-10) |
+| IC weight 전부 0.0 | 가중 자체가 비활성(59일<60일)인데 '제외'로 표기 | `active`/`inactive_reason` 명시 (2026-09-10) |
 
 **작업 시 원칙**:
 1. `except`에서 사유를 버리지 말 것. 최소한 로그에 남긴다.
