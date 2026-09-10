@@ -16,6 +16,39 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ROOT_ENV = _PROJECT_ROOT / ".env"
 
 
+def find_duplicate_env_keys(path: Path) -> list[str]:
+    """.env에 두 번 이상 선언된 키 목록.
+
+    dotenv는 뒤에 온 선언을 채택한다. 파일을 위에서 읽은 사람과 실효값이 갈리고,
+    그 차이는 조용하다 — `DATA_SOURCE`가 `yfinance` → `toss`로 두 번 선언돼 있어
+    문서·주석은 yfinance인데 시스템은 toss로 돌던 사례가 있다 (2026-09-10).
+
+    값은 절대 반환·출력하지 않는다 (키 이름만).
+    """
+    if not path.exists():
+        return []
+    seen: dict[str, int] = {}
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key = line.split("=", 1)[0].strip()
+            if key:
+                seen[key] = seen.get(key, 0) + 1
+    except OSError:
+        return []
+    return sorted(k for k, n in seen.items() if n > 1)
+
+
+_DUPLICATE_ENV_KEYS = find_duplicate_env_keys(_ROOT_ENV)
+if _DUPLICATE_ENV_KEYS:
+    print(
+        "[config] 경고 — .env에 중복 선언된 키가 있습니다 (뒤 선언이 실효값): "
+        + ", ".join(_DUPLICATE_ENV_KEYS)
+    )
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(_ROOT_ENV),
@@ -91,6 +124,16 @@ class Settings(BaseSettings):
     MULTI_AGENT_BATCH_MINUTE: int = Field(default=30, ge=0, le=59)
 
     WATCHLIST: str = ""
+
+    # ── 신호 사후 평가 큐 ─────────────────────────────────────────────
+    # days_back 45 + limit 500 + issued_at DESC 조합이 백로그를 영구 아사시켰다:
+    # 하루 100건 이상 적립되는 규모에서 매 런이 최신 500건(전부 미도래)만 집어
+    # 4,201건이 대기하고 08-06 이후 평가가 0건이었다 (2026-09-10 진단).
+    # 30일 horizon이 도래한 뒤에도 여유를 갖도록 창을 넓게 둔다.
+    SIGNAL_EVAL_DAYS_BACK: int = Field(default=90, ge=31)
+    SIGNAL_EVAL_BATCH_LIMIT: int = Field(default=2000, ge=1)
+    # 잔량이 이 값을 넘으면 ops 알림 — '완료'로 보고되는 무동작 런을 드러낸다.
+    SIGNAL_EVAL_BACKLOG_ALERT: int = Field(default=500, ge=0)
 
     # 신호 판정 임계값 — composite score는 '방향성 도구 평균' 스케일.
     # 개별 도구 점수는 [-6, +8] 범위지만 24개를 평균하면 분산이 상쇄돼
@@ -219,6 +262,9 @@ MULTI_AGENT_BATCH_ENABLED = settings.MULTI_AGENT_BATCH_ENABLED
 MULTI_AGENT_BATCH_HOUR = settings.MULTI_AGENT_BATCH_HOUR
 MULTI_AGENT_BATCH_MINUTE = settings.MULTI_AGENT_BATCH_MINUTE
 WATCHLIST = settings.WATCHLIST
+SIGNAL_EVAL_DAYS_BACK = settings.SIGNAL_EVAL_DAYS_BACK
+SIGNAL_EVAL_BATCH_LIMIT = settings.SIGNAL_EVAL_BATCH_LIMIT
+SIGNAL_EVAL_BACKLOG_ALERT = settings.SIGNAL_EVAL_BACKLOG_ALERT
 SIGNAL_BUY_THRESHOLD = settings.SIGNAL_BUY_THRESHOLD
 SIGNAL_SELL_THRESHOLD = settings.SIGNAL_SELL_THRESHOLD
 BUY_THRESHOLD = settings.BUY_THRESHOLD

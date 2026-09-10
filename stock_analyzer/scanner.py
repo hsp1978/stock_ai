@@ -148,7 +148,7 @@ def run_signal_validation():
     print(f"{'='*60}\n")
     try:
         from signal_tracker import run_daily_validation
-        result = run_daily_validation(days_back=45, limit=500, refit_calibrator=True)
+        result = run_daily_validation(refit_calibrator=True)
         ev = result.get("evaluation", {})
         calib = result.get("calibrator") or {}
         print(f"  ✓ 평가: 처리 {ev.get('processed')}, 업데이트 {ev.get('updated')}")

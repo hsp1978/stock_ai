@@ -49,6 +49,7 @@ from config import (
     CORPORATE_ACTION_CHECK_HOUR, CORPORATE_ACTION_CHECK_MINUTE,
     DATA_HEALTH_CHECK_MINUTES, DATA_HEALTH_ALERT_STALE_HOURS,
     OPS_ALERT_DEDUPE_MINUTES, DEFAULT_HISTORY_PERIOD,
+    SIGNAL_EVAL_DAYS_BACK, SIGNAL_EVAL_BACKLOG_ALERT,
     MULTI_AGENT_BATCH_ENABLED, MULTI_AGENT_BATCH_HOUR, MULTI_AGENT_BATCH_MINUTE,
 )
 from safety.kill_switch import KillSwitchASGIMiddleware
@@ -1360,6 +1361,50 @@ def run_scheduled_scan(override_tickers: "list[str] | None" = None):
         raise
 
 
+def _signal_eval_backlog_status(ev: dict) -> dict:
+    """평가 큐 적체 여부. 무동작 런이 '완료'로 보고되지 않게 하는 판정.
+
+    degrade 조건은 **사람이 조치할 수 있는 상태**로만 좁힌다. 존재하지 않는 심볼
+    하나 때문에 매일 경고가 나가면 그 경고는 읽히지 않게 되고, 그건 은폐와 같은
+    결과를 만든다. 개별 시세 미수신은 카운트로 남기고, 종결(unresolved) 마킹이
+    일어난 런에서만 한 번 알린다.
+    """
+    pending = int(ev.get("pending_due") or 0)
+    expired = int(ev.get("expired_unevaluated") or 0)
+    oldest_days = ev.get("oldest_pending_days")
+    days_back = int(ev.get("days_back") or SIGNAL_EVAL_DAYS_BACK)
+    prefetch = ev.get("prefetch") or {}
+    requested = int(prefetch.get("tickers_requested") or 0)
+    failed = list(prefetch.get("tickers_failed") or [])
+    marked = int(ev.get("marked_unresolved") or 0)
+
+    reasons = []
+    if pending > SIGNAL_EVAL_BACKLOG_ALERT:
+        reasons.append(f"대기 {pending}건 > 임계 {SIGNAL_EVAL_BACKLOG_ALERT}")
+    if expired > 0:
+        reasons.append(f"창({days_back}일) 밖 미평가 {expired}건")
+    # 창의 80%를 넘긴 대기 행은 30일 horizon을 채우지 못하고 만료될 궤도에 있다.
+    if isinstance(oldest_days, (int, float)) and oldest_days > days_back * 0.8:
+        reasons.append(f"최고령 대기 {oldest_days}일")
+    # 요청한 티커가 전부 실패 = 시세 소스 전면 장애. 일부 실패는 종결 경로가 처리한다.
+    if requested > 0 and len(failed) == requested:
+        reasons.append(f"시세 소스 전면 실패 ({requested}종목)")
+    if marked > 0:
+        tickers = ",".join(map(str, (ev.get("unresolved_tickers") or [])[:5]))
+        reasons.append(f"시세 없어 종결 {marked}건 [{tickers}]")
+
+    return {
+        "degraded": bool(reasons),
+        "pending_due": pending,
+        "expired_unevaluated": expired,
+        "oldest_pending_days": oldest_days,
+        "unresolved_total": int(ev.get("unresolved_total") or 0),
+        "skipped_no_price": int(ev.get("skipped_no_price") or 0),
+        "prefetch_failed": failed,
+        "detail": "; ".join(reasons) if reasons else "backlog clear",
+    }
+
+
 def _run_signal_validation_impl():
     """일일 신호 사후 평가 + 신뢰도 칼리브레이션."""
     started_at = datetime.now().isoformat()
@@ -1369,22 +1414,35 @@ def _run_signal_validation_impl():
     try:
         from signal_tracker import run_daily_validation
 
-        result = run_daily_validation(days_back=45, limit=500, refit_calibrator=True)
+        result = run_daily_validation(refit_calibrator=True)
+        ev = result.get("evaluation", {}) or {}
+        backlog = _signal_eval_backlog_status(ev)
         payload = {
-            "status": "completed",
+            # 잔량이 쌓여 있으면 '완료'로 적지 않는다 — 08-06 이후 평가 0건이
+            # 40일간 completed 로 보고됐던 원인이 이것이다.
+            "status": "degraded" if backlog["degraded"] else "completed",
             "started_at": started_at,
             "finished_at": datetime.now().isoformat(),
             "result": result,
+            "backlog": backlog,
         }
         with _STATE_LOCK:
             _LAST_SIGNAL_VALIDATION.clear()
             _LAST_SIGNAL_VALIDATION.update(payload)
             set_app_state(_STATE_SIGNAL_VALIDATION, _LAST_SIGNAL_VALIDATION)
-        ev = result.get("evaluation", {})
         print(
             f"  신호 검증 완료: 처리 {ev.get('processed', 0)}건, "
-            f"업데이트 {ev.get('updated', 0)}건, 오류 {ev.get('errors', 0)}건"
+            f"업데이트 {ev.get('updated', 0)}건, 오류 {ev.get('errors', 0)}건, "
+            f"잔량 {ev.get('pending_due', 0)}건"
         )
+        if backlog["degraded"]:
+            print(f"  [경고] 평가 큐 적체: {backlog['detail']}")
+            _send_ops_alert(
+                "Signal evaluation backlog",
+                backlog["detail"],
+                severity="warning",
+                dedupe_key="signal_eval_backlog",
+            )
     except Exception as exc:
         payload = {
             "status": "error",
@@ -3117,15 +3175,27 @@ def api_signal_accuracy(horizon: int = 7, min_confidence: float = 0.0,
 
 
 @app.post("/signal-accuracy/evaluate")
-def api_signal_evaluate(days_back: int = 45, limit: int = 500):
-    """과거 신호에 대한 실제 결과 평가를 수동 실행."""
+def api_signal_evaluate(
+    days_back: int | None = None,
+    limit: int | None = None,
+    reset_unresolved: bool = False,
+):
+    """과거 신호에 대한 실제 결과 평가를 수동 실행 (미지정 시 config 기본값).
+
+    reset_unresolved=true 는 시세 없음으로 종결된 행을 다시 대기로 돌린다 —
+    데이터 소스를 바꾼 뒤 한 번 돌리는 용도.
+    """
     from signal_tracker import run_daily_validation
-    result = run_daily_validation(days_back=days_back, limit=limit)
+    result = run_daily_validation(
+        days_back=days_back, limit=limit, reset_unresolved=reset_unresolved
+    )
+    backlog = _signal_eval_backlog_status(result.get("evaluation", {}) or {})
     payload = {
-        "status": "completed",
+        "status": "degraded" if backlog["degraded"] else "completed",
         "started_at": datetime.now().isoformat(),
         "finished_at": datetime.now().isoformat(),
         "result": result,
+        "backlog": backlog,
     }
     with _STATE_LOCK:
         _LAST_SIGNAL_VALIDATION.clear()

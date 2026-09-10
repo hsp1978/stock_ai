@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
@@ -25,6 +26,27 @@ HORIZONS = [7, 14, 30]
 
 # outcome 판정 threshold (±%)
 OUTCOME_THRESHOLD_PCT = 2.0
+
+# 가격 조회 창 — target 하루 전부터 7일 뒤까지에서 첫 거래일 종가를 찾는다.
+_PRICE_WINDOW_BEFORE_DAYS = 1
+_PRICE_WINDOW_AFTER_DAYS = 7
+
+# 마지막 horizon이 도래한 뒤 이만큼 더 기다려도 시세가 없으면 종결 처리한다.
+# 존재하지 않는 심볼(예: 057050.KS — yfinance 404, 실제로는 .KQ)로 적립된 행이
+# 매일 재시도되며 잔량·경고를 영구히 붙잡고 있는 것을 막는다.
+_UNRESOLVED_GRACE_DAYS = 14
+_STATE_UNRESOLVED = "unresolved"
+
+
+def _eval_setting(name: str, default: int) -> int:
+    """평가 큐 파라미터를 config에서 읽는다 (config 없이 import되는 테스트 환경 대비)."""
+    try:
+        from config import settings
+
+        value = getattr(settings, name, default)
+        return int(value) if value is not None else default
+    except Exception:
+        return default
 
 
 def insert_signal_outcome(
@@ -72,34 +94,159 @@ def insert_signal_outcome(
     return signal_id
 
 
+# 런(run) 스코프 가격 캐시 — 스레드별로 분리한다.
+# 스케줄러 잡과 수동 엔드포인트가 동시에 돌 수 있고, 프레임을 런 밖으로 들고 가면
+# 어제 내려받은 데이터로 오늘의 horizon을 채우는 stale 평가가 된다.
+_PRICE_CACHE = threading.local()
+
+
+def _cache_frames() -> Optional[dict]:
+    return getattr(_PRICE_CACHE, "frames", None)
+
+
+def _select_close(hist, target_date: datetime) -> Optional[float]:
+    """조회 창 안에서 target_date와 같거나 이후인 첫 종가. 없으면 창의 마지막 종가."""
+    if hist is None or hist.empty:
+        return None
+    for idx in hist.index:
+        idx_naive = (
+            idx.tz_localize(None)
+            if hasattr(idx, "tz_localize") and idx.tzinfo
+            else idx
+        )
+        if idx_naive.to_pydatetime().date() >= target_date.date():
+            return float(hist.loc[idx, "Close"])
+    return float(hist["Close"].iloc[-1])
+
+
+def _window_bounds(target_date: datetime) -> Tuple[datetime, datetime]:
+    return (
+        target_date - timedelta(days=_PRICE_WINDOW_BEFORE_DAYS),
+        target_date + timedelta(days=_PRICE_WINDOW_AFTER_DAYS),
+    )
+
+
+# data_collector 의 period 는 **오늘 기준 과거 구간**이다. 따라서 필요한 것은
+# target 들의 폭(span)이 아니라 **가장 오래된 target 이 며칠 전인지**다.
+# span 으로 잡으면 85일 전에 몰린 배치가 "3mo"(≈92일)로 요청돼 경계에서 샌다.
+_PERIOD_BY_LOOKBACK = ((25, "3mo"), (80, "6mo"), (280, "1y"), (550, "2y"))
+
+
+def _period_for_lookback(lookback_days: float) -> str:
+    """lookback_days 만큼의 과거를 여유 있게 덮는 period 문자열."""
+    for limit, period in _PERIOD_BY_LOOKBACK:
+        if lookback_days <= limit:
+            return period
+    return "5y"
+
+
+def _fetch_history(ticker: str, start: datetime, end: datetime):
+    """구간을 덮는 OHLCV — 설정된 데이터 소스 체인을 그대로 쓴다.
+
+    Why: 사후 평가만 yfinance 를 직접 호출하고 있었다. 시스템의 다른 모든 경로는
+    `data_collector`(설정 소스 → 한국 pykrx/FDR/yfinance → 미국 yfinance/FDR)를
+    타는데, 평가만 우회한 탓에 Toss·pykrx 로는 받아지는 종목이 여기서만 404 로
+    죽었다 (`057050.KS` 53건 종결, 2026-09-10). 소스가 갈리면 평가에 쓰는 가격이
+    시스템이 실제로 본 가격과 달라질 수 있다는 문제도 함께 남는다.
+
+    yfinance 직접 호출은 data_collector 를 import 할 수 없는 환경의 폴백으로만 남긴다.
+    """
+    lookback_days = (
+        max((datetime.now(timezone.utc) - start).days, (end - start).days, 0)
+        + _PRICE_WINDOW_BEFORE_DAYS
+    )
+    try:
+        from data_collector import fetch_ohlcv
+    except Exception:
+        import yfinance as yf
+
+        return yf.Ticker(ticker).history(start=start.date(), end=end.date())
+
+    frame = fetch_ohlcv(ticker, period=_period_for_lookback(lookback_days))
+    if frame is None or frame.empty or "Close" not in frame.columns:
+        return None
+    return frame
+
+
+def _slice_window(frame, target_date: datetime):
+    """캐시된 프레임에서 이 target의 조회 창만 잘라낸다 (선택 규칙을 창 밖으로 넓히지 않기 위함)."""
+    if frame is None or frame.empty:
+        return None
+    import pandas as pd
+
+    start, end = _window_bounds(target_date)
+    index = frame.index
+    naive = index.tz_localize(None) if getattr(index, "tz", None) is not None else index
+    mask = (naive >= pd.Timestamp(start.date())) & (naive < pd.Timestamp(end.date()))
+    sliced = frame[mask]
+    return None if sliced.empty else sliced
+
+
 def _latest_close_for(ticker: str, target_date: datetime) -> Optional[float]:
     """
     target_date 이후 첫 거래일의 종가 반환 (yfinance/FDR 사용).
     주말/휴장일은 다음 거래일로 자동 조정.
-    """
-    try:
-        import yfinance as yf
 
-        # target_date부터 +5일 범위에서 첫 유효 데이터
-        end = target_date + timedelta(days=7)
-        start = target_date - timedelta(days=1)
-        t = yf.Ticker(ticker)
-        hist = t.history(start=start.date(), end=end.date())
-        if hist is None or hist.empty:
+    런 스코프 캐시(`prefetch_price_history`)가 warm이면 네트워크를 타지 않는다.
+    캐시 미스는 실패가 아니므로 종전처럼 개별 조회로 폴백한다.
+    """
+    frames = _cache_frames()
+    if frames is not None and ticker in getattr(_PRICE_CACHE, "requested", ()):
+        frame = frames.get(ticker)
+        if frame is None:
+            # 배치 조회가 이미 실패한 티커 — 개별 조회로 수천 회 되돌리지 않는다.
+            # 다음 런에서 다시 시도한다.
             return None
-        # target_date와 같거나 이후의 첫 행
-        for idx in hist.index:
-            idx_naive = (
-                idx.tz_localize(None)
-                if hasattr(idx, "tz_localize") and idx.tzinfo
-                else idx
-            )
-            if idx_naive.to_pydatetime().date() >= target_date.date():
-                return float(hist.loc[idx, "Close"])
-        # 없으면 마지막 행
-        return float(hist["Close"].iloc[-1])
+        sliced = _slice_window(frame, target_date)
+        if sliced is None:
+            # 이 창에 거래일 데이터가 없다 = 아직 시세가 없거나 상장폐지.
+            return None
+        try:
+            return _select_close(sliced, target_date)
+        except Exception:
+            return None
+    try:
+        start, end = _window_bounds(target_date)
+        return _select_close(_fetch_history(ticker, start, end), target_date)
     except Exception:
         return None
+
+
+def prefetch_price_history(needs: Dict[str, Tuple[datetime, datetime]]) -> Dict:
+    """티커별로 필요한 전체 구간을 한 번씩만 내려받아 런 스코프 캐시에 적재한다.
+
+    Why: 종전에는 (행 x horizon)마다 `history()`를 호출했다. 백로그 4,000행이면
+    1만 회 이상 왕복이라 야간 배치 안에 끝나지 않고, rate limit에 걸린 실패가
+    '평가할 게 없음'과 구별되지 않는다 (2026-09 진단).
+    """
+    frames: dict = {}
+    failed: list = []
+    for ticker, (start, end) in needs.items():
+        try:
+            frame = _fetch_history(
+                ticker,
+                start - timedelta(days=_PRICE_WINDOW_BEFORE_DAYS),
+                end + timedelta(days=_PRICE_WINDOW_AFTER_DAYS),
+            )
+            if frame is None or frame.empty:
+                failed.append(ticker)
+                continue
+            frames[ticker] = frame
+        except Exception as exc:  # 개별 티커 실패가 런 전체를 죽이지 않게 한다
+            print(f"[signal_tracker] {ticker} 시세 배치 조회 실패: {exc}")
+            failed.append(ticker)
+    _PRICE_CACHE.frames = frames
+    _PRICE_CACHE.requested = set(needs)
+    return {
+        "tickers_requested": len(needs),
+        "tickers_cached": len(frames),
+        "tickers_failed": failed,
+    }
+
+
+def clear_price_history_cache() -> None:
+    _PRICE_CACHE.frames = None
+    _PRICE_CACHE.requested = set()
 
 
 def _outcome_label(return_pct: float, signal: str) -> str:
@@ -172,71 +319,198 @@ def get_tracking_health(days_back: int = 7) -> Dict:
     }
 
 
-def evaluate_past_signals(days_back: int = 45, limit: int = 500) -> Dict:
+# 도래한 horizon이 하나라도 남아 있는 행만 고른다.
+# 종전 조건(`return_7d IS NULL OR ...`)은 **발행 직후 행까지 후보로 잡았고**,
+# 정렬이 issued_at DESC 였다. 하루 100건 이상 적립되는 현재 규모에서는 매 런마다
+# 최신 5일치 500건만 뽑히고 그 전부가 7일 미도래 → 4,201건이 영구 대기했다
+# (2026-09-10 진단: processed 0 / skipped_not_due 500, 08-06 이후 평가 0건).
+_DUE_FILTER = """
+        price_at_signal IS NOT NULL
+        AND eval_state IS NULL
+        AND issued_at >= :cutoff
+        AND (
+              (return_7d  IS NULL AND issued_at <= :due_7)
+           OR (return_14d IS NULL AND issued_at <= :due_14)
+           OR (return_30d IS NULL AND issued_at <= :due_30)
+        )
+"""
+
+
+def _due_params(now: datetime, days_back: int) -> Dict[str, str]:
+    params = {"cutoff": (now - timedelta(days=days_back)).isoformat()}
+    for h in HORIZONS:
+        params[f"due_{h}"] = (now - timedelta(days=h)).isoformat()
+    return params
+
+
+def _backlog_snapshot(conn, now: datetime, days_back: int) -> Dict:
+    """평가 대기 잔량. '완료'로 보고되는 런이 실제로는 아무것도 못 했는지 드러낸다."""
+    params = _due_params(now, days_back)
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n, MIN(issued_at) AS oldest FROM signal_outcomes "
+        f"WHERE {_DUE_FILTER}",
+        params,
+    ).fetchone()
+    pending = int(row["n"] or 0)
+    oldest = row["oldest"]
+    expired = conn.execute(
+        """
+        SELECT COUNT(*) FROM signal_outcomes
+        WHERE price_at_signal IS NOT NULL
+          AND eval_state IS NULL
+          AND issued_at < :cutoff
+          AND (return_7d IS NULL OR return_14d IS NULL OR return_30d IS NULL)
+        """,
+        {"cutoff": params["cutoff"]},
+    ).fetchone()[0]
+    unresolved = conn.execute(
+        "SELECT COUNT(*) FROM signal_outcomes WHERE eval_state = ?",
+        (_STATE_UNRESOLVED,),
+    ).fetchone()[0]
+    oldest_days = None
+    if oldest:
+        try:
+            issued = datetime.fromisoformat(oldest)
+            if issued.tzinfo is None:
+                issued = issued.replace(tzinfo=timezone.utc)
+            oldest_days = round((now - issued).total_seconds() / 86400, 1)
+        except ValueError:
+            oldest_days = None
+    return {
+        "pending_due": pending,
+        "oldest_pending_at": oldest,
+        "oldest_pending_days": oldest_days,
+        # days_back 창을 벗어나 다시는 후보가 되지 않는 행. 창을 늘려야 하는 신호다.
+        "expired_unevaluated": int(expired or 0),
+        # 시세 소스에 심볼이 없어 종결된 행 (재시도 대상 아님, 통계에도 안 들어간다)
+        "unresolved_total": int(unresolved or 0),
+    }
+
+
+def _price_needs(rows, now: datetime) -> Dict[str, Tuple[datetime, datetime]]:
+    """티커별로 이 런에서 필요한 target 날짜의 최소~최대 구간."""
+    needs: Dict[str, Tuple[datetime, datetime]] = {}
+    for row in rows:
+        if not row["price_at_signal"]:
+            continue
+        issued_at = _as_utc(row["issued_at"])
+        if issued_at is None:
+            continue
+        targets = [
+            issued_at + timedelta(days=h)
+            for h in HORIZONS
+            if row[f"return_{h}d"] is None and issued_at + timedelta(days=h) <= now
+        ]
+        if not targets:
+            continue
+        lo, hi = min(targets), max(targets)
+        prev = needs.get(row["ticker"])
+        needs[row["ticker"]] = (
+            (lo, hi) if prev is None else (min(prev[0], lo), max(prev[1], hi))
+        )
+    return needs
+
+
+def _as_utc(value) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+
+def _reset_unresolved(conn, now: datetime, days_back: int) -> int:
+    """창 안의 종결(unresolved) 행을 다시 대기로 돌린다.
+
+    데이터 소스가 바뀐 뒤(예: 평가 경로를 data_collector 로 통일) 한 번 돌려주면
+    종전 소스로만 실패했던 행이 재시도된다. 여전히 시세가 없으면 다시 종결된다.
+    """
+    cutoff = (now - timedelta(days=days_back)).isoformat()
+    cur = conn.execute(
+        "UPDATE signal_outcomes SET eval_state=NULL "
+        "WHERE eval_state=? AND issued_at >= ?",
+        (_STATE_UNRESOLVED, cutoff),
+    )
+    return cur.rowcount or 0
+
+
+def evaluate_past_signals(
+    days_back: Optional[int] = None,
+    limit: Optional[int] = None,
+    reset_unresolved: bool = False,
+) -> Dict:
     """
     과거 signal_outcomes 레코드를 순회하여 실제 수익률을 갱신.
 
     로직:
-    - signal_outcomes에서 horizon별 수익률이 아직 없는 레코드 조회
-    - 각 레코드마다 7/14/30일 후 가격을 가져와 수익률/outcome 계산
-    - signal_outcomes UPDATE
+    - horizon이 도래했고 아직 수익률이 없는 레코드를 **오래된 것부터** 조회
+    - 티커별 시세를 한 번에 프리페치 (행 x horizon 개별 조회 제거)
+    - 각 레코드마다 7/14/30일 후 가격으로 수익률 계산 후 UPDATE
+    - 잔량(pending_due)을 함께 반환 — 아무것도 못 한 런이 '완료'로 보이지 않게 한다
 
     Args:
-        days_back: 얼마나 오래된 신호까지 재평가할지 (기본 45일)
-        limit: 한 번에 처리할 최대 레코드 수
+        days_back: 얼마나 오래된 신호까지 재평가할지 (기본 SIGNAL_EVAL_DAYS_BACK)
+        limit: 한 번에 처리할 최대 레코드 수 (기본 SIGNAL_EVAL_BATCH_LIMIT)
 
     Returns:
         처리 통계 dict
     """
+    days_back = _eval_setting("SIGNAL_EVAL_DAYS_BACK", 90) if days_back is None else days_back
+    limit = _eval_setting("SIGNAL_EVAL_BATCH_LIMIT", 2000) if limit is None else limit
     now = datetime.now(timezone.utc)
-    cutoff = (now - timedelta(days=days_back)).isoformat()
+    params = _due_params(now, days_back)
 
     conn = _get_conn()
+    reset_count = _reset_unresolved(conn, now, days_back) if reset_unresolved else 0
     rows = conn.execute(
-        """
+        f"""
         SELECT signal_id, ticker, signal_type, signal_source,
                issued_at, conviction, price_at_signal,
                price_7d, price_14d, price_30d,
                return_7d, return_14d, return_30d
         FROM signal_outcomes
-        WHERE issued_at >= ?
-          AND price_at_signal IS NOT NULL
-          AND (
-            return_7d IS NULL OR return_14d IS NULL OR return_30d IS NULL
-          )
-        ORDER BY issued_at DESC
-        LIMIT ?
+        WHERE {_DUE_FILTER}
+        ORDER BY issued_at ASC
+        LIMIT :limit
         """,
-        (cutoff, limit),
+        {**params, "limit": limit},
     ).fetchall()
+
+    backlog_before = _backlog_snapshot(conn, now, days_back)
+    prefetch = prefetch_price_history(_price_needs(rows, now))
 
     processed = 0
     updated = 0
     skipped_no_entry = 0
     skipped_not_due = 0
+    skipped_no_price = 0
+    marked_unresolved = 0
+    unresolved_tickers: set = set()
     errors = 0
+    # 이번 런에서 **새로 채운** horizon 수. 종전에는 이미 채워져 있던 horizon도
+    # 여기에 더해져서, 아무것도 안 한 런이 "completed_by_horizon 500"으로 보였다.
     completed_by_horizon = {h: 0 for h in HORIZONS}
+    already_complete_by_horizon = {h: 0 for h in HORIZONS}
 
     for row in rows:
         signal_id = row["signal_id"]
         ticker = row["ticker"]
-        issued_at = datetime.fromisoformat(row["issued_at"])
-        if issued_at.tzinfo is None:
-            issued_at = issued_at.replace(tzinfo=timezone.utc)
+        issued_at = _as_utc(row["issued_at"])
         entry_price = row["price_at_signal"]
-        if not entry_price:
+        if issued_at is None or not entry_price:
             skipped_no_entry += 1
             continue
 
         # 각 horizon별 미래 가격과 outcome 계산
         horizon_data = {}
         row_updated = False
+        price_missing = False
         for h in HORIZONS:
             ret_key = f"return_{h}d"
             price_key = f"price_{h}d"
             if row[ret_key] is not None:
                 horizon_data[h] = (row[price_key], row[ret_key])
-                completed_by_horizon[h] += 1
+                already_complete_by_horizon[h] += 1
                 continue
 
             target = issued_at + timedelta(days=h)
@@ -247,6 +521,7 @@ def evaluate_past_signals(days_back: int = 45, limit: int = 500) -> Dict:
             future_price = _latest_close_for(ticker, target)
             if future_price is None:
                 horizon_data[h] = (row[price_key], row[ret_key])
+                price_missing = True
                 continue
 
             ret = future_price / entry_price - 1
@@ -255,7 +530,29 @@ def evaluate_past_signals(days_back: int = 45, limit: int = 500) -> Dict:
             row_updated = True
 
         if not row_updated:
-            skipped_not_due += 1
+            # 도래한 horizon만 후보로 뽑으므로, 여기 걸리는 건 시세를 못 받은 경우다.
+            # 두 사유를 같은 카운터에 담으면 rate limit 장애가 '평가할 게 없음'으로 읽힌다.
+            if price_missing:
+                skipped_no_price += 1
+                # 마지막 horizon 도래 + grace 를 넘겼는데도 시세가 없다 = 이 심볼로는
+                # 영원히 못 채운다. 종결해서 큐와 경고를 붙잡지 않게 하고, 대신
+                # unresolved 카운트로 계속 보이게 한다.
+                deadline = issued_at + timedelta(
+                    days=max(HORIZONS) + _UNRESOLVED_GRACE_DAYS
+                )
+                if now > deadline:
+                    try:
+                        conn.execute(
+                            "UPDATE signal_outcomes SET eval_state=? WHERE signal_id=?",
+                            (_STATE_UNRESOLVED, signal_id),
+                        )
+                        marked_unresolved += 1
+                        unresolved_tickers.add(ticker)
+                    except Exception as exc:
+                        print(f"[signal_tracker] {ticker} ({signal_id}) 종결 실패: {exc}")
+                        errors += 1
+            else:
+                skipped_not_due += 1
             continue
 
         processed += 1
@@ -287,15 +584,32 @@ def evaluate_past_signals(days_back: int = 45, limit: int = 500) -> Dict:
             errors += 1
 
     conn.commit()
+    backlog_after = _backlog_snapshot(conn, now, days_back)
     conn.close()
+    clear_price_history_cache()
 
     return {
         "processed": processed,
         "updated": updated,
         "skipped_no_entry": skipped_no_entry,
         "skipped_not_due": skipped_not_due,
+        "skipped_no_price": skipped_no_price,
+        "marked_unresolved": marked_unresolved,
+        "unresolved_tickers": sorted(unresolved_tickers),
         "errors": errors,
         "completed_by_horizon": completed_by_horizon,
+        "already_complete_by_horizon": already_complete_by_horizon,
+        "candidates": len(rows),
+        "reset_unresolved": reset_count,
+        "days_back": days_back,
+        "limit": limit,
+        "prefetch": prefetch,
+        "pending_due_before": backlog_before["pending_due"],
+        "pending_due": backlog_after["pending_due"],
+        "oldest_pending_at": backlog_after["oldest_pending_at"],
+        "oldest_pending_days": backlog_after["oldest_pending_days"],
+        "expired_unevaluated": backlog_after["expired_unevaluated"],
+        "unresolved_total": backlog_after["unresolved_total"],
         "scanned_at": now.isoformat(),
     }
 
@@ -579,14 +893,19 @@ def get_calibrator(horizon: int = 7) -> ConfidenceCalibrator:
 #  일일 cron 진입점
 # ─────────────────────────────────────────────────────────
 def run_daily_validation(
-    days_back: int = 45, limit: int = 500, refit_calibrator: bool = True
+    days_back: Optional[int] = None,
+    limit: Optional[int] = None,
+    refit_calibrator: bool = True,
+    reset_unresolved: bool = False,
 ) -> Dict:
     """
     일일 실행: 과거 신호 평가 + 칼리브레이터 재학습.
 
     Returns: 처리 통계 + 칼리브레이터 상태
     """
-    eval_stats = evaluate_past_signals(days_back=days_back, limit=limit)
+    eval_stats = evaluate_past_signals(
+        days_back=days_back, limit=limit, reset_unresolved=reset_unresolved
+    )
 
     calibrator_status = None
     if refit_calibrator:
@@ -607,7 +926,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     print("\n1) 과거 신호 평가 실행 중...")
-    stats = evaluate_past_signals(days_back=45, limit=100)
+    stats = evaluate_past_signals(limit=100)
     print(f"  처리: {stats['processed']}, 업데이트: {stats['updated']}")
     print(f"  엔트리가 없음: {stats['skipped_no_entry']}, 에러: {stats['errors']}")
 
