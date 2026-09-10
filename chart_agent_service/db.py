@@ -66,7 +66,10 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     market_context   TEXT,
     regime           TEXT,
     signal_std       REAL,
-    agreement_level  TEXT
+    agreement_level  TEXT,
+    -- NULL=평가 대기/완료, 'unresolved'=시세 소스에 심볼이 없어 종결
+    -- (영구 재시도와 영구 경고를 막되, 카운트로는 계속 보이게 한다)
+    eval_state       TEXT
 );
 """
 
@@ -256,8 +259,12 @@ def _migrate_signal_outcomes(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE signal_outcomes RENAME TO signal_outcomes_legacy")
         print("[DB] signal_outcomes 구 스키마 → signal_outcomes_legacy 백업")
         return
-    # Step 12: signal_std, agreement_level 컬럼 추가 (기존 DB 호환)
-    for col, coltype in [("signal_std", "REAL"), ("agreement_level", "TEXT")]:
+    # Step 12: signal_std, agreement_level / 2026-09: eval_state 컬럼 추가 (기존 DB 호환)
+    for col, coltype in [
+        ("signal_std", "REAL"),
+        ("agreement_level", "TEXT"),
+        ("eval_state", "TEXT"),
+    ]:
         if col not in cols:
             try:
                 conn.execute(f"ALTER TABLE signal_outcomes ADD COLUMN {col} {coltype}")

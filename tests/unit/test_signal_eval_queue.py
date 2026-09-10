@@ -46,7 +46,8 @@ CREATE TABLE signal_outcomes (
     market_context   TEXT,
     regime           TEXT,
     signal_std       REAL,
-    agreement_level  TEXT
+    agreement_level  TEXT,
+    eval_state       TEXT
 );
 """
 
@@ -249,3 +250,88 @@ def test_backlog_status_marks_validation_degraded():
     )
     assert starved["degraded"] is True
     assert "4201" in starved["detail"]
+
+
+def test_symbol_without_prices_is_closed_out_instead_of_retried_forever(signal_db):
+    """존재하지 않는 심볼(057050.KS 사례)이 큐와 경고를 영구히 붙잡지 않는다."""
+    # 30일 horizon + grace(14일)를 넘긴 행 / 아직 안 넘긴 행
+    _insert(signal_db, "stuck-old", days_ago=60, ticker="GHOST")
+    _insert(signal_db, "stuck-young", days_ago=20, ticker="GHOST")
+
+    def _run_empty():
+        with (
+            patch("signal_tracker._get_conn", lambda: _conn_for(signal_db)),
+            patch("signal_tracker._fetch_history", lambda *a, **k: pd.DataFrame()),
+        ):
+            import signal_tracker
+
+            signal_tracker.clear_price_history_cache()
+            return signal_tracker.evaluate_past_signals(days_back=90, limit=10)
+
+    first = _run_empty()
+    assert first["marked_unresolved"] == 1
+    assert first["unresolved_tickers"] == ["GHOST"]
+    assert first["unresolved_total"] == 1
+    # grace 안쪽 행은 계속 대기 — 조급하게 종결하지 않는다
+    assert first["pending_due"] == 1
+
+    # 종결된 행은 다음 런에서 후보가 아니다 (영구 재시도 제거)
+    second = _run_empty()
+    assert second["candidates"] == 1
+    assert second["marked_unresolved"] == 0
+    assert second["pending_due"] == 1
+
+
+def test_persistent_missing_symbol_does_not_keep_alerting():
+    """한 심볼의 시세 미수신이 매일 degraded 를 만들면 그 경고는 읽히지 않게 된다."""
+    import service
+
+    # 종결이 일어난 런: 한 번은 알린다
+    marking_run = service._signal_eval_backlog_status(
+        {
+            "pending_due": 12,
+            "expired_unevaluated": 0,
+            "oldest_pending_days": 5,
+            "days_back": 90,
+            "marked_unresolved": 53,
+            "unresolved_tickers": ["057050.KS"],
+            "prefetch": {"tickers_requested": 19, "tickers_failed": ["057050.KS"]},
+        }
+    )
+    assert marking_run["degraded"] is True
+    assert "057050.KS" in marking_run["detail"]
+
+    # 이후 런: 같은 심볼이 계속 실패하지만 종결은 끝났고 잔량도 정상
+    steady_run = service._signal_eval_backlog_status(
+        {
+            "pending_due": 12,
+            "expired_unevaluated": 0,
+            "oldest_pending_days": 5,
+            "days_back": 90,
+            "marked_unresolved": 0,
+            "unresolved_total": 53,
+            "skipped_no_price": 0,
+            "prefetch": {"tickers_requested": 19, "tickers_failed": ["057050.KS"]},
+        }
+    )
+    assert steady_run["degraded"] is False
+    assert steady_run["unresolved_total"] == 53      # 카운트로는 계속 보인다
+    assert steady_run["prefetch_failed"] == ["057050.KS"]
+
+
+def test_total_price_source_outage_still_degrades():
+    """전 종목 시세 실패는 즉시 degraded — 종결 경로로 조용히 넘기지 않는다."""
+    import service
+
+    status = service._signal_eval_backlog_status(
+        {
+            "pending_due": 40,
+            "expired_unevaluated": 0,
+            "oldest_pending_days": 8,
+            "days_back": 90,
+            "marked_unresolved": 0,
+            "prefetch": {"tickers_requested": 7, "tickers_failed": ["A", "B", "C", "D", "E", "F", "G"]},
+        }
+    )
+    assert status["degraded"] is True
+    assert "전면 실패" in status["detail"]

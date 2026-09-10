@@ -38,7 +38,8 @@ def signal_db(tmp_path):
             market_context   TEXT,
             regime           TEXT,
             signal_std       REAL,
-            agreement_level  TEXT
+            agreement_level  TEXT,
+            eval_state       TEXT
         );
         """
     )

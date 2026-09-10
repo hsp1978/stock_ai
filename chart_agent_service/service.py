@@ -1362,11 +1362,22 @@ def run_scheduled_scan(override_tickers: "list[str] | None" = None):
 
 
 def _signal_eval_backlog_status(ev: dict) -> dict:
-    """평가 큐 적체 여부. 무동작 런이 '완료'로 보고되지 않게 하는 판정."""
+    """평가 큐 적체 여부. 무동작 런이 '완료'로 보고되지 않게 하는 판정.
+
+    degrade 조건은 **사람이 조치할 수 있는 상태**로만 좁힌다. 존재하지 않는 심볼
+    하나 때문에 매일 경고가 나가면 그 경고는 읽히지 않게 되고, 그건 은폐와 같은
+    결과를 만든다. 개별 시세 미수신은 카운트로 남기고, 종결(unresolved) 마킹이
+    일어난 런에서만 한 번 알린다.
+    """
     pending = int(ev.get("pending_due") or 0)
     expired = int(ev.get("expired_unevaluated") or 0)
     oldest_days = ev.get("oldest_pending_days")
     days_back = int(ev.get("days_back") or SIGNAL_EVAL_DAYS_BACK)
+    prefetch = ev.get("prefetch") or {}
+    requested = int(prefetch.get("tickers_requested") or 0)
+    failed = list(prefetch.get("tickers_failed") or [])
+    marked = int(ev.get("marked_unresolved") or 0)
+
     reasons = []
     if pending > SIGNAL_EVAL_BACKLOG_ALERT:
         reasons.append(f"대기 {pending}건 > 임계 {SIGNAL_EVAL_BACKLOG_ALERT}")
@@ -1375,16 +1386,21 @@ def _signal_eval_backlog_status(ev: dict) -> dict:
     # 창의 80%를 넘긴 대기 행은 30일 horizon을 채우지 못하고 만료될 궤도에 있다.
     if isinstance(oldest_days, (int, float)) and oldest_days > days_back * 0.8:
         reasons.append(f"최고령 대기 {oldest_days}일")
-    if ev.get("skipped_no_price"):
-        reasons.append(f"시세 미수신 {ev['skipped_no_price']}건")
-    failed = ((ev.get("prefetch") or {}).get("tickers_failed")) or []
-    if failed:
-        reasons.append(f"시세 배치 실패 {','.join(map(str, failed[:5]))}")
+    # 요청한 티커가 전부 실패 = 시세 소스 전면 장애. 일부 실패는 종결 경로가 처리한다.
+    if requested > 0 and len(failed) == requested:
+        reasons.append(f"시세 소스 전면 실패 ({requested}종목)")
+    if marked > 0:
+        tickers = ",".join(map(str, (ev.get("unresolved_tickers") or [])[:5]))
+        reasons.append(f"시세 없어 종결 {marked}건 [{tickers}]")
+
     return {
         "degraded": bool(reasons),
         "pending_due": pending,
         "expired_unevaluated": expired,
         "oldest_pending_days": oldest_days,
+        "unresolved_total": int(ev.get("unresolved_total") or 0),
+        "skipped_no_price": int(ev.get("skipped_no_price") or 0),
+        "prefetch_failed": failed,
         "detail": "; ".join(reasons) if reasons else "backlog clear",
     }
 

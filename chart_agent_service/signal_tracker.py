@@ -31,6 +31,12 @@ OUTCOME_THRESHOLD_PCT = 2.0
 _PRICE_WINDOW_BEFORE_DAYS = 1
 _PRICE_WINDOW_AFTER_DAYS = 7
 
+# 마지막 horizon이 도래한 뒤 이만큼 더 기다려도 시세가 없으면 종결 처리한다.
+# 존재하지 않는 심볼(예: 057050.KS — yfinance 404, 실제로는 .KQ)로 적립된 행이
+# 매일 재시도되며 잔량·경고를 영구히 붙잡고 있는 것을 막는다.
+_UNRESOLVED_GRACE_DAYS = 14
+_STATE_UNRESOLVED = "unresolved"
+
 
 def _eval_setting(name: str, default: int) -> int:
     """평가 큐 파라미터를 config에서 읽는다 (config 없이 import되는 테스트 환경 대비)."""
@@ -284,6 +290,7 @@ def get_tracking_health(days_back: int = 7) -> Dict:
 # (2026-09-10 진단: processed 0 / skipped_not_due 500, 08-06 이후 평가 0건).
 _DUE_FILTER = """
         price_at_signal IS NOT NULL
+        AND eval_state IS NULL
         AND issued_at >= :cutoff
         AND (
               (return_7d  IS NULL AND issued_at <= :due_7)
@@ -314,10 +321,15 @@ def _backlog_snapshot(conn, now: datetime, days_back: int) -> Dict:
         """
         SELECT COUNT(*) FROM signal_outcomes
         WHERE price_at_signal IS NOT NULL
+          AND eval_state IS NULL
           AND issued_at < :cutoff
           AND (return_7d IS NULL OR return_14d IS NULL OR return_30d IS NULL)
         """,
         {"cutoff": params["cutoff"]},
+    ).fetchone()[0]
+    unresolved = conn.execute(
+        "SELECT COUNT(*) FROM signal_outcomes WHERE eval_state = ?",
+        (_STATE_UNRESOLVED,),
     ).fetchone()[0]
     oldest_days = None
     if oldest:
@@ -334,6 +346,8 @@ def _backlog_snapshot(conn, now: datetime, days_back: int) -> Dict:
         "oldest_pending_days": oldest_days,
         # days_back 창을 벗어나 다시는 후보가 되지 않는 행. 창을 늘려야 하는 신호다.
         "expired_unevaluated": int(expired or 0),
+        # 시세 소스에 심볼이 없어 종결된 행 (재시도 대상 아님, 통계에도 안 들어간다)
+        "unresolved_total": int(unresolved or 0),
     }
 
 
@@ -416,6 +430,8 @@ def evaluate_past_signals(
     skipped_no_entry = 0
     skipped_not_due = 0
     skipped_no_price = 0
+    marked_unresolved = 0
+    unresolved_tickers: set = set()
     errors = 0
     # 이번 런에서 **새로 채운** horizon 수. 종전에는 이미 채워져 있던 horizon도
     # 여기에 더해져서, 아무것도 안 한 런이 "completed_by_horizon 500"으로 보였다.
@@ -464,6 +480,23 @@ def evaluate_past_signals(
             # 두 사유를 같은 카운터에 담으면 rate limit 장애가 '평가할 게 없음'으로 읽힌다.
             if price_missing:
                 skipped_no_price += 1
+                # 마지막 horizon 도래 + grace 를 넘겼는데도 시세가 없다 = 이 심볼로는
+                # 영원히 못 채운다. 종결해서 큐와 경고를 붙잡지 않게 하고, 대신
+                # unresolved 카운트로 계속 보이게 한다.
+                deadline = issued_at + timedelta(
+                    days=max(HORIZONS) + _UNRESOLVED_GRACE_DAYS
+                )
+                if now > deadline:
+                    try:
+                        conn.execute(
+                            "UPDATE signal_outcomes SET eval_state=? WHERE signal_id=?",
+                            (_STATE_UNRESOLVED, signal_id),
+                        )
+                        marked_unresolved += 1
+                        unresolved_tickers.add(ticker)
+                    except Exception as exc:
+                        print(f"[signal_tracker] {ticker} ({signal_id}) 종결 실패: {exc}")
+                        errors += 1
             else:
                 skipped_not_due += 1
             continue
@@ -507,6 +540,8 @@ def evaluate_past_signals(
         "skipped_no_entry": skipped_no_entry,
         "skipped_not_due": skipped_not_due,
         "skipped_no_price": skipped_no_price,
+        "marked_unresolved": marked_unresolved,
+        "unresolved_tickers": sorted(unresolved_tickers),
         "errors": errors,
         "completed_by_horizon": completed_by_horizon,
         "already_complete_by_horizon": already_complete_by_horizon,
@@ -519,6 +554,7 @@ def evaluate_past_signals(
         "oldest_pending_at": backlog_after["oldest_pending_at"],
         "oldest_pending_days": backlog_after["oldest_pending_days"],
         "expired_unevaluated": backlog_after["expired_unevaluated"],
+        "unresolved_total": backlog_after["unresolved_total"],
         "scanned_at": now.isoformat(),
     }
 
