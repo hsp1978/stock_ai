@@ -630,6 +630,7 @@ SAMPLE_MODES = ("ticker_day", "ticker_horizon", "none")
 DEFAULT_SAMPLE_MODE = "ticker_day"
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_JULIAN_EPOCH = 2440587.5  # 1970-01-01T00:00Z 의 julian day
 
 
 def _sample_bucket_sql(dedupe: str, horizon: int) -> Optional[str]:
@@ -637,7 +638,13 @@ def _sample_bucket_sql(dedupe: str, horizon: int) -> Optional[str]:
     if dedupe == "ticker_day":
         return "substr(issued_at, 1, 10)"
     if dedupe == "ticker_horizon":
-        return f"CAST(julianday(issued_at) / {int(horizon)} AS INTEGER)"
+        # `_horizon_block()` 과 **같은 경계**를 써야 한다. julianday 를 그대로 나누면
+        # 기준점이 기원전 4713년 정오라 블록 경계가 UTC 자정과 어긋나고,
+        # 표본 수가 독립 블록 수보다 많아지는 모순이 생긴다 (실측 358 vs 320).
+        # 2440587.5 = 1970-01-01T00:00Z 의 julian day.
+        return (
+            f"CAST((julianday(issued_at) - {_JULIAN_EPOCH}) / {int(horizon)} AS INTEGER)"
+        )
     return None
 
 

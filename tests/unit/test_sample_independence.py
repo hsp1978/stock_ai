@@ -217,3 +217,18 @@ def test_ic_ensemble_loads_deduped_rows(db):
     # scan_agent 48행 → 1행, multi_agent_final 1행 → 소스 간 표본 수가 대등해진다
     assert len(df) == 2
     assert set(df["signal_source"]) == {"scan_agent", "multi_agent_final"}
+
+
+def test_horizon_buckets_match_the_block_definition(db):
+    """표본 단위와 독립 블록이 같은 경계를 써야 한다.
+
+    julianday 를 그대로 나누면 기준점이 기원전 4713년 정오라 블록 경계가 UTC
+    자정과 어긋난다. 실측에서 ticker_horizon 표본 358건 > 독립 블록 320건이라는
+    모순이 나왔다 — 겹치지 않게 뽑은 표본이 블록보다 많을 수는 없다.
+    """
+    for day in range(1, 40):
+        _insert(db, f"row-{day}", days_ago=day, ret=0.05)
+
+    stats = _stats(db, horizon=7, days_back=90, dedupe="ticker_horizon")
+
+    assert stats["total_evaluated"] == stats["independent_blocks"]
