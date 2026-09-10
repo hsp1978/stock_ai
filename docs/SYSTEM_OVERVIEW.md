@@ -28,7 +28,7 @@
 | ML | 5모델 앙상블 (RF/GBM/LightGBM/XGBoost/LSTM) + SHAP + Optuna + Walk-Forward |
 | 코드 규모 | 프로덕션 Python 53,834 라인 / 최대 파일 `webui.py` 6,379 라인 |
 | API | FastAPI 엔드포인트 83개 (`chart_agent_service/service.py`, 3,192 라인) |
-| 테스트 | 53 파일 / 548 test, CI(GitHub Actions) 최근 실행 전부 success |
+| 테스트 | 54 파일 / 557 test, CI(GitHub Actions) 최근 실행 전부 success |
 | 데이터 축적 | `scan_log` 69,341행 (2026-04-14~), `signal_outcomes` 5,018행 — 평가 완료 4,272 / 종결 53 / 대기 0 |
 | 이미지 | agent-api 8.0GB / webui 1.97GB |
 
@@ -349,8 +349,9 @@ entry_plan → OrderRequest → TradingSafety.require_all_checks → 모드별 �
 
 ### 11.2 로직 개편(2026-08-06) 전후 — 표본 단위 `ticker_day`
 
-`signed`는 방향 보정 기대값(매수 +수익률 / 매도 −수익률)이다. `/signal-accuracy`의
-`avg_return_pct`는 방향 보정이 없어 매도가 맞을수록 내려가므로 성능 지표로 읽으면 안 된다.
+`signed`는 방향 보정 기대값(매수 +수익률 / 매도 −수익률)이며, 2026-09-10부터
+`/signal-accuracy`가 이 값을 `avg_signed_return_pct`로 직접 반환한다(§13.3).
+원시값은 `avg_raw_return_pct`로 따로 나온다.
 
 | 구간 | n | 독립 블록 | signed 평균(7일) | signed 중앙값 | 양(+) 비율 |
 |---|---:|---:|---:|---:|---:|
@@ -369,6 +370,9 @@ entry_plan → OrderRequest → TradingSafety.require_all_checks → 모드별 �
 4. win 정의는 7일 수익률이 신호 방향으로 ±2% 이상 움직인 경우다. ±2% 이내는 neutral로
    분리되므로 win_rate는 승률이 아니다.
 5. 53건(`057050.KS`)은 거래 중단으로 평가 불가 — 종결 처리돼 통계에서 빠진다.
+6. 방향 보정 전에는 매도 신호가 맞을수록 지표가 나빠졌다. 수정 후 실측(180일, `ticker_day`):
+   전체 방향보정 **−0.98%** / 원시 −1.13%, 매도만 보면 **방향보정 +0.16%** / 원시 −0.16%로
+   부호가 뒤집힌다 (§13.3).
 
 ### 11.3 데이터 규모
 
@@ -381,7 +385,7 @@ entry_plan → OrderRequest → TradingSafety.require_all_checks → 모드별 �
 
 ## 12. 품질 인프라
 
-- **테스트**: `tests/unit/` 53 파일 / 548 test. LLM·외부 API는 mock(`respx`), 실호출 금지.
+- **테스트**: `tests/unit/` 54 파일 / 557 test. LLM·외부 API는 mock(`respx`), 실호출 금지.
   테스트는 "함수가 무엇을 반환하는가" 층 외에 **리포트 자기 정합성 / 출력 필드 레지스트리 /
   임계값 도달 가능성 / 알림 전송 관측성** 같은 회귀 방지 층이 별도로 있다.
 - **CI**: `.github/workflows/ci.yml` — ruff(bug-class만: F601/F811/F821/F823/E9) +
@@ -448,7 +452,28 @@ entry_plan → OrderRequest → TradingSafety.require_all_checks → 모드별 �
 효과는 §11.1 표에 그대로 있다 — 같은 데이터의 승률이 44.9% → 33.7%로 내려간다.
 회귀 테스트 10건(`tests/unit/test_sample_independence.py`).
 
-### 13.3 구조적 부채 (기존 인식)
+### 13.3 ✅ 수리 완료 (2026-09-10) — 방향 보정
+
+`signal_outcomes.return_7d`는 **가격 변화**다. 매도 신호는 가격이 내려가야 맞은 것인데,
+지표 네 곳이 부호를 그대로 평균하거나 `> 0`으로 적중을 판정하고 있었다. 공통 결과는
+**잘 맞춘 신호가 못 맞춘 것처럼 보이는 것**이다.
+
+| 위치 | 증상 | 수정 |
+|---|---|---|
+| `/signal-accuracy`·WebUI·텔레그램 | `avg_return_pct`가 방향 무시 | `avg_signed_return_pct`(성과) / `avg_raw_return_pct`(진단)로 분리. 모호한 옛 키는 **삭제** — 남겨 두면 계속 잘못 읽힌다 |
+| `llm_calibrator` | `hit = return_7d > 0` → 매도(표본의 44%)를 반대로 라벨링 | 방향 보정 수익률로 판정, neutral은 학습 대상에서 제외 |
+| `ic_ensemble` | IC = corr(conviction, 원시수익률) → 잘 맞추는 매도 소스가 IC 음수 | 방향 보정 수익률과의 상관으로 계산 |
+| `signal_performance_summary` VIEW | `hit_rate_7d = AVG(return_7d > 0)` | 방향별 판정 + `signed_expectancy`/`raw_expectancy` 병기. VIEW는 `IF NOT EXISTS`로 갱신되지 않으므로 `init_db`에서 DROP 후 재생성 |
+
+실측 확인: `scan_agent`의 매도 1,371건 hit_rate가 0.249 → **0.751**로 뒤집혔다.
+
+**부수 발견 — IC 앙상블은 켜진 적이 없다.** `/ic-weights`가 모든 소스를 `weight: 0.0`으로
+보고하고 있었는데, 실제로는 누적 59일 < 최소 60일 요건이라 `compute_ic_weights()`가
+**빈 dict**를 돌려주는 폴백 상태였다. '가중치 0(제외됨)'과 '가중 자체가 꺼짐'은 완전히
+다른 뜻이다. 이제 `active`·`inactive_reason`·`applied_in_decisions`를 함께 반환한다.
+그리고 `apply_ic_weights()`는 **호출부가 없다** — 계산만 되고 판정에 연결돼 있지 않다.
+
+### 13.4 구조적 부채 (기존 인식)
 
 | # | 항목 | 현재 상태 |
 |---|---|---|
@@ -463,7 +488,7 @@ entry_plan → OrderRequest → TradingSafety.require_all_checks → 모드별 �
 | 9 | 백테스트 Composite 전략의 과거 replay 제외 | look-ahead 회피 목적. 도구 신호의 역사적 성능은 미측정 |
 | 10 | 단일 노드 SPOF | testdev가 죽으면 전부 정지. 백업/복구 절차 문서화 없음 |
 
-### 13.4 데이터 품질 위험
+### 13.5 데이터 품질 위험
 
 - OHLCV 캐시는 TTL 메타(`fetched_at`, `latest_bar_date`, `source`)를 갖지만,
   소스 폴백(한국 pykrx→FDR→yfinance, 미국 yfinance→FDR)이 종목별로 다르게 걸릴 수 있어
@@ -527,20 +552,23 @@ DB 직접 SQL 변경, `webui.py` 일괄 분해.
    승률 ±5%p 신뢰구간에는 수백 건이 필요하다. 종목 수를 늘릴지, 기간을 기다릴지,
    평가 horizon을 바꿀지가 선택지다. 부수적으로: 30분 스캔 신호를 `signal_outcomes`에
    전량(하루 48 × 7종목) 적립할 필요가 있는지 — 읽는 쪽에서 어차피 하루 1건으로 접는다.
-2. **성과 평가 프레임 자체** — win 정의(±2% 밴드), horizon(7/14/30일), 벤치마크 부재.
-   `/signal-accuracy`의 `avg_return_pct`는 방향 보정이 없어 매도 신호가 맞을수록 내려간다 —
-   지표 자체가 오해를 부른다. 현재 지표로는 "시장 대비 알파"를 말할 수 없다.
-   7종목·표본 수백 건 규모에서 통계적으로 방어 가능한 평가 설계는 무엇인가.
-3. **24 도구 + 8 에이전트 구성의 정당성** — 도구별·에이전트별 기여도가 측정되지 않은 상태에서
+2. **벤치마크 부재** (방향 보정은 2026-09-10 완료, §13.3) — win 정의(±2% 밴드)와
+   horizon(7/14/30일)이 임의값이고 **시장 대비 초과수익을 계산하지 않는다**.
+   "+0.29%"가 같은 기간 지수 대비 무엇인지 말할 수 없다. 덧붙여 `llm_calibrator`의
+   `ece_after`는 **학습 표본 그대로 계산**해 늘 0에 가깝게 나온다(홀드아웃 없음) —
+   개선폭을 그대로 믿으면 안 된다.
+3. **IC 앙상블을 살릴 것인가, 지울 것인가** — 계산은 되지만 `apply_ic_weights()` 호출부가
+   없어 판정에 반영되지 않는다(§13.3). 소비자 없는 출력은 기능이 있다는 착시만 만든다(§14).
+4. **24 도구 + 8 에이전트 구성의 정당성** — 도구별·에이전트별 기여도가 측정되지 않은 상태에서
    구성 요소가 계속 늘어났다. 어떤 것을 줄여야 하는가. (IC 앙상블은 60일 표본 요건 미충족으로 균등가중 폴백 중)
-4. **정성(LLM) 기여의 역할** — 현재는 정량 기여를 넘지 못하도록 상한이 걸려 있다.
+5. **정성(LLM) 기여의 역할** — 현재는 정량 기여를 넘지 못하도록 상한이 걸려 있다.
    LLM 서술이 신호 품질에 실제로 기여하는지, 아니면 비용·지연만 추가하는지.
-5. **live 전환 게이트 설계** — 무엇을 만족하면 paper→approval→live로 올릴 수 있는가.
+6. **live 전환 게이트 설계** — 무엇을 만족하면 paper→approval→live로 올릴 수 있는가.
    측정은 복구됐지만 게이트 기준("60일 hit-rate")이 어떤 표본·어떤 지표·어떤 하한을
    뜻하는지가 정의돼 있지 않다.
-6. **아키텍처 정리 순서** — `webui.py` 분해 / 이중 호출 경로 단일화 / async 전환 /
+7. **아키텍처 정리 순서** — `webui.py` 분해 / 이중 호출 경로 단일화 / async 전환 /
    구조화 로깅 중 무엇을 먼저 해야 운영 리스크가 가장 빨리 줄어드는가.
-7. **단일 노드 SPOF와 백업** — 현재 복구 절차·데이터 백업 정책이 없다. 개인 운영 규모에서
+8. **단일 노드 SPOF와 백업** — 현재 복구 절차·데이터 백업 정책이 없다. 개인 운영 규모에서
    합리적인 최소 대비는 무엇인가.
 
 ---

@@ -707,6 +707,22 @@ def load_sampled_outcomes(
     return rows, int(raw_total or 0)
 
 
+def signed_return(signal_type: str, ret: float) -> Optional[float]:
+    """방향 보정 수익률 — 매수는 +ret, 매도는 -ret.
+
+    Why: 원시 평균수익률은 **매도 신호가 맞을수록 내려간다**. 그 값을 성과 지표로
+    읽으면 잘 맞춘 구간이 손실처럼 보인다 (2026-09-10: 전체 -0.352%인데 매도 신호는
+    맞고 있었다). 방향이 없는 neutral 은 부호를 붙일 수 없으므로 None — 평균에서
+    제외하고, 제외했다는 사실을 표본 수로 함께 보고한다.
+    """
+    sig = (signal_type or "").lower()
+    if sig == "buy":
+        return ret
+    if sig == "sell":
+        return -ret
+    return None
+
+
 def _outcome_of(signal_type: str, ret: float) -> str:
     threshold = OUTCOME_THRESHOLD_PCT / 100.0
     sig = (signal_type or "").lower()
@@ -721,14 +737,23 @@ def _tally(rows: List) -> Dict:
     total = len(rows)
     wins = sum(1 for r in rows if _outcome_of(r["signal_type"], r["ret"]) == "win")
     losses = sum(1 for r in rows if _outcome_of(r["signal_type"], r["ret"]) == "loss")
-    avg = (sum(r["ret"] for r in rows) / total * 100.0) if total else 0.0
+    raw_avg = (sum(r["ret"] for r in rows) / total * 100.0) if total else 0.0
+    signed = [
+        v
+        for v in (signed_return(r["signal_type"], r["ret"]) for r in rows)
+        if v is not None
+    ]
+    signed_avg = (sum(signed) / len(signed) * 100.0) if signed else 0.0
     return {
         "total": total,
         "wins": wins,
         "losses": losses,
         "neutrals": total - wins - losses,
         "win_rate_pct": round((wins / total * 100) if total else 0, 1),
-        "avg_return_pct": round(avg, 3),
+        # 성과 지표는 방향 보정본이다. 원시값은 진단용으로만 함께 낸다.
+        "avg_signed_return_pct": round(signed_avg, 3),
+        "avg_raw_return_pct": round(raw_avg, 3),
+        "signed_sample": len(signed),
     }
 
 
@@ -751,7 +776,9 @@ def get_accuracy_stats(
       "total_evaluated": int,           # 표본화 후
       "win_count": int, "loss_count": int, "neutral_count": int,
       "win_rate_pct": float, "win_rate_ci95": [lo, hi],
-      "avg_return_pct": float,
+      "avg_signed_return_pct": float,   # 매수 +ret / 매도 -ret (성과 지표)
+      "avg_raw_return_pct": float,      # 부호 그대로 (진단용)
+      "signed_sample": int,             # 방향이 있는 신호 수 (neutral 제외)
       "by_signal": {...}, "by_confidence_band": [...], "by_source": {...},
       "sample_size": int,
       "independent_blocks": int,        # horizon 겹침까지 제거한 수
@@ -807,7 +834,9 @@ def get_accuracy_stats(
             "total": t["total"],
             "wins": t["wins"],
             "win_rate_pct": t["win_rate_pct"],
-            "avg_return_pct": t["avg_return_pct"],
+            "avg_signed_return_pct": t["avg_signed_return_pct"],
+            "avg_raw_return_pct": t["avg_raw_return_pct"],
+            "signed_sample": t["signed_sample"],
         }
 
     # 신뢰도 구간별 (종전과 동일하게 min_confidence·signal 필터를 적용하지 않는다)
@@ -820,7 +849,8 @@ def get_accuracy_stats(
                 "total": t["total"],
                 "wins": t["wins"],
                 "win_rate_pct": t["win_rate_pct"],
-                "avg_return_pct": t["avg_return_pct"],
+                "avg_signed_return_pct": t["avg_signed_return_pct"],
+                "avg_raw_return_pct": t["avg_raw_return_pct"],
             }
         )
 
@@ -833,7 +863,9 @@ def get_accuracy_stats(
             "total": t["total"],
             "wins": t["wins"],
             "win_rate_pct": t["win_rate_pct"],
-            "avg_return_pct": t["avg_return_pct"],
+            "avg_signed_return_pct": t["avg_signed_return_pct"],
+            "avg_raw_return_pct": t["avg_raw_return_pct"],
+            "signed_sample": t["signed_sample"],
         }
     by_source = dict(
         sorted(by_source.items(), key=lambda kv: kv[1]["total"], reverse=True)
@@ -856,7 +888,11 @@ def get_accuracy_stats(
         "neutral_count": overall["neutrals"],
         "win_rate_pct": overall["win_rate_pct"],
         "win_rate_ci95": ci,
-        "avg_return_pct": overall["avg_return_pct"],
+        # `avg_return_pct` 는 없앴다 — 방향 보정이 없어 매도가 맞을수록 내려가는
+        # 값이었고, 이름만 봐서는 그 사실을 알 수 없었다. 이름을 갈라 둘 다 낸다.
+        "avg_signed_return_pct": overall["avg_signed_return_pct"],
+        "avg_raw_return_pct": overall["avg_raw_return_pct"],
+        "signed_sample": overall["signed_sample"],
         "by_signal": by_signal,
         "by_confidence_band": bands,
         "by_source": by_source,
@@ -1028,7 +1064,11 @@ if __name__ == "__main__":
     print("\n2) 7일 horizon 정확도 통계...")
     acc = get_accuracy_stats(horizon=7, days_back=180)
     print(f"  총 평가: {acc['total_evaluated']}건")
-    print(f"  승률: {acc['win_rate_pct']}% (평균 수익 {acc['avg_return_pct']}%)")
+    print(
+        f"  승률: {acc['win_rate_pct']}% "
+        f"(방향보정 기대값 {acc['avg_signed_return_pct']}%, "
+        f"원시 {acc['avg_raw_return_pct']}%)"
+    )
     for sig, s in acc["by_signal"].items():
         if s["total"]:
             print(f"    {sig}: {s['win_rate_pct']}% (n={s['total']})")

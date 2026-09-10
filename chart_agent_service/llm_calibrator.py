@@ -68,7 +68,7 @@ class LLMCalibrator:
             # 실제보다 좋게 나온다 (2026-09-10 표본 독립성 진단).
             df = pd.read_sql_query(
                 """WITH ranked AS (
-                       SELECT conviction, return_7d,
+                       SELECT conviction, return_7d, signal_type,
                               ROW_NUMBER() OVER (
                                   PARTITION BY ticker, signal_source,
                                                substr(issued_at, 1, 10)
@@ -80,7 +80,7 @@ class LLMCalibrator:
                          AND conviction IS NOT NULL
                          AND issued_at >= ?
                    )
-                   SELECT conviction, return_7d FROM ranked WHERE rn = 1""",
+                   SELECT conviction, return_7d, signal_type FROM ranked WHERE rn = 1""",
                 conn,
                 params=(cutoff,),
             )
@@ -90,7 +90,17 @@ class LLMCalibrator:
         finally:
             conn.close()
         if not df.empty:
-            df["hit"] = (df["return_7d"] > 0).astype(float)
+            # hit 을 `return_7d > 0` 으로 두면 **매도 신호는 맞을 때마다 오답**으로
+            # 라벨링된다. 표본의 약 44%가 매도라 isotonic 이 반대 방향으로 학습됐다
+            # (2026-09-10 방향 보정 감사). 방향 보정 수익률로 판정한다.
+            from signal_tracker import signed_return
+
+            signed = df.apply(
+                lambda r: signed_return(r.get("signal_type"), r["return_7d"]), axis=1
+            )
+            # 방향이 없는 neutral 은 학습 대상이 아니다 (부호를 붙일 수 없다).
+            df = df.assign(signed_return=signed).dropna(subset=["signed_return"])
+            df["hit"] = (df["signed_return"] > 0).astype(float)
         return df
 
     # ── ECE 계산 ──────────────────────────────────────────────────────
