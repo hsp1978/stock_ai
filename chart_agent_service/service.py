@@ -3175,10 +3175,20 @@ def api_signal_accuracy(horizon: int = 7, min_confidence: float = 0.0,
 
 
 @app.post("/signal-accuracy/evaluate")
-def api_signal_evaluate(days_back: int | None = None, limit: int | None = None):
-    """과거 신호에 대한 실제 결과 평가를 수동 실행 (미지정 시 config 기본값)."""
+def api_signal_evaluate(
+    days_back: int | None = None,
+    limit: int | None = None,
+    reset_unresolved: bool = False,
+):
+    """과거 신호에 대한 실제 결과 평가를 수동 실행 (미지정 시 config 기본값).
+
+    reset_unresolved=true 는 시세 없음으로 종결된 행을 다시 대기로 돌린다 —
+    데이터 소스를 바꾼 뒤 한 번 돌리는 용도.
+    """
     from signal_tracker import run_daily_validation
-    result = run_daily_validation(days_back=days_back, limit=limit)
+    result = run_daily_validation(
+        days_back=days_back, limit=limit, reset_unresolved=reset_unresolved
+    )
     backlog = _signal_eval_backlog_status(result.get("evaluation", {}) or {})
     payload = {
         "status": "degraded" if backlog["degraded"] else "completed",

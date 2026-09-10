@@ -335,3 +335,80 @@ def test_total_price_source_outage_still_degrades():
     )
     assert status["degraded"] is True
     assert "전면 실패" in status["detail"]
+
+
+def test_evaluation_uses_configured_data_source_chain(signal_db, monkeypatch):
+    """평가가 yfinance 를 직접 부르지 않고 data_collector 체인을 탄다."""
+    import sys
+    import types
+
+    calls = []
+
+    fake = types.ModuleType("data_collector")
+
+    def fake_fetch_ohlcv(ticker, period="1y"):
+        calls.append((ticker, period))
+        return _frame()
+
+    fake.fetch_ohlcv = fake_fetch_ohlcv
+    monkeypatch.setitem(sys.modules, "data_collector", fake)
+
+    _insert(signal_db, "row-1", days_ago=20, ticker="057050.KS")
+
+    with patch("signal_tracker._get_conn", lambda: _conn_for(signal_db)):
+        import signal_tracker
+
+        signal_tracker.clear_price_history_cache()
+        stats = signal_tracker.evaluate_past_signals(days_back=90, limit=10)
+
+    assert stats["updated"] == 1
+    assert [t for t, _ in calls] == ["057050.KS"]
+    assert calls[0][1] in {"3mo", "6mo", "1y", "2y", "5y"}
+
+
+def test_period_covers_the_oldest_target_not_just_the_span():
+    """period 는 오늘 기준 과거 구간이라, target 폭이 아니라 '며칠 전'으로 잡아야 한다."""
+    from signal_tracker import _period_for_lookback
+
+    approx_days = {"3mo": 92, "6mo": 183, "1y": 365, "2y": 730, "5y": 1825}
+    for lookback in (7, 20, 45, 89, 90, 120, 300, 700, 900):
+        period = _period_for_lookback(lookback)
+        assert approx_days[period] >= lookback, (lookback, period)
+    # 창 상한(90일) 근처를 3mo(≈92일) 경계에 맡기지 않는다
+    assert _period_for_lookback(89) != "3mo"
+
+
+def test_reset_unresolved_gives_closed_rows_another_chance(signal_db):
+    """소스를 바꾼 뒤 종결분을 다시 큐에 넣는 운영 스위치."""
+    _insert(signal_db, "closed", days_ago=60, ticker="GHOST", eval_state="unresolved")
+
+    with (
+        patch("signal_tracker._get_conn", lambda: _conn_for(signal_db)),
+        patch("signal_tracker._fetch_history", side_effect=lambda *a, **k: _frame()),
+    ):
+        import signal_tracker
+
+        signal_tracker.clear_price_history_cache()
+        stats = signal_tracker.evaluate_past_signals(
+            days_back=90, limit=10, reset_unresolved=True
+        )
+
+    assert stats["reset_unresolved"] == 1
+    assert stats["updated"] == 1
+    assert stats["unresolved_total"] == 0
+
+
+def test_duplicate_env_keys_are_reported_by_key_name_only(tmp_path):
+    """중복 키는 이름만 보고한다 — 값이 로그에 새면 안 된다."""
+    from config import find_duplicate_env_keys
+
+    env = tmp_path / ".env"
+    env.write_text(
+        "DATA_SOURCE=yfinance\n# comment\nGEMINI_API_KEY=secret\nDATA_SOURCE=toss\n",
+        encoding="utf-8",
+    )
+    dupes = find_duplicate_env_keys(env)
+
+    assert dupes == ["DATA_SOURCE"]
+    assert all("toss" not in d and "secret" not in d for d in dupes)
+    assert find_duplicate_env_keys(tmp_path / "missing.env") == []

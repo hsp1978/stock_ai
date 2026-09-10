@@ -126,10 +126,46 @@ def _window_bounds(target_date: datetime) -> Tuple[datetime, datetime]:
     )
 
 
-def _fetch_history(ticker: str, start: datetime, end: datetime):
-    import yfinance as yf
+# data_collector 의 period 는 **오늘 기준 과거 구간**이다. 따라서 필요한 것은
+# target 들의 폭(span)이 아니라 **가장 오래된 target 이 며칠 전인지**다.
+# span 으로 잡으면 85일 전에 몰린 배치가 "3mo"(≈92일)로 요청돼 경계에서 샌다.
+_PERIOD_BY_LOOKBACK = ((25, "3mo"), (80, "6mo"), (280, "1y"), (550, "2y"))
 
-    return yf.Ticker(ticker).history(start=start.date(), end=end.date())
+
+def _period_for_lookback(lookback_days: float) -> str:
+    """lookback_days 만큼의 과거를 여유 있게 덮는 period 문자열."""
+    for limit, period in _PERIOD_BY_LOOKBACK:
+        if lookback_days <= limit:
+            return period
+    return "5y"
+
+
+def _fetch_history(ticker: str, start: datetime, end: datetime):
+    """구간을 덮는 OHLCV — 설정된 데이터 소스 체인을 그대로 쓴다.
+
+    Why: 사후 평가만 yfinance 를 직접 호출하고 있었다. 시스템의 다른 모든 경로는
+    `data_collector`(설정 소스 → 한국 pykrx/FDR/yfinance → 미국 yfinance/FDR)를
+    타는데, 평가만 우회한 탓에 Toss·pykrx 로는 받아지는 종목이 여기서만 404 로
+    죽었다 (`057050.KS` 53건 종결, 2026-09-10). 소스가 갈리면 평가에 쓰는 가격이
+    시스템이 실제로 본 가격과 달라질 수 있다는 문제도 함께 남는다.
+
+    yfinance 직접 호출은 data_collector 를 import 할 수 없는 환경의 폴백으로만 남긴다.
+    """
+    lookback_days = (
+        max((datetime.now(timezone.utc) - start).days, (end - start).days, 0)
+        + _PRICE_WINDOW_BEFORE_DAYS
+    )
+    try:
+        from data_collector import fetch_ohlcv
+    except Exception:
+        import yfinance as yf
+
+        return yf.Ticker(ticker).history(start=start.date(), end=end.date())
+
+    frame = fetch_ohlcv(ticker, period=_period_for_lookback(lookback_days))
+    if frame is None or frame.empty or "Close" not in frame.columns:
+        return None
+    return frame
 
 
 def _slice_window(frame, target_date: datetime):
@@ -383,8 +419,25 @@ def _as_utc(value) -> Optional[datetime]:
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
 
 
+def _reset_unresolved(conn, now: datetime, days_back: int) -> int:
+    """창 안의 종결(unresolved) 행을 다시 대기로 돌린다.
+
+    데이터 소스가 바뀐 뒤(예: 평가 경로를 data_collector 로 통일) 한 번 돌려주면
+    종전 소스로만 실패했던 행이 재시도된다. 여전히 시세가 없으면 다시 종결된다.
+    """
+    cutoff = (now - timedelta(days=days_back)).isoformat()
+    cur = conn.execute(
+        "UPDATE signal_outcomes SET eval_state=NULL "
+        "WHERE eval_state=? AND issued_at >= ?",
+        (_STATE_UNRESOLVED, cutoff),
+    )
+    return cur.rowcount or 0
+
+
 def evaluate_past_signals(
-    days_back: Optional[int] = None, limit: Optional[int] = None
+    days_back: Optional[int] = None,
+    limit: Optional[int] = None,
+    reset_unresolved: bool = False,
 ) -> Dict:
     """
     과거 signal_outcomes 레코드를 순회하여 실제 수익률을 갱신.
@@ -408,6 +461,7 @@ def evaluate_past_signals(
     params = _due_params(now, days_back)
 
     conn = _get_conn()
+    reset_count = _reset_unresolved(conn, now, days_back) if reset_unresolved else 0
     rows = conn.execute(
         f"""
         SELECT signal_id, ticker, signal_type, signal_source,
@@ -546,6 +600,7 @@ def evaluate_past_signals(
         "completed_by_horizon": completed_by_horizon,
         "already_complete_by_horizon": already_complete_by_horizon,
         "candidates": len(rows),
+        "reset_unresolved": reset_count,
         "days_back": days_back,
         "limit": limit,
         "prefetch": prefetch,
@@ -841,13 +896,16 @@ def run_daily_validation(
     days_back: Optional[int] = None,
     limit: Optional[int] = None,
     refit_calibrator: bool = True,
+    reset_unresolved: bool = False,
 ) -> Dict:
     """
     일일 실행: 과거 신호 평가 + 칼리브레이터 재학습.
 
     Returns: 처리 통계 + 칼리브레이터 상태
     """
-    eval_stats = evaluate_past_signals(days_back=days_back, limit=limit)
+    eval_stats = evaluate_past_signals(
+        days_back=days_back, limit=limit, reset_unresolved=reset_unresolved
+    )
 
     calibrator_status = None
     if refit_calibrator:

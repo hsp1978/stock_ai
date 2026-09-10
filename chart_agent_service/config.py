@@ -16,6 +16,39 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ROOT_ENV = _PROJECT_ROOT / ".env"
 
 
+def find_duplicate_env_keys(path: Path) -> list[str]:
+    """.env에 두 번 이상 선언된 키 목록.
+
+    dotenv는 뒤에 온 선언을 채택한다. 파일을 위에서 읽은 사람과 실효값이 갈리고,
+    그 차이는 조용하다 — `DATA_SOURCE`가 `yfinance` → `toss`로 두 번 선언돼 있어
+    문서·주석은 yfinance인데 시스템은 toss로 돌던 사례가 있다 (2026-09-10).
+
+    값은 절대 반환·출력하지 않는다 (키 이름만).
+    """
+    if not path.exists():
+        return []
+    seen: dict[str, int] = {}
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key = line.split("=", 1)[0].strip()
+            if key:
+                seen[key] = seen.get(key, 0) + 1
+    except OSError:
+        return []
+    return sorted(k for k, n in seen.items() if n > 1)
+
+
+_DUPLICATE_ENV_KEYS = find_duplicate_env_keys(_ROOT_ENV)
+if _DUPLICATE_ENV_KEYS:
+    print(
+        "[config] 경고 — .env에 중복 선언된 키가 있습니다 (뒤 선언이 실효값): "
+        + ", ".join(_DUPLICATE_ENV_KEYS)
+    )
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(_ROOT_ENV),
