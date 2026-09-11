@@ -15,6 +15,17 @@ from datetime import datetime
 from signal_normalizer import SignalNormalizer, normalize_signal
 
 
+def _as_float(value: Any) -> Optional[float]:
+    """yfinance info 값은 None·문자열·NaN이 섞여 온다. 숫자만 통과시킨다."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if num != num else num  # NaN 제외
+
+
 class EnhancedDecisionMaker:
     """개선된 의사결정자 - 점수와 신호 강도를 정확히 분석"""
 
@@ -87,6 +98,18 @@ class EnhancedDecisionMaker:
     # (실적은 가격 갭을 만들고 손절이 성립하지 않는다).
     EARNINGS_BLACKOUT_DAYS = 3
 
+    # 적자 + EBITDA 마이너스 조합은 방향 판단과 무관하게 매수 부적격으로 본다.
+    # 근거(2026-09 사후검증): SKAI(EPS -438, EBITDA 마진 -28.1%)가 스크리너 A등급
+    # 1순위로 올라온 뒤 고점 대비 -60%. 적자 기업의 급등은 CB 발행·희석과 같은
+    # 주기를 타므로, 기술적 점수만으로 진입하면 안 된다.
+    EBITDA_MARGIN_FLOOR = -0.10
+
+    # 순현금(현금성자산 - 총부채)이 시가총액의 이 비율을 넘으면 deep value 플래그.
+    # 근거: 삼영무역(002810)은 순금융자산 > 시가총액이었고 +31% 리레이팅이 났으나
+    # 시스템에 해당 지표가 없어 인식조차 하지 못했다. 점수는 바꾸지 않고
+    # 플래그·근거만 남긴다 (가중치 조정은 표본 축적 후 별건).
+    DEEP_VALUE_NET_CASH_RATIO = 0.8
+
     def _min_risk_reward(self, agent_results) -> Optional[float]:
         """에이전트 evidence에서 지지/저항 기준 R/R 최솟값을 뽑는다.
 
@@ -158,6 +181,38 @@ class EnhancedDecisionMaker:
                 if isinstance(decision.get(key), (int, float)):
                     decision[key] = min(float(decision[key]), 5.0)
         return decision
+
+    def _apply_valuation_gate(
+        self, final_decision: Dict, fundamental_risks: Optional[Dict]
+    ) -> Dict:
+        """펀더멘털 critical risk 가 있으면 매수를 관망으로 강등한다.
+
+        종전에는 P/E·Beta·적자 경고가 `warnings`/`critical_risks` 문자열로만 남고
+        신호를 막지 못했다. 2026-09 사후검증에서 이 구조가 두 번 손실로 이어졌다:
+        PLTR(P/E 225, Beta 2.09 → "특별한 리스크 없음" → -26%),
+        SKAI(EPS -438, EBITDA -28.1% → 스크리너 1순위 → 고점 대비 -60%).
+
+        R/R 게이트와 같은 규약을 따른다 — 강등 사유를 conflicts·risks 에 싣고
+        execution_ready 를 내린다.
+        """
+        risks = (fundamental_risks or {}).get("critical_risks") or []
+        if not risks:
+            return final_decision
+
+        detail = "; ".join(risks[:3])
+        final_decision["signal"] = "neutral"
+        final_decision["confidence"] = min(float(final_decision.get("confidence") or 0), 3.0)
+        final_decision["execution_ready"] = False
+        msg = f"펀더멘털 게이트 — 매수 부적격: {detail}"
+        prev = final_decision.get("conflicts")
+        final_decision["conflicts"] = (
+            f"{prev}, {msg}" if prev and prev != "없음" else msg
+        )
+        existing = final_decision.get("risks") or []
+        if existing == ["특별한 리스크 없음"]:
+            existing = []
+        final_decision["risks"] = existing + [r for r in risks if r not in existing]
+        return final_decision
 
     def _apply_risk_reward_gate(self, final_decision: Dict, rr: Optional[float]) -> Dict:
         """R/R 하한 미달이면 매수를 관망으로 강등한다.
@@ -479,7 +534,15 @@ class EnhancedDecisionMaker:
         for risk in agent_risks:
             if risk not in merged_risks:
                 merged_risks.append(risk)
-        final_decision["risks"] = merged_risks if merged_risks else ["특별한 리스크 없음"]
+        if not merged_risks:
+            # 데이터를 못 받아서 리스크가 비어 있는 것과, 실제로 리스크가 없는 것을
+            # 같은 문장으로 쓰면 안 된다. PLTR(P/E 225)이 "특별한 리스크 없음"으로
+            # 나간 사례가 이 구분 부재에서 나왔다.
+            if (fundamental_risks or {}).get("data_available") is False:
+                merged_risks = ["펀더멘털 데이터 부재 — 리스크 평가 불완전"]
+            else:
+                merged_risks = ["특별한 리스크 없음"]
+        final_decision["risks"] = merged_risks
 
         # 6.6. [켈리 게이트] 켈리 비중 음수(통계적 엣지 없음)인데 buy면 신뢰도 상한 적용
         kelly_no_bet = any("켈리" in r and ("음수" in r or "엣지 부족" in r) for r in agent_risks)
@@ -501,6 +564,12 @@ class EnhancedDecisionMaker:
         )
         if rr_blocked:
             final_decision = self._apply_risk_reward_gate(final_decision, min_rr)
+
+        # 6.72. [펀더멘털 게이트] P/E 극단·적자+EBITDA 마이너스·극단 Beta 등
+        # critical risk 가 있으면 방향 판단과 무관하게 매수 부적격이다.
+        # 경고 문자열만으로는 신호가 그대로 나간다 (R/R 게이트와 같은 교훈).
+        if final_decision["signal"] == "buy":
+            final_decision = self._apply_valuation_gate(final_decision, fundamental_risks)
 
         # 6.75. [실적 블랙아웃] 발표 직전에는 갭 때문에 손절가가 성립하지 않는다.
         days_to_earnings = (fundamental_risks or {}).get("days_to_earnings")
@@ -666,6 +735,7 @@ class EnhancedDecisionMaker:
                 "pe_trailing": None,
                 "pe_forward": None,
                 "week52_decline": None,
+                "data_available": False,
                 "warnings": ["Invalid ticker for fundamental check"],
                 "critical_risks": []
             }
@@ -681,6 +751,7 @@ class EnhancedDecisionMaker:
                     "pe_trailing": None,
                     "pe_forward": None,
                     "week52_decline": None,
+                    "data_available": False,
                     "warnings": [f"Fundamental 데이터 없음: {ticker}"],
                     "critical_risks": []
                 }
@@ -800,10 +871,44 @@ class EnhancedDecisionMaker:
             elif days_since_earnings is not None and days_since_earnings <= 7:
                 warnings.append(f"실적 발표 {days_since_earnings:.0f}일 경과")
 
+            # ── 적자 + EBITDA 마이너스 (투기 등급) ──────────────────────
+            eps = _as_float(info.get("trailingEps"))
+            ebitda_margin = _as_float(info.get("ebitdaMargins"))
+            if (
+                eps is not None
+                and eps < 0
+                and ebitda_margin is not None
+                and ebitda_margin < self.EBITDA_MARGIN_FLOOR
+            ):
+                critical_risks.append(
+                    f"EPS {eps:.2f} 적자 + EBITDA 마진 {ebitda_margin:.1%} — 투기 등급"
+                )
+
+            # ── 순현금 > 시총 (deep value) ───────────────────────────────
+            net_cash_ratio = None
+            market_cap = _as_float(info.get("marketCap"))
+            total_cash = _as_float(info.get("totalCash"))
+            total_debt = _as_float(info.get("totalDebt")) or 0.0
+            if market_cap and market_cap > 0 and total_cash is not None:
+                net_cash_ratio = (total_cash - total_debt) / market_cap
+                if net_cash_ratio > self.DEEP_VALUE_NET_CASH_RATIO:
+                    warnings.append(
+                        f"순현금이 시가총액의 {net_cash_ratio:.0%} — EV 실질 마이너스 "
+                        "(deep value 후보)"
+                    )
+
             return {
                 "beta": beta,
                 "pe_trailing": pe_trailing,
                 "pe_forward": pe_forward,
+                "eps": eps,
+                "ebitda_margin": ebitda_margin,
+                "net_cash_ratio": net_cash_ratio,
+                "deep_value": bool(
+                    net_cash_ratio is not None
+                    and net_cash_ratio > self.DEEP_VALUE_NET_CASH_RATIO
+                ),
+                "data_available": True,
                 "week52_decline": decline_pct if 'decline_pct' in locals() else None,
                 "days_to_earnings": days_to_earnings,
                 "days_since_earnings": days_since_earnings,
@@ -819,6 +924,7 @@ class EnhancedDecisionMaker:
                 "week52_decline": None,
                 "days_to_earnings": None,
                 "days_since_earnings": None,
+                "data_available": False,
                 "warnings": ["Fundamental 데이터 수집 실패"],
                 "critical_risks": []
             }
