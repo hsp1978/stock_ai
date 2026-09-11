@@ -668,7 +668,7 @@ def engine_system_monitor() -> dict:
         from signal_tracker import get_accuracy_stats, get_calibrator
 
         signal_status = {
-            "accuracy_7d": get_accuracy_stats(horizon=7, days_back=180),
+            "accuracy_primary": get_accuracy_stats(days_back=180),
             "calibrator": get_calibrator().status(),
             "last_validation": get_app_state("service.signal_validation.last_result", {"status": "never_run"}),
         }
@@ -1514,7 +1514,7 @@ def engine_rebalance_history(limit: int = 10) -> dict:
 
 
 def engine_signal_accuracy(
-    horizon: int = 7,
+    horizon: int | None = None,
     min_confidence: float = 0.0,
     signal: Optional[str] = None,
     days_back: int = 180,

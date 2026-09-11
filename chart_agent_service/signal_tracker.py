@@ -24,6 +24,31 @@ from db import _get_conn
 # 평가 horizon (영업일 기준 근사: 7/14/30 캘린더 일)
 HORIZONS = [7, 14, 30]
 
+
+def expected_holding_days() -> int:
+    """설정된 매매 스타일의 의도 보유기간 (config 단일 출처)."""
+    try:
+        from config import EXPECTED_HOLDING_DAYS
+
+        return int(EXPECTED_HOLDING_DAYS)
+    except Exception:
+        return 10  # swing 기본값
+
+
+def primary_horizon_days(holding_days: Optional[int] = None) -> int:
+    """대표 평가 horizon — 의도 보유기간을 덮는 가장 짧은 horizon.
+
+    Why: 평가 horizon 7일이 하드코딩돼 있었는데 스윙 스타일의 의도 보유기간은
+    10일이다. 10일 보유를 의도한 신호를 7일에 채점하면 **무엇을 재는지 알 수 없다**
+    (2026-09 진단). longterm(60일)은 30일 horizon 으로도 못 덮으므로 가장 긴
+    horizon 을 쓰되 그 사실을 stats 에서 드러낸다.
+    """
+    target = holding_days if holding_days is not None else expected_holding_days()
+    for h in sorted(HORIZONS):
+        if h >= target:
+            return h
+    return max(HORIZONS)
+
 # outcome 판정 threshold (±%)
 OUTCOME_THRESHOLD_PCT = 2.0
 
@@ -857,7 +882,7 @@ def _tally(rows: List) -> Dict:
 
 
 def get_accuracy_stats(
-    horizon: int = 7,
+    horizon: Optional[int] = None,
     min_confidence: float = 0.0,
     signal: Optional[str] = None,
     days_back: int = 180,
@@ -884,8 +909,10 @@ def get_accuracy_stats(
       "sampling": {...},                # 표본화 진단
     }
     """
+    if horizon is None:
+        horizon = primary_horizon_days()
     if horizon not in HORIZONS:
-        horizon = 7
+        horizon = primary_horizon_days()
     if dedupe not in SAMPLE_MODES:
         dedupe = DEFAULT_SAMPLE_MODE
 
@@ -981,8 +1008,14 @@ def get_accuracy_stats(
         else 0.0
     )
 
+    holding = expected_holding_days()
     return {
         "horizon_days": horizon,
+        # 이 horizon 이 '의도한 보유기간'을 덮는지 명시한다. 덮지 못하면 그 지표는
+        # 보유 도중의 중간 성과일 뿐이다.
+        "expected_holding_days": holding,
+        "horizon_covers_holding": horizon >= holding,
+        "primary_horizon_days": primary_horizon_days(holding),
         "min_confidence_filter": min_confidence,
         "days_back": days_back,
         "total_evaluated": overall["total"],
@@ -1041,7 +1074,8 @@ class ConfidenceCalibrator:
     # 보정 데이터를 축적하는 최소 표본 (이 이하면 raw 그대로 반환)
     MIN_SAMPLE_SIZE = 50
 
-    def __init__(self, horizon: int = 7):
+    def __init__(self, horizon: Optional[int] = None):
+        horizon = horizon if horizon is not None else primary_horizon_days()
         self.horizon = horizon
         # band 구간별 실제 win_rate (0-1 스케일)
         # 예: {"buy": {(6,8): 0.62, (8,10): 0.71}, ...}
@@ -1119,7 +1153,7 @@ class ConfidenceCalibrator:
 _global_calibrator: Optional[ConfidenceCalibrator] = None
 
 
-def get_calibrator(horizon: int = 7) -> ConfidenceCalibrator:
+def get_calibrator(horizon: Optional[int] = None) -> ConfidenceCalibrator:
     global _global_calibrator
     if _global_calibrator is None or _global_calibrator.horizon != horizon:
         _global_calibrator = ConfidenceCalibrator(horizon=horizon)
@@ -1168,7 +1202,7 @@ if __name__ == "__main__":
     print(f"  엔트리가 없음: {stats['skipped_no_entry']}, 에러: {stats['errors']}")
 
     print("\n2) 7일 horizon 정확도 통계...")
-    acc = get_accuracy_stats(horizon=7, days_back=180)
+    acc = get_accuracy_stats(days_back=180)
     print(f"  총 평가: {acc['total_evaluated']}건")
     print(
         f"  승률: {acc['win_rate_pct']}% "

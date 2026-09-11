@@ -28,7 +28,7 @@
 | ML | 5모델 앙상블 (RF/GBM/LightGBM/XGBoost/LSTM) + SHAP + Optuna + Walk-Forward |
 | 코드 규모 | 프로덕션 Python 53,834 라인 / 최대 파일 `webui.py` 6,379 라인 |
 | API | FastAPI 엔드포인트 83개 (`chart_agent_service/service.py`, 3,192 라인) |
-| 테스트 | 61 파일 / 639 test, CI(GitHub Actions) 최근 실행 전부 success |
+| 테스트 | 62 파일 / 649 test, CI(GitHub Actions) 최근 실행 전부 success |
 | 데이터 축적 | `scan_log` 69,341행 (2026-04-14~), `signal_outcomes` 5,018행 — 평가 완료 4,272 / 종결 53 / 대기 0 |
 | 이미지 | agent-api 8.0GB / webui 1.97GB |
 
@@ -391,6 +391,23 @@ entry_plan → OrderRequest → TradingSafety.require_all_checks → 모드별 �
    전체 방향보정 **−0.98%** / 원시 −1.13%, 매도만 보면 **방향보정 +0.16%** / 원시 −0.16%로
    부호가 뒤집힌다 (§13.3).
 
+### 11.2c 평가 기간 정합 (2026-09-11)
+
+대표 평가 horizon 은 이제 매매 스타일의 **의도 보유기간**에서 파생된다 (§13.5).
+현재 `swing` = 보유 10일 → 대표 horizon **14일**. 종전 7일 하드코딩은 보유 도중의
+중간 성과를 재고 있었다.
+
+| horizon | 구간 | n | 블록 | 절대 | 시장 대비 | 상회율 |
+|---|---|---:|---:|---:|---:|---:|
+| 7일 (종전 기본) | 전체 180일 | 1,232 | 385 | −0.98% | −0.85% | 51.7% |
+| **14일 (현 기본)** | 전체 180일 | 1,141 | 230 | **−2.57%** | **−2.31%** | — |
+| 7일 | 신 로직, scan 제외 | 221 | 107 | +0.23% | +0.41% | 53.4% |
+| **14일** | 신 로직, scan 제외 | 172 | 67 | **+0.77%** | **+0.91%** | 58.1% |
+
+방향이 갈린다 — 전체 창(급락장 포함)은 14일에서 더 나쁘고, 신 로직 구간은 더 좋다.
+**독립 블록이 107 → 67로 줄어드는 것이 더 중요한 사실이다**: horizon 을 늘리면
+관측 구간이 겹쳐 유효 표본이 줄어든다. 어느 쪽이든 우위를 주장할 크기가 아니다.
+
 ### 11.3 데이터 규모
 
 | 항목 | 값 |
@@ -402,7 +419,7 @@ entry_plan → OrderRequest → TradingSafety.require_all_checks → 모드별 �
 
 ## 12. 품질 인프라
 
-- **테스트**: `tests/unit/` 61 파일 / 639 test. LLM·외부 API는 mock(`respx`), 실호출 금지.
+- **테스트**: `tests/unit/` 62 파일 / 649 test. LLM·외부 API는 mock(`respx`), 실호출 금지.
   테스트는 "함수가 무엇을 반환하는가" 층 외에 **리포트 자기 정합성 / 출력 필드 레지스트리 /
   임계값 도달 가능성 / 알림 전송 관측성** 같은 회귀 방지 층이 별도로 있다.
 - **CI**: `.github/workflows/ci.yml` — ruff(bug-class만: F601/F811/F821/F823/E9) +
@@ -508,7 +525,22 @@ entry_plan → OrderRequest → TradingSafety.require_all_checks → 모드별 �
 보정은 실제로 효과가 있다 — 다만 오차가 사라지는 게 아니라 절반 정도 남는다.
 종전 수치는 그 사실을 숨기고 있었다 (train 862 / holdout 370).
 
-### 13.5 구조적 부채 (기존 인식)
+### 13.5 ✅ 완료 (2026-09-11) — 평가 기간 ↔ 보유기간 정합
+
+보유기간이 세 곳에 흩어져 있었다: `entry_plan._HOLDING_DAYS_BY_STYLE`(2/10/60),
+`signal_tracker.HORIZONS`(7/14/30, 기본 7 하드코딩), `decision_context`(기본 7).
+스윙 10일 보유를 의도한 신호를 7일에 채점하고 있었다.
+
+- 단일 출처를 `config._STYLE_PRESETS[...]["holding_days"]` 로 통일. `entry_plan` 이
+  이 값을 읽는다.
+- `primary_horizon_days()` — 의도 보유기간을 **덮는 가장 짧은** horizon (10일 → 14일).
+- `/signal-accuracy` 기본 horizon, `decision_context.default_horizon_days()`,
+  `ConfidenceCalibrator` 기본값이 모두 이 값을 쓴다. `DECISION_HORIZON_DAYS` 는 유지.
+- `horizon_covers_holding` 을 응답에 실어, 덮지 못하는 조합(longterm 60일)을
+  **조용히 넘기지 않는다**. WebUI 는 그 경우 경고를 띄운다.
+- `/signal-accuracy/horizon` 신설 — 스타일·보유기간·대표 horizon 정합 상태.
+
+### 13.6 구조적 부채 (기존 인식)
 
 | # | 항목 | 현재 상태 |
 |---|---|---|
@@ -523,7 +555,7 @@ entry_plan → OrderRequest → TradingSafety.require_all_checks → 모드별 �
 | 9 | 백테스트 Composite 전략의 과거 replay 제외 | look-ahead 회피 목적. 도구 신호의 역사적 성능은 미측정 |
 | 10 | 단일 노드 SPOF | testdev가 죽으면 전부 정지. 백업/복구 절차 문서화 없음 |
 
-### 13.6 데이터 품질 위험
+### 13.7 데이터 품질 위험
 
 - OHLCV 캐시는 TTL 메타(`fetched_at`, `latest_bar_date`, `source`)를 갖지만,
   소스 폴백(한국 pykrx→FDR→yfinance, 미국 yfinance→FDR)이 종목별로 다르게 걸릴 수 있어
@@ -587,10 +619,10 @@ DB 직접 SQL 변경, `webui.py` 일괄 분해.
    승률 ±5%p 신뢰구간에는 수백 건이 필요하다. 종목 수를 늘릴지, 기간을 기다릴지,
    평가 horizon을 바꿀지가 선택지다. 부수적으로: 30분 스캔 신호를 `signal_outcomes`에
    전량(하루 48 × 7종목) 적립할 필요가 있는지 — 읽는 쪽에서 어차피 하루 1건으로 접는다.
-2. **평가 기준의 임의성** (벤치마크·홀드아웃은 2026-09-11 완료, §13.6) — 시장 대비
-   초과수익과 정직한 보정 개선폭은 이제 측정된다. 남은 것은 **win 정의(±2% 밴드)와
-   horizon(7/14/30일)이 임의값**이라는 점이다. 밴드를 바꾸면 승률이 크게 움직이고,
-   horizon은 실제 보유기간(`expected_holding_days`)과 연결돼 있지 않다.
+2. **win 정의(±2% 밴드)의 임의성** (벤치마크·홀드아웃 §13.4, horizon 정합 §13.5는
+   2026-09-11 완료) — 남은 것은 밴드뿐이다. ±2%를 바꾸면 승률이 크게 움직이는데
+   그 값의 근거가 없다. horizon 별로 달라야 한다는 주장도 가능하다
+   (14일 구간에 ±2%는 7일 구간의 ±2%보다 느슨하다).
 3. **IC 앙상블을 살릴 것인가, 지울 것인가** — 계산은 되지만 `apply_ic_weights()` 호출부가
    없어 판정에 반영되지 않는다(§13.3). 소비자 없는 출력은 기능이 있다는 착시만 만든다(§14).
 4. **24 도구 + 8 에이전트 구성의 정당성** — 도구별·에이전트별 기여도가 측정되지 않은 상태에서

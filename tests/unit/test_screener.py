@@ -190,7 +190,10 @@ def test_korean_screener_keeps_pykrx_priority_without_yfinance_prefetch(monkeypa
     assert prefetch_calls == []
     assert result["analyzed_count"] == 1
     assert result["results"][0]["ticker"] == "005930.KS"
-    assert result["results"][0]["horizon_days"] == 7
+    # horizon 은 매매 스타일의 의도 보유기간에서 파생된다 (2026-09 정합 작업).
+    from signal_tracker import primary_horizon_days
+
+    assert result["results"][0]["horizon_days"] == primary_horizon_days()
     assert result["results"][0]["decision_context"]["source"] == "screener"
     assert result["results"][0]["decision_context"]["role"] == "candidate_discovery"
 
@@ -213,7 +216,9 @@ def test_screener_multiagent_divergence_includes_reason_codes():
 
     assert agreement["status"] == "divergent"
     assert agreement["level"] == "partial_match"
-    assert agreement["horizon_days"] == 7
+    from signal_tracker import primary_horizon_days
+
+    assert agreement["horizon_days"] == primary_horizon_days()
     assert agreement["primary"]["role"] == "candidate_discovery"
     assert agreement["secondary"]["role"] == "deep_validation"
     assert "AGENT_DISAGREEMENT" in agreement["reason_codes"]

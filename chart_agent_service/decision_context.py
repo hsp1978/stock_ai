@@ -15,12 +15,25 @@ SCHEMA_VERSION = "decision_context.v1"
 
 
 def default_horizon_days() -> int:
-    """Return the shared decision horizon used for signal comparison."""
+    """Return the shared decision horizon used for signal comparison.
+
+    기본값은 매매 스타일의 의도 보유기간에서 파생한다 — 7일 하드코딩은 스윙(10일
+    보유)과 어긋났다 (2026-09 정합 작업). 환경변수는 여전히 우선한다.
+    """
+    override = os.getenv("DECISION_HORIZON_DAYS")
+    if override:
+        try:
+            value = int(override)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
     try:
-        value = int(os.getenv("DECISION_HORIZON_DAYS", "7"))
-    except (TypeError, ValueError):
-        value = 7
-    return value if value > 0 else 7
+        from signal_tracker import primary_horizon_days
+
+        return primary_horizon_days()
+    except Exception:
+        return 7
 
 
 def normalize_trade_signal(signal: Any) -> str:

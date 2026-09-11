@@ -29,10 +29,12 @@ from tick_size import round_to_tick
 _BETA_STOP_THRESHOLD = 1.5
 _BETA_STOP_MAX_SCALE = 2.0
 
+# 보유기간은 config._STYLE_PRESETS 가 단일 출처다 — 여기 복제하면 평가 horizon 과
+# 어긋난다 (2026-09 정합 작업).
+from config import _STYLE_PRESETS  # noqa: E402
+
 _HOLDING_DAYS_BY_STYLE = {
-    "scalping": 2,
-    "swing": 10,
-    "longterm": 60,
+    style: preset["holding_days"] for style, preset in _STYLE_PRESETS.items()
 }
 
 

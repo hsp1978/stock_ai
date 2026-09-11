@@ -4844,11 +4844,17 @@ def render_system_monitor():
             st.info("Data health snapshot unavailable.")
 
     with tab_signals:
-        accuracy = signals.get("accuracy_7d") if isinstance(signals, dict) else {}
+        accuracy = (
+            signals.get("accuracy_primary") or signals.get("accuracy_7d") or {}
+            if isinstance(signals, dict) else {}
+        )
         if accuracy and not accuracy.get("error"):
+            # 평가 기간은 매매 스타일의 의도 보유기간에서 파생된다 — 라벨을 고정
+            # 문자열("7D")로 두면 실제 horizon 과 어긋난다.
+            hz = accuracy.get("horizon_days", 7)
             a1, a2, a3, a4 = st.columns(4)
-            a1.metric("7D Evaluated", f"{accuracy.get('total_evaluated', 0):,}")
-            a2.metric("7D Win Rate", f"{accuracy.get('win_rate_pct', 0):.1f}%")
+            a1.metric(f"{hz}D Evaluated", f"{accuracy.get('total_evaluated', 0):,}")
+            a2.metric(f"{hz}D Win Rate", f"{accuracy.get('win_rate_pct', 0):.1f}%")
             # 방향 보정본을 쓴다 — 원시 평균은 매도가 맞을수록 내려간다.
             a3.metric("방향보정 기대값", f"{accuracy.get('avg_signed_return_pct', 0):+.2f}%")
             a4.metric("Samples", f"{accuracy.get('sample_size', 0):,}")
@@ -4910,7 +4916,14 @@ def render_signal_accuracy():
     # ── 컨트롤 ─────────────────────────────────────
     col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
     with col1:
-        horizon = st.selectbox("평가 기간", [7, 14, 30], index=0, help="신호 후 N일 수익률 기준")
+        # 기본값은 매매 스타일의 의도 보유기간을 덮는 대표 horizon 이다.
+        _primary = (api_get("/signal-accuracy/horizon") or {}).get("primary_horizon_days", 7)
+        _options = [7, 14, 30]
+        horizon = st.selectbox(
+            "평가 기간", _options,
+            index=_options.index(_primary) if _primary in _options else 0,
+            help="신호 후 N일 수익률 기준. 기본값은 의도 보유기간을 덮는 horizon.",
+        )
     with col2:
         min_conf = st.slider("최소 신뢰도", 0.0, 10.0, 0.0, step=0.5)
     with col3:
@@ -5045,6 +5058,13 @@ def render_signal_accuracy():
             f"{ci[0]:.0f}~{ci[1]:.0f}%" if len(ci) == 2 else "—",
             delta=f"독립 블록 {blocks:,}건",
             delta_color="off",
+        )
+
+    if not data.get("horizon_covers_holding", True):
+        st.warning(
+            f"평가 기간 {data.get('horizon_days')}일이 의도 보유기간 "
+            f"{data.get('expected_holding_days')}일보다 짧습니다 — 이 지표는 보유 도중의 "
+            f"중간 성과입니다 (대표 horizon: {data.get('primary_horizon_days')}일)."
         )
 
     if sampling:

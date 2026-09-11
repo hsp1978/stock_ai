@@ -324,6 +324,9 @@ _STYLE_PRESETS = {
         "atr_multiplier": 1.2,
         "history_period": "60d",
         "timeframe": "intraday",
+        # 의도 보유기간. 평가 horizon 은 이 값에서 파생된다 — 10일 보유를 의도한
+        # 신호를 7일에 채점하면 무엇을 재는지 알 수 없다 (2026-09 진단).
+        "holding_days": 2,
     },
     "swing": {
         "sma_periods": [20, 50, 200],
@@ -331,6 +334,7 @@ _STYLE_PRESETS = {
         "atr_multiplier": 2.0,
         "history_period": "2y",
         "timeframe": "daily",
+        "holding_days": 10,
     },
     "longterm": {
         "sma_periods": [50, 120, 200],
@@ -338,11 +342,14 @@ _STYLE_PRESETS = {
         "atr_multiplier": 3.0,
         "history_period": "5y",
         "timeframe": "weekly",
+        "holding_days": 60,
     },
 }
 _preset = _STYLE_PRESETS[TRADING_STYLE]
 
 DEFAULT_HISTORY_PERIOD = _preset["history_period"]
+# 의도 보유기간 (일). entry_plan 과 평가 horizon 이 같은 값을 본다.
+EXPECTED_HOLDING_DAYS = _preset["holding_days"]
 SMA_PERIODS = _preset["sma_periods"]
 EMA_PERIODS = _preset["ema_periods"]
 ATR_STOP_MULTIPLIER = _preset["atr_multiplier"]
