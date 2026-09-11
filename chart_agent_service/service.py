@@ -646,6 +646,28 @@ def _collect_data_health_tickers(tickers: list[str] | None = None) -> list[str]:
     return result
 
 
+def _price_verification_for(ticker: str) -> dict | None:
+    """캐시된 교차검증 결과. 네트워크는 타지 않는다 (헬스체크는 관측용)."""
+    try:
+        from data_collector import DEFAULT_HISTORY_PERIOD as _period
+        from data_collector import _verification_cache, _verification_lock
+    except Exception:
+        return None
+    key = f"{ticker.upper()}|{_period}"
+    with _verification_lock:
+        cached = _verification_cache.get(key)
+    if not cached:
+        return None
+    _, result = cached
+    return {
+        "status": result.status,
+        "primary_source": result.primary_source,
+        "secondary_source": result.secondary_source,
+        "diff_pct": result.diff_pct,
+        "detail": result.detail,
+    }
+
+
 def build_data_health(tickers: list[str] | None = None) -> dict:
     """현재 캐시 기준 데이터 freshness SLO 스냅샷을 만든다."""
     target_tickers = _collect_data_health_tickers(tickers)
@@ -690,6 +712,20 @@ def build_data_health(tickers: list[str] | None = None) -> dict:
         elif not news.get("fresh"):
             reasons.append("news_stale")
 
+        # 가격 소스 교차검증 — 폴백은 '한 소스가 죽었을 때'를 처리하지만
+        # 두 소스가 다른 값을 줄 때는 잡지 못한다. 캐시가 있을 때만 확인한다
+        # (헬스체크가 네트워크를 새로 타지 않게).
+        verification = _price_verification_for(ticker)
+        if verification is not None:
+            if verification.get("status") == "mismatch":
+                if severity != "stale":
+                    severity = "degraded"
+                reasons.append("price_source_mismatch")
+            elif verification.get("status") == "bar_date_mismatch":
+                reasons.append("price_bar_date_mismatch")
+            elif verification.get("status") in ("single_source", "unavailable"):
+                reasons.append("price_unverified")
+
         row = {
             "ticker": ticker,
             "severity": severity,
@@ -698,6 +734,7 @@ def build_data_health(tickers: list[str] | None = None) -> dict:
             "ohlcv_fetched_at": ohlcv.get("fetched_at"),
             "ohlcv_age_sec": ohlcv_age,
             "ohlcv_latest_bar": ohlcv.get("latest_bar_date"),
+            "price_verification": verification,
             "fundamental_source": fundamentals.get("source"),
             "fundamental_quality": fundamental_quality,
             "fundamental_fetched_at": fundamentals.get("fetched_at"),
@@ -1001,6 +1038,34 @@ def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
         result["fundamentals"] = fundamentals
         result["options_pcr"] = options_pcr
         result["insider_trades"] = insider_trades
+
+        # 가격 소스 교차검증 — 가격이 틀리면 Z-score·ATR·지지저항·R/R 이 전부
+        # 무의미해진다. 불일치를 예외로 올리지 않고 상태로 실어 보낸다.
+        try:
+            from data_collector import verify_latest_close
+
+            pv = verify_latest_close(ticker)
+            result["price_verification"] = {
+                "status": pv.status,
+                "primary_source": pv.primary_source,
+                "primary_close": pv.primary_close,
+                "secondary_source": pv.secondary_source,
+                "secondary_close": pv.secondary_close,
+                "diff_pct": pv.diff_pct,
+                "detail": pv.detail,
+            }
+            # 현재가는 리포트 필수 필드다 (없으면 진입가·손절을 검산할 수 없다).
+            result.setdefault("current_price", pv.primary_close)
+            if pv.is_mismatch:
+                risks = list(result.get("critical_risks") or [])
+                risks.append(f"가격 소스 불일치 — {pv.detail}")
+                result["critical_risks"] = risks
+                print(f"  [{ticker}] 경고: {pv.detail}")
+        except Exception as exc:
+            result["price_verification"] = {
+                "status": "unavailable",
+                "detail": f"교차검증 실패 — {type(exc).__name__}: {exc}",
+            }
 
         chart_path = None
         try:

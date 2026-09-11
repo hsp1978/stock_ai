@@ -62,6 +62,19 @@ def format_entry_plan_markdown(ticker: str, final_decision: Dict[str, Any]) -> s
     order = _ORDER_TYPE_KR.get(plan.get("order_type"), plan.get("order_type") or "?")
     timing = _TIMING_KR.get(plan.get("entry_timing"), plan.get("entry_timing") or "?")
     lines.append(f"- **주문**: {order} · {timing}")
+    # 현재가를 함께 적는다 — 진입가만 있으면 읽는 사람이 가격 오류를 검산할 수 없다
+    # (PLTR 2026-04-17: 진입가 $147.12 가 당일 범위 $139.53~$146.50 밖이었다).
+    current_price = final_decision.get("current_price")
+    if current_price is not None:
+        line = f"- **현재가**: {format_price(current_price, ticker)}"
+        verification = final_decision.get("price_verification") or {}
+        if verification.get("status") == "mismatch":
+            line += f" ⚠️ 소스 불일치 ({verification.get('detail', '')})"
+        elif verification.get("status") in ("single_source", "unavailable"):
+            line += " (교차검증 불가)"
+        lines.append(line)
+    else:
+        lines.append("- **현재가**: 미표기 — 진입가 검산 불가")
     lines.append(f"- **진입가**: {format_price(plan.get('limit_price'), ticker)}")
     lines.append(f"- **🛑 손절**: {format_price(plan.get('stop_loss'), ticker)}")
     lines.append(f"- **🎯 익절**: {format_price(plan.get('take_profit'), ticker)}")
