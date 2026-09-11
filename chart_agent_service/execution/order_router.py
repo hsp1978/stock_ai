@@ -89,6 +89,22 @@ class OrderRouter:
         if not entry_plan or entry_plan.get("entry_timing") == "wait":
             return []
 
+        # 손절 없는 진입은 주문으로 만들지 않는다. 종전에는 entry_plan 이
+        # stop_loss=None 이어도 주문이 생성됐고, 청산 규칙 없는 포지션이 남았다.
+        # 근거(2026-09 사후검증): SKAI 는 손절·익절 없이 "보유 10일"만 제시돼
+        # 같은 진입에서 +54% 와 -40% 가 갈렸다 (100%p 격차).
+        if entry_plan.get("stop_loss") is None:
+            # 사유를 버리지 않는다 — 빈 리스트만 돌려주면 '주문할 게 없었다'와
+            # 구별되지 않는다.
+            print(
+                f"[order_router] {ticker} ({source}) 주문 생성 거부 — "
+                "손절가 없는 진입 계획"
+            )
+            entry_plan.setdefault("notes", []).append(
+                "주문 생성 거부: 손절가 미설정"
+            )
+            return []
+
         # 계좌/비중 결정
         if account_size is None:
             try:

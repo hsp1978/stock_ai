@@ -25,6 +25,10 @@ from tick_size import round_to_tick
 
 
 # 투자 스타일별 기본 보유 기간
+# Beta 손절 확대 임계·상한. 상한 2.0은 ATR 2배 이상으로 벌어지는 것을 막는다.
+_BETA_STOP_THRESHOLD = 1.5
+_BETA_STOP_MAX_SCALE = 2.0
+
 _HOLDING_DAYS_BY_STYLE = {
     "scalping": 2,
     "swing": 10,
@@ -82,6 +86,35 @@ def build_entry_plan(
     plan["stop_loss"] = final_levels.get("stop_loss") or risk.get("stop_loss")
     plan["take_profit"] = final_levels.get("take_profit") or risk.get("take_profit")
     plan["invalidation_price"] = plan["stop_loss"]
+
+    # ─── 고베타 손절 확대 ───
+    # ATR 손절폭은 종목 자체 변동성만 본다. 시장 대비 민감도(Beta)가 높으면
+    # 지수 조정 한 번에 일상 변동 범위 안에서 손절이 체결된다.
+    # 근거(2026-09 사후검증): PLTR Beta 2.09 에 손절 -9.9% 를 걸어 6월 조정에서
+    # 청산됐고, 그 뒤 주가는 회복했다. 손절이 '판단 실패'가 아니라 '노이즈'로
+    # 맞은 사례다. R/R 설계 의도를 유지하기 위해 익절도 같은 비율로 넓힌다.
+    beta = (by_tool.get("beta_correlation_analysis") or {}).get("beta")
+    if plan["stop_loss"] is not None and beta and beta > _BETA_STOP_THRESHOLD:
+        scale = min(float(beta), _BETA_STOP_MAX_SCALE)
+        stop_distance = current_price - plan["stop_loss"]
+        if stop_distance > 0:
+            rr_ratio = None
+            if plan["take_profit"] is not None:
+                rr_ratio = (plan["take_profit"] - current_price) / stop_distance
+            widened = stop_distance * scale
+            plan["stop_loss"] = round_to_tick(
+                current_price - widened, ticker, side="down"
+            )
+            plan["invalidation_price"] = plan["stop_loss"]
+            if rr_ratio and rr_ratio > 0:
+                plan["take_profit"] = round_to_tick(
+                    current_price + widened * rr_ratio, ticker, side="up"
+                )
+            plan["notes"].append(
+                f"Beta {beta:.2f} — 손절 폭 {scale:.2f}배 확대 "
+                f"({stop_distance / current_price:.1%} → {widened / current_price:.1%}). "
+                f"주당 리스크가 커지므로 수량은 1/{scale:.2f}로 축소해야 한다"
+            )
 
     # ─── 손절가 미설정 경고 ───
     if plan["stop_loss"] is None:
