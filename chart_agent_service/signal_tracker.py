@@ -837,6 +837,28 @@ def _outcome_of(signal_type: str, ret: float) -> str:
     return "win" if abs(ret) <= threshold else "loss"
 
 
+def _percentiles(values: List[float]) -> Dict[str, float]:
+    """분포 요약. 평균 하나로는 꼬리가 보이지 않는다."""
+    if not values:
+        return {"p25": 0.0, "median": 0.0, "p75": 0.0}
+    ordered = sorted(values)
+    import statistics
+
+    def _q(fraction: float) -> float:
+        if len(ordered) == 1:
+            return ordered[0]
+        idx = fraction * (len(ordered) - 1)
+        lo, hi = int(idx), min(int(idx) + 1, len(ordered) - 1)
+        weight = idx - lo
+        return ordered[lo] * (1 - weight) + ordered[hi] * weight
+
+    return {
+        "p25": round(_q(0.25) * 100, 3),
+        "median": round(statistics.median(ordered) * 100, 3),
+        "p75": round(_q(0.75) * 100, 3),
+    }
+
+
 def _tally(rows: List) -> Dict:
     total = len(rows)
     wins = sum(1 for r in rows if _outcome_of(r["signal_type"], r["ret"]) == "win")
@@ -864,12 +886,37 @@ def _tally(rows: List) -> Dict:
         excess.append(s_stock - s_bench)
     excess_avg = (sum(excess) / len(excess) * 100.0) if excess else 0.0
     beat = sum(1 for v in excess if v > 0)
+
+    # 방향 적중률 — ±2% 밴드 없이 부호만 본다. 밴드는 임의값이고 horizon 이 길수록
+    # 넘기 쉬워져(14일 ±2% 는 7일 ±2% 보다 느슨하다) 기간 간 비교를 왜곡한다
+    # (2026-09-11 진단). 밴드 기반 집계는 `band_outcome` 에 사유와 함께 남긴다.
+    direction_hits = sum(1 for v in signed if v > 0)
     return {
         "total": total,
         "wins": wins,
         "losses": losses,
         "neutrals": total - wins - losses,
-        "win_rate_pct": round((wins / total * 100) if total else 0, 1),
+        # 밴드 없는 대표 지표 — 신호 방향이 맞았는가(부호)만 본다.
+        "direction_hit_rate_pct": round(
+            (direction_hits / len(signed) * 100) if signed else 0, 1
+        ),
+        "direction_hits": direction_hits,
+        "direction_sample": len(signed),
+        # ±2% 밴드 기반 집계. 임계를 값과 함께 실어 '승률'로 오독되지 않게 한다.
+        "band_outcome": {
+            "threshold_pct": OUTCOME_THRESHOLD_PCT,
+            "win": wins,
+            "loss": losses,
+            "neutral": total - wins - losses,
+            "win_rate_pct": round((wins / total * 100) if total else 0, 1),
+            "note": (
+                f"|수익률| > {OUTCOME_THRESHOLD_PCT}% 만 승/패로 센다. "
+                "밴드는 임의값이며 horizon 이 길수록 넘기 쉬워진다."
+            ),
+        },
+        # 분포 — 평균 하나로는 꼬리가 보이지 않는다.
+        "signed_return_dist": _percentiles(signed),
+        "excess_return_dist": _percentiles(excess),
         # 성과 지표는 방향 보정본이다. 원시값은 진단용으로만 함께 낸다.
         "avg_signed_return_pct": round(signed_avg, 3),
         "avg_raw_return_pct": round(raw_avg, 3),
@@ -898,8 +945,10 @@ def get_accuracy_stats(
     Returns: {
       "horizon_days": int,
       "total_evaluated": int,           # 표본화 후
-      "win_count": int, "loss_count": int, "neutral_count": int,
-      "win_rate_pct": float, "win_rate_ci95": [lo, hi],
+      "direction_hit_rate_pct": float,   # 부호만 본 적중률 (밴드 없음)
+      "direction_hit_ci95": [lo, hi],    # 독립 블록 기준 Wilson
+      "band_outcome": {...},             # ±2% 밴드 집계 (임계값 포함)
+      "signed_return_dist"/"excess_return_dist": {p25, median, p75},
       "avg_signed_return_pct": float,   # 매수 +ret / 매도 -ret (성과 지표)
       "avg_raw_return_pct": float,      # 부호 그대로 (진단용)
       "signed_sample": int,             # 방향이 있는 신호 수 (neutral 제외)
@@ -944,8 +993,14 @@ def get_accuracy_stats(
         for r in scoped
     }
     independent_blocks = len(blocks)
-    block_wins_ratio = overall["wins"] / overall["total"] if overall["total"] else 0.0
-    ci = _wilson_ci(round(block_wins_ratio * independent_blocks), independent_blocks)
+    # 신뢰구간은 **밴드 없는 방향 적중률** 기준이다. 밴드 승률로 재면 임의 임계가
+    # 구간 폭까지 좌우한다.
+    hit_ratio = (
+        overall["direction_hits"] / overall["direction_sample"]
+        if overall["direction_sample"]
+        else 0.0
+    )
+    ci = _wilson_ci(round(hit_ratio * independent_blocks), independent_blocks)
 
     # 신호별 (신호 필터와 무관하게 3종 모두 — 종전 동작 유지)
     by_signal: Dict[str, Dict] = {}
@@ -958,8 +1013,9 @@ def get_accuracy_stats(
         t = _tally(rows)
         by_signal[sig] = {
             "total": t["total"],
-            "wins": t["wins"],
-            "win_rate_pct": t["win_rate_pct"],
+            "direction_hit_rate_pct": t["direction_hit_rate_pct"],
+            "direction_sample": t["direction_sample"],
+            "band_outcome": t["band_outcome"],
             "avg_signed_return_pct": t["avg_signed_return_pct"],
             "avg_raw_return_pct": t["avg_raw_return_pct"],
             "signed_sample": t["signed_sample"],
@@ -975,8 +1031,8 @@ def get_accuracy_stats(
             {
                 "band": f"{lo:.1f}-{min(hi, 10.0):.1f}",
                 "total": t["total"],
-                "wins": t["wins"],
-                "win_rate_pct": t["win_rate_pct"],
+                "direction_hit_rate_pct": t["direction_hit_rate_pct"],
+                "band_win_rate_pct": t["band_outcome"]["win_rate_pct"],
                 "avg_signed_return_pct": t["avg_signed_return_pct"],
                 "avg_raw_return_pct": t["avg_raw_return_pct"],
             }
@@ -989,8 +1045,8 @@ def get_accuracy_stats(
         t = _tally(rows)
         by_source[name] = {
             "total": t["total"],
-            "wins": t["wins"],
-            "win_rate_pct": t["win_rate_pct"],
+            "direction_hit_rate_pct": t["direction_hit_rate_pct"],
+            "direction_sample": t["direction_sample"],
             "avg_signed_return_pct": t["avg_signed_return_pct"],
             "avg_raw_return_pct": t["avg_raw_return_pct"],
             "signed_sample": t["signed_sample"],
@@ -1019,11 +1075,15 @@ def get_accuracy_stats(
         "min_confidence_filter": min_confidence,
         "days_back": days_back,
         "total_evaluated": overall["total"],
-        "win_count": overall["wins"],
-        "loss_count": overall["losses"],
-        "neutral_count": overall["neutrals"],
-        "win_rate_pct": overall["win_rate_pct"],
-        "win_rate_ci95": ci,
+        # ±2% 밴드 기반 승률은 대표 지표에서 내렸다 — 임의 임계이고 horizon 이
+        # 길수록 넘기 쉬워져 기간 간 비교를 왜곡한다. 밴드 집계는 band_outcome 에.
+        "direction_hit_rate_pct": overall["direction_hit_rate_pct"],
+        "direction_hits": overall["direction_hits"],
+        "direction_sample": overall["direction_sample"],
+        "direction_hit_ci95": ci,
+        "band_outcome": overall["band_outcome"],
+        "signed_return_dist": overall["signed_return_dist"],
+        "excess_return_dist": overall["excess_return_dist"],
         # `avg_return_pct` 는 없앴다 — 방향 보정이 없어 매도가 맞을수록 내려가는
         # 값이었고, 이름만 봐서는 그 사실을 알 수 없었다. 이름을 갈라 둘 다 낸다.
         "avg_signed_return_pct": overall["avg_signed_return_pct"],
@@ -1050,7 +1110,7 @@ def get_accuracy_stats(
             "dominant_source_share_pct": dominant_share,
             "note": (
                 "30분 스캔이 같은 종목·같은 날을 반복 기록하므로 원시 행 수는 독립 표본이 "
-                "아니다. win_rate_ci95 는 independent_blocks(수익률 구간이 겹치지 않는 "
+                "아니다. direction_hit_ci95 는 independent_blocks(수익률 구간이 겹치지 않는 "
                 "블록 수) 기준이다."
             ),
         },
@@ -1108,7 +1168,9 @@ class ConfidenceCalibrator:
                 if b["total"] < 5:
                     continue
                 lo, hi = (float(x) for x in b["band"].split("-"))
-                band_map[(lo, hi)] = b["win_rate_pct"] / 100.0
+                # 보정 대상은 '방향이 맞을 확률'이다. ±2% 밴드 승률로 맞추면
+                # 임의 임계가 보정값을 좌우한다 (llm_calibrator 도 부호 기준이다).
+                band_map[(lo, hi)] = b["direction_hit_rate_pct"] / 100.0
             if band_map:
                 self._calibration[sig] = band_map
 
@@ -1205,13 +1267,13 @@ if __name__ == "__main__":
     acc = get_accuracy_stats(days_back=180)
     print(f"  총 평가: {acc['total_evaluated']}건")
     print(
-        f"  승률: {acc['win_rate_pct']}% "
+        f"  방향 적중률: {acc['direction_hit_rate_pct']}% "
         f"(방향보정 기대값 {acc['avg_signed_return_pct']}%, "
         f"원시 {acc['avg_raw_return_pct']}%)"
     )
     for sig, s in acc["by_signal"].items():
         if s["total"]:
-            print(f"    {sig}: {s['win_rate_pct']}% (n={s['total']})")
+            print(f"    {sig}: {s['direction_hit_rate_pct']}% (n={s['total']})")
 
     print("\n3) 신뢰도 칼리브레이터 재학습...")
     calib = get_calibrator()

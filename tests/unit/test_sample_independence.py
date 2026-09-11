@@ -94,8 +94,11 @@ def test_repeated_intraday_scans_collapse_to_one_sample_per_day(db):
     assert stats["sampling"]["rows_raw"] == 96
     assert stats["total_evaluated"] == 2          # 하루 1건
     assert stats["sampling"]["collapse_ratio"] == 48.0
-    assert stats["win_count"] == 1 and stats["loss_count"] == 1
-    assert stats["win_rate_pct"] == 50.0
+    band = stats["band_outcome"]
+    assert band["win"] == 1 and band["loss"] == 1
+    assert band["win_rate_pct"] == 50.0
+    # 대표 지표는 밴드 없는 방향 적중률이다
+    assert stats["direction_hit_rate_pct"] == 50.0
 
 
 def test_last_row_of_the_day_represents_the_day(db):
@@ -106,7 +109,7 @@ def test_last_row_of_the_day_represents_the_day(db):
     stats = _stats(db, horizon=7, days_back=90)
 
     assert stats["total_evaluated"] == 1
-    assert stats["loss_count"] == 1               # 마지막(23시) 행이 뽑혔다
+    assert stats["band_outcome"]["loss"] == 1     # 마지막(23시) 행이 뽑혔다
     assert stats["avg_signed_return_pct"] == -10.0   # 매수 신호라 부호 그대로
 
 
@@ -133,7 +136,7 @@ def test_confidence_interval_uses_independent_blocks_not_rows(db):
     assert stats["total_evaluated"] == 5
     # 5일이 같은 7일 블록 1~2개에 들어간다 — 표본 수보다 작아야 한다
     assert stats["independent_blocks"] <= 2
-    lo, hi = stats["win_rate_ci95"]
+    lo, hi = stats["direction_hit_ci95"]
     assert hi - lo > 40, (lo, hi)   # 블록 1~2개면 구간이 넓어야 정직하다
 
 
