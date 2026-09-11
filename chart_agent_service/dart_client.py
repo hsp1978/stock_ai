@@ -528,3 +528,233 @@ def score_insider_trades(trades: list[InsiderTrade]) -> InsiderSignal:
         sell_shares=sell_shares,
         trade_count=len(trades),
     )
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  희석 이벤트 — 전환사채·유상증자 (주요사항보고서)
+# ═══════════════════════════════════════════════════════════════════
+#
+# 2026-09 사후검증: SKAI 는 시가총액 1,117억 대비 CB 450억(4월) + 30억(7월),
+# 합계 약 43% 규모의 자금조달을 하는 동안 스크리너 A등급 1순위였다.
+# 주가 경로는 ₩2,530 → ₩6,160(고점) → ₩2,280~2,560 — 급등 → CB 발행 → 희석 → 급락.
+# 시스템은 "유상증자" 키워드를 악재 목록에 갖고 있었을 뿐, **규모를 보지 않았다.**
+#
+# DART 주요사항보고서 API 는 전환 시 발행될 주식수의 비율(`cvisstk_tisstk_vs`)을
+# 직접 준다 — 시가총액으로 추정할 필요가 없다. 그 값을 1차 지표로 쓴다.
+#
+# 미구현: 신주인수권부사채(bdwtIsDecsn)·교환사채(exbdIsDecsn). 실측 샘플을 확보하지
+# 못해 필드 파싱을 검증할 수 없었다. 추측으로 파싱하면 조용히 0% 희석으로 읽힐 수
+# 있어 넣지 않았다 — 필요해지면 실제 응답을 확인한 뒤 같은 패턴으로 추가한다.
+
+_DILUTION_ENDPOINTS = {
+    "cb": "https://opendart.fss.or.kr/api/cvbdIsDecsn.json",   # 전환사채권 발행결정
+    "rights": "https://opendart.fss.or.kr/api/piicDecsn.json",  # 유상증자 결정
+}
+_DILUTION_KIND_LABEL = {"cb": "전환사채", "rights": "유상증자"}
+
+
+@dataclass(frozen=True)
+class DilutionEvent:
+    """희석을 일으키는 자금조달 결정 1건."""
+
+    kind: str                       # "cb" | "rights"
+    date: str                       # YYYY-MM-DD (이사회결의일 또는 접수일)
+    new_shares: Optional[int]       # 전환/신주 발행 예정 주식수
+    dilution_pct: Optional[float]   # 발행주식총수 대비 %
+    amount_krw: Optional[int]       # 권면총액 (CB)
+    private_placement: bool         # 사모 여부
+    receipt_no: str
+    note: str = ""
+
+    @property
+    def label(self) -> str:
+        return _DILUTION_KIND_LABEL.get(self.kind, self.kind)
+
+
+def _parse_kr_date(value: Any, fallback_receipt: str = "") -> Optional[str]:
+    """'2026년 09월 10일' / '20260910' 형태를 ISO 로. 실패 시 접수번호 앞 8자리."""
+    text = str(value or "").strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) < 8:
+        digits = "".join(ch for ch in str(fallback_receipt or "") if ch.isdigit())[:8]
+    if len(digits) < 8:
+        return None
+    try:
+        return datetime.strptime(digits[:8], "%Y%m%d").date().isoformat()
+    except ValueError:
+        return None
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=6),
+    retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError)),
+    reraise=True,
+)
+def _request_major_report(url: str, corp_code: str, api_key: str,
+                          bgn_de: str, end_de: str) -> dict:
+    resp = httpx.get(
+        url,
+        params={
+            "crtfc_key": api_key,
+            "corp_code": corp_code,
+            "bgn_de": bgn_de,
+            "end_de": end_de,
+        },
+        timeout=_ELESTOCK_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _cb_event(row: dict) -> DilutionEvent:
+    return DilutionEvent(
+        kind="cb",
+        date=_parse_kr_date(row.get("bddd"), row.get("rcept_no")) or "",
+        new_shares=_to_int(row.get("cvisstk_cnt")),
+        # DART 가 직접 계산해 주는 '전환될 주식수 / 발행주식총수' 비율(%)
+        dilution_pct=_to_float(row.get("cvisstk_tisstk_vs")),
+        amount_krw=_to_int(row.get("bd_fta")),
+        private_placement="사모" in str(row.get("bdis_mthn") or row.get("bd_knd") or ""),
+        receipt_no=str(row.get("rcept_no") or ""),
+        note=str(row.get("bd_knd") or "").strip(),
+    )
+
+
+def _rights_event(row: dict) -> DilutionEvent:
+    new_shares = _to_int(row.get("nstk_ostk_cnt"))
+    before = _to_int(row.get("bfic_tisstk_ostk"))
+    dilution = (
+        round(new_shares / before * 100, 2)
+        if new_shares and before and before > 0
+        else None
+    )
+    return DilutionEvent(
+        kind="rights",
+        date=_parse_kr_date(None, row.get("rcept_no")) or "",
+        new_shares=new_shares,
+        dilution_pct=dilution,
+        amount_krw=None,
+        private_placement="3자" in str(row.get("ic_mthn") or ""),
+        receipt_no=str(row.get("rcept_no") or ""),
+        note=str(row.get("ic_mthn") or "").strip(),
+    )
+
+
+def fetch_dilution_events(ticker: str, months: int = 6) -> list[DilutionEvent]:
+    """최근 `months` 개월 전환사채·유상증자 결정 목록 (최신순).
+
+    Raises:
+        DartUnavailable: 조회 자체가 불가한 경우. 빈 리스트('발행 없음')와 구분한다.
+    """
+    api_key = _get_dart_api_key()
+    if not api_key:
+        raise DartUnavailable("DART_API_KEY 미설정")
+    corp_code = get_corp_code(ticker)
+    if not corp_code:
+        raise DartUnavailable(f"고유번호 조회 실패: {ticker}")
+
+    end = date.today()
+    bgn = end - timedelta(days=int(months * 30.5))
+    bgn_de, end_de = bgn.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+
+    events: list[DilutionEvent] = []
+    failures: list[str] = []
+    for kind, url in _DILUTION_ENDPOINTS.items():
+        try:
+            payload = _request_major_report(url, corp_code, api_key, bgn_de, end_de)
+        except Exception as exc:
+            failures.append(f"{kind}: {type(exc).__name__}")
+            continue
+        status = str(payload.get("status") or "")
+        if status == "013":      # 조회된 데이터 없음 = 발행 없음
+            continue
+        if status != "000":
+            failures.append(f"{kind}: status={status}")
+            continue
+        builder = _cb_event if kind == "cb" else _rights_event
+        seen: set[str] = set()
+        for row in payload.get("list") or []:
+            event = builder(row)
+            # 기재정정 공시가 같은 내용으로 중복 접수되는 경우가 많다.
+            key = f"{event.kind}|{event.date}|{event.new_shares}|{event.amount_krw}"
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append(event)
+
+    # 두 엔드포인트가 **모두** 실패하면 '발행 없음'으로 위장하지 않는다.
+    if failures and len(failures) == len(_DILUTION_ENDPOINTS) and not events:
+        raise DartUnavailable("; ".join(failures))
+
+    events.sort(key=lambda e: e.date, reverse=True)
+    return events
+
+
+# 희석률 임계 — DART 가 주는 '발행주식총수 대비 %' 기준.
+_DILUTION_CRITICAL_PCT = 10.0
+_DILUTION_WARNING_PCT = 5.0
+_DILUTION_CRITICAL_SCORE = -4
+_DILUTION_WARNING_SCORE = -2
+
+
+@dataclass
+class DilutionSignal:
+    signal: str
+    score: int
+    detail: str
+    total_dilution_pct: float = 0.0
+    event_count: int = 0
+    critical_risks: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+def score_dilution_events(events: list[DilutionEvent]) -> DilutionSignal:
+    """희석 규모를 신호로 환산한다. 규모를 보지 않으면 '유상증자' 키워드는 무의미하다."""
+    if not events:
+        return DilutionSignal("neutral", 0, "최근 전환사채·유상증자 결정 없음")
+
+    total = round(sum(e.dilution_pct or 0.0 for e in events), 2)
+    labels = [
+        f"{e.label} {e.date}"
+        + (f" {e.dilution_pct:.1f}%" if e.dilution_pct is not None else " 규모미상")
+        + ("(사모)" if e.private_placement else "")
+        for e in events
+    ]
+    unknown = [e for e in events if e.dilution_pct is None]
+
+    if total >= _DILUTION_CRITICAL_PCT:
+        return DilutionSignal(
+            signal="sell",
+            score=_DILUTION_CRITICAL_SCORE,
+            detail=f"희석 예정 {total:.1f}% ({len(events)}건): {', '.join(labels[:3])}",
+            total_dilution_pct=total,
+            event_count=len(events),
+            critical_risks=[
+                f"희석 리스크 {total:.1f}% — {', '.join(labels[:2])}"
+            ],
+        )
+    if total >= _DILUTION_WARNING_PCT:
+        return DilutionSignal(
+            signal="sell",
+            score=_DILUTION_WARNING_SCORE,
+            detail=f"희석 예정 {total:.1f}% ({len(events)}건): {', '.join(labels[:3])}",
+            total_dilution_pct=total,
+            event_count=len(events),
+            warnings=[f"희석 예정 {total:.1f}% — {labels[0]}"],
+        )
+
+    detail = f"전환사채·유상증자 {len(events)}건, 희석 예정 {total:.1f}%"
+    warnings: list[str] = []
+    if unknown:
+        # 규모를 못 읽은 건을 0%로 취급하면 '희석 없음'이 된다.
+        detail += f" (규모 미상 {len(unknown)}건 포함)"
+        warnings.append(f"희석 규모 미상 공시 {len(unknown)}건 — 수동 확인 필요")
+    return DilutionSignal(
+        signal="neutral",
+        score=0,
+        detail=detail,
+        total_dilution_pct=total,
+        event_count=len(events),
+        warnings=warnings,
+    )
