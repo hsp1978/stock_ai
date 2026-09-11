@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 
 MIN_SAMPLES = 30  # 학습 최소 샘플 수
 
+# 홀드아웃 — 학습 표본으로 평가한 ECE 는 isotonic 특성상 거의 0이 나온다.
+# 개선폭을 그대로 믿으면 '보정이 잘 되고 있다'는 착시가 된다 (2026-09 진단:
+# ece_before 0.1989 → ece_after 0.0000). 시계열이므로 **과거로 학습해 미래로
+# 평가**한다(out-of-time). 랜덤 분할은 미래 정보를 학습에 흘린다.
+HOLDOUT_FRACTION = 0.3
+MIN_HOLDOUT_SAMPLES = 20
+
 
 class LLMCalibrator:
     """
@@ -51,7 +58,8 @@ class LLMCalibrator:
         self._is_fitted = False
         self._n_samples = 0
         self._ece_before: Optional[float] = None
-        self._ece_after: Optional[float] = None
+        self._ece_after_in_sample: Optional[float] = None
+        self._holdout: dict = {"status": "not_evaluated"}
         self._fitted_at: Optional[str] = None
 
     # ── 데이터 로드 ───────────────────────────────────────────────────
@@ -68,7 +76,7 @@ class LLMCalibrator:
             # 실제보다 좋게 나온다 (2026-09-10 표본 독립성 진단).
             df = pd.read_sql_query(
                 """WITH ranked AS (
-                       SELECT conviction, return_7d, signal_type,
+                       SELECT conviction, return_7d, signal_type, issued_at,
                               ROW_NUMBER() OVER (
                                   PARTITION BY ticker, signal_source,
                                                substr(issued_at, 1, 10)
@@ -80,7 +88,9 @@ class LLMCalibrator:
                          AND conviction IS NOT NULL
                          AND issued_at >= ?
                    )
-                   SELECT conviction, return_7d, signal_type FROM ranked WHERE rn = 1""",
+                   SELECT conviction, return_7d, signal_type, issued_at
+                   FROM ranked WHERE rn = 1
+                   ORDER BY issued_at ASC""",
                 conn,
                 params=(cutoff,),
             )
@@ -146,43 +156,86 @@ class LLMCalibrator:
                 "n_samples": len(df),
                 "required": MIN_SAMPLES,
                 "ece_before": None,
-                "ece_after": None,
+                "ece_after_in_sample": None,
+                "holdout": {"status": "not_evaluated"},
             }
 
         X = df["conviction"].to_numpy(dtype=float)
         y = df["hit"].to_numpy(dtype=float)
 
-        # ECE before
+        # 보정 전 ECE — 학습이 개입하지 않으므로 전체 표본으로 재도 정직하다.
         self._ece_before = self._compute_ece(X, y)
 
-        # Isotonic regression (conviction 0-10 → calibrated 0-1)
+        # ── 홀드아웃 평가 (out-of-time) ─────────────────────────────
+        # 개선폭은 **학습에 쓰지 않은 구간**에서만 의미가 있다.
+        self._holdout = self._evaluate_holdout(X, y)
+
+        # ── 운영용 보정기는 전체 표본으로 학습한다 ──────────────────
+        # (최신 정보까지 반영해야 하므로. 성능 보고는 위 홀드아웃 값을 쓴다.)
         iso = IsotonicRegression(out_of_bounds="clip")
-        iso.fit(X / 10.0, y)  # 입력을 0-1로 정규화
+        iso.fit(X / 10.0, y)
         self._calibrator = iso
         self._is_fitted = True
         self._n_samples = len(df)
         self._fitted_at = datetime.now(timezone.utc).isoformat()
 
-        # ECE after
+        # 학습 표본으로 잰 ECE — isotonic 특성상 거의 0이다. 이름에 그 사실을 박아
+        # 성능 지표로 오독되지 않게 한다.
         y_pred = iso.predict(X / 10.0)
-        self._ece_after = self._compute_ece(y_pred * 10.0, y)  # 다시 0-10 스케일로
+        self._ece_after_in_sample = self._compute_ece(y_pred * 10.0, y)
 
         logger.info(
-            "LLMCalibrator fitted: n=%d, ECE before=%.4f, after=%.4f",
+            "LLMCalibrator fitted: n=%d, ECE before=%.4f, in-sample after=%.4f, "
+            "holdout=%s",
             self._n_samples,
             self._ece_before or 0,
-            self._ece_after or 0,
+            self._ece_after_in_sample or 0,
+            self._holdout.get("status"),
         )
 
         return {
             "status": "fitted",
             "n_samples": self._n_samples,
             "ece_before": round(self._ece_before or 0, 4),
-            "ece_after": round(self._ece_after or 0, 4),
-            "ece_improvement": round(
-                (self._ece_before or 0) - (self._ece_after or 0), 4
-            ),
+            # 옛 `ece_after` 키는 없앴다 — 학습 표본으로 잰 값이라 항상 0에 가까웠고,
+            # 이름만 봐서는 그 사실을 알 수 없었다 (avg_return_pct 와 같은 이유).
+            "ece_after_in_sample": round(self._ece_after_in_sample or 0, 4),
+            "holdout": self._holdout,
             "fitted_at": self._fitted_at,
+        }
+
+    def _evaluate_holdout(self, X, y) -> dict:
+        """과거로 학습해 미래로 평가한다(out-of-time). 표본이 모자라면 그렇다고 적는다."""
+        from sklearn.isotonic import IsotonicRegression  # type: ignore[import-untyped]
+
+        n = len(X)
+        split = int(n * (1 - HOLDOUT_FRACTION))
+        train_n, test_n = split, n - split
+        if train_n < MIN_SAMPLES or test_n < MIN_HOLDOUT_SAMPLES:
+            return {
+                "status": "insufficient",
+                "train_samples": train_n,
+                "holdout_samples": test_n,
+                "min_train": MIN_SAMPLES,
+                "min_holdout": MIN_HOLDOUT_SAMPLES,
+                "detail": "홀드아웃 표본 부족 — 개선폭을 말할 수 없다",
+            }
+
+        X_train, y_train = X[:split], y[:split]
+        X_test, y_test = X[split:], y[split:]
+
+        iso = IsotonicRegression(out_of_bounds="clip")
+        iso.fit(X_train / 10.0, y_train)
+        before = self._compute_ece(X_test, y_test)
+        after = self._compute_ece(iso.predict(X_test / 10.0) * 10.0, y_test)
+        return {
+            "status": "evaluated",
+            "train_samples": train_n,
+            "holdout_samples": test_n,
+            "ece_before": round(before, 4),
+            "ece_after": round(after, 4),
+            "improvement": round(before - after, 4),
+            "detail": "시간순 분할 — 과거 학습, 미래 평가",
         }
 
     # ── 보정 ─────────────────────────────────────────────────────────
@@ -208,7 +261,8 @@ class LLMCalibrator:
             "n_samples": self._n_samples,
             "min_required": MIN_SAMPLES,
             "ece_before": self._ece_before,
-            "ece_after": self._ece_after,
+            "ece_after_in_sample": self._ece_after_in_sample,
+            "holdout": self._holdout,
             "fitted_at": self._fitted_at,
         }
 

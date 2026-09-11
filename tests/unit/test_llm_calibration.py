@@ -114,7 +114,10 @@ def test_fit_success():
     assert calib._is_fitted
     assert result["n_samples"] == 60
     assert result["ece_before"] is not None
-    assert result["ece_after"] is not None
+    # 학습 표본으로 잰 값임을 이름에 박았다 (옛 ece_after 는 제거).
+    assert result["ece_after_in_sample"] is not None
+    assert "ece_after" not in result
+    assert result["holdout"]["status"] in ("evaluated", "insufficient")
 
 
 def test_ece_improvement_after_calibration():
@@ -127,7 +130,7 @@ def test_ece_improvement_after_calibration():
     # 작은 샘플에서는 항상 보장되지 않지만, 대부분 개선
     if result["status"] == "fitted":
         ece_before = result.get("ece_before", 0)
-        ece_after = result.get("ece_after", 0)
+        ece_after = result.get("ece_after_in_sample", 0)
         # 보정이 크게 악화되지 않아야 함
         assert ece_after <= ece_before + 0.1
 
@@ -186,7 +189,8 @@ def test_status_fitted():
     assert s["is_active"] is True
     assert s["n_samples"] == 60
     assert s["ece_before"] is not None
-    assert s["ece_after"] is not None
+    assert s["ece_after_in_sample"] is not None
+    assert "holdout" in s
     assert s["fitted_at"] is not None
 
 
