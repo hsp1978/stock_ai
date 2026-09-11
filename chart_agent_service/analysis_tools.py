@@ -2017,12 +2017,98 @@ class AnalysisTools:
                     f"호재 {ds['positive']}, 악재 {ds['negative']}, 중립 {ds['neutral']}"
                 ),
             })
+            # 희석(전환사채·유상증자)은 키워드가 아니라 **규모**로 판단한다.
+            self._merge_dilution_into(result)
         except Exception as exc:
             result.update({
                 "signal": "neutral", "score": 0,
                 "detail": f"DART 공시 분석 실패: {str(exc)[:80]}",
             })
         return result
+
+    def _merge_dilution_into(self, result: dict) -> None:
+        """전환사채·유상증자 희석 규모를 공시 분석 결과에 합친다.
+
+        종전에는 "유상증자" 키워드만 악재 목록에 있었고 **규모를 보지 않았다**.
+        SKAI 는 시총 1,117억 대비 CB 450억+30억(약 43%)을 발행하는 동안 스크리너
+        A등급 1순위였고, 급등 → CB 발행 → 희석 → 급락 주기를 탔다 (2026-09 사후검증).
+        """
+        try:
+            from dart_client import (
+                DartUnavailable,
+                fetch_dilution_events,
+                score_dilution_events,
+            )
+        except Exception as exc:
+            result["dilution_unavailable"] = f"희석 조회 불가: {exc}"
+            return
+
+        try:
+            events = fetch_dilution_events(self.ticker, months=6)
+        except DartUnavailable as exc:
+            # 미조회를 '희석 없음'으로 적지 않는다.
+            result["dilution_unavailable"] = f"희석 조회 불가: {str(exc)[:80]}"
+            return
+        except Exception as exc:
+            result["dilution_unavailable"] = (
+                f"희석 조회 오류: {type(exc).__name__}: {str(exc)[:60]}"
+            )
+            return
+
+        sig = score_dilution_events(events)
+        result["dilution_pct"] = sig.total_dilution_pct
+        result["dilution_event_count"] = sig.event_count
+        result["dilution_detail"] = sig.detail
+        result["dilution_events"] = [
+            {
+                "kind": e.kind,
+                "date": e.date,
+                "dilution_pct": e.dilution_pct,
+                "new_shares": e.new_shares,
+                "amount_krw": e.amount_krw,
+                "private_placement": e.private_placement,
+            }
+            for e in events[:5]
+        ]
+
+        # 급등 직후 조달은 '고점 자금조달' 패턴이다 — 규모와 별개로 표시한다.
+        spike_note = self._recent_spike_note(events)
+        if spike_note:
+            sig.warnings.append(spike_note)
+
+        if sig.critical_risks:
+            result["critical_risks"] = (
+                list(result.get("critical_risks") or []) + sig.critical_risks
+            )
+        if sig.warnings:
+            result["warnings"] = list(result.get("warnings") or []) + sig.warnings
+
+        # 희석 점수는 공시 점수에 합산하되 도구 스케일([-6,+8])을 넘지 않게 클램프.
+        if sig.score:
+            merged = float(result.get("score") or 0) + sig.score
+            result["score"] = max(-6.0, min(8.0, merged))
+            if result["score"] < 0:
+                result["signal"] = "sell"
+            result["detail"] = f"{result.get('detail', '')} | {sig.detail}"
+
+    def _recent_spike_note(self, events: list) -> Optional[str]:
+        """직전 1개월 급등(+50%) 중 희석 결정이 있었는지."""
+        if not events or self.df is None or len(self.df) < 22:
+            return None
+        try:
+            recent = float(self.close.iloc[-1])
+            month_ago = float(self.close.iloc[-22])
+            if month_ago <= 0:
+                return None
+            change = recent / month_ago - 1
+        except Exception:
+            return None
+        if change < 0.5:
+            return None
+        return (
+            f"직전 1개월 {change:+.0%} 급등 중 {events[0].label} 결정 "
+            "— 고점 자금조달 패턴"
+        )
 
     # ── P2: Piotroski F-Score / Altman Z-Score ───────────────────
 

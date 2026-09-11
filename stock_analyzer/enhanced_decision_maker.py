@@ -182,6 +182,29 @@ class EnhancedDecisionMaker:
                     decision[key] = min(float(decision[key]), 5.0)
         return decision
 
+    def _collect_tool_hard_blocks(self, agent_results) -> List[str]:
+        """도구 결과 중 **방향 판단과 무관하게 매수를 막아야 하는** critical risk.
+
+        현재 대상: 희석(전환사채·유상증자 규모), 내부자 전량 이탈.
+        펀더멘털(P/E·적자)과 같은 게이트로 흘려보내 신호를 강등한다 — 경고 문자열만
+        남기면 신호가 그대로 나간다는 교훈(#19, R/R 게이트)의 연장이다.
+        """
+        blocks: List[str] = []
+        for result in agent_results or []:
+            if getattr(result, "error", None):
+                continue
+            for ev in (result.evidence or []):
+                if ev.get("tool") not in (
+                    "dart_disclosure_analysis",
+                    "insider_trading_analysis",
+                ):
+                    continue
+                for risk in ((ev.get("result") or {}).get("critical_risks") or []):
+                    text = str(risk)
+                    if text not in blocks:
+                        blocks.append(text)
+        return blocks
+
     def _apply_valuation_gate(
         self, final_decision: Dict, fundamental_risks: Optional[Dict]
     ) -> Dict:
@@ -569,7 +592,11 @@ class EnhancedDecisionMaker:
         # critical risk 가 있으면 방향 판단과 무관하게 매수 부적격이다.
         # 경고 문자열만으로는 신호가 그대로 나간다 (R/R 게이트와 같은 교훈).
         if final_decision["signal"] == "buy":
-            final_decision = self._apply_valuation_gate(final_decision, fundamental_risks)
+            gate_input = dict(fundamental_risks or {})
+            gate_input["critical_risks"] = list(
+                (fundamental_risks or {}).get("critical_risks") or []
+            ) + self._collect_tool_hard_blocks(agent_results)
+            final_decision = self._apply_valuation_gate(final_decision, gate_input)
 
         # 6.75. [실적 블랙아웃] 발표 직전에는 갭 때문에 손절가가 성립하지 않는다.
         days_to_earnings = (fundamental_risks or {}).get("days_to_earnings")
@@ -965,6 +992,14 @@ class EnhancedDecisionMaker:
                 elif tool == "geopolitical_analysis":
                     for risk in (tool_result.get("risks") or [])[:3]:
                         add(f"지정학: {risk}")
+                elif tool == "dart_disclosure_analysis":
+                    # 희석은 규모가 커지면 방향 판단과 무관하게 진입 부적격이다.
+                    for risk in (tool_result.get("critical_risks") or [])[:2]:
+                        add(str(risk))
+                    for warn in (tool_result.get("warnings") or [])[:2]:
+                        add(str(warn))
+                    if tool_result.get("dilution_unavailable"):
+                        add(f"희석 리스크 미확인 — {tool_result['dilution_unavailable']}")
                 elif tool == "insider_trading_analysis":
                     # 전량 이탈(잔량 0)은 부분 매도와 다른 사건이다 — 핵심 리스크로 승격.
                     for risk in (tool_result.get("critical_risks") or [])[:2]:
