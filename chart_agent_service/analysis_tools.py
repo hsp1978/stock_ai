@@ -1784,9 +1784,85 @@ class AnalysisTools:
         })
         return result
 
+    def _insider_trading_from_dart(self) -> Optional[dict]:
+        """DART 소유상황보고 기반 내부자 신호. 조회 불가면 그 사실을 결과로 낸다.
+
+        `None` 반환은 "DART 경로를 쓰지 않는다"(비한국 종목 등)를 뜻하고,
+        조회 불가는 `data_source="unavailable"` 로 **명시**한다. 미조회를 '변동 없음'
+        으로 적으면 장애가 정상으로 위장된다 (#17 DART 공시 사례와 같은 함정).
+        """
+        try:
+            from dart_client import (
+                DartUnavailable,
+                fetch_insider_trades,
+                score_insider_trades,
+            )
+        except Exception as exc:
+            return {
+                "signal": "neutral",
+                "score": 0,
+                "data_source": "unavailable",
+                "detail": f"DART 클라이언트 사용 불가 — 내부자 거래 미확인 ({exc})",
+            }
+
+        try:
+            trades = fetch_insider_trades(self.ticker, months=6)
+        except DartUnavailable as exc:
+            return {
+                "signal": "neutral",
+                "score": 0,
+                "data_source": "unavailable",
+                "detail": f"DART 조회 불가 — 내부자 거래 미확인 ({exc})",
+            }
+        except Exception as exc:  # 예기치 못한 오류도 '없음'으로 적지 않는다
+            return {
+                "signal": "neutral",
+                "score": 0,
+                "data_source": "unavailable",
+                "detail": f"DART 조회 오류 — 내부자 거래 미확인 ({type(exc).__name__}: {exc})",
+            }
+
+        sig = score_insider_trades(trades)
+        payload = {
+            "signal": sig.signal if sig.signal in ("buy", "sell", "neutral") else "sell",
+            "score": sig.score,
+            "data_source": "dart_elestock",
+            "detail": sig.detail,
+            "insider_trade_count": sig.trade_count,
+            "insider_buy_shares": sig.buy_shares,
+            "insider_sell_shares": sig.sell_shares,
+            "insider_full_exits": sig.full_exits,
+            "recent_trades": [
+                {
+                    "date": t.report_date,
+                    "reporter": t.reporter,
+                    "position": t.position,
+                    "shares_delta": t.shares_delta,
+                    "shares_after": t.shares_after,
+                    "ownership_pct": t.ownership_pct,
+                }
+                for t in trades[:5]
+            ],
+        }
+        if sig.critical_risks:
+            # enhanced_decision_maker._collect_agent_risks 가 승격하는 경로
+            payload["critical_risks"] = sig.critical_risks
+            payload["strength"] = "strong"
+        return payload
+
     def insider_trading_analysis(self) -> dict:
         """[퀀트10] 내부자 거래 분석 - CEO/CFO 매수/매도 패턴"""
         result = {"tool": "insider_trading_analysis", "name": "내부자 거래 분석"}
+
+        # ── 한국 종목: DART 임원·주요주주 소유상황보고 (elestock) ──────
+        # yfinance 의 insider_trades 는 국내 종목을 커버하지 않아, 지금까지 KR 종목은
+        # 항상 "데이터 없음"으로 끝났다. 유엔젤 이사 전량매도(2026-04-01, 잔량 0주)가
+        # 그 상태에서 누락됐고 이후 주가는 약 -42% (2026-09 사후검증).
+        if _market_from_ticker(self.ticker) == "KR":
+            kr = self._insider_trading_from_dart()
+            if kr is not None:
+                result.update(kr)
+                return result
 
         try:
             # 내부자 거래 분석기 임포트

@@ -965,6 +965,12 @@ class EnhancedDecisionMaker:
                 elif tool == "geopolitical_analysis":
                     for risk in (tool_result.get("risks") or [])[:3]:
                         add(f"지정학: {risk}")
+                elif tool == "insider_trading_analysis":
+                    # 전량 이탈(잔량 0)은 부분 매도와 다른 사건이다 — 핵심 리스크로 승격.
+                    for risk in (tool_result.get("critical_risks") or [])[:2]:
+                        add(str(risk))
+                    if tool_result.get("data_source") == "unavailable":
+                        add("내부자 거래 미확인 — DART 조회 불가 (리스크 평가 불완전)")
                 elif tool == "value_investing_analysis":
                     roe = tool_result.get("roe")
                     if roe is not None and 0 <= roe < 0.05:
