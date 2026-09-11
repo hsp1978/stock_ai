@@ -227,7 +227,7 @@ def send_rich_signal_alert(
         by_sig = (accuracy_stats.get("by_signal") or {}).get(signal.lower(), {})
         if by_sig.get("total", 0) >= 10:
             lines.append(
-                f"\n📈 <b>과거 적중률</b>: {by_sig['win_rate_pct']:.0f}% "
+                f"\n📈 <b>과거 방향 적중률</b>: {by_sig['direction_hit_rate_pct']:.0f}% "
                 f"(n={by_sig['total']}, 방향보정 기대값 "
                 f"{by_sig['avg_signed_return_pct']:+.2f}%)"
             )

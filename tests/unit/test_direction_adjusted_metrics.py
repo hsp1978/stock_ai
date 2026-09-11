@@ -87,7 +87,8 @@ def test_correct_sell_signals_no_longer_read_as_losses(db):
 
     stats = _stats(db, horizon=7, days_back=90)
 
-    assert stats["win_count"] == 4                      # 판정은 원래 방향을 알았다
+    assert stats["direction_hit_rate_pct"] == 100.0     # 매도 4건 전부 방향 적중
+    assert stats["band_outcome"]["win"] == 4            # 밴드 기준으로도 승
     assert stats["avg_signed_return_pct"] == 5.0        # 성과 지표
     assert stats["avg_raw_return_pct"] == -5.0          # 진단용 원시값
     assert stats["signed_sample"] == 4
@@ -105,7 +106,7 @@ def test_mixed_book_expectancy_is_not_cancelled_out(db):
 
     assert stats["avg_raw_return_pct"] == 0.0
     assert stats["avg_signed_return_pct"] == 4.0
-    assert stats["win_count"] == 2
+    assert stats["direction_hit_rate_pct"] == 100.0
 
 
 def test_neutral_rows_are_excluded_from_signed_average(db):

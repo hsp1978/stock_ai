@@ -105,11 +105,12 @@ def test_accuracy_stats_uses_signal_direction_and_confidence_filter(signal_db):
         stats = get_accuracy_stats(horizon=7, min_confidence=8.0, days_back=30)
 
     assert stats["total_evaluated"] == 3
-    assert stats["win_count"] == 2
-    assert stats["loss_count"] == 1
-    assert stats["win_rate_pct"] == 66.7
+    band = stats["band_outcome"]
+    assert band["win"] == 2 and band["loss"] == 1
+    assert band["win_rate_pct"] == 66.7
+    assert band["threshold_pct"] == 2.0          # 임계를 값과 함께 싣는다
     assert stats["by_signal"]["buy"]["total"] == 1
-    assert stats["by_signal"]["buy"]["win_rate_pct"] == 100.0
+    assert stats["by_signal"]["buy"]["band_outcome"]["win_rate_pct"] == 100.0
     assert stats["by_signal"]["sell"]["total"] == 2
-    assert stats["by_signal"]["sell"]["win_rate_pct"] == 50.0
+    assert stats["by_signal"]["sell"]["band_outcome"]["win_rate_pct"] == 50.0
     assert stats["by_source"]["scan_agent"]["total"] == 3

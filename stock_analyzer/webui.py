@@ -4854,7 +4854,10 @@ def render_system_monitor():
             hz = accuracy.get("horizon_days", 7)
             a1, a2, a3, a4 = st.columns(4)
             a1.metric(f"{hz}D Evaluated", f"{accuracy.get('total_evaluated', 0):,}")
-            a2.metric(f"{hz}D Win Rate", f"{accuracy.get('win_rate_pct', 0):.1f}%")
+            a2.metric(
+                f"{hz}D 방향 적중률",
+                f"{accuracy.get('direction_hit_rate_pct', 0):.1f}%",
+            )
             # 방향 보정본을 쓴다 — 원시 평균은 매도가 맞을수록 내려간다.
             a3.metric("방향보정 기대값", f"{accuracy.get('avg_signed_return_pct', 0):+.2f}%")
             a4.metric("Samples", f"{accuracy.get('sample_size', 0):,}")
@@ -4864,7 +4867,7 @@ def render_system_monitor():
                 band_df = pd.DataFrame(bands)
                 fig = go.Figure(go.Bar(
                     x=band_df["band"],
-                    y=band_df["win_rate_pct"],
+                    y=band_df["direction_hit_rate_pct"],
                     text=[f"n={n}" for n in band_df["total"]],
                     marker_color="#10b981",
                 ))
@@ -5003,16 +5006,17 @@ def render_signal_accuracy():
 
     # ── 핵심 지표 카드 ───────────────────────────
     total = data.get("total_evaluated", 0)
-    win_rate = data.get("win_rate_pct", 0)
+    hit_rate = data.get("direction_hit_rate_pct", 0)
+    band = data.get("band_outcome") or {}
     avg_return = data.get("avg_signed_return_pct", 0)
     avg_raw = data.get("avg_raw_return_pct", 0)
-    wins = data.get("win_count", 0)
-    losses = data.get("loss_count", 0)
+    wins = band.get("win", 0)
+    losses = band.get("loss", 0)
 
     sampling = data.get("sampling") or {}
     rows_raw = sampling.get("rows_raw", total)
     blocks = data.get("independent_blocks", 0)
-    ci = data.get("win_rate_ci95") or []
+    ci = data.get("direction_hit_ci95") or []
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -5023,8 +5027,17 @@ def render_signal_accuracy():
             delta_color="off",
         )
     with c2:
-        delta = "" if wins == 0 else f"{wins}승 / {losses}패"
-        st.metric("적중률", f"{win_rate:.1f}%", delta=delta, delta_color="off")
+        # 대표 지표는 밴드 없는 방향 적중률이다 — ±2% 밴드는 임의값이고
+        # horizon 이 길수록 넘기 쉬워진다. 밴드 집계는 delta 에 부기한다.
+        st.metric(
+            "방향 적중률", f"{hit_rate:.1f}%",
+            delta=(
+                f"±{band.get('threshold_pct', 2)}% 기준 {wins}승/{losses}패"
+                if band else ""
+            ),
+            delta_color="off",
+            help="신호 방향대로 움직였는지(부호)만 본다. 밴드 승률은 임계에 의존한다.",
+        )
     with c3:
         # 매수는 +수익률, 매도는 -수익률. 원시 평균은 매도가 맞을수록 내려가므로
         # 성과 지표로 쓸 수 없다 (진단용으로 delta 에만 남긴다).
@@ -5054,7 +5067,7 @@ def render_signal_accuracy():
     with c5:
         # 신뢰구간은 독립 블록 수로 계산한다 — 행 수로 계산하면 거짓으로 좁아진다.
         st.metric(
-            "적중률 95% 구간",
+            "방향 적중률 95% 구간",
             f"{ci[0]:.0f}~{ci[1]:.0f}%" if len(ci) == 2 else "—",
             delta=f"독립 블록 {blocks:,}건",
             delta_color="off",
@@ -5089,7 +5102,7 @@ def render_signal_accuracy():
         s = by_signal.get(sig, {})
         with sig_cols[i]:
             n = s.get("total", 0)
-            wr = s.get("win_rate_pct", 0)
+            wr = s.get("direction_hit_rate_pct", 0)
             avg_r = s.get("avg_signed_return_pct", 0)
             icon = {"buy": "🟢", "sell": "🔴", "neutral": "⚪"}.get(sig, "")
             if n > 0:
@@ -5121,7 +5134,8 @@ def render_signal_accuracy():
                     "구간": b["band"],
                     "건수": b["total"],
                     "적중": b["wins"],
-                    "적중률": f"{b['win_rate_pct']:.1f}%",
+                    "방향 적중률": f"{b['direction_hit_rate_pct']:.1f}%",
+                    "±2% 승률": f"{b['band_win_rate_pct']:.1f}%",
                     "방향보정 기대값": f"{b['avg_signed_return_pct']:+.2f}%",
                 })
         if band_table:
@@ -5131,7 +5145,7 @@ def render_signal_accuracy():
             try:
                 import plotly.graph_objects as _go
                 x = [b["band"] for b in bands if b["total"] > 0]
-                y = [b["win_rate_pct"] for b in bands if b["total"] > 0]
+                y = [b["direction_hit_rate_pct"] for b in bands if b["total"] > 0]
                 ns = [b["total"] for b in bands if b["total"] > 0]
                 fig = _go.Figure()
                 fig.add_trace(_go.Bar(
