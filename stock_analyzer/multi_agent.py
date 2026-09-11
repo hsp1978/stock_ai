@@ -2383,6 +2383,36 @@ class MultiAgentOrchestrator:
                 final_decision["entry_plan"] = None
                 final_decision["entry_plan_error"] = "진입 계획 생성 실패"
 
+            # 4.4. 현재가 + 가격 소스 교차검증을 리포트에 싣는다.
+            # 진입가만 있으면 읽는 사람이 가격 오류를 검산할 수 없다
+            # (PLTR 2026-04-17: 진입가 $147.12가 당일 범위 $139.53~$146.50 밖).
+            try:
+                final_decision["current_price"] = round(float(df["Close"].iloc[-1]), 4)
+            except Exception:
+                final_decision["current_price"] = None
+            try:
+                from data_collector import verify_latest_close
+
+                _pv = verify_latest_close(ticker)
+                final_decision["price_verification"] = {
+                    "status": _pv.status,
+                    "primary_source": _pv.primary_source,
+                    "secondary_source": _pv.secondary_source,
+                    "diff_pct": _pv.diff_pct,
+                    "detail": _pv.detail,
+                }
+                if _pv.is_mismatch:
+                    _risks = list(final_decision.get("key_risks") or [])
+                    _msg = f"가격 소스 불일치 — {_pv.detail}"
+                    if _msg not in _risks:
+                        _risks.append(_msg)
+                    final_decision["key_risks"] = _risks
+            except Exception as _pe:
+                final_decision["price_verification"] = {
+                    "status": "unavailable",
+                    "detail": f"교차검증 실패 — {type(_pe).__name__}",
+                }
+
             # 4.5. 실행 가능성 판정 — 진입 계획이 붙은 뒤여야 한다.
             # aggregate() 안에서 판정하면 entry_plan이 아직 없어 항상 False가 된다.
             try:

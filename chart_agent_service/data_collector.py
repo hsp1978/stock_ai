@@ -14,7 +14,8 @@ import logging
 import os
 import threading
 from datetime import datetime, timezone
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -313,6 +314,228 @@ def _age_seconds(fetched_at: datetime | None) -> float | None:
     if not isinstance(fetched_at, datetime):
         return None
     return max(0.0, (datetime.now(timezone.utc) - fetched_at).total_seconds())
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  가격 소스 교차검증
+# ═══════════════════════════════════════════════════════════════════
+#
+# 다중 소스 폴백은 '한 소스가 죽었을 때 다른 소스로 넘어가는' 장치일 뿐,
+# **두 소스가 서로 다른 값을 줄 때를 잡지 못한다.** 가격이 틀리면 Z-score·ATR·
+# 지지저항·R/R 이 전부 무의미해지므로, 최신 종가만 교차 확인한다.
+#
+# 2026-09 사후검증에서 나온 불일치 사례:
+#   DB손해보험  공식 IR ₩68,400(9/3) vs 외부 위젯 ₩202,000(9/2) — 약 3배
+#   PLTR       시스템 진입가 $147.12 vs 당일 실제 범위 $139.53~$146.50
+#
+# 설계 선택:
+#   - 전체 히스토리가 아니라 **최신 종가 1개**만 비교한다 (호출 비용 최소화).
+#   - 같은 거래일(latest_bar_date)일 때만 가격을 비교한다. 날짜가 다르면 가격
+#     차이가 아니라 **소스 지연**이므로 따로 보고한다 (장중 시점 차이 포함).
+#   - 불일치는 예외로 올리지 않는다. 분석 전체를 죽이면 데이터 소스 딸꾹질이
+#     운영 중단이 된다 — 대신 상태로 보고해 게이트가 판단하게 한다.
+#   - 결과는 OHLCV 와 같은 TTL 로 캐시한다 (스캔마다 재검증하지 않는다).
+
+_verification_cache: dict[str, tuple[datetime, "PriceVerification"]] = {}
+_verification_lock = threading.Lock()
+
+# 같은 거래일 종가가 이 비율 이상 어긋나면 불일치로 본다.
+PRICE_MISMATCH_PCT = 2.0
+
+
+@dataclass(frozen=True)
+class PriceVerification:
+    """최신 종가 교차검증 결과."""
+
+    ticker: str
+    status: str          # ok | mismatch | bar_date_mismatch | single_source | unavailable
+    primary_source: Optional[str] = None
+    primary_close: Optional[float] = None
+    primary_bar_date: Optional[str] = None
+    secondary_source: Optional[str] = None
+    secondary_close: Optional[float] = None
+    secondary_bar_date: Optional[str] = None
+    compared_bar_date: Optional[str] = None   # 실제로 비교한 공통 거래일
+    diff_pct: Optional[float] = None
+    detail: str = ""
+
+    @property
+    def is_mismatch(self) -> bool:
+        return self.status in ("mismatch", "bar_date_mismatch")
+
+
+def _secondary_sources(ticker: str, primary_name: str) -> list:
+    """1차 소스를 제외한 검증용 소스 목록 (같은 체인 순서)."""
+    if _is_korean_ticker(ticker):
+        candidates = [PykrxSource(), FdrSource(), YFinanceSource()]
+    else:
+        candidates = [YFinanceSource(), FdrSource()]
+    return [
+        src
+        for src in _dedupe_sources(candidates)
+        if getattr(src, "name", "") != primary_name
+    ]
+
+
+def _close_by_date(df: "pd.DataFrame") -> dict[str, float]:
+    """{ISO 날짜: 종가}. 소스 간 '같은 거래일'을 맞추기 위한 인덱스."""
+    if df is None or df.empty or "Close" not in df.columns:
+        return {}
+    out: dict[str, float] = {}
+    for idx, value in df["Close"].items():
+        key = idx.date().isoformat() if hasattr(idx, "date") else str(idx)[:10]
+        try:
+            out[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _latest_close_and_date(df: "pd.DataFrame") -> tuple[Optional[float], Optional[str]]:
+    if df is None or df.empty or "Close" not in df.columns:
+        return None, None
+    try:
+        close = float(df["Close"].iloc[-1])
+    except (TypeError, ValueError):
+        return None, None
+    last_idx = df.index[-1]
+    bar_date = (
+        last_idx.date().isoformat()
+        if hasattr(last_idx, "date")
+        else str(last_idx)[:10]
+    )
+    return close, bar_date
+
+
+def verify_latest_close(
+    ticker: str, period: str = DEFAULT_HISTORY_PERIOD, use_cache: bool = True
+) -> PriceVerification:
+    """1차 소스의 최신 종가를 다른 소스와 비교한다.
+
+    네트워크를 타므로 TTL 캐시를 쓴다. 검증 불가는 'ok' 로 적지 않는다.
+    """
+    key = f"{ticker.upper()}|{period}"
+    ttl = _get_ttl_seconds(period)
+    now = datetime.now(timezone.utc)
+    if use_cache:
+        with _verification_lock:
+            cached = _verification_cache.get(key)
+        if cached and (now - cached[0]).total_seconds() < ttl:
+            return cached[1]
+
+    try:
+        primary = fetch_ohlcv_with_meta(ticker, period)
+    except Exception as exc:
+        result = PriceVerification(
+            ticker=ticker.upper(),
+            status="unavailable",
+            detail=f"1차 소스 조회 실패 — 검증 불가 ({type(exc).__name__}: {exc})",
+        )
+        _store_verification(key, now, result)
+        return result
+
+    p_close, p_date = _latest_close_and_date(primary.data)
+    base = {
+        "ticker": ticker.upper(),
+        "primary_source": primary.source,
+        "primary_close": p_close,
+        "primary_bar_date": p_date,
+    }
+    if p_close is None:
+        result = PriceVerification(
+            **base, status="unavailable", detail="1차 소스 종가 없음 — 검증 불가"
+        )
+        _store_verification(key, now, result)
+        return result
+
+    failures: list[str] = []
+    for source in _secondary_sources(ticker, primary.source):
+        name = getattr(source, "name", source.__class__.__name__)
+        try:
+            df = _fetch_with_retry(source, ticker, period)
+        except Exception as exc:
+            failures.append(f"{name}({type(exc).__name__})")
+            continue
+        s_close, s_date = _latest_close_and_date(df)
+        if s_close is None:
+            failures.append(f"{name}(종가없음)")
+            continue
+
+        # '최신 vs 최신'을 비교하면 안 된다. 실측(2026-09-11): 미국 종목에서 Toss 는
+        # KST 날짜(09-11), yfinance 는 미국장 날짜(09-10)로 최신 봉을 라벨링한다.
+        # 그대로 비교하면 **모든 미국 종목이 매일 불일치**로 잡혀 경고가 상시 켜진다.
+        # 두 소스에 공통으로 있는 가장 최근 거래일의 종가를 맞춰서 본다.
+        primary_by_date = _close_by_date(primary.data)
+        secondary_by_date = _close_by_date(df)
+        common = sorted(set(primary_by_date) & set(secondary_by_date))
+        if not common:
+            result = PriceVerification(
+                **base,
+                status="bar_date_mismatch",
+                secondary_source=name,
+                secondary_close=s_close,
+                secondary_bar_date=s_date,
+                detail=(
+                    f"공통 거래일 없음: {primary.source} 최신 {p_date} vs {name} 최신 {s_date} "
+                    "— 가격 비교 불가"
+                ),
+            )
+            _store_verification(key, now, result)
+            return result
+
+        compared = common[-1]
+        p_cmp = primary_by_date[compared]
+        s_cmp = secondary_by_date[compared]
+        lag_note = ""
+        if p_date != s_date:
+            lag_note = f", 최신봉 {primary.source} {p_date}/{name} {s_date}"
+
+        diff_pct = abs(p_cmp - s_cmp) / s_cmp * 100 if s_cmp else None
+        status = (
+            "mismatch"
+            if diff_pct is not None and diff_pct > PRICE_MISMATCH_PCT
+            else "ok"
+        )
+        detail = (
+            f"{compared} 종가 비교: {primary.source} {p_cmp:,.2f} vs {name} {s_cmp:,.2f} "
+            f"(차이 {diff_pct:.2f}%){lag_note}"
+        )
+        if status == "mismatch":
+            detail += f" — 임계 {PRICE_MISMATCH_PCT}% 초과, 가격 기반 지표 신뢰 불가"
+        result = PriceVerification(
+            **base,
+            status=status,
+            secondary_source=name,
+            secondary_close=s_cmp,
+            secondary_bar_date=s_date,
+            compared_bar_date=compared,
+            diff_pct=round(diff_pct, 3) if diff_pct is not None else None,
+            detail=detail,
+        )
+        _store_verification(key, now, result)
+        return result
+
+    # 2차 소스가 하나도 응답하지 않았다 — '일치'가 아니라 '미검증'이다.
+    result = PriceVerification(
+        **base,
+        status="single_source",
+        detail=(
+            f"{primary.source} 단일 소스 — 교차검증 불가"
+            + (f" (실패: {', '.join(failures)})" if failures else "")
+        ),
+    )
+    _store_verification(key, now, result)
+    return result
+
+
+def _store_verification(key: str, now: datetime, result: "PriceVerification") -> None:
+    with _verification_lock:
+        _verification_cache[key] = (now, result)
+
+
+def clear_price_verification_cache() -> None:
+    with _verification_lock:
+        _verification_cache.clear()
 
 
 def get_data_cache_status(

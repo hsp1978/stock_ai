@@ -2712,6 +2712,16 @@ def _is_directional_result(result: dict) -> bool:
     return result.get("tool") not in NON_DIRECTIONAL_TOOLS
 
 
+def _latest_close_of(df) -> Optional[float]:
+    """DataFrame 의 최신 종가. ChartAnalysisAgent 는 self.latest 를 갖지 않는다."""
+    try:
+        if df is None or len(df) == 0 or "Close" not in df.columns:
+            return None
+        return round(float(df["Close"].iloc[-1]), 4)
+    except Exception:
+        return None
+
+
 def apply_cross_tool_guards(results: list) -> list:
     """도구 간 모순을 해소한다 — 지금은 평균회귀 × 자기상관.
 
@@ -2926,6 +2936,10 @@ class ChartAnalysisAgent:
             "final_signal": final_signal,
             "composite_score": round(avg_score, 2),
             "confidence": confidence,
+            # 현재가는 리포트 필수 필드다 — 진입가·손절을 검산할 수 없으면
+            # 리포트를 읽는 사람이 가격 오류를 발견할 방법이 없다
+            # (영원무역 2026-07-31 리포트에는 현재가 필드 자체가 없었다).
+            "current_price": _latest_close_of(self.df),
             "signal_distribution": signals,
             "directional_signal_distribution": directional_signals,
             "tool_count": total,
