@@ -26,30 +26,9 @@ _AGENT_DIR = os.path.join(os.path.dirname(__file__), "../../chart_agent_service"
 if _AGENT_DIR not in sys.path:  # noqa: E402
     sys.path.insert(0, _AGENT_DIR)
 
-_SCHEMA = """
-CREATE TABLE signal_outcomes (
-    signal_id        TEXT PRIMARY KEY,
-    ticker           TEXT NOT NULL,
-    signal_type      TEXT NOT NULL,
-    signal_source    TEXT NOT NULL,
-    issued_at        TIMESTAMP NOT NULL,
-    conviction       REAL NOT NULL,
-    price_at_signal  REAL NOT NULL,
-    price_7d         REAL,
-    price_14d        REAL,
-    price_30d        REAL,
-    return_7d        REAL,
-    return_14d       REAL,
-    return_30d       REAL,
-    max_drawdown_30d REAL,
-    evaluated_at     TIMESTAMP,
-    market_context   TEXT,
-    regime           TEXT,
-    signal_std       REAL,
-    agreement_level  TEXT,
-    eval_state       TEXT
-);
-"""
+# 스키마는 db.py 의 실제 DDL 을 쓴다 — 복제하면 컬럼이 추가될 때마다 픽스처가
+# 현실과 어긋난다 (2026-09: ticker/signal_type/eval_state/benchmark_* 추가 때마다 발생).
+from db import _CREATE_OUTCOMES_TABLE as _SCHEMA  # noqa: E402
 
 NOW = datetime.now(timezone.utc)
 
@@ -191,9 +170,10 @@ def test_price_history_is_fetched_once_per_ticker(signal_db):
     stats, calls = _run(signal_db, days_back=90, limit=100)
 
     assert stats["updated"] == 10
-    # 종전이라면 10행 x 3 horizon = 30회. 지금은 티커당 1회.
-    assert sorted(t for t, _, _ in calls) == ["AAPL", "MSFT"]
-    assert stats["prefetch"]["tickers_cached"] == 2
+    # 종전이라면 10행 x 3 horizon = 30회. 지금은 티커당 1회 + 벤치마크 지수 1회.
+    # (지수는 종목당이 아니라 시장당 1회라 비용이 거의 없다 — 2026-09 벤치마크 도입)
+    assert sorted(t for t, _, _ in calls) == ["AAPL", "MSFT", "^GSPC"]
+    assert stats["prefetch"]["tickers_cached"] == 3
 
 
 def test_result_reports_remaining_backlog_and_window_expiry(signal_db):
@@ -227,7 +207,8 @@ def test_missing_price_is_not_reported_as_nothing_to_do(signal_db):
     assert stats["updated"] == 0
     assert stats["skipped_no_price"] == 1
     assert stats["skipped_not_due"] == 0
-    assert stats["prefetch"]["tickers_failed"] == ["DEAD"]
+    # 벤치마크 지수도 같은 fake fetch 를 타므로 함께 실패 목록에 오른다.
+    assert "DEAD" in stats["prefetch"]["tickers_failed"]
     assert stats["pending_due"] == 1
 
 
@@ -362,7 +343,8 @@ def test_evaluation_uses_configured_data_source_chain(signal_db, monkeypatch):
         stats = signal_tracker.evaluate_past_signals(days_back=90, limit=10)
 
     assert stats["updated"] == 1
-    assert [t for t, _ in calls] == ["057050.KS"]
+    # 종목 + 벤치마크 지수(KOSPI) 가 같은 체인을 탄다
+    assert [t for t, _ in calls] == ["057050.KS", "^KS11"]
     assert calls[0][1] in {"3mo", "6mo", "1y", "2y", "5y"}
 
 

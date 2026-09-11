@@ -17,32 +17,10 @@ if _AGENT_DIR not in sys.path:  # noqa: E402
 def signal_db(tmp_path):
     db_path = tmp_path / "signals.db"
     conn = sqlite3.connect(db_path)
-    conn.executescript(
-        """
-        CREATE TABLE signal_outcomes (
-            signal_id        TEXT PRIMARY KEY,
-            ticker           TEXT NOT NULL,
-            signal_type      TEXT NOT NULL,
-            signal_source    TEXT NOT NULL,
-            issued_at        TIMESTAMP NOT NULL,
-            conviction       REAL NOT NULL,
-            price_at_signal  REAL NOT NULL,
-            price_7d         REAL,
-            price_14d        REAL,
-            price_30d        REAL,
-            return_7d        REAL,
-            return_14d       REAL,
-            return_30d       REAL,
-            max_drawdown_30d REAL,
-            evaluated_at     TIMESTAMP,
-            market_context   TEXT,
-            regime           TEXT,
-            signal_std       REAL,
-            agreement_level  TEXT,
-            eval_state       TEXT
-        );
-        """
-    )
+    # 스키마는 db.py 의 실제 DDL 을 쓴다 — 복제하면 컬럼 추가 때마다 어긋난다.
+    from db import _CREATE_OUTCOMES_TABLE
+
+    conn.executescript(_CREATE_OUTCOMES_TABLE)
     conn.commit()
     conn.close()
     return str(db_path)
@@ -67,7 +45,10 @@ def test_evaluate_past_signals_updates_current_signal_outcomes_schema(signal_db)
     conn.commit()
     conn.close()
 
-    def _mock_price(_ticker, target_date):
+    def _mock_price(ticker, target_date):
+        # 벤치마크 지수(^KS11/^GSPC 등)는 발행일 기준점도 조회되므로 horizon 0 이 온다.
+        if str(ticker).startswith("^"):
+            return 1000.0          # 지수 변화 없음 → 초과수익 = 종목 수익
         horizon = round((target_date - issued_at).total_seconds() / 86400)
         return {7: 104.0, 14: 99.0, 30: 110.0}[horizon]
 
