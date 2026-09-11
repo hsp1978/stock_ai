@@ -15,6 +15,7 @@ Week 2-3: 8개 전문 에이전트 협업 시스템 (Fincept Terminal 벤치마�
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -277,6 +278,14 @@ class BaseAgent:
             # 4. 응답 파싱
             signal, confidence, reasoning = self._parse_response(response)
 
+            # 4.5. 서술이 근거 숫자와 모순되면 신뢰도를 깎고 사유를 남긴다.
+            # 조용히 통과시키면 리포트가 스스로를 잘못 설명한다 (2026-09 사후검증).
+            contradictions = self._check_reasoning_contradictions(reasoning, evidence)
+            if contradictions:
+                confidence = round(float(confidence) * 0.5, 2)
+                reasoning = f"{reasoning}\n[정합성 경고] " + " / ".join(contradictions)
+                print(f"  [{self.name}] 서술 모순 {len(contradictions)}건 — 신뢰도 절반 적용")
+
             execution_time = (datetime.now() - start_time).total_seconds()
 
             return AgentResult(
@@ -301,6 +310,72 @@ class BaseAgent:
                 execution_time=execution_time,
                 error=str(e)
             )
+
+    @staticmethod
+    def _threshold_table() -> str:
+        """지표 임계 기준표. 도구와 같은 출처를 써서 서술이 숫자와 어긋나지 않게 한다."""
+        try:
+            from indicator_thresholds import prompt_threshold_table
+
+            return prompt_threshold_table()
+        except Exception:
+            return ""
+
+    def _check_reasoning_contradictions(
+        self, reasoning: str, evidence: List[Dict[str, Any]]
+    ) -> List[str]:
+        """서술이 근거 숫자와 정면으로 모순되는지 본다.
+
+        2026-09 사후검증에서 나온 실제 모순:
+          - 회귀확률 1.04% 인데 "되돌림 가능성 높음" (DB손해보험)
+          - RSI 64.57 인데 "과매수 진입" (기준 70 미달)
+          - 연환산 변동성 64.0% 인데 "안정적"
+        도구는 올바른 라벨을 내고 있었고 서술만 어긋났다. 모순을 발견하면 신뢰도를
+        깎고 사유를 남긴다 — 조용히 통과시키면 리포트가 스스로를 잘못 설명한다.
+        """
+        if not reasoning:
+            return []
+        facts: Dict[str, Any] = {}
+        for item in evidence or []:
+            result = item.get("result") or {}
+            for key in (
+                "reversion_probability",
+                "current_rsi",
+                "annualized_volatility",
+            ):
+                if result.get(key) is not None and key not in facts:
+                    facts[key] = result[key]
+
+        text = reasoning.replace(" ", "")
+        issues: List[str] = []
+
+        prob = facts.get("reversion_probability")
+        if prob is not None and prob < 0.15 and re.search(r"되돌림[^.]{0,12}(높|커|임박)", text):
+            issues.append(
+                f"서술 모순: 회귀확률 {prob:.1%}(낮음)인데 되돌림 가능성이 높다고 서술"
+            )
+
+        rsi = facts.get("current_rsi")
+        if rsi is not None:
+            try:
+                from indicator_thresholds import RSI_OVERBOUGHT, RSI_OVERSOLD
+            except Exception:
+                RSI_OVERBOUGHT, RSI_OVERSOLD = 70, 30
+            if rsi <= RSI_OVERBOUGHT and "과매수" in text:
+                issues.append(
+                    f"서술 모순: RSI {rsi:.1f}는 과매수 기준 {RSI_OVERBOUGHT} 미달인데 과매수로 서술"
+                )
+            if rsi >= RSI_OVERSOLD and "과매도" in text:
+                issues.append(
+                    f"서술 모순: RSI {rsi:.1f}는 과매도 기준 {RSI_OVERSOLD} 초과인데 과매도로 서술"
+                )
+
+        vol = facts.get("annualized_volatility")
+        if vol is not None and vol > 40 and re.search(r"(안정적|변동성[^.]{0,6}낮)", text):
+            issues.append(
+                f"서술 모순: 연환산 변동성 {vol:.1f}%인데 안정적/낮다고 서술"
+            )
+        return issues
 
     def _build_prompt(self, ticker: str, evidence: List[Dict[str, Any]]) -> str:
         """LLM 프롬프트 생성"""
@@ -337,6 +412,8 @@ class BaseAgent:
 
 ## 분석 결과
 {evidence_text}
+
+{self._threshold_table()}
 
 ## 해석 원칙
 - rule_reference, signal, score는 도구 내부의 하드코딩 휴리스틱 참고값입니다.
