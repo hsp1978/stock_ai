@@ -239,7 +239,8 @@ def test_tool_reports_unavailable_instead_of_no_dilution():
 
 
 def test_dilution_critical_risk_blocks_buy_signal():
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../stock_analyzer"))
+    # append — insert(0) 하면 chart_agent_service 보다 앞서서 동명 모듈 해석이 뒤바뀐다
+    sys.path.append(os.path.join(os.path.dirname(__file__), "../../stock_analyzer"))
     from enhanced_decision_maker import EnhancedDecisionMaker
 
     class _Result:

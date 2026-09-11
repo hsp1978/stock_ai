@@ -15,9 +15,14 @@ from typing import Optional
 
 _ANALYZER_DIR = os.path.join(os.path.dirname(__file__), "../../stock_analyzer")
 _AGENT_DIR = os.path.join(os.path.dirname(__file__), "../../chart_agent_service")
-for _d in (_ANALYZER_DIR, _AGENT_DIR):
-    if _d not in sys.path:  # noqa: E402
-        sys.path.insert(0, _d)
+# 순서 주의: chart_agent_service 가 stock_analyzer 보다 앞이어야 한다. 두 패키지에
+# 같은 이름의 모듈(news_analyzer 등)이 있어서, stock_analyzer 를 sys.path[0] 에
+# 넣으면 **이 모듈을 import 한 뒤** 다른 테스트의 `import service` 가 깨진다
+# (2026-09-12 수집 단계 ImportError). 그래서 analyzer 는 뒤에 붙인다.
+if _AGENT_DIR not in sys.path:  # noqa: E402
+    sys.path.insert(0, _AGENT_DIR)
+if _ANALYZER_DIR not in sys.path:  # noqa: E402
+    sys.path.append(_ANALYZER_DIR)
 
 from agent_groups import (  # noqa: E402
     AgentGroup,

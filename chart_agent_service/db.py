@@ -62,6 +62,12 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     return_14d       REAL,
     return_30d       REAL,
     max_drawdown_30d REAL,
+    -- 보유 구간 중 **신호 반대 방향**으로 간 최대 폭 (양수 = 불리한 이동 %).
+    -- 매수는 저가 기준 하락, 매도는 고가 기준 상승. 손절이 어디서 걸렸을지를
+    -- 재려면 종료 시점 수익률만으로는 안 된다 (2026-09 왼쪽 꼬리 진단).
+    adverse_excursion_7d  REAL,
+    adverse_excursion_14d REAL,
+    adverse_excursion_30d REAL,
     evaluated_at     TIMESTAMP,
     market_context   TEXT,
     regime           TEXT,
@@ -101,6 +107,7 @@ SELECT
         AS signed_expectancy_30d,
     AVG(return_7d)  AS raw_expectancy_7d,
     AVG(return_30d) AS raw_expectancy_30d,
+    AVG(adverse_excursion_30d) AS avg_adverse_excursion_30d,
     AVG(max_drawdown_30d) AS avg_max_dd
 FROM signal_outcomes
 WHERE evaluated_at IS NOT NULL
@@ -287,6 +294,10 @@ def _migrate_signal_outcomes(conn: sqlite3.Connection) -> None:
         ("benchmark_return_7d", "REAL"),
         ("benchmark_return_14d", "REAL"),
         ("benchmark_return_30d", "REAL"),
+        # 2026-09: 역행폭(손절 시뮬레이션용)
+        ("adverse_excursion_7d", "REAL"),
+        ("adverse_excursion_14d", "REAL"),
+        ("adverse_excursion_30d", "REAL"),
     ]:
         if col not in cols:
             try:
