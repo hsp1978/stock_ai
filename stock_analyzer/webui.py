@@ -5022,6 +5022,23 @@ def render_signal_accuracy():
                  "원시 평균은 매도 신호가 맞을수록 내려가 성과 지표가 되지 못한다.",
         )
     with c4:
+        # 시장 대비 초과수익 — 절대 수익만으로는 '시장이 올라서'와 '신호가 맞아서'를
+        # 구분할 수 없다. 벤치마크 표본이 없으면 그렇다고 적는다.
+        bench_n = data.get("benchmark_sample", 0)
+        excess = data.get("avg_excess_return_pct", 0)
+        beat = data.get("beat_benchmark_rate_pct", 0)
+        if bench_n:
+            st.metric(
+                "시장 대비 초과수익", f"{excess:+.2f}%",
+                delta=f"시장 상회 {beat:.0f}% (n={bench_n:,})",
+                delta_color="off",
+                help="매수는 종목−지수, 매도는 지수−종목. 지수는 KOSPI/KOSDAQ/S&P500.",
+            )
+        else:
+            st.metric("시장 대비 초과수익", "—", delta="벤치마크 미기록", delta_color="off")
+
+    c5, c6 = st.columns(2)
+    with c5:
         # 신뢰구간은 독립 블록 수로 계산한다 — 행 수로 계산하면 거짓으로 좁아진다.
         st.metric(
             "적중률 95% 구간",

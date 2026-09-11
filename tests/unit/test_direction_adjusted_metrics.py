@@ -24,30 +24,9 @@ _AGENT_DIR = os.path.join(os.path.dirname(__file__), "../../chart_agent_service"
 if _AGENT_DIR not in sys.path:  # noqa: E402
     sys.path.insert(0, _AGENT_DIR)
 
-_SCHEMA = """
-CREATE TABLE signal_outcomes (
-    signal_id        TEXT PRIMARY KEY,
-    ticker           TEXT NOT NULL,
-    signal_type      TEXT NOT NULL,
-    signal_source    TEXT NOT NULL,
-    issued_at        TIMESTAMP NOT NULL,
-    conviction       REAL NOT NULL,
-    price_at_signal  REAL NOT NULL,
-    price_7d         REAL,
-    price_14d        REAL,
-    price_30d        REAL,
-    return_7d        REAL,
-    return_14d       REAL,
-    return_30d       REAL,
-    max_drawdown_30d REAL,
-    evaluated_at     TIMESTAMP,
-    market_context   TEXT,
-    regime           TEXT,
-    signal_std       REAL,
-    agreement_level  TEXT,
-    eval_state       TEXT
-);
-"""
+# 스키마는 db.py 의 실제 DDL 을 쓴다 — 복제하면 컬럼이 추가될 때마다 픽스처가
+# 현실과 어긋난다 (2026-09: ticker/signal_type/eval_state/benchmark_* 추가 때마다 발생).
+from db import _CREATE_OUTCOMES_TABLE as _SCHEMA  # noqa: E402
 
 NOW = datetime.now(timezone.utc)
 

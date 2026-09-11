@@ -67,6 +67,12 @@ CREATE TABLE IF NOT EXISTS signal_outcomes (
     regime           TEXT,
     signal_std       REAL,
     agreement_level  TEXT,
+    -- 같은 기간 시장 수익률. 절대 수익만 보면 '시장이 올라서 오른 것'과
+    -- '신호가 맞아서 오른 것'을 구분할 수 없다 (2026-09 벤치마크 부재 진단).
+    benchmark_symbol   TEXT,
+    benchmark_return_7d  REAL,
+    benchmark_return_14d REAL,
+    benchmark_return_30d REAL,
     -- NULL=평가 대기/완료, 'unresolved'=시세 소스에 심볼이 없어 종결
     -- (영구 재시도와 영구 경고를 막되, 카운트로는 계속 보이게 한다)
     eval_state       TEXT
@@ -276,6 +282,11 @@ def _migrate_signal_outcomes(conn: sqlite3.Connection) -> None:
         ("signal_std", "REAL"),
         ("agreement_level", "TEXT"),
         ("eval_state", "TEXT"),
+        # 2026-09: 시장 대비 초과수익 계산용
+        ("benchmark_symbol", "TEXT"),
+        ("benchmark_return_7d", "REAL"),
+        ("benchmark_return_14d", "REAL"),
+        ("benchmark_return_30d", "REAL"),
     ]:
         if col not in cols:
             try:

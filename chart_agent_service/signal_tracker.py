@@ -94,6 +94,21 @@ def insert_signal_outcome(
     return signal_id
 
 
+# 시장 벤치마크 — 절대 수익만 보면 '시장이 올라서 오른 것'과 '신호가 맞아서
+# 오른 것'을 구분할 수 없다. 종목의 시장을 따라 지수를 고른다.
+_BENCHMARKS = {"KQ": "^KQ11", "KS": "^KS11", "US": "^GSPC"}
+
+
+def benchmark_for(ticker: str) -> str:
+    """종목의 벤치마크 지수 심볼."""
+    upper = (ticker or "").upper()
+    if upper.endswith(".KQ"):
+        return _BENCHMARKS["KQ"]
+    if upper.endswith(".KS"):
+        return _BENCHMARKS["KS"]
+    return _BENCHMARKS["US"]
+
+
 # 런(run) 스코프 가격 캐시 — 스레드별로 분리한다.
 # 스케줄러 잡과 수동 엔드포인트가 동시에 돌 수 있고, 프레임을 런 밖으로 들고 가면
 # 어제 내려받은 데이터로 오늘의 horizon을 채우는 stale 평가가 된다.
@@ -332,6 +347,11 @@ _DUE_FILTER = """
               (return_7d  IS NULL AND issued_at <= :due_7)
            OR (return_14d IS NULL AND issued_at <= :due_14)
            OR (return_30d IS NULL AND issued_at <= :due_30)
+           -- 수익률은 채워졌는데 시장 수익률이 비어 있는 행도 대상이다
+           -- (벤치마크 컬럼 도입 전 평가분 소급 채움).
+           OR (return_7d  IS NOT NULL AND benchmark_return_7d  IS NULL)
+           OR (return_14d IS NOT NULL AND benchmark_return_14d IS NULL)
+           OR (return_30d IS NOT NULL AND benchmark_return_30d IS NULL)
         )
 """
 
@@ -388,8 +408,19 @@ def _backlog_snapshot(conn, now: datetime, days_back: int) -> Dict:
 
 
 def _price_needs(rows, now: datetime) -> Dict[str, Tuple[datetime, datetime]]:
-    """티커별로 이 런에서 필요한 target 날짜의 최소~최대 구간."""
+    """티커별로 이 런에서 필요한 target 날짜의 최소~최대 구간.
+
+    벤치마크 지수도 같은 방식으로 프리페치한다 — 종목당이 아니라 시장당 1회라
+    비용이 거의 없다. 벤치마크 구간은 **발행일부터** 필요하다(수익률 계산 기준점).
+    """
     needs: Dict[str, Tuple[datetime, datetime]] = {}
+
+    def _extend(symbol: str, lo: datetime, hi: datetime) -> None:
+        prev = needs.get(symbol)
+        needs[symbol] = (
+            (lo, hi) if prev is None else (min(prev[0], lo), max(prev[1], hi))
+        )
+
     for row in rows:
         if not row["price_at_signal"]:
             continue
@@ -399,15 +430,18 @@ def _price_needs(rows, now: datetime) -> Dict[str, Tuple[datetime, datetime]]:
         targets = [
             issued_at + timedelta(days=h)
             for h in HORIZONS
-            if row[f"return_{h}d"] is None and issued_at + timedelta(days=h) <= now
+            if issued_at + timedelta(days=h) <= now
+            and (
+                row[f"return_{h}d"] is None
+                or row[f"benchmark_return_{h}d"] is None
+            )
         ]
         if not targets:
             continue
         lo, hi = min(targets), max(targets)
-        prev = needs.get(row["ticker"])
-        needs[row["ticker"]] = (
-            (lo, hi) if prev is None else (min(prev[0], lo), max(prev[1], hi))
-        )
+        _extend(row["ticker"], lo, hi)
+        # 지수는 발행일 종가가 기준점이므로 구간을 발행일까지 넓힌다.
+        _extend(benchmark_for(row["ticker"]), min(issued_at, lo), hi)
     return needs
 
 
@@ -467,7 +501,9 @@ def evaluate_past_signals(
         SELECT signal_id, ticker, signal_type, signal_source,
                issued_at, conviction, price_at_signal,
                price_7d, price_14d, price_30d,
-               return_7d, return_14d, return_30d
+               return_7d, return_14d, return_30d,
+               benchmark_symbol,
+               benchmark_return_7d, benchmark_return_14d, benchmark_return_30d
         FROM signal_outcomes
         WHERE {_DUE_FILTER}
         ORDER BY issued_at ASC
@@ -484,6 +520,7 @@ def evaluate_past_signals(
     skipped_no_entry = 0
     skipped_not_due = 0
     skipped_no_price = 0
+    benchmark_filled = 0
     marked_unresolved = 0
     unresolved_tickers: set = set()
     errors = 0
@@ -529,6 +566,30 @@ def evaluate_past_signals(
             completed_by_horizon[h] += 1
             row_updated = True
 
+        # ── 같은 기간 시장 수익률 ────────────────────────────────────
+        # 절대 수익만으로는 '시장이 올라서 오른 것'과 '신호가 맞아서 오른 것'을
+        # 구분할 수 없다. 지수는 시장당 1회 프리페치되므로 비용이 거의 없다.
+        bench_symbol = benchmark_for(ticker)
+        bench_data: Dict[int, Optional[float]] = {}
+        bench_entry = _latest_close_for(bench_symbol, issued_at)
+        for h in HORIZONS:
+            existing = row[f"benchmark_return_{h}d"]
+            if existing is not None:
+                bench_data[h] = existing
+                continue
+            target = issued_at + timedelta(days=h)
+            if target > now or bench_entry is None or bench_entry <= 0:
+                bench_data[h] = None
+                continue
+            bench_close = _latest_close_for(bench_symbol, target)
+            if bench_close is None:
+                bench_data[h] = None
+                continue
+            bench_data[h] = round(bench_close / bench_entry - 1, 6)
+            if bench_data[h] != existing:
+                benchmark_filled += 1
+                row_updated = True
+
         if not row_updated:
             # 도래한 horizon만 후보로 뽑으므로, 여기 걸리는 건 시세를 못 받은 경우다.
             # 두 사유를 같은 카운터에 담으면 rate limit 장애가 '평가할 게 없음'으로 읽힌다.
@@ -564,6 +625,10 @@ def evaluate_past_signals(
                 SET price_7d=?, return_7d=?,
                     price_14d=?, return_14d=?,
                     price_30d=?, return_30d=?,
+                    benchmark_symbol=?,
+                    benchmark_return_7d=?,
+                    benchmark_return_14d=?,
+                    benchmark_return_30d=?,
                     evaluated_at=?
                 WHERE signal_id=?
                 """,
@@ -574,6 +639,10 @@ def evaluate_past_signals(
                     horizon_data[14][1],
                     horizon_data[30][0],
                     horizon_data[30][1],
+                    bench_symbol,
+                    bench_data.get(7),
+                    bench_data.get(14),
+                    bench_data.get(30),
                     now.isoformat(),
                     signal_id,
                 ),
@@ -594,6 +663,7 @@ def evaluate_past_signals(
         "skipped_no_entry": skipped_no_entry,
         "skipped_not_due": skipped_not_due,
         "skipped_no_price": skipped_no_price,
+        "benchmark_filled": benchmark_filled,
         "marked_unresolved": marked_unresolved,
         "unresolved_tickers": sorted(unresolved_tickers),
         "errors": errors,
@@ -680,7 +750,8 @@ def load_sampled_outcomes(
 
     columns = (
         "signal_id, ticker, signal_source, signal_type, conviction, issued_at, "
-        f"{ret_col} AS ret"
+        f"{ret_col} AS ret, benchmark_return_{horizon}d AS bench_ret, "
+        "benchmark_symbol"
     )
     bucket = _sample_bucket_sql(dedupe, horizon)
     if bucket is None:
@@ -723,6 +794,14 @@ def signed_return(signal_type: str, ret: float) -> Optional[float]:
     return None
 
 
+def _row_value(row, key: str):
+    """sqlite3.Row 는 .get 이 없고 없는 키는 IndexError 를 낸다."""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return None
+
+
 def _outcome_of(signal_type: str, ret: float) -> str:
     threshold = OUTCOME_THRESHOLD_PCT / 100.0
     sig = (signal_type or "").lower()
@@ -744,6 +823,22 @@ def _tally(rows: List) -> Dict:
         if v is not None
     ]
     signed_avg = (sum(signed) / len(signed) * 100.0) if signed else 0.0
+
+    # 시장 대비 초과수익 — 절대 수익은 '시장이 올라서'와 '신호가 맞아서'를
+    # 구분하지 못한다. 매도 신호는 시장보다 더 떨어져야 이긴 것이므로 부호를
+    # 종목과 같은 방식으로 뒤집는다 (excess = signed(stock) - signed(bench)).
+    excess: List[float] = []
+    for r in rows:
+        bench = _row_value(r, "bench_ret")
+        if bench is None:
+            continue
+        s_stock = signed_return(r["signal_type"], r["ret"])
+        s_bench = signed_return(r["signal_type"], bench)
+        if s_stock is None or s_bench is None:
+            continue
+        excess.append(s_stock - s_bench)
+    excess_avg = (sum(excess) / len(excess) * 100.0) if excess else 0.0
+    beat = sum(1 for v in excess if v > 0)
     return {
         "total": total,
         "wins": wins,
@@ -754,6 +849,10 @@ def _tally(rows: List) -> Dict:
         "avg_signed_return_pct": round(signed_avg, 3),
         "avg_raw_return_pct": round(raw_avg, 3),
         "signed_sample": len(signed),
+        # 시장 대비. benchmark_sample 이 0이면 초과수익을 말할 수 없다.
+        "avg_excess_return_pct": round(excess_avg, 3),
+        "beat_benchmark_rate_pct": round(beat / len(excess) * 100, 1) if excess else 0.0,
+        "benchmark_sample": len(excess),
     }
 
 
@@ -837,6 +936,8 @@ def get_accuracy_stats(
             "avg_signed_return_pct": t["avg_signed_return_pct"],
             "avg_raw_return_pct": t["avg_raw_return_pct"],
             "signed_sample": t["signed_sample"],
+            "avg_excess_return_pct": t["avg_excess_return_pct"],
+            "benchmark_sample": t["benchmark_sample"],
         }
 
     # 신뢰도 구간별 (종전과 동일하게 min_confidence·signal 필터를 적용하지 않는다)
@@ -866,6 +967,8 @@ def get_accuracy_stats(
             "avg_signed_return_pct": t["avg_signed_return_pct"],
             "avg_raw_return_pct": t["avg_raw_return_pct"],
             "signed_sample": t["signed_sample"],
+            "avg_excess_return_pct": t["avg_excess_return_pct"],
+            "benchmark_sample": t["benchmark_sample"],
         }
     by_source = dict(
         sorted(by_source.items(), key=lambda kv: kv[1]["total"], reverse=True)
@@ -893,6 +996,9 @@ def get_accuracy_stats(
         "avg_signed_return_pct": overall["avg_signed_return_pct"],
         "avg_raw_return_pct": overall["avg_raw_return_pct"],
         "signed_sample": overall["signed_sample"],
+        "avg_excess_return_pct": overall["avg_excess_return_pct"],
+        "beat_benchmark_rate_pct": overall["beat_benchmark_rate_pct"],
+        "benchmark_sample": overall["benchmark_sample"],
         "by_signal": by_signal,
         "by_confidence_band": bands,
         "by_source": by_source,
