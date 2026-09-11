@@ -2164,7 +2164,8 @@ def system_monitor():
         from signal_tracker import get_accuracy_stats, get_calibrator
 
         signal_status = {
-            "accuracy_7d": get_accuracy_stats(horizon=7, days_back=180),
+            # 대표 horizon 은 매매 스타일의 의도 보유기간에서 파생된다
+            "accuracy_primary": get_accuracy_stats(days_back=180),
             "calibrator": get_calibrator().status(),
             "last_validation": _LAST_SIGNAL_VALIDATION or {"status": "never_run"},
         }
@@ -3023,7 +3024,7 @@ def api_telegram_rich_signal(ticker: str, webui_base_url: Optional[str] = None):
     }
 
     try:
-        acc = get_accuracy_stats(horizon=7, days_back=180)
+        acc = get_accuracy_stats(days_back=180)
     except Exception:
         acc = None
 
@@ -3223,7 +3224,7 @@ def api_screener_pipeline(
 
 # ─── 신호 정확도 / 칼리브레이션 (Sprint 2) ──────────────
 @app.get("/signal-accuracy")
-def api_signal_accuracy(horizon: int = 7, min_confidence: float = 0.0,
+def api_signal_accuracy(horizon: int | None = None, min_confidence: float = 0.0,
                          signal: str = None, days_back: int = 180,
                          dedupe: str = "ticker_day"):
     """
@@ -3241,6 +3242,22 @@ def api_signal_accuracy(horizon: int = 7, min_confidence: float = 0.0,
         horizon=horizon, min_confidence=min_confidence,
         signal=signal, days_back=days_back, dedupe=dedupe
     )
+
+
+@app.get("/signal-accuracy/horizon")
+def api_signal_horizon():
+    """평가 horizon 과 의도 보유기간의 정합 상태."""
+    from signal_tracker import HORIZONS, expected_holding_days, primary_horizon_days
+
+    holding = expected_holding_days()
+    primary = primary_horizon_days(holding)
+    return {
+        "trading_style": TRADING_STYLE,
+        "expected_holding_days": holding,
+        "primary_horizon_days": primary,
+        "available_horizons": HORIZONS,
+        "covers_holding": primary >= holding,
+    }
 
 
 @app.post("/signal-accuracy/evaluate")

@@ -231,9 +231,14 @@ def test_final_decision_includes_shared_decision_context(monkeypatch):
         ],
     )
 
-    assert output["horizon_days"] == 7
+    # horizon 은 매매 스타일의 의도 보유기간에서 파생된다 (2026-09 정합 작업).
+    # 7 을 박아 두면 스윙(10일 보유)에서 어긋난다.
+    from signal_tracker import primary_horizon_days
+
+    expected_horizon = primary_horizon_days()
+    assert output["horizon_days"] == expected_horizon
     assert output["decision_schema_version"] == "decision_context.v1"
     assert output["decision_context"]["source"] == "multi_agent"
     assert output["decision_context"]["role"] == "deep_validation"
-    assert output["decision_context"]["horizon_days"] == 7
+    assert output["decision_context"]["horizon_days"] == expected_horizon
     assert output["decision_context"]["signal"] == output["final_signal"]
