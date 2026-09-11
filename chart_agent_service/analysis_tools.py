@@ -18,6 +18,7 @@ import pandas as pd
 
 import yfinance as yf
 
+from indicator_thresholds import adx_label, rsi_label, volatility_label
 from config import (
     OPENAI_API_KEY, OLLAMA_BASE_URL, OLLAMA_MODEL, OUTPUT_DIR,
     OLLAMA_NUM_CTX, OLLAMA_KEEP_ALIVE,
@@ -361,6 +362,8 @@ class AnalysisTools:
             "score": round(score, 1),
             "current_rsi": round(current_rsi, 2),
             "rsi_zone": "overbought" if current_rsi > rsi_overbought else ("oversold" if current_rsi < rsi_oversold else "neutral"),
+            # 기준을 문자열에 박아 보낸다 — 에이전트가 임계를 재발명하지 못하게.
+            "rsi_reading": rsi_label(current_rsi),
             "rsi_thresholds": {"overbought": rsi_overbought, "oversold": rsi_oversold, "regime": regime_adjust},
             "divergence": divergence,
             "detail": f"RSI={current_rsi:.1f} (임계값 {rsi_oversold}/{rsi_overbought}, {regime_adjust}), 다이버전스={divergence}"
@@ -558,6 +561,7 @@ class AnalysisTools:
             "plus_di": round(dmp, 2),
             "minus_di": round(dmn, 2),
             "trend_strength": strength,
+            "adx_reading": adx_label(adx),
             "trend_direction": direction,
             "di_cross": di_cross,
             "detail": f"ADX={adx:.1f} ({strength}), 방향={direction}, DI크로스={di_cross}"
@@ -876,6 +880,7 @@ class AnalysisTools:
             "regime": regime,
             "vol_trend": vol_trend,
             "annualized_volatility": round(annualized_vol, 2),
+            "volatility_reading": volatility_label(annualized_vol),
             "daily_volatility": round(daily_vol_pct, 4),
             "vol_label": vol_label,
             # 라벨 기준 명시: vol_label은 절대 기준(S&P 평균 15-20% 대비 연환산),
@@ -979,7 +984,20 @@ class AnalysisTools:
         score = max(-10, min(10, score))
         signal = "buy" if score > 2 else ("sell" if score < -2 else "neutral")
 
-        detail_text = f"평균Z={avg_z:.2f}, 회귀확률={reversion_prob:.1%}"
+        # 회귀확률은 '되돌림이 발생할 확률'이다. 값이 낮으면 추세 지속을 뜻하는데,
+        # Z-score 크기와 혼동해 정반대로 읽힌 사례가 있다 (DB손해보험 2026-08-18:
+        # 회귀확률 1.04%를 "되돌림 가능성 높음"으로 서술). 숫자와 함께 해석을 실어
+        # 보낸다 — 프롬프트만으로는 드리프트를 막지 못한다.
+        reversion_reading = (
+            "낮음 → 추세 지속 우세" if reversion_prob < 0.10
+            else "높음 → 되돌림 경계" if reversion_prob > 0.60
+            else "중간"
+        )
+
+        detail_text = (
+            f"평균Z={avg_z:.2f}, 회귀확률={reversion_prob:.1%}"
+            f" ({reversion_reading})"
+        )
         if post_earnings_mode:
             detail_text += f" [실적후: 신뢰도 {mean_reversion_confidence}, 가중치 {weight_multiplier}]"
 
@@ -989,6 +1007,7 @@ class AnalysisTools:
             "z_scores": z_scores,
             "avg_z_score": round(avg_z, 3),
             "reversion_probability": round(reversion_prob, 4),
+            "reversion_reading": reversion_reading,
             "post_earnings_mode": post_earnings_mode,
             "confidence_level": mean_reversion_confidence,
             "weight_multiplier": weight_multiplier,
@@ -2693,6 +2712,47 @@ def _is_directional_result(result: dict) -> bool:
     return result.get("tool") not in NON_DIRECTIONAL_TOOLS
 
 
+def apply_cross_tool_guards(results: list) -> list:
+    """도구 간 모순을 해소한다 — 지금은 평균회귀 × 자기상관.
+
+    회귀확률이 낮다(<10%)는 것은 '되돌림이 오지 않는다'는 뜻이고, Hurst > 0.55 는
+    추세 지속을 뜻한다. 두 신호가 같은 방향인데 평균회귀 도구가 sell 을 내면 그건
+    'Z 가 크다'만 본 것이다 — DB손해보험(2026-08-18)에서 이 조합이 매도 근거로
+    인용됐고 실제로는 +11% 상승했다.
+
+    이 함수는 도구 점수를 바꾸지 않는다. 모순된 **방향**만 중립으로 되돌리고 사유를
+    남긴다 (점수 조정은 임계 재정합 없이 하면 이중 보정이 된다).
+    """
+    by_tool = {}
+    for r in results:
+        if isinstance(r, dict) and r.get("tool"):
+            by_tool[r["tool"]] = r
+
+    mr = by_tool.get("mean_reversion_analysis")
+    cr = by_tool.get("correlation_regime_analysis")
+    if not mr or not cr:
+        return results
+
+    prob = mr.get("reversion_probability")
+    hurst = cr.get("hurst_exponent")
+    if prob is None or hurst is None:
+        return results
+
+    if prob < _REVERSION_LOW and hurst > _HURST_TRENDING and mr.get("signal") == "sell":
+        mr["signal"] = "neutral"
+        mr["cross_tool_guard"] = (
+            f"회귀확률 {prob:.1%} (<{_REVERSION_LOW:.0%}) + Hurst {hurst:.3f} "
+            f"(>{_HURST_TRENDING}) → 추세 지속 우세, 평균회귀 매도 근거 무효"
+        )
+        mr["detail"] = f"{mr.get('detail', '')} | {mr['cross_tool_guard']}"
+    return results
+
+
+# 교차 가드 임계 — 회귀확률이 이보다 낮고 Hurst 가 이보다 크면 추세 지속으로 본다.
+_REVERSION_LOW = 0.10
+_HURST_TRENDING = 0.55
+
+
 def _annotate_rule_reference(result: dict) -> dict:
     """Keep legacy signal/score fields, but label them as heuristic references."""
     if not isinstance(result, dict):
@@ -2783,6 +2843,8 @@ class ChartAnalysisAgent:
                     "signal": "neutral",
                     "score": 0,
                 }))
+
+        results = apply_cross_tool_guards(results)
 
         # 종합 score 기반으로 임시 signal/confidence를 산출하여 entry_plan에 전달
         avg_score = 0
