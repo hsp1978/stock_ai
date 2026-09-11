@@ -252,6 +252,47 @@ def _latest_close_for(ticker: str, target_date: datetime) -> Optional[float]:
         return None
 
 
+def adverse_excursion(
+    ticker: str, signal_type: str, entry_price: float,
+    issued_at: datetime, target: datetime,
+) -> Optional[float]:
+    """보유 구간 중 신호 반대 방향으로 간 최대 폭 (양수 %).
+
+    매수는 저가 기준 하락폭, 매도는 고가 기준 상승폭. 종료 시점 수익률만으로는
+    **손절이 어디서 걸렸을지 알 수 없다** — 되돌아온 손실은 보이지 않는다
+    (2026-09 왼쪽 꼬리 진단: 중앙값 +0.14% 인데 평균 -2.57%).
+
+    저가/고가가 없으면 종가로 대체한다 (일부 소스는 Close 만 준다).
+    """
+    frames = _cache_frames()
+    frame = frames.get(ticker) if frames else None
+    if frame is None or entry_price <= 0:
+        return None
+    try:
+        import pandas as pd
+
+        index = frame.index
+        naive = index.tz_localize(None) if getattr(index, "tz", None) is not None else index
+        mask = (naive >= pd.Timestamp(issued_at.date())) & (
+            naive <= pd.Timestamp(target.date())
+        )
+        window = frame[mask]
+        if window.empty:
+            return None
+        sig = (signal_type or "").lower()
+        if sig == "buy":
+            series = window["Low"] if "Low" in window.columns else window["Close"]
+            worst = float(series.min())
+            return round(max(0.0, (entry_price - worst) / entry_price), 6)
+        if sig == "sell":
+            series = window["High"] if "High" in window.columns else window["Close"]
+            worst = float(series.max())
+            return round(max(0.0, (worst - entry_price) / entry_price), 6)
+    except Exception:
+        return None
+    return None
+
+
 def prefetch_price_history(needs: Dict[str, Tuple[datetime, datetime]]) -> Dict:
     """티커별로 필요한 전체 구간을 한 번씩만 내려받아 런 스코프 캐시에 적재한다.
 
@@ -377,6 +418,10 @@ _DUE_FILTER = """
            OR (return_7d  IS NOT NULL AND benchmark_return_7d  IS NULL)
            OR (return_14d IS NOT NULL AND benchmark_return_14d IS NULL)
            OR (return_30d IS NOT NULL AND benchmark_return_30d IS NULL)
+           -- 역행폭 미기록 행도 소급 대상 (컬럼 도입 전 평가분)
+           OR (return_7d  IS NOT NULL AND adverse_excursion_7d  IS NULL)
+           OR (return_14d IS NOT NULL AND adverse_excursion_14d IS NULL)
+           OR (return_30d IS NOT NULL AND adverse_excursion_30d IS NULL)
         )
 """
 
@@ -459,12 +504,15 @@ def _price_needs(rows, now: datetime) -> Dict[str, Tuple[datetime, datetime]]:
             and (
                 row[f"return_{h}d"] is None
                 or row[f"benchmark_return_{h}d"] is None
+                or row[f"adverse_excursion_{h}d"] is None
             )
         ]
         if not targets:
             continue
         lo, hi = min(targets), max(targets)
-        _extend(row["ticker"], lo, hi)
+        # 역행폭은 **발행일부터** 종료일까지의 봉이 필요하다. 종전에는 target 근처만
+        # 받아 와서 보유 초반이 프레임에 없었다.
+        _extend(row["ticker"], min(issued_at, lo), hi)
         # 지수는 발행일 종가가 기준점이므로 구간을 발행일까지 넓힌다.
         _extend(benchmark_for(row["ticker"]), min(issued_at, lo), hi)
     return needs
@@ -528,7 +576,8 @@ def evaluate_past_signals(
                price_7d, price_14d, price_30d,
                return_7d, return_14d, return_30d,
                benchmark_symbol,
-               benchmark_return_7d, benchmark_return_14d, benchmark_return_30d
+               benchmark_return_7d, benchmark_return_14d, benchmark_return_30d,
+               adverse_excursion_7d, adverse_excursion_14d, adverse_excursion_30d
         FROM signal_outcomes
         WHERE {_DUE_FILTER}
         ORDER BY issued_at ASC
@@ -546,6 +595,7 @@ def evaluate_past_signals(
     skipped_not_due = 0
     skipped_no_price = 0
     benchmark_filled = 0
+    adverse_filled = 0
     marked_unresolved = 0
     unresolved_tickers: set = set()
     errors = 0
@@ -590,6 +640,25 @@ def evaluate_past_signals(
             horizon_data[h] = (future_price, round(ret, 6))
             completed_by_horizon[h] += 1
             row_updated = True
+
+        # ── 역행폭 (보유 구간 중 반대 방향 최대 이동) ───────────────
+        adverse_data: Dict[int, Optional[float]] = {}
+        for h in HORIZONS:
+            existing = row[f"adverse_excursion_{h}d"]
+            if existing is not None:
+                adverse_data[h] = existing
+                continue
+            target = issued_at + timedelta(days=h)
+            if target > now:
+                adverse_data[h] = None
+                continue
+            value = adverse_excursion(
+                ticker, row["signal_type"], entry_price, issued_at, target
+            )
+            adverse_data[h] = value
+            if value is not None:
+                adverse_filled += 1
+                row_updated = True
 
         # ── 같은 기간 시장 수익률 ────────────────────────────────────
         # 절대 수익만으로는 '시장이 올라서 오른 것'과 '신호가 맞아서 오른 것'을
@@ -654,6 +723,9 @@ def evaluate_past_signals(
                     benchmark_return_7d=?,
                     benchmark_return_14d=?,
                     benchmark_return_30d=?,
+                    adverse_excursion_7d=?,
+                    adverse_excursion_14d=?,
+                    adverse_excursion_30d=?,
                     evaluated_at=?
                 WHERE signal_id=?
                 """,
@@ -668,6 +740,9 @@ def evaluate_past_signals(
                     bench_data.get(7),
                     bench_data.get(14),
                     bench_data.get(30),
+                    adverse_data.get(7),
+                    adverse_data.get(14),
+                    adverse_data.get(30),
                     now.isoformat(),
                     signal_id,
                 ),
@@ -689,6 +764,7 @@ def evaluate_past_signals(
         "skipped_not_due": skipped_not_due,
         "skipped_no_price": skipped_no_price,
         "benchmark_filled": benchmark_filled,
+        "adverse_filled": adverse_filled,
         "marked_unresolved": marked_unresolved,
         "unresolved_tickers": sorted(unresolved_tickers),
         "errors": errors,
@@ -776,7 +852,7 @@ def load_sampled_outcomes(
     columns = (
         "signal_id, ticker, signal_source, signal_type, conviction, issued_at, "
         f"{ret_col} AS ret, benchmark_return_{horizon}d AS bench_ret, "
-        "benchmark_symbol"
+        f"adverse_excursion_{horizon}d AS adverse, benchmark_symbol"
     )
     bucket = _sample_bucket_sql(dedupe, horizon)
     if bucket is None:
@@ -859,6 +935,82 @@ def _percentiles(values: List[float]) -> Dict[str, float]:
     }
 
 
+def _tail_metrics(signed: List[float]) -> Dict:
+    """왼쪽/오른쪽 꼬리 비대칭. tail_ratio > 1 이면 손실 꼬리가 더 두껍다."""
+    if not signed:
+        return {"p10": 0.0, "p90": 0.0, "tail_ratio": 0.0, "loss_share_pct": 0.0}
+    ordered = sorted(signed)
+
+    def _q(fraction: float) -> float:
+        idx = fraction * (len(ordered) - 1)
+        lo, hi = int(idx), min(int(idx) + 1, len(ordered) - 1)
+        w = idx - lo
+        return ordered[lo] * (1 - w) + ordered[hi] * w
+
+    p10, p90 = _q(0.10), _q(0.90)
+    losses = [v for v in signed if v < 0]
+    gains = [v for v in signed if v > 0]
+    avg_loss = abs(sum(losses) / len(losses)) if losses else 0.0
+    avg_gain = (sum(gains) / len(gains)) if gains else 0.0
+    return {
+        "p10": round(p10 * 100, 3),
+        "p90": round(p90 * 100, 3),
+        # |하위 10%| / 상위 10% — 1보다 크면 잃을 때 더 크게 잃는다
+        "tail_ratio": round(abs(p10) / p90, 3) if p90 > 0 else 0.0,
+        "avg_loss_pct": round(avg_loss * 100, 3),
+        "avg_gain_pct": round(avg_gain * 100, 3),
+        # 손익비 — 평균이익 / 평균손실. 1 미만이면 방향 5할로는 적자다.
+        "payoff_ratio": round(avg_gain / avg_loss, 3) if avg_loss > 0 else 0.0,
+        "loss_share_pct": round(len(losses) / len(signed) * 100, 1),
+    }
+
+
+def simulate_stop_levels(
+    rows: List, levels: Optional[List[float]] = None
+) -> List[Dict]:
+    """손절을 걸었다면 기대값이 어떻게 됐을지 — 역행폭으로 되짚는다.
+
+    가정을 명시한다:
+      - 역행폭이 손절폭을 넘으면 **그 손절가에 정확히 청산**됐다고 본다
+        (슬리피지·갭 미반영 → 실제보다 낙관적이다)
+      - 넘지 않았으면 종료 시점 수익률 그대로
+      - 일봉 저가/고가 기준이라 장중 되돌림 순서는 알 수 없다
+    """
+    levels = levels or [0.03, 0.05, 0.08, 0.10, 0.15]
+    usable = [
+        r
+        for r in rows
+        if _row_value(r, "adverse") is not None
+        and signed_return(r["signal_type"], r["ret"]) is not None
+    ]
+    out: List[Dict] = []
+    baseline = (
+        sum(signed_return(r["signal_type"], r["ret"]) for r in usable) / len(usable)
+        if usable
+        else 0.0
+    )
+    for level in levels:
+        triggered = 0
+        total = 0.0
+        for r in usable:
+            adverse = float(_row_value(r, "adverse"))
+            realized = signed_return(r["signal_type"], r["ret"])
+            if adverse >= level:
+                triggered += 1
+                total += -level
+            else:
+                total += realized
+        n = len(usable)
+        out.append({
+            "stop_pct": round(level * 100, 2),
+            "trigger_rate_pct": round(triggered / n * 100, 1) if n else 0.0,
+            "avg_signed_return_pct": round(total / n * 100, 3) if n else 0.0,
+            "delta_vs_no_stop_pct": round((total / n - baseline) * 100, 3) if n else 0.0,
+            "sample": n,
+        })
+    return out
+
+
 def _tally(rows: List) -> Dict:
     total = len(rows)
     wins = sum(1 for r in rows if _outcome_of(r["signal_type"], r["ret"]) == "win")
@@ -891,6 +1043,14 @@ def _tally(rows: List) -> Dict:
     # 넘기 쉬워져(14일 ±2% 는 7일 ±2% 보다 느슨하다) 기간 간 비교를 왜곡한다
     # (2026-09-11 진단). 밴드 기반 집계는 `band_outcome` 에 사유와 함께 남긴다.
     direction_hits = sum(1 for v in signed if v > 0)
+
+    # ── 왼쪽 꼬리 ────────────────────────────────────────────────
+    # 방향 적중률이 반반인데 평균이 마이너스라면 **틀릴 때 더 크게 잃는** 것이다.
+    # 평균·중앙값만으로는 그 비대칭이 보이지 않는다 (2026-09-11 진단).
+    tail = _tail_metrics(signed)
+    adverse_values = [
+        v for v in (_row_value(r, "adverse") for r in rows) if v is not None
+    ]
     return {
         "total": total,
         "wins": wins,
@@ -917,6 +1077,10 @@ def _tally(rows: List) -> Dict:
         # 분포 — 평균 하나로는 꼬리가 보이지 않는다.
         "signed_return_dist": _percentiles(signed),
         "excess_return_dist": _percentiles(excess),
+        "tail": tail,
+        # 역행폭: 보유 중 반대 방향 최대 이동 (양수 %). 손절이 어디서 걸렸을지.
+        "adverse_excursion_dist": _percentiles(adverse_values),
+        "adverse_sample": len(adverse_values),
         # 성과 지표는 방향 보정본이다. 원시값은 진단용으로만 함께 낸다.
         "avg_signed_return_pct": round(signed_avg, 3),
         "avg_raw_return_pct": round(raw_avg, 3),
@@ -1084,6 +1248,16 @@ def get_accuracy_stats(
         "band_outcome": overall["band_outcome"],
         "signed_return_dist": overall["signed_return_dist"],
         "excess_return_dist": overall["excess_return_dist"],
+        "tail": overall["tail"],
+        "adverse_excursion_dist": overall["adverse_excursion_dist"],
+        "adverse_sample": overall["adverse_sample"],
+        "stop_simulation": simulate_stop_levels(scoped),
+        "stop_simulation_caveat": (
+            "가정: 역행폭이 손절폭을 넘으면 그 가격에 정확히 청산 — 슬리피지·갭·"
+            "장중 경로 미반영이라 **실제보다 낙관적**이다. 또 이 개선폭은 기간에 따라 "
+            "부호가 바뀐다 (2026-09-12 실측: 급락장 구간 +4.5%p vs 08-06 이후 -0.6~-1.8%p). "
+            "집계값만 보고 손절폭을 고정하면 급락장에 과적합된다."
+        ),
         # `avg_return_pct` 는 없앴다 — 방향 보정이 없어 매도가 맞을수록 내려가는
         # 값이었고, 이름만 봐서는 그 사실을 알 수 없었다. 이름을 갈라 둘 다 낸다.
         "avg_signed_return_pct": overall["avg_signed_return_pct"],
