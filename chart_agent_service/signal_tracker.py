@@ -1196,6 +1196,10 @@ def get_accuracy_stats(
                 "band": f"{lo:.1f}-{min(hi, 10.0):.1f}",
                 "total": t["total"],
                 "direction_hit_rate_pct": t["direction_hit_rate_pct"],
+                # 비율만 주면 화면에서 'n건 중 m건'을 못 쓴다 (#46 이후 webui 가
+                # 없어진 `wins` 를 읽어 밴드 표에서 KeyError 로 죽고 있었다).
+                "direction_hits": t["direction_hits"],
+                "direction_sample": t["direction_sample"],
                 "band_win_rate_pct": t["band_outcome"]["win_rate_pct"],
                 "avg_signed_return_pct": t["avg_signed_return_pct"],
                 "avg_raw_return_pct": t["avg_raw_return_pct"],

@@ -26,7 +26,7 @@
 | LLM | 8 에이전트 = Gemini 4 (gemini-2.0-flash) + Ollama 4 (Mac Studio qwen2.5:32b) |
 | 분석 도구 | 24개 (방향성 22 + 비방향성 2: `risk_position_sizing`, `entry_plan_analysis`) |
 | ML | 5모델 앙상블 (RF/GBM/LightGBM/XGBoost/LSTM) + SHAP + Optuna + Walk-Forward |
-| 코드 규모 | 프로덕션 Python 약 54,000 라인 / 최대 파일 `webui.py` 5,047 라인 |
+| 코드 규모 | 프로덕션 Python 약 54,000 라인 / 최대 파일 `webui.py` 4,383 라인 |
 | API | FastAPI 엔드포인트 83개 (`chart_agent_service/service.py`, 3,192 라인) |
 | 테스트 | 65 파일 / 679 test, CI(GitHub Actions) 최근 실행 전부 success |
 | 데이터 축적 | `scan_log` 69,341행 (2026-04-14~), `signal_outcomes` 5,018행 — 평가 완료 4,272 / 종결 53 / 대기 0 |
@@ -101,7 +101,7 @@ HTTP 200은 코드 반영의 증거가 아니다.
 
 | 파일 | 라인 | 역할 |
 |---|---:|---|
-| `stock_analyzer/webui.py` | 5,047 | Streamlit 앱 (17페이지). **최대 부채** — 분해 2단계 진행(§13.9a) |
+| `stock_analyzer/webui.py` | 4,383 | Streamlit 앱 (17페이지). 분해 3단계 진행(§13.9a) — 최대 파일은 여전 |
 | `chart_agent_service/service.py` | 3,192 | FastAPI 83 엔드포인트 + APScheduler 5 잡 |
 | `chart_agent_service/analysis_tools.py` | 3,087 | 24 도구 + `ChartAnalysisAgent` (도구 실행 오케스트레이션) |
 | `stock_analyzer/multi_agent.py` | 2,406 | 8 에이전트 클래스 + `MultiAgentOrchestrator` |
@@ -657,7 +657,7 @@ win 정의가 "신호 방향으로 ±2% 이상"이었는데 **±2%에 근거가 
 
 | # | 항목 | 현재 상태 |
 |---|---|---|
-| 1 | `webui.py` God file | **분해 진행** (2026-09-12): 6,482 → 5,047 라인(−22%). `ui/` 4모듈 분리. 다음은 페이지 단위 — 아래 §13.9a |
+| 1 | `webui.py` God file | **분해 진행** (2026-09-12): 6,482 → 4,383 라인(−32%). `ui/` 7모듈 + `ui/pages/` 2페이지 분리 — 아래 §13.9a |
 | 2 | 이중 호출 경로 (직접 import + HTTP) | `/paper`·`/trading`·`/gpu`만 HTTP 강제. 나머지는 여전히 이중 |
 | 3 | `print()` 기반 로깅 | 미해결 |
 | 4 | 양방향 `sys.path` 주입 | 미해결 (webui↔agent 상호 import) |
@@ -678,9 +678,24 @@ CLAUDE.md §6-10: **한 번에 분리하지 말 것.** 의존성이 낮은 순�
 | 2 | `ui/api_client.py` — agent-api 호출 (모든 페이지 공용) | ✅ 2026-09-12 |
 | 3 | `ui/market.py` — 지수·환율 데이터 (`MARKET_INDICES`, `KRW_CROSS`, `fetch_market_indices`) | ✅ 2026-09-12 |
 | 4 | `ui/tickers.py` — 티커 해석·표기·워치리스트 (`resolve_ticker`, `load/save_watchlist`, 검증) | ✅ 2026-09-12 |
-| 5 | `ui/pages/*.py` — 페이지 단위 (가장 큰 `render_multi_agent` 594줄부터) | 예정 |
+| 5 | `ui/format.py` — 가격·통화 표기 (페이지 공용) | ✅ 2026-09-12 |
+| 6 | `ui/pages/signal_accuracy.py`, `ui/pages/screener.py` — 의존성이 `api_get/api_post` 뿐인 페이지부터 | ✅ 2026-09-12 |
+| 7 | 나머지 페이지 (`render_multi_agent` 594줄, `render_dashboard`, `render_scan_log` …) | 예정 |
 
-누적: **6,482 → 5,047 라인 (−22%)**, `ui/` 4모듈 1,562줄.
+누적: **6,482 → 4,383 라인 (−32%)**, `ui/` 7모듈 약 2,300줄.
+
+페이지 단계에서 얻은 것 — **렌더 함수를 실제로 호출해야 잡히는 결함이 있다.**
+`render_signal_accuracy` 를 직접 호출하자 `KeyError: 'wins'` 가 났다. #46 에서 밴드
+payload 를 바꾸며 화면 쪽 `b["wins"]` 를 놓쳐, **main 의 Signal Accuracy 페이지가
+신뢰도 구간 표에서 죽고 있었다.** 테스트도 ruff 도 못 잡았고 HTTP 200 도 정상이었다.
+그래서 페이지 분리마다 다음을 돌린다:
+
+```bash
+docker exec stock-auto-webui python -c "
+import sys; sys.path.insert(0,'/app/stock_analyzer')
+from ui.pages.signal_accuracy import render_signal_accuracy
+render_signal_accuracy()"
+```
 
 2단계에서 실제로 겪은 함정 — **함수 중간을 자르면 문법 검사는 통과한다.** `resolve_ticker`
 를 옮기다 앞뒤가 갈렸는데 `ast.parse` 는 두 조각 모두 파싱했다. 그래서 이동 후에는
