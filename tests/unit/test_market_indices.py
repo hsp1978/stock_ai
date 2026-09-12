@@ -6,17 +6,23 @@ webui.py는 streamlit 의존이라 import가 무겁다. 순수 상수/맵만 뽑
 import ast
 import os
 
-_WEBUI = os.path.join(os.path.dirname(__file__), "../../stock_analyzer/webui.py")
+# 지수·환율 데이터는 2026-09-12 에 ui/market.py 로 분리됐고, 차트 기간 같은
+# 화면 상수는 아직 webui.py 에 있다. 둘 다 뒤진다.
+_SOURCES = [
+    os.path.join(os.path.dirname(__file__), "../../stock_analyzer/ui/market.py"),
+    os.path.join(os.path.dirname(__file__), "../../stock_analyzer/webui.py"),
+]
 
 
 def _literal(name: str):
-    """webui.py를 실행하지 않고 모듈 최상위 리터럴 대입을 읽는다."""
-    tree = ast.parse(open(_WEBUI, encoding="utf-8").read())
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == name:
-                    return ast.literal_eval(node.value)
+    """모듈을 실행하지 않고 최상위 리터럴 대입을 읽는다."""
+    for path in _SOURCES:
+        tree = ast.parse(open(path, encoding="utf-8").read())
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == name:
+                        return ast.literal_eval(node.value)
     raise AssertionError(f"{name} 정의를 찾지 못함")
 
 
