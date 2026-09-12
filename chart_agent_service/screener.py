@@ -43,6 +43,13 @@ import os as _os
 
 MIN_MARKET_CAP_KRW = float(_os.getenv("SCREENER_MIN_MARKET_CAP_KRW", "200_000_000_000"))  # 2천억
 TOP_N_RESULTS = int(_os.getenv("SCREENER_TOP_N", "20"))
+
+# 스크리너 결과를 signal_outcomes 표본으로 적립할지. 7종목 워치리스트만으로는
+# 독립 블록이 79개(신 로직)에 그쳐 어떤 규칙도 세울 수 없다 (2026-09-12 진단).
+# 스크리너는 KOSPI+KOSDAQ 280여 종목을 이미 훑으므로, 그 결과를 버리지 않고 쌓으면
+# **LLM 비용 없이** 종목 다양성이 큰 표본이 모인다.
+RECORD_OUTCOMES = _os.getenv("SCREENER_RECORD_OUTCOMES", "1") not in ("0", "false", "False")
+RECORD_TOP_N = int(_os.getenv("SCREENER_RECORD_TOP_N", "10"))
 OHLCV_PERIOD_DAYS = int(_os.getenv("SCREENER_OHLCV_DAYS", "200"))
 
 
@@ -668,6 +675,49 @@ def score_to_grade(score: float) -> str:
 # ─────────────────────────────────────────────────────────
 #  메인 파이프라인
 # ─────────────────────────────────────────────────────────
+def record_screener_outcomes(results: List[Dict], limit: int = RECORD_TOP_N) -> Dict:
+    """스크리너 상위 결과를 `signal_outcomes` 에 적립한다.
+
+    Why: 워치리스트 7종목만으로는 독립 표본이 모이지 않는다 (신 로직 기준 블록 79개).
+    스크리너는 이미 280여 종목을 훑고 있으므로 그 판단을 버리지 않고 쌓으면
+    **LLM 비용 없이** 종목 다양성이 큰 표본이 생긴다. 평가 파이프라인(#35~#47)이
+    수익률·시장대비·역행폭을 자동으로 채운다.
+
+    방향이 없는 신호(neutral)는 적립하지 않는다 — 부호를 매길 수 없어 방향 적중률·
+    초과수익 계산에 들어가지 못한다. 건너뛴 수는 반환해 '기록 없음'과 구분한다.
+    """
+    from signal_tracker import insert_signal_outcome
+
+    stats = {"recorded": 0, "skipped_non_directional": 0, "errors": 0}
+    for item in results[:limit]:
+        signal = str(item.get("screener_signal") or "").lower()
+        price = item.get("current_price")
+        if signal not in ("buy", "sell"):
+            stats["skipped_non_directional"] += 1
+            continue
+        if not price or price <= 0:
+            stats["errors"] += 1
+            continue
+        try:
+            insert_signal_outcome(
+                ticker=item["ticker"],
+                signal_type=signal,
+                signal_source="screener",
+                conviction=float(item.get("screener_confidence") or 0.0),
+                price_at_signal=float(price),
+                market_context={
+                    "score": item.get("score"),
+                    "grade": item.get("grade"),
+                    "rank": item.get("rank"),
+                },
+            )
+            stats["recorded"] += 1
+        except Exception as exc:  # 개별 실패가 스크리너 전체를 죽이지 않게
+            print(f"[screener] 표본 적립 실패 {item.get('ticker')}: {exc}")
+            stats["errors"] += 1
+    return stats
+
+
 def run_screener(
     min_market_cap: float = MIN_MARKET_CAP_KRW,
     top_n: int = TOP_N_RESULTS,
@@ -795,8 +845,19 @@ def run_screener(
         except Exception as e:
             print(f"[screener] DB 저장 실패: {e}")
 
+    # 6. 표본 적립 — 사후 평가 파이프라인이 수익률·벤치마크·역행폭을 채운다.
+    outcome_stats = {"recorded": 0, "skipped_non_directional": 0, "errors": 0}
+    if save_db and top and RECORD_OUTCOMES:
+        outcome_stats = record_screener_outcomes(top, limit=RECORD_TOP_N)
+        print(
+            f"[screener] 표본 적립: {outcome_stats['recorded']}건 "
+            f"(방향성 없음 {outcome_stats['skipped_non_directional']}, "
+            f"오류 {outcome_stats['errors']})"
+        )
+
     return {
         "run_id": run_id,
+        "outcome_recording": outcome_stats,
         "scanned_at": t_start.isoformat(),
         "universe_size": len(universe),
         "analyzed_count": len(scored),

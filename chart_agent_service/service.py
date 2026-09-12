@@ -49,6 +49,7 @@ from config import (
     CORPORATE_ACTION_CHECK_HOUR, CORPORATE_ACTION_CHECK_MINUTE,
     DATA_HEALTH_CHECK_MINUTES, DATA_HEALTH_ALERT_STALE_HOURS,
     OPS_ALERT_DEDUPE_MINUTES, DEFAULT_HISTORY_PERIOD,
+    SCREENER_BATCH_ENABLED, SCREENER_BATCH_HOUR, SCREENER_BATCH_MINUTE,
     SIGNAL_EVAL_DAYS_BACK, SIGNAL_EVAL_BACKLOG_ALERT,
     MULTI_AGENT_BATCH_ENABLED, MULTI_AGENT_BATCH_HOUR, MULTI_AGENT_BATCH_MINUTE,
 )
@@ -329,6 +330,7 @@ def gpu_pause_status() -> dict:
 
 _KNOWN_OPS_JOBS = {
     "watchlist_scan": "Watchlist Scan",
+    "screener_batch": "Screener Batch",
     "daily_signal_validation": "Signal Validation",
     "corporate_actions": "Corporate Actions",
     "data_health_check": "Data Health Check",
@@ -1668,6 +1670,32 @@ def run_corporate_action_adjustment(force: bool = False) -> dict:
         return {"status": "error", "error": str(exc)}
 
 
+def run_screener_batch() -> dict:
+    """일일 스크리너 — 표본 적립원.
+
+    워치리스트 7종목만으로는 독립 블록이 79개(신 로직)에 그쳐 국면별 규칙을 세울 수
+    없다 (2026-09-12 진단). 스크리너는 이미 KOSPI+KOSDAQ 280여 종목을 훑으므로,
+    그 결과를 매일 표본으로 쌓으면 LLM 비용 없이 종목 다양성이 큰 표본이 모인다.
+    """
+    started_at = _record_job_start("screener_batch", _KNOWN_OPS_JOBS["screener_batch"])
+    try:
+        from screener import run_screener
+
+        result = run_screener()
+        summary = {
+            "status": "completed",
+            "run_id": result.get("run_id"),
+            "universe_size": result.get("universe_size"),
+            "result_count": len(result.get("results") or []),
+            "outcome_recording": result.get("outcome_recording"),
+        }
+        _record_job_success("screener_batch", started_at, summary)
+        return summary
+    except Exception as exc:
+        _record_job_error("screener_batch", started_at, exc)
+        return {"status": "error", "error": str(exc)}
+
+
 def run_data_health_check() -> dict:
     """데이터 freshness SLO를 평가하고 stale/degraded 상태를 알린다."""
     started_at = _record_job_start("data_health_check", _KNOWN_OPS_JOBS["data_health_check"])
@@ -1734,6 +1762,15 @@ def _start_background_scheduler(run_initial_scan: bool = False) -> None:
         id='data_health_check',
         replace_existing=True,
     )
+    if SCREENER_BATCH_ENABLED:
+        scheduler.add_job(
+            run_screener_batch,
+            'cron',
+            hour=SCREENER_BATCH_HOUR,
+            minute=SCREENER_BATCH_MINUTE,
+            id='screener_batch',
+            replace_existing=True,
+        )
     if MULTI_AGENT_BATCH_ENABLED:
         scheduler.add_job(
             run_multi_agent_batch,
@@ -2234,6 +2271,8 @@ def ops_run_job(job_id: str, force: bool = False):
         return run_data_health_check()
     if normalized in {"multi_agent_batch", "multi_agent"}:
         return run_multi_agent_batch()
+    if normalized in {"screener_batch", "screener"}:
+        return run_screener_batch()
     raise HTTPException(404, f"Unknown ops job: {job_id}")
 
 

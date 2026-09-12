@@ -119,6 +119,13 @@ class Settings(BaseSettings):
     OPS_ALERT_DEDUPE_MINUTES: int = Field(default=60, ge=1)
     # 일일 멀티에이전트(V2) 배치 — signal_outcomes 표본 자동 축적용.
     # 시각은 서버 로컬 시간 기준. 기본 17:30 (KRX 마감 15:30 이후).
+    # 일일 스크리너 — 표본 적립원. 워치리스트 7종목만으로는 독립 블록이 모이지
+    # 않아(2026-09-12 진단), KOSPI+KOSDAQ 스크리너 결과를 매일 표본으로 쌓는다.
+    # KRX 마감(15:30) 이후, 멀티에이전트 배치(17:30) 앞에 둔다.
+    SCREENER_BATCH_ENABLED: bool = True
+    SCREENER_BATCH_HOUR: int = Field(default=16, ge=0, le=23)
+    SCREENER_BATCH_MINUTE: int = Field(default=30, ge=0, le=59)
+
     MULTI_AGENT_BATCH_ENABLED: bool = True
     MULTI_AGENT_BATCH_HOUR: int = Field(default=17, ge=0, le=23)
     MULTI_AGENT_BATCH_MINUTE: int = Field(default=30, ge=0, le=59)
@@ -258,6 +265,9 @@ CORPORATE_ACTION_CHECK_MINUTE = settings.CORPORATE_ACTION_CHECK_MINUTE
 DATA_HEALTH_CHECK_MINUTES = settings.DATA_HEALTH_CHECK_MINUTES
 DATA_HEALTH_ALERT_STALE_HOURS = settings.DATA_HEALTH_ALERT_STALE_HOURS
 OPS_ALERT_DEDUPE_MINUTES = settings.OPS_ALERT_DEDUPE_MINUTES
+SCREENER_BATCH_ENABLED = settings.SCREENER_BATCH_ENABLED
+SCREENER_BATCH_HOUR = settings.SCREENER_BATCH_HOUR
+SCREENER_BATCH_MINUTE = settings.SCREENER_BATCH_MINUTE
 MULTI_AGENT_BATCH_ENABLED = settings.MULTI_AGENT_BATCH_ENABLED
 MULTI_AGENT_BATCH_HOUR = settings.MULTI_AGENT_BATCH_HOUR
 MULTI_AGENT_BATCH_MINUTE = settings.MULTI_AGENT_BATCH_MINUTE
