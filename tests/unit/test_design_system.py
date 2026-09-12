@@ -8,10 +8,18 @@ import os
 import re
 
 _WEBUI = os.path.join(os.path.dirname(__file__), "../../stock_analyzer/webui.py")
+# CSS 는 2026-09-12 에 webui.py 에서 ui/theme.py 로 분리됐다 (점진 분해 1단계).
+# 화면 규칙(레이아웃·컴포넌트 사용)은 여전히 webui.py 를 본다.
+_THEME = os.path.join(os.path.dirname(__file__), "../../stock_analyzer/ui/theme.py")
 
 
 def _css() -> str:
-    return open(_WEBUI, encoding="utf-8").read()
+    """CSS 는 theme 모듈에, 인라인 style 은 webui 에 남아 있다 — 둘 다 본다."""
+    return (
+        open(_THEME, encoding="utf-8").read()
+        + "\n"
+        + open(_WEBUI, encoding="utf-8").read()
+    )
 
 
 def _token(name: str) -> str:
@@ -87,7 +95,7 @@ def test_control_heights_are_three():
 
 
 def test_legacy_aliases_map_to_new_tokens():
-    """webui.py는 5,100 라인 단일 파일이라 CSS를 한 번에 치환하지 않는다.
+    """CSS 를 한 번에 치환하지 않는다 (점진 이행).
 
     기존 규칙이 계속 동작하도록 별칭이 새 토큰을 가리켜야 한다.
     """
@@ -136,7 +144,13 @@ def test_period_uses_segmented_control():
 
 
 def _webui():
+    """webui.py 원본 — AST 파싱·라우팅 검사용."""
     return open(_WEBUI, encoding="utf-8").read()
+
+
+def _ui_source():
+    """화면 규칙은 webui.py 와 ui/theme.py 에 나뉘어 있다 (2026-09-12 분리)."""
+    return _webui() + "\n" + open(_THEME, encoding="utf-8").read()
 
 
 def test_nav_has_three_groups():
@@ -189,12 +203,12 @@ def test_sidebar_is_nav_only():
 
 
 def test_sidebar_width_264():
-    assert "width: 264px" in _webui()
+    assert "width: 264px" in _ui_source()
 
 
 def test_selected_nav_uses_left_accent_bar():
     """선택 상태를 색만으로 표현하지 않는다 — 좌측 2px accent 바."""
-    src = _webui()
+    src = _ui_source()
     assert "border-left: 2px solid transparent" in src
     assert "border-left-color: var(--accent)" in src
 

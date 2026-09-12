@@ -26,7 +26,7 @@
 | LLM | 8 에이전트 = Gemini 4 (gemini-2.0-flash) + Ollama 4 (Mac Studio qwen2.5:32b) |
 | 분석 도구 | 24개 (방향성 22 + 비방향성 2: `risk_position_sizing`, `entry_plan_analysis`) |
 | ML | 5모델 앙상블 (RF/GBM/LightGBM/XGBoost/LSTM) + SHAP + Optuna + Walk-Forward |
-| 코드 규모 | 프로덕션 Python 53,834 라인 / 최대 파일 `webui.py` 6,379 라인 |
+| 코드 규모 | 프로덕션 Python 약 54,000 라인 / 최대 파일 `webui.py` 5,882 라인 |
 | API | FastAPI 엔드포인트 83개 (`chart_agent_service/service.py`, 3,192 라인) |
 | 테스트 | 65 파일 / 679 test, CI(GitHub Actions) 최근 실행 전부 success |
 | 데이터 축적 | `scan_log` 69,341행 (2026-04-14~), `signal_outcomes` 5,018행 — 평가 완료 4,272 / 종결 53 / 대기 0 |
@@ -101,7 +101,7 @@ HTTP 200은 코드 반영의 증거가 아니다.
 
 | 파일 | 라인 | 역할 |
 |---|---:|---|
-| `stock_analyzer/webui.py` | 6,379 | Streamlit 단일 파일 앱 (17페이지). **최대 부채** |
+| `stock_analyzer/webui.py` | 5,882 | Streamlit 앱 (17페이지). **최대 부채** — 분해 시작(§13.9) |
 | `chart_agent_service/service.py` | 3,192 | FastAPI 83 엔드포인트 + APScheduler 5 잡 |
 | `chart_agent_service/analysis_tools.py` | 3,087 | 24 도구 + `ChartAnalysisAgent` (도구 실행 오케스트레이션) |
 | `stock_analyzer/multi_agent.py` | 2,406 | 8 에이전트 클래스 + `MultiAgentOrchestrator` |
@@ -657,7 +657,7 @@ win 정의가 "신호 방향으로 ±2% 이상"이었는데 **±2%에 근거가 
 
 | # | 항목 | 현재 상태 |
 |---|---|---|
-| 1 | `webui.py` 6,379 라인 God file | 포맷 로직만 `report_format.py`로 분리 시작. 페이지 단위 점진 분리 예정 |
+| 1 | `webui.py` God file | **분해 시작** (2026-09-12): 6,482 → 5,882 라인. `ui/theme.py`(CSS 480줄), `ui/api_client.py`(127줄) 분리. 다음은 페이지 단위 — 아래 §13.9a |
 | 2 | 이중 호출 경로 (직접 import + HTTP) | `/paper`·`/trading`·`/gpu`만 HTTP 강제. 나머지는 여전히 이중 |
 | 3 | `print()` 기반 로깅 | 미해결 |
 | 4 | 양방향 `sys.path` 주입 | 미해결 (webui↔agent 상호 import) |
@@ -667,6 +667,26 @@ win 정의가 "신호 방향으로 ±2% 이상"이었는데 **±2%에 근거가 
 | 8 | 모델 버전 태그 핀 | `qwen3:14b-q4_K_M` 등 태그 고정이나 digest 핀은 아님 |
 | 9 | 백테스트 Composite 전략의 과거 replay 제외 | look-ahead 회피 목적. 도구 신호의 역사적 성능은 미측정 |
 | 10 | 단일 노드 SPOF | testdev가 죽으면 전부 정지. 백업/복구 절차 문서화 없음 |
+
+#### 13.9a `webui.py` 분해 계획 (진행 중)
+
+CLAUDE.md §6-10: **한 번에 분리하지 말 것.** 의존성이 낮은 순서로 뗀다.
+
+| 단계 | 대상 | 상태 |
+|---|---|---|
+| 1 | `ui/theme.py` — CSS 토큰 (순수 문자열, 의존성 0) | ✅ 2026-09-12 |
+| 2 | `ui/api_client.py` — agent-api 호출 (모든 페이지 공용) | ✅ 2026-09-12 |
+| 3 | `ui/market.py` — 지수·환율 데이터/차트 (`MARKET_INDICES`, `KRW_CROSS`, 약 250줄) | 예정 |
+| 4 | `ui/tickers.py` — 티커 검증·표기·워치리스트 (약 400줄) | 예정 |
+| 5 | `ui/pages/*.py` — 페이지 단위 (가장 큰 `render_multi_agent` 594줄부터) | 예정 |
+
+각 단계의 검증은 테스트만으로 부족하다. Streamlit 은 스크립트가 죽어도 HTTP 200 을
+주므로(§14-5), 매번 **스크립트를 실제로 실행**해 예외 없이 끝나는지 확인한다:
+
+```bash
+docker exec stock-auto-webui python -c \
+  "import runpy; runpy.run_path('/app/stock_analyzer/webui.py', run_name='__main__')"
+```
 
 ### 13.10 데이터 품질 위험
 
