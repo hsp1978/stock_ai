@@ -17,6 +17,10 @@ from bs4 import BeautifulSoup
 import json
 import os
 
+from app_logging import get_logger
+
+logger = get_logger("stock_auto.korean_stocks")
+
 
 class KoreanStockData:
     """한국 주식 데이터 수집기"""
@@ -93,20 +97,20 @@ class KoreanStockData:
         """
         try:
             yahoo_ticker, stock_code, market = self.normalize_ticker(ticker)
-            print(f"[KR Stock] Fetching {yahoo_ticker} ({self.get_stock_name(stock_code)})")
+            logger.info(f"[KR Stock] Fetching {yahoo_ticker} ({self.get_stock_name(stock_code)})")
 
             stock = yf.Ticker(yahoo_ticker)
             df = stock.history(period=period)
 
             if df.empty:
-                print(f"[KR Stock] No data for {yahoo_ticker}, trying .KQ")
+                logger.info(f"[KR Stock] No data for {yahoo_ticker}, trying .KQ")
                 # KOSPI에서 못 찾으면 KOSDAQ 시도
                 yahoo_ticker = f"{stock_code}.KQ"
                 stock = yf.Ticker(yahoo_ticker)
                 df = stock.history(period=period)
 
             if df.empty:
-                print(f"[KR Stock] Failed to fetch data for {ticker}")
+                logger.info(f"[KR Stock] Failed to fetch data for {ticker}")
                 return None
 
             # 컬럼명 표준화
@@ -121,11 +125,11 @@ class KoreanStockData:
             df['Ticker'] = yahoo_ticker
             df['Market'] = market
 
-            print(f"[KR Stock] Success: {len(df)} days of data")
+            logger.info(f"[KR Stock] Success: {len(df)} days of data")
             return df
 
         except Exception as e:
-            print(f"[KR Stock] Error fetching {ticker}: {e}")
+            logger.error(f"[KR Stock] Error fetching {ticker}: {e}")
             return None
 
     def fetch_naver_info(self, ticker: str) -> Dict:
@@ -159,7 +163,7 @@ class KoreanStockData:
             return info
 
         except Exception as e:
-            print(f"[Naver] Error fetching info for {ticker}: {e}")
+            logger.error(f"[Naver] Error fetching info for {ticker}: {e}")
             return {}
 
     def fetch_institutional_trading(self, ticker: str, days: int = 5) -> Dict:
@@ -206,9 +210,9 @@ class KoreanStockData:
                 # 데이터가 없거나 필요한 컬럼이 없으면 fallback
                 if df is None or df.empty or '외국인' not in df.columns:
                     if df is not None and not df.empty and '외국인' not in df.columns:
-                        print(f"[FDR] API changed - investor columns not available for {stock_code}")
+                        logger.info(f"[FDR] API changed - investor columns not available for {stock_code}")
                     else:
-                        print(f"[FDR] No institutional data for {stock_code}")
+                        logger.info(f"[FDR] No institutional data for {stock_code}")
                     # Fallback: Yahoo Finance에서 가져온 데이터로 추정
                     return self._estimate_institutional_from_volume(stock_code, days)
 
@@ -249,15 +253,15 @@ class KoreanStockData:
                 }
 
             except ImportError:
-                print(f"[Institutional] FinanceDataReader not available")
+                logger.info(f"[Institutional] FinanceDataReader not available")
                 return {}
             except Exception as fetch_error:
-                print(f"[Institutional] FDR fetch error: {fetch_error}")
+                logger.error(f"[Institutional] FDR fetch error: {fetch_error}")
                 # Fallback
                 return self._estimate_institutional_from_volume(stock_code, days)
 
         except Exception as e:
-            print(f"[Institutional] Error fetching trading data for {ticker}: {e}")
+            logger.error(f"[Institutional] Error fetching trading data for {ticker}: {e}")
             import traceback
             traceback.print_exc()
             return {}
@@ -314,7 +318,7 @@ class KoreanStockData:
             }
 
         except Exception as e:
-            print(f"[Estimate] Error: {e}")
+            logger.error(f"[Estimate] Error: {e}")
             return {}
 
     def get_market_index(self, index: str = 'KOSPI') -> Dict:
@@ -353,7 +357,7 @@ class KoreanStockData:
             }
 
         except Exception as e:
-            print(f"[Market Index] Error fetching {index}: {e}")
+            logger.error(f"[Market Index] Error fetching {index}: {e}")
             return {}
 
     def verify_ticker(self, ticker: str) -> bool:
@@ -398,7 +402,7 @@ class KoreanStockData:
                 json.dump(self.favorites, f, ensure_ascii=False, indent=2)
             return True
         except Exception as e:
-            print(f"[Favorites] 저장 실패: {e}")
+            logger.error(f"[Favorites] 저장 실패: {e}")
             return False
 
     def add_favorite(self, code: str, name: str = None) -> bool:
@@ -614,8 +618,8 @@ class KoreanStockData:
                 self.add_favorite(code, stock_name)
                 return code
 
-        print(f"[Search] '{name}'을(를) 찾을 수 없습니다.")
-        print(f"[Search] 종목코드를 직접 입력하거나 즐겨찾기에 추가해주세요.")
+        logger.info(f"[Search] '{name}'을(를) 찾을 수 없습니다.")
+        logger.info(f"[Search] 종목코드를 직접 입력하거나 즐겨찾기에 추가해주세요.")
         return None
 
     def search_stock(self, query: str) -> List[Dict]:
@@ -641,8 +645,8 @@ class KoreanStockData:
                 results.append(stock_info)
                 # 즐겨찾기에 자동 추가 옵션
                 if query not in self.favorites:
-                    print(f"[Search] '{stock_info['name']}'({query})를 즐겨찾기에 추가하시겠습니까?")
-                    print(f"[Search] collector.add_favorite('{query}', '{stock_info['name']}')")
+                    logger.info(f"[Search] '{stock_info['name']}'({query})를 즐겨찾기에 추가하시겠습니까?")
+                    logger.info(f"[Search] collector.add_favorite('{query}', '{stock_info['name']}')")
         else:
             # 종목명으로 검색
             code = self.search_stock_by_name(query)
@@ -656,16 +660,16 @@ class KoreanStockData:
     def show_favorites(self):
         """즐겨찾기 목록 출력"""
         if not self.favorites:
-            print("즐겨찾기가 비어있습니다.")
-            print("종목 추가: collector.add_favorite('종목코드', '종목명')")
+            logger.info("즐겨찾기가 비어있습니다.")
+            logger.info("종목 추가: collector.add_favorite('종목코드', '종목명')")
             return
 
-        print("\n=== 한국 주식 즐겨찾기 ===")
+        logger.info("\n=== 한국 주식 즐겨찾기 ===")
         for code, name in self.favorites.items():
-            print(f"  {code}: {name}")
-        print(f"\n총 {len(self.favorites)}개 종목")
-        print("제거: collector.remove_favorite('종목코드')")
-        print("조회: collector.search_stock('종목코드_또는_종목명')")
+            logger.info(f"  {code}: {name}")
+        logger.info(f"\n총 {len(self.favorites)}개 종목")
+        logger.info("제거: collector.remove_favorite('종목코드')")
+        logger.info("조회: collector.search_stock('종목코드_또는_종목명')")
 
 
 # 편의 함수들

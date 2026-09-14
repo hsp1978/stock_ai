@@ -50,6 +50,10 @@ from config import (
 
 from data_collector import fetch_ohlcv, calculate_indicators
 from analysis_tools import AnalysisTools
+
+from app_logging import get_logger
+
+logger = get_logger("stock_auto.multi_agent")
 try:
     from gpu_monitor import get_gpu_memory_snapshot
 except ImportError:  # pragma: no cover - package import path
@@ -284,7 +288,7 @@ class BaseAgent:
             if contradictions:
                 confidence = round(float(confidence) * 0.5, 2)
                 reasoning = f"{reasoning}\n[정합성 경고] " + " / ".join(contradictions)
-                print(f"  [{self.name}] 서술 모순 {len(contradictions)}건 — 신뢰도 절반 적용")
+                logger.info(f"  [{self.name}] 서술 모순 {len(contradictions)}건 — 신뢰도 절반 적용")
 
             execution_time = (datetime.now() - start_time).total_seconds()
 
@@ -1880,7 +1884,7 @@ def _build_decision_maker(llm_provider: str):
             dm = DecisionMaker(llm_provider)
             dm.decision_maker_mode = "legacy_llm"
             dm.legacy_fallback_reason = str(exc)
-            print(
+            logger.error(
                 "  ⚠️ EnhancedDecisionMaker import 실패 — "
                 "MULTI_AGENT_ALLOW_LEGACY_DECISION_MAKER=true 설정으로 legacy DecisionMaker 사용"
             )
@@ -1976,7 +1980,7 @@ class MultiAgentOrchestrator:
             from dual_node_config import is_mac_studio_available
             self.mac_studio_available = is_mac_studio_available()
             if not self.mac_studio_available:
-                print("  ⚠️ Mac Studio 연결 불가 - 로컬 GPU 전용 모드 (병렬 제한: 2)")
+                logger.error("  ⚠️ Mac Studio 연결 불가 - 로컬 GPU 전용 모드 (병렬 제한: 2)")
                 self.max_workers = 2
         except Exception:
             pass
@@ -1995,13 +1999,13 @@ class MultiAgentOrchestrator:
                 # 모델 목록 확인
                 tags = response.json().get('models', [])
                 if len(tags) > 0:
-                    print(f"  ✅ Ollama 서버 정상 ({len(tags)}개 모델 사용 가능)")
+                    logger.info(f"  ✅ Ollama 서버 정상 ({len(tags)}개 모델 사용 가능)")
                     return True
                 else:
-                    print("  ⚠️ Ollama 서버는 실행 중이나 모델 없음")
+                    logger.warning("  ⚠️ Ollama 서버는 실행 중이나 모델 없음")
                     return False
             else:
-                print(f"  ❌ Ollama 서버 응답 이상: {response.status_code}")
+                logger.error(f"  ❌ Ollama 서버 응답 이상: {response.status_code}")
                 return False
         except requests.exceptions.Timeout:
             # 콘솔 로그 제거 - 이미 ollama_healthy 상태로 파악 가능
@@ -2101,7 +2105,7 @@ class MultiAgentOrchestrator:
                 f"{len(not_done)}/{len(futures)}개 미완료"
             )
             warnings.append(timeout_message)
-            print(f"    ⚠️ {timeout_message}")
+            logger.warning(f"    ⚠️ {timeout_message}")
 
         for future, agent in futures.items():
             if future in done:
@@ -2113,14 +2117,14 @@ class MultiAgentOrchestrator:
                         )
 
                     status = "✓" if not result.error else "✗"
-                    print(
+                    logger.info(
                         f"    {status} {agent.name}: {result.signal} "
                         f"({result.confidence:.1f}/10) [{result.execution_time:.1f}s]"
                     )
                     agent_results.append(result)
                 except Exception as e:
                     message = f"Execution failed: {str(e)}"
-                    print(f"    ✗ {agent.name}: Error - {str(e)[:50]}")
+                    logger.error(f"    ✗ {agent.name}: Error - {str(e)[:50]}")
                     agent_results.append(
                         self._agent_execution_error(agent, message, started_at)
                     )
@@ -2130,7 +2134,7 @@ class MultiAgentOrchestrator:
                     f"Agent timed out after {timeout_seconds}s and was excluded "
                     "from final aggregation"
                 )
-                print(f"    ✗ {agent.name}: Timeout after {timeout_seconds}s")
+                logger.info(f"    ✗ {agent.name}: Timeout after {timeout_seconds}s")
                 agent_results.append(
                     self._agent_execution_error(agent, message, started_at)
                 )
@@ -2152,9 +2156,9 @@ class MultiAgentOrchestrator:
         stock_name = self._get_stock_name(ticker)
 
         if stock_name:
-            print(f"\n[MultiAgent] {stock_name}({ticker}) 분석 시작...")
+            logger.info(f"\n[MultiAgent] {stock_name}({ticker}) 분석 시작...")
         else:
-            print(f"\n[MultiAgent] {ticker} 분석 시작...")
+            logger.info(f"\n[MultiAgent] {ticker} 분석 시작...")
         start_time = datetime.now()
         warnings = []
 
@@ -2163,7 +2167,7 @@ class MultiAgentOrchestrator:
             ollama_agents = [a.name for a in self.agents if a.llm_provider == 'ollama']
             if ollama_agents:
                 warnings.append(f"⚠️ Ollama 서버 장애로 {len(ollama_agents)}개 에이전트가 실패할 수 있습니다")
-                print(f"  ⚠️ 경고: Ollama 서버 장애 감지 - {', '.join(ollama_agents[:3])}... 에이전트 영향")
+                logger.warning(f"  ⚠️ 경고: Ollama 서버 장애 감지 - {', '.join(ollama_agents[:3])}... 에이전트 영향")
 
         try:
             # 0. 한글 포함 여부 체크 - 한글이 있으면 바로 종목 추천
@@ -2181,7 +2185,7 @@ class MultiAgentOrchestrator:
                     best = suggestion_result['suggestions'][0]
                     warnings.append(f"종목 자동 매칭: {ticker} → {best['ticker']} ({best['name']})")
                     ticker = best['ticker']
-                    print(f"  ✅ 자동 선택: {best['name']} ({best['ticker']}) [{best['score']*100:.0f}%]")
+                    logger.info(f"  ✅ 자동 선택: {best['name']} ({best['ticker']}) [{best['score']*100:.0f}%]")
                 else:
                     # 추천 목록 반환
                     if suggestion_result['found']:
@@ -2228,7 +2232,7 @@ class MultiAgentOrchestrator:
                             best = suggestion_result['suggestions'][0]
                             warnings.append(f"종목 자동 매칭: {ticker} → {best['ticker']} ({best['name']})")
                             ticker = best['ticker']
-                            print(f"  ✅ 자동 선택: {best['name']} ({best['ticker']}) [{best['score']*100:.0f}%]")
+                            logger.info(f"  ✅ 자동 선택: {best['name']} ({best['ticker']}) [{best['score']*100:.0f}%]")
                         else:
                             # 추천 목록 반환
                             return {
@@ -2286,7 +2290,7 @@ class MultiAgentOrchestrator:
 
             # 회사명 확인됨 - 경고에 추가
             if verification.get('company_name'):
-                print(f"  종목 확인: {verification['company_name']} ({ticker})")
+                logger.info(f"  종목 확인: {verification['company_name']} ({ticker})")
 
             # 데이터 품질 경고 추가
             if verification.get('warnings'):
@@ -2295,7 +2299,7 @@ class MultiAgentOrchestrator:
             market_info = get_market_info(ticker)
 
             # 1. 데이터 수집
-            print(f"  [1/3] 데이터 수집 중...")
+            logger.info(f"  [1/3] 데이터 수집 중...")
             df = fetch_ohlcv(ticker)
 
             # 데이터 검증
@@ -2314,7 +2318,7 @@ class MultiAgentOrchestrator:
             tools = AnalysisTools(ticker, df)
 
             # 2. 병렬 에이전트 실행 (GPU 메모리 보호)
-            print(f"  [2/3] {len(self.agents)}개 에이전트 병렬 실행 중 (워커: {self.max_workers})")
+            logger.info(f"  [2/3] {len(self.agents)}개 에이전트 병렬 실행 중 (워커: {self.max_workers})")
             agent_results = []
             _ma_timeout = _int_env("MULTI_AGENT_TIMEOUT", MULTI_AGENT_TIMEOUT)
 
@@ -2349,7 +2353,7 @@ class MultiAgentOrchestrator:
                 executor.shutdown(wait=False, cancel_futures=True)
 
             # 3. Decision Maker가 종합
-            print(f"  [3/3] Decision Maker가 의견 종합 중...")
+            logger.info(f"  [3/3] Decision Maker가 의견 종합 중...")
             final_decision = self.decision_maker.aggregate(ticker, agent_results)
             final_decision = _ensure_decision_context(final_decision)
 
@@ -2459,13 +2463,13 @@ class MultiAgentOrchestrator:
                 }
             }
 
-            print(f"\n[MultiAgent] 완료: {final_decision['final_signal']} (신뢰도: {final_decision.get('final_confidence', 0):.1f}/10) [{total_time:.1f}s]")
+            logger.info(f"\n[MultiAgent] 완료: {final_decision['final_signal']} (신뢰도: {final_decision.get('final_confidence', 0):.1f}/10) [{total_time:.1f}s]")
 
             return result
 
         except Exception as e:
             if _looks_like_unfinished_futures_timeout(e):
-                print(f"\n[MultiAgent] future 타임아웃 단락: {str(e)}")
+                logger.info(f"\n[MultiAgent] future 타임아웃 단락: {str(e)}")
                 return _timeout_failure_result(
                     ticker=ticker,
                     message=str(e),
@@ -2473,7 +2477,7 @@ class MultiAgentOrchestrator:
                     started_at=start_time,
                 )
 
-            print(f"\n[MultiAgent] 오류: {str(e)}")
+            logger.error(f"\n[MultiAgent] 오류: {str(e)}")
             traceback.print_exc()
 
             return {
@@ -2491,17 +2495,17 @@ class MultiAgentOrchestrator:
 def test_multi_agent(ticker=DEFAULT_TEST_TICKER):
     """멀티에이전트 시스템 테스트"""
 
-    print("=" * 70)
-    print("Multi-Agent System Test")
-    print("=" * 70)
+    logger.info("=" * 70)
+    logger.info("Multi-Agent System Test")
+    logger.info("=" * 70)
 
     orchestrator = MultiAgentOrchestrator()
     result = orchestrator.analyze(ticker)
 
-    print("\n" + "=" * 70)
-    print("결과")
-    print("=" * 70)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    logger.info("\n" + "=" * 70)
+    logger.info("결과")
+    logger.info("=" * 70)
+    logger.info(json.dumps(result, indent=2, ensure_ascii=False))
 
     return result
 

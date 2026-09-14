@@ -13,6 +13,10 @@ from typing import Optional, Dict, List
 from dotenv import load_dotenv
 from pathlib import Path
 
+from app_logging import get_logger
+
+logger = get_logger("stock_auto.dart_api")
+
 # .env 파일 경로를 명시적으로 지정
 env_path = Path(__file__).parent / '.env'
 load_dotenv(env_path)
@@ -119,7 +123,7 @@ class DARTClient:
                                     self._corp_code_cache[stock_code] = corp_code
                                     return corp_code
             except Exception as search_error:
-                print(f"[DART] Search error: {search_error}")
+                logger.error(f"[DART] Search error: {search_error}")
 
             # 기본 매핑 (자주 조회되는 종목)
             # 필요시 수동으로 추가 가능
@@ -136,7 +140,7 @@ class DARTClient:
             return None
 
         except Exception as e:
-            print(f"[DART] Error getting corp code for {ticker}: {e}")
+            logger.error(f"[DART] Error getting corp code for {ticker}: {e}")
             return None
 
     def fetch_recent_disclosures(self, ticker: str, days: int = 30) -> List[Dict]:
@@ -183,7 +187,7 @@ class DARTClient:
             data = response.json()
 
             if data.get('status') != '000':
-                print(f"[DART] API error: {data.get('message')}")
+                logger.error(f"[DART] API error: {data.get('message')}")
                 return []
 
             disclosures = []
@@ -199,7 +203,7 @@ class DARTClient:
             return disclosures
 
         except Exception as e:
-            print(f"[DART] Error fetching disclosures for {ticker}: {e}")
+            logger.error(f"[DART] Error fetching disclosures for {ticker}: {e}")
             return []
 
     def fetch_financial_statement(self, ticker: str, year: int, quarter: int = 1) -> Dict:
@@ -265,7 +269,7 @@ class DARTClient:
             }
 
         except Exception as e:
-            print(f"[DART] Error fetching financial for {ticker}: {e}")
+            logger.error(f"[DART] Error fetching financial for {ticker}: {e}")
             return {}
 
     def get_dividend_info(self, ticker: str) -> Dict:
@@ -293,7 +297,7 @@ class DARTClient:
             }
 
         except Exception as e:
-            print(f"[DART] Error fetching dividend for {ticker}: {e}")
+            logger.error(f"[DART] Error fetching dividend for {ticker}: {e}")
             return {}
 
 

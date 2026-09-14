@@ -14,6 +14,10 @@ from stock_analyzer.multi_agent import MultiAgentOrchestrator
 from stock_analyzer.ticker_suggestion import TickerSuggestion
 from stock_analyzer.ticker_verifier import verify_and_validate
 
+from app_logging import get_logger
+
+logger = get_logger("stock_auto.interactive_analyzer")
+
 
 class InteractiveAnalyzer:
     """대화형 주식 분석기"""
@@ -47,7 +51,7 @@ class InteractiveAnalyzer:
 
         if verification['exists'] and verification['can_analyze']:
             # 정확한 티커 - 바로 분석
-            print(f"✅ 종목 확인: {verification['company_name']} ({input_text})")
+            logger.info(f"✅ 종목 확인: {verification['company_name']} ({input_text})")
             return self.orchestrator.analyze(input_text)
 
         # 2. 종목을 찾을 수 없으면 추천
@@ -64,8 +68,8 @@ class InteractiveAnalyzer:
         # 3. 자동 선택 체크 (임계값 이상 매치)
         if auto_select and suggestions[0]['score'] >= auto_select_threshold:
             selected_ticker = suggestions[0]['ticker']
-            print(f"✅ 자동 선택: {suggestions[0]['name']} ({selected_ticker})")
-            print(f"   매치율: {suggestions[0]['score']*100:.1f}%")
+            logger.info(f"✅ 자동 선택: {suggestions[0]['name']} ({selected_ticker})")
+            logger.info(f"   매치율: {suggestions[0]['score']*100:.1f}%")
             return self.orchestrator.analyze(selected_ticker)
 
         # 4. 수동 선택 필요
@@ -86,11 +90,11 @@ class InteractiveAnalyzer:
 
         # 수동 선택이 필요한 경우
         if result.get('error') == '종목 선택 필요':
-            print("\n" + "="*60)
-            print("종목 검색 결과")
-            print("="*60)
-            print(result['formatted_suggestions'])
-            print("\n번호를 입력하여 선택하거나, 0을 입력하여 취소하세요.")
+            logger.info("\n" + "="*60)
+            logger.info("종목 검색 결과")
+            logger.info("="*60)
+            logger.info(result['formatted_suggestions'])
+            logger.info("\n번호를 입력하여 선택하거나, 0을 입력하여 취소하세요.")
 
             while True:
                 try:
@@ -106,16 +110,16 @@ class InteractiveAnalyzer:
                     idx = int(choice) - 1
                     if 0 <= idx < len(result['suggestions']):
                         selected = result['suggestions'][idx]
-                        print(f"\n✅ 선택됨: {selected['name']} ({selected['ticker']})")
-                        print("="*60)
+                        logger.info(f"\n✅ 선택됨: {selected['name']} ({selected['ticker']})")
+                        logger.info("="*60)
 
                         # 선택된 종목 분석
                         return self.orchestrator.analyze(selected['ticker'])
                     else:
-                        print("❌ 잘못된 번호입니다. 다시 선택해주세요.")
+                        logger.error("❌ 잘못된 번호입니다. 다시 선택해주세요.")
 
                 except ValueError:
-                    print("❌ 숫자를 입력해주세요.")
+                    logger.error("❌ 숫자를 입력해주세요.")
                 except KeyboardInterrupt:
                     return {
                         "error": "사용자가 취소함",

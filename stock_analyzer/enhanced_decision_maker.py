@@ -14,6 +14,10 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 from signal_normalizer import SignalNormalizer, normalize_signal
 
+from app_logging import get_logger
+
+logger = get_logger("stock_auto.enhanced_decision_maker")
+
 
 def _as_float(value: Any) -> Optional[float]:
     """yfinance info 값은 None·문자열·NaN이 섞여 온다. 숫자만 통과시킨다."""
@@ -744,7 +748,7 @@ class EnhancedDecisionMaker:
             # 검사기 자체의 실패가 리포트를 막아서는 안 되지만, 조용히 넘기면
             # '검사했다'는 착시가 생긴다. 미검증 상태를 명시한다.
             result["invariant_violations"] = [f"CHECKER_FAILED: {exc}"]
-            print(f"[report_invariants] 검사기 실패: {exc}")
+            logger.error(f"[report_invariants] 검사기 실패: {exc}")
 
         return result
 

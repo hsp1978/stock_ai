@@ -18,6 +18,10 @@ from bs4 import BeautifulSoup
 import json
 import time
 
+from app_logging import get_logger
+
+logger = get_logger("stock_auto.news_analyzer")
+
 
 @dataclass
 class NewsItem:
@@ -225,7 +229,7 @@ class NewsAnalyzer:
                     news_items.append(news_item)
 
         except Exception as e:
-            print(f"Error fetching Yahoo news: {e}")
+            logger.error(f"Error fetching Yahoo news: {e}")
             import traceback
             traceback.print_exc()
 
@@ -286,7 +290,7 @@ class NewsAnalyzer:
                                 news_items.append(news_item)
 
         except Exception as e:
-            print(f"Error fetching Finviz news: {e}")
+            logger.error(f"Error fetching Finviz news: {e}")
 
         return news_items
 

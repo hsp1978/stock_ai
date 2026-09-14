@@ -19,6 +19,10 @@ _AGENT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
 sys.path.insert(0, _AGENT_DIR)
 from config import SCAN_INTERVAL_MINUTES
 
+from app_logging import get_logger
+
+logger = get_logger("stock_auto.scanner")
+
 
 def load_watchlist() -> list[str]:
     wl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.txt")
@@ -32,14 +36,14 @@ def run_scan():
     """주기적 watchlist 스캔"""
     tickers = load_watchlist()
     if not tickers:
-        print(f"[{datetime.now():%H:%M}] Watchlist empty, skipping scan")
+        logger.warning(f"[{datetime.now():%H:%M}] Watchlist empty, skipping scan")
         return
-    print(f"\n{'='*60}")
-    print(f"  Scheduled scan: {datetime.now():%Y-%m-%d %H:%M}")
-    print(f"  Tickers: {len(tickers)} - {', '.join(tickers)}")
-    print(f"{'='*60}\n")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"  Scheduled scan: {datetime.now():%Y-%m-%d %H:%M}")
+    logger.info(f"  Tickers: {len(tickers)} - {', '.join(tickers)}")
+    logger.info(f"{'='*60}\n")
     engine_scan_all(tickers)
-    print(f"\n  Scan complete: {datetime.now():%H:%M}\n")
+    logger.info(f"\n  Scan complete: {datetime.now():%H:%M}\n")
 
 
 def run_telegram_callbacks():
@@ -82,9 +86,9 @@ def run_telegram_callbacks():
 
         result = process_callback_updates({"watch": _watch, "mute": _mute})
         if result.get("processed", 0) > 0:
-            print(f"[Telegram] 콜백 {result['processed']}건 처리")
+            logger.info(f"[Telegram] 콜백 {result['processed']}건 처리")
     except Exception as e:
-        print(f"[Telegram] 콜백 처리 실패: {e}")
+        logger.error(f"[Telegram] 콜백 처리 실패: {e}")
 
 
 def run_market_close_digest():
@@ -97,12 +101,12 @@ def run_market_close_digest():
         resp = httpx.post(url, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
-            print(f"[Telegram] 일일 다이제스트 발송: sent={data.get('sent')}, "
+            logger.info(f"[Telegram] 일일 다이제스트 발송: sent={data.get('sent')}, "
                   f"총 스캔 {data.get('total_scans', 0)}건")
         else:
-            print(f"[Telegram] 다이제스트 실패: {resp.status_code}")
+            logger.error(f"[Telegram] 다이제스트 실패: {resp.status_code}")
     except Exception as e:
-        print(f"[Telegram] 다이제스트 오류: {e}")
+        logger.error(f"[Telegram] 다이제스트 오류: {e}")
 
 
 def run_kr_screener():
@@ -110,9 +114,9 @@ def run_kr_screener():
     한국 주식 기술적 스크리너 (일일 15:35 KST 실행).
     시총 2,000억 이상 종목 → 상위 20개 선별 → DB 저장.
     """
-    print(f"\n{'='*60}")
-    print(f"  한국 주식 스크리너: {datetime.now():%Y-%m-%d %H:%M}")
-    print(f"{'='*60}\n")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"  한국 주식 스크리너: {datetime.now():%Y-%m-%d %H:%M}")
+    logger.info(f"{'='*60}\n")
     try:
         import httpx
         import os as _os
@@ -125,44 +129,44 @@ def run_kr_screener():
         if r.status_code == 200:
             data = r.json()
             results = data.get("results", [])
-            print(f"  ✓ 스크리너 완료: {len(results)}종목 선별")
-            print(f"  ✓ 유니버스 {data.get('universe_size', 0)}개 분석")
-            print(f"  ✓ 소요 {data.get('elapsed_seconds', 0)}s")
+            logger.info(f"  ✓ 스크리너 완료: {len(results)}종목 선별")
+            logger.info(f"  ✓ 유니버스 {data.get('universe_size', 0)}개 분석")
+            logger.info(f"  ✓ 소요 {data.get('elapsed_seconds', 0)}s")
             if results:
                 top5 = results[:5]
-                print(f"\n  TOP 5:")
+                logger.info(f"\n  TOP 5:")
                 for r_ in top5:
-                    print(f"    {r_['rank']:2}. {r_['name'][:15]:15} "
+                    logger.info(f"    {r_['rank']:2}. {r_['name'][:15]:15} "
                           f"점수 {r_['score']:.1f} ({r_['grade']}등급)")
         else:
-            print(f"  ✗ API 실패: {r.status_code}")
+            logger.error(f"  ✗ API 실패: {r.status_code}")
     except Exception as e:
-        print(f"  ✗ 스크리너 실행 실패: {e}")
-    print(f"\n{'='*60}\n")
+        logger.error(f"  ✗ 스크리너 실행 실패: {e}")
+    logger.info(f"\n{'='*60}\n")
 
 
 def run_signal_validation():
     """일일 신호 사후 평가 + 신뢰도 칼리브레이션 재학습"""
-    print(f"\n{'='*60}")
-    print(f"  Daily signal validation: {datetime.now():%Y-%m-%d %H:%M}")
-    print(f"{'='*60}\n")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"  Daily signal validation: {datetime.now():%Y-%m-%d %H:%M}")
+    logger.info(f"{'='*60}\n")
     try:
         from signal_tracker import run_daily_validation
         result = run_daily_validation(refit_calibrator=True)
         ev = result.get("evaluation", {})
         calib = result.get("calibrator") or {}
-        print(f"  ✓ 평가: 처리 {ev.get('processed')}, 업데이트 {ev.get('updated')}")
-        print(f"  ✓ 칼리브레이터: active={calib.get('active')}, 표본={calib.get('total_samples')}")
+        logger.info(f"  ✓ 평가: 처리 {ev.get('processed')}, 업데이트 {ev.get('updated')}")
+        logger.info(f"  ✓ 칼리브레이터: active={calib.get('active')}, 표본={calib.get('total_samples')}")
     except Exception as e:
-        print(f"  ✗ 검증 실패: {e}")
-    print(f"\n{'='*60}\n")
+        logger.error(f"  ✗ 검증 실패: {e}")
+    logger.info(f"\n{'='*60}\n")
 
 
 def run_rebalancing():
     """주기적 포트폴리오 리밸런싱 (V2.0)"""
-    print(f"\n{'='*60}")
-    print(f"  Scheduled rebalancing: {datetime.now():%Y-%m-%d %H:%M}")
-    print(f"{'='*60}\n")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"  Scheduled rebalancing: {datetime.now():%Y-%m-%d %H:%M}")
+    logger.info(f"{'='*60}\n")
 
     result = engine_portfolio_rebalance(
         method="markowitz",
@@ -179,24 +183,24 @@ def run_rebalancing():
         cost = result.get("total_transaction_cost", 0)
         drift = result.get("drift", 0)
 
-        print(f"  ✓ 리밸런싱 실행")
-        print(f"  - 사유: {reason}")
-        print(f"  - Drift: {drift:.2%}")
-        print(f"  - 주문: {len(orders)}개")
-        print(f"  - 거래비용: ${cost:.2f}")
+        logger.info(f"  ✓ 리밸런싱 실행")
+        logger.info(f"  - 사유: {reason}")
+        logger.info(f"  - Drift: {drift:.2%}")
+        logger.info(f"  - 주문: {len(orders)}개")
+        logger.info(f"  - 거래비용: ${cost:.2f}")
 
         for order in orders:
-            print(f"    • {order['action']} {order['ticker']} {order['qty']}주 @ ${order['price']:.2f}")
-            print(f"      ({order['current_weight']:.1%} → {order['target_weight']:.1%})")
+            logger.info(f"    • {order['action']} {order['ticker']} {order['qty']}주 @ ${order['price']:.2f}")
+            logger.info(f"      ({order['current_weight']:.1%} → {order['target_weight']:.1%})")
 
     elif status == "skipped":
-        print(f"  ○ 리밸런싱 스킵: {reason}")
-        print(f"  - 현재 Drift: {result.get('drift', 0):.2%}")
+        logger.info(f"  ○ 리밸런싱 스킵: {reason}")
+        logger.info(f"  - 현재 Drift: {result.get('drift', 0):.2%}")
 
     else:
-        print(f"  ✗ 리밸런싱 실패: {reason}")
+        logger.error(f"  ✗ 리밸런싱 실패: {reason}")
 
-    print(f"\n{'='*60}\n")
+    logger.info(f"\n{'='*60}\n")
 
 
 if __name__ == "__main__":

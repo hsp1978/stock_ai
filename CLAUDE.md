@@ -157,7 +157,8 @@ make help
 1. **`.env` 파일을 절대 git에 커밋하지 말 것.** `.gitignore`, `.dockerignore`에 이미 등록됨.
 2. **API 키를 코드·로그·docstring에 노출하지 말 것.** 디버깅 시 `printenv`, `docker config` 출력 시 키 부분 마스킹.
    로그는 `logging_setup.SecretRedactingFilter` 가 자동 마스킹한다 (쿼리스트링·Bearer·환경변수 값).
-   **print() 로 우회하면 이 보호가 적용되지 않는다** — agent-api 에서는 logger 를 쓸 것.
+   **print() 로 우회하면 이 보호가 적용되지 않는다** — 라이브러리 경로에서는 logger 를 쓸 것
+   (webui 는 `stock_analyzer/app_logging.py`). `__main__` 블록의 CLI 출력은 print 가 맞다.
 3. **`paper_trading_state.json`을 직접 편집하지 말 것.** API 또는 SQLite 마이그레이션 후 DB로 처리.
 4. **백테스트 결과의 Sharpe·수익률을 그대로 신뢰하지 말 것.** DSR + PBO 보정 필수.
 5. **새 LLM provider 직접 SDK 호출 추가하지 말 것.** LiteLLM Router 통한 등록만 허용.
@@ -303,7 +304,7 @@ PR 머지 시:
 |---|---|---|
 | 1 | ~~God file (`webui.py`)~~ ✅ 6,482 → **350 라인** (`ui/` 공용 8모듈 + `pages/` 17페이지, 2026-09-14) | 완료 |
 | 2 | Dual call path (in-proc + HTTP) | P2 (HTTP 단일화). `/paper`·`/trading`·`/gpu`는 강제 HTTP. 판정은 `ui/api_client.USE_LOCAL_ENGINE` 한 곳 (webui 중복 제거 2026-09-14) |
-| 3 | `print()` 기반 로깅 | agent-api ✅ 완료 (2026-09-14, `logging_setup.py`). `stock_analyzer/` 385건은 미전환 |
+| 3 | ~~`print()` 기반 로깅~~ ✅ 완료 (2026-09-14). agent-api 188건 + webui 라이브러리 179건. CLI 블록 206건은 의도적 유지 |
 | 4 | `paper_state.json` 무락 | 시스템 P0 |
 | 5 | 양방향 sys.path 주입 | P2 |
 | 6 | 모델 버전 미핀 (`qwen3:14b-q4_K_M`) | P2 |

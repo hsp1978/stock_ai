@@ -16,6 +16,10 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 import yfinance as yf
 
+from app_logging import get_logger
+
+logger = get_logger("stock_auto.insider_trading")
+
 
 class InsiderTradingAnalyzer:
     """내부자 거래 분석기"""
@@ -52,7 +56,7 @@ class InsiderTradingAnalyzer:
             return insider_trades
 
         except Exception as e:
-            print(f"내부자 거래 데이터 수집 오류: {str(e)}")
+            logger.error(f"내부자 거래 데이터 수집 오류: {str(e)}")
             return pd.DataFrame()
 
     def _fetch_from_alternative_source(self, ticker: str, days: int) -> pd.DataFrame:

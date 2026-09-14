@@ -15,6 +15,10 @@ import yfinance as yf
 from dataclasses import dataclass
 from enum import Enum
 
+from app_logging import get_logger
+
+logger = get_logger("stock_auto.enhanced_technical_analyzer")
+
 
 class SignalType(Enum):
     """Signal classification"""
@@ -119,7 +123,7 @@ class EnhancedTechnicalAnalyzer:
 
             return df
         except Exception as e:
-            print(f"Error fetching data: {e}")
+            logger.error(f"Error fetching data: {e}")
             return None
 
     def _calculate_all_indicators(self, df: pd.DataFrame) -> List[TechnicalSignal]:
@@ -188,7 +192,7 @@ class EnhancedTechnicalAnalyzer:
                 reasoning=reasoning
             )
         except Exception as e:
-            print(f"MA calculation error: {e}")
+            logger.error(f"MA calculation error: {e}")
             return None
 
     def _calculate_rsi_signal(self, df: pd.DataFrame) -> Optional[TechnicalSignal]:
@@ -240,7 +244,7 @@ class EnhancedTechnicalAnalyzer:
                 reasoning=reasoning
             )
         except Exception as e:
-            print(f"RSI calculation error: {e}")
+            logger.error(f"RSI calculation error: {e}")
             return None
 
     def _calculate_volume_signal(self, df: pd.DataFrame) -> Optional[TechnicalSignal]:
@@ -286,7 +290,7 @@ class EnhancedTechnicalAnalyzer:
                 reasoning=reasoning
             )
         except Exception as e:
-            print(f"Volume calculation error: {e}")
+            logger.error(f"Volume calculation error: {e}")
             return None
 
     def _calculate_support_resistance_signal(self, df: pd.DataFrame) -> Optional[TechnicalSignal]:
@@ -332,7 +336,7 @@ class EnhancedTechnicalAnalyzer:
                 price_level=price_level
             )
         except Exception as e:
-            print(f"S/R calculation error: {e}")
+            logger.error(f"S/R calculation error: {e}")
             return None
 
     def _calculate_macd_signal(self, df: pd.DataFrame) -> Optional[TechnicalSignal]:
@@ -379,7 +383,7 @@ class EnhancedTechnicalAnalyzer:
                 reasoning=reasoning
             )
         except Exception as e:
-            print(f"MACD calculation error: {e}")
+            logger.error(f"MACD calculation error: {e}")
             return None
 
     def _calculate_bollinger_signal(self, df: pd.DataFrame) -> Optional[TechnicalSignal]:
@@ -432,7 +436,7 @@ class EnhancedTechnicalAnalyzer:
                 reasoning=reasoning
             )
         except Exception as e:
-            print(f"Bollinger calculation error: {e}")
+            logger.error(f"Bollinger calculation error: {e}")
             return None
 
     def _calculate_fibonacci_signal(self, df: pd.DataFrame) -> Optional[TechnicalSignal]:
@@ -492,7 +496,7 @@ class EnhancedTechnicalAnalyzer:
                 price_level=nearest_level[1] if nearest_level else None
             )
         except Exception as e:
-            print(f"Fibonacci calculation error: {e}")
+            logger.error(f"Fibonacci calculation error: {e}")
             return None
 
     def _calculate_adx_signal(self, df: pd.DataFrame) -> Optional[TechnicalSignal]:
@@ -550,7 +554,7 @@ class EnhancedTechnicalAnalyzer:
                 reasoning=reasoning
             )
         except Exception as e:
-            print(f"ADX calculation error: {e}")
+            logger.error(f"ADX calculation error: {e}")
             return None
 
     def _analyze_context(self, df: pd.DataFrame, ticker: str) -> MarketContext:
@@ -606,7 +610,7 @@ class EnhancedTechnicalAnalyzer:
                 resistance_levels=resistance_levels
             )
         except Exception as e:
-            print(f"Context analysis error: {e}")
+            logger.error(f"Context analysis error: {e}")
             return MarketContext(
                 trend='SIDEWAYS',
                 volatility='MEDIUM',
@@ -648,7 +652,7 @@ class EnhancedTechnicalAnalyzer:
 
             return events
         except Exception as e:
-            print(f"Event fetch error: {e}")
+            logger.error(f"Event fetch error: {e}")
             return []
 
     def _calculate_support_levels(self, df: pd.DataFrame) -> List[float]:

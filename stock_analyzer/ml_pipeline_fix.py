@@ -13,6 +13,10 @@ import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Tuple
 import warnings
+
+from app_logging import get_logger
+
+logger = get_logger("stock_auto.ml_pipeline_fix")
 warnings.filterwarnings('ignore')
 
 
@@ -361,7 +365,7 @@ def enhanced_ml_ensemble(ticker: str, df: pd.DataFrame, debug: bool = False) -> 
     except Exception as e:
         result["models"]["random_forest"] = {"status": "failed", "error": str(e)[:50]}
         if debug:
-            print(f"RF 실패: {e}")
+            logger.error(f"RF 실패: {e}")
 
     # Gradient Boosting
     try:
@@ -389,7 +393,7 @@ def enhanced_ml_ensemble(ticker: str, df: pd.DataFrame, debug: bool = False) -> 
     except Exception as e:
         result["models"]["gradient_boosting"] = {"status": "failed", "error": str(e)[:50]}
         if debug:
-            print(f"GB 실패: {e}")
+            logger.error(f"GB 실패: {e}")
 
     # LightGBM (옵션)
     try:

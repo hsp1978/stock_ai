@@ -45,6 +45,13 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# 로깅은 UI 를 그리기 전에 설정한다 — 그 전에 난 로그는 사라진다.
+# agent-api 와 같은 설정을 공유하므로 비밀값 마스킹도 함께 적용된다.
+from app_logging import configure_logging, get_logger  # noqa: E402
+
+configure_logging()
+logger = get_logger("stock_auto.webui")
+
 # ── UI 공용 모듈 (webui.py 점진 분리 — CLAUDE.md §6-10) ──
 from ui.api_client import (  # noqa: E402
     AGENT_API_URL, api_get, api_post, get_chart_url, log_action,
