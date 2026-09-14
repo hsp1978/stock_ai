@@ -45,6 +45,11 @@ class Free(ast.NodeVisitor):
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
+    def visit_Lambda(self, n):
+        for a in n.args.args + n.args.kwonlyargs + n.args.posonlyargs:
+            self.bound.add(a.arg)
+        self.generic_visit(n)
+
     def visit_Name(self, n):
         (self.bound if isinstance(n.ctx, ast.Store) else self.free).add(n.id)
 
