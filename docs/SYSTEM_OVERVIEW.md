@@ -668,7 +668,7 @@ win 정의가 "신호 방향으로 ±2% 이상"이었는데 **±2%에 근거가 
 | 7 | FastAPI 전 핸들러 sync + blocking I/O | `httpx.AsyncClient` 단계 전환 미착수 |
 | 8 | 모델 버전 태그 핀 | `qwen3:14b-q4_K_M` 등 태그 고정이나 digest 핀은 아님 |
 | 9 | 백테스트 Composite 전략의 과거 replay 제외 | look-ahead 회피 목적. 도구 신호의 역사적 성능은 미측정 |
-| 10 | 단일 노드 SPOF | testdev가 죽으면 전부 정지. 백업/복구 절차 문서화 없음 |
+| 10 | 단일 노드 SPOF | 구조는 그대로. **백업·복구 절차 추가** (2026-09-14): `state_backup` 잡(04:00) + `docs/RUNBOOK_BACKUP.md` + 복구 리허설 — 아래 §13.9g |
 
 #### 13.9a `webui.py` 분해 (완료, 2026-09-12 ~ 09-14)
 
@@ -967,6 +967,45 @@ ERROR [stock_auto.local_engine] news_analyzer import 실패 (HTTP fallback):
 | `news_analyzer.__file__` | `stock_analyzer/…` | `chart_agent_service/…` |
 | `local_engine._DIRECT_NEWS` | `False` | **`True`** |
 | `_fetch_news_context` | `{'error': …}` | 기사 **15건**, `_context_available=True` |
+
+#### 13.9g 백업·복구 (2026-09-14)
+
+백업이 없었다. 잃게 되는 것은 재생성 불가능한 것들이다 — `scan_log.db`(스캔 이력
+70,840행 + `signal_outcomes` 5,442건 + `app_state`), 페이퍼 포지션, 거래 안전장치 DB,
+워치리스트. **60일 검증 시계가 0부터 다시 시작된다.**
+
+##### cp 로 백업하면 복원할 때 깨진다
+
+DB 는 WAL 모드다. 실행 중에 `cp` 하면 `.db` 와 `-wal` 이 서로 다른 시점의 것이 되어
+복원 시 깨지는데, **파일 크기도 개수도 멀쩡해 보인다** — 복구를 시도하는 순간에야
+알게 된다. 백업이 있다고 믿는 상태가 백업이 없는 것보다 나쁠 수 있다.
+
+`state_backup.py` 는 sqlite 온라인 백업 API(`Connection.backup()`)를 쓴다. 원본이
+쓰이는 중에도 일관된 스냅샷을 만들고, **만든 다음 검증한다** — 체크섬 +
+`PRAGMA integrity_check` + 행 수 기록.
+
+- 분석 JSON·차트는 담지 않는다 (재생성 가능, 1.5GB)
+- `.env` 는 **기본 미포함** — 백업이 곧 자격증명 사본이 된다. `include_env=True` 로
+  명시할 때만 넣고 매니페스트에 경고를 남긴다
+- 잡 결과: 검증 실패면 `error`, 대상 누락이면 `degraded`. 둘 다 ops 알림
+
+##### 복구는 실제로 해 봐야 한다
+
+`scripts/restore_drill.py` 가 운영 파일을 건드리지 않고 최신 아카이브를 임시 경로에
+풀어 대조한다 (`make backup-drill`).
+
+**2026-09-14 08:32 리허설 결과: 성공** — DB 5개 integrity ok, `scan_log` 70,840 /
+`signal_outcomes` 5,442 / `app_state` 8행 일치, 파일 2개 크기 일치. 아카이브 2.83 MB,
+생성 0.4초.
+
+(운영 DB 와 3행 차이가 났는데, 백업 이후 스캔이 돈 만큼이다 — 온라인 백업이
+**쓰이는 중인 DB** 에서 일관된 시점을 떠 왔다는 증거이기도 하다.)
+
+##### 남은 한계 (문서에 명시)
+
+- 백업 경로가 **같은 디스크**다. 다른 노드 복사(`rsync … macstudio:`)는 아직 수동이다
+- 서비스를 실제로 정지하고 갈아끼우는 전체 복구 절차는 **아직 돌려본 적 없다**
+- `.env` 를 백업에 넣지 않으면 키 보관 장소를 따로 정해야 한다 — 지금은 정해져 있지 않다
 
 ### 13.10 데이터 품질 위험
 

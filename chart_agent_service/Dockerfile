@@ -54,6 +54,8 @@ COPY chart_agent_service/ ./chart_agent_service/
 # enhanced_decision_maker, korean_stocks, ticker_*, signal_tracker 등)을
 # 함께 포함시켜야 /multi-agent/{ticker} 가 503으로 떨어지지 않음.
 COPY stock_analyzer/ ./stock_analyzer/
+# 운영 스크립트 (복구 리허설 등) — 컨테이너 안에서 돌린다
+COPY scripts/ ./scripts/
 
 WORKDIR /app/chart_agent_service
 

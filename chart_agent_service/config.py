@@ -140,6 +140,14 @@ class Settings(BaseSettings):
     OUTPUT_CHART_RETENTION_DAYS: int = Field(default=30, ge=1)
     OUTPUT_RETENTION_HOUR: int = Field(default=3, ge=0, le=23)
     OUTPUT_RETENTION_MINUTE: int = Field(default=30, ge=0, le=59)
+    # 상태 백업 — 단일 노드 SPOF 대비. 잃으면 재생성 불가한 것만 담는다
+    # (scan_log/signal_outcomes, 페이퍼 상태, 워치리스트). 분석 JSON·차트는 제외.
+    # 기본 경로는 리포지토리 밖이어야 한다 — 같은 디스크라도 실수로 커밋되지 않게.
+    STATE_BACKUP_ENABLED: bool = True
+    STATE_BACKUP_DIR: str = "/home/ubuntu/stock_auto_backups"
+    STATE_BACKUP_KEEP: int = Field(default=7, ge=1)
+    STATE_BACKUP_HOUR: int = Field(default=4, ge=0, le=23)
+    STATE_BACKUP_MINUTE: int = Field(default=0, ge=0, le=59)
     OPS_ALERT_DEDUPE_MINUTES: int = Field(default=60, ge=1)
     # 일일 멀티에이전트(V2) 배치 — signal_outcomes 표본 자동 축적용.
     # 시각은 서버 로컬 시간 기준. 기본 17:30 (KRX 마감 15:30 이후).
@@ -295,6 +303,11 @@ OUTPUT_JSON_RETENTION_DAYS = settings.OUTPUT_JSON_RETENTION_DAYS
 OUTPUT_CHART_RETENTION_DAYS = settings.OUTPUT_CHART_RETENTION_DAYS
 OUTPUT_RETENTION_HOUR = settings.OUTPUT_RETENTION_HOUR
 OUTPUT_RETENTION_MINUTE = settings.OUTPUT_RETENTION_MINUTE
+STATE_BACKUP_ENABLED = settings.STATE_BACKUP_ENABLED
+STATE_BACKUP_DIR = settings.STATE_BACKUP_DIR
+STATE_BACKUP_KEEP = settings.STATE_BACKUP_KEEP
+STATE_BACKUP_HOUR = settings.STATE_BACKUP_HOUR
+STATE_BACKUP_MINUTE = settings.STATE_BACKUP_MINUTE
 OPS_ALERT_DEDUPE_MINUTES = settings.OPS_ALERT_DEDUPE_MINUTES
 SCREENER_BATCH_ENABLED = settings.SCREENER_BATCH_ENABLED
 SCREENER_BATCH_HOUR = settings.SCREENER_BATCH_HOUR
