@@ -34,6 +34,13 @@ def _int_setting(name: str, default: int) -> int:
         return default
 
 
+def _bool_setting(name: str, default: bool) -> bool:
+    raw = _setting(name, "1" if default else "0")
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in {"0", "false", "no", "off", ""}
+
+
 def _float_setting(name: str, default: float) -> float:
     try:
         return float(_setting(name, str(default)))
@@ -173,6 +180,9 @@ _mac_health_cache: Dict[str, Any] = {
     "failures": 0,
     "last_error": None,
     "last_status": None,
+    # 도달성과 별개로 **가속기 상태**를 남긴다 (2026-09-14). 아래 주석 참조.
+    "runtime": "unknown",
+    "cpu_only_models": [],
 }
 _node_lock = threading.Lock()
 _node_semaphores: Dict[str, threading.BoundedSemaphore] = {}
@@ -208,12 +218,75 @@ def reset_mac_studio_health_cache() -> None:
             "failures": 0,
             "last_error": None,
             "last_status": None,
+            "runtime": "unknown",
+            "cpu_only_models": [],
         })
 
 
 def mac_studio_health_snapshot() -> Dict[str, Any]:
     with _mac_health_lock:
         return dict(_mac_health_cache)
+
+
+def mac_studio_runtime_status(timeout: float | None = None) -> Dict[str, Any]:
+    """Mac Studio Ollama 가 **GPU 로 돌고 있는지** 본다.
+
+    `/api/tags` 200 은 데몬이 응답한다는 뜻일 뿐 가속기와 무관하다. agent-api 쪽은
+    이미 같은 검사를 하고 있었는데(`service._ollama_runtime_status`, #15) Mac Studio
+    노드에는 옮겨지지 않았다. 그 사이에 실제로 이런 일이 있었다 (2026-09-14 진단):
+
+      2026-09-09 13:50  다른 프로세스가 CPU 를 점유
+      2026-09-09 13:51  Ollama 기동 중 "failure during GPU discovery
+                        — failed to finish discovery before timeout"
+                        → load_tensors: offloaded 0/65 layers to GPU
+
+    Metal 은 정상 인식됐고(`Apple M1 Max, 25557 MiB free`) 레이어를 하나도 올리지
+    않았을 뿐이다. 32B 모델이 CPU 에서 돌아 **0.5 tok/s** 가 나왔다 — GPU 기준의
+    1/19 다. 그동안 `is_mac_studio_available()` 은 5일 내내 True 를 돌려줬고,
+    8개 중 4개 에이전트가 그 노드로 갔다. 모델 적재는 되므로 `/api/ps` 의
+    `size_vram` 이 0 인 것으로 잡아낼 수 있다.
+
+    Returns: {"status": gpu|cpu_fallback|idle|unknown, "models": [...], ...}
+      idle  — 적재된 모델이 없어 **판정 불가**. '정상'이 아니다
+    """
+    mac_url = LLM_NODES["mac_studio"]["url"]
+    timeout = timeout if timeout is not None else _float_setting(
+        "MAC_STUDIO_HEALTH_TIMEOUT", 7.0
+    )
+    status: Dict[str, Any] = {"status": "unknown", "models": []}
+    try:
+        response = get_http_session().get(f"{mac_url}/api/ps", timeout=timeout)
+        if response.status_code != 200:
+            status["error"] = f"HTTP {response.status_code}"
+            return status
+        models = response.json().get("models") or []
+    except Exception as exc:
+        status["error"] = str(exc)[:200]
+        return status
+
+    cpu_only = []
+    for model in models:
+        name = model.get("name") or model.get("model") or "?"
+        size = int(model.get("size") or 0)
+        vram = int(model.get("size_vram") or 0)
+        fraction = round(vram / size, 3) if size else None
+        if fraction is None or fraction < _float_setting("MAC_STUDIO_MIN_GPU_FRACTION", 0.5):
+            cpu_only.append(name)
+        status["models"].append({
+            "name": name,
+            "size_bytes": size,
+            "size_vram_bytes": vram,
+            "gpu_fraction": fraction,
+        })
+
+    if not models:
+        status["status"] = "idle"
+    elif cpu_only:
+        status["status"] = "cpu_fallback"
+        status["cpu_only_models"] = cpu_only
+    else:
+        status["status"] = "gpu"
+    return status
 
 
 def is_mac_studio_available(force_refresh: bool = False) -> bool:
@@ -231,7 +304,17 @@ def is_mac_studio_available(force_refresh: bool = False) -> bool:
 
     try:
         response = get_http_session().get(f"{mac_url}/api/tags", timeout=timeout)
-        available = response.status_code == 200
+        reachable = response.status_code == 200
+
+        # 도달한다고 쓸 수 있는 건 아니다. CPU 폴백 중인 노드로 보내면
+        # 타임아웃만 쌓인다 — 차라리 RTX 단독이 낫다.
+        runtime = {"status": "unknown"}
+        require_gpu = _bool_setting("MAC_STUDIO_REQUIRE_GPU", True)
+        if reachable:
+            runtime = mac_studio_runtime_status(timeout=timeout)
+        degraded = require_gpu and runtime.get("status") == "cpu_fallback"
+        available = reachable and not degraded
+
         with _mac_health_lock:
             if available:
                 _mac_health_cache.update({
@@ -240,6 +323,22 @@ def is_mac_studio_available(force_refresh: bool = False) -> bool:
                     "failures": 0,
                     "last_error": None,
                     "last_status": response.status_code,
+                    "runtime": runtime.get("status"),
+                    "cpu_only_models": [],
+                })
+            elif degraded:
+                # 연결 실패가 아니다 — 연속 실패 카운터로 덮지 않는다.
+                _mac_health_cache.update({
+                    "checked_at": now,
+                    "available": False,
+                    "failures": 0,
+                    "last_error": (
+                        "CPU 폴백 감지 — GPU 미적재: "
+                        + ", ".join(runtime.get("cpu_only_models") or [])
+                    )[:200],
+                    "last_status": response.status_code,
+                    "runtime": "cpu_fallback",
+                    "cpu_only_models": runtime.get("cpu_only_models") or [],
                 })
             else:
                 failures = int(_mac_health_cache.get("failures") or 0) + 1

@@ -49,8 +49,18 @@ def _reset_node_slots():
 
 
 def test_mac_studio_health_uses_longer_timeout_and_ttl_cache(monkeypatch):
+    """TTL 캐시로 두 번째 호출은 네트워크를 타지 않는다.
+
+    2026-09-14: 도달성 확인 뒤 `/api/ps` 로 가속기 상태까지 본다
+    (test_mac_studio_gpu_gate.py). 그래서 한 번의 health 검사가 GET 2회다 —
+    tags 그리고 ps. TTL 안의 재호출은 여전히 0회여야 한다.
+    """
     session = _Session()
-    session.get_responses.append(_Response(200))
+    session.get_responses.extend([
+        _Response(200),                                     # /api/tags
+        _Response(200, {"models": [                          # /api/ps
+            {"name": "qwen2.5:32b", "size": 1000, "size_vram": 990}]}),
+    ])
     monkeypatch.setattr(dual_node_config, "get_http_session", lambda: session)
     monkeypatch.setenv("MAC_STUDIO_HEALTH_TIMEOUT", "6.5")
     monkeypatch.setenv("MAC_STUDIO_HEALTH_TTL_SECONDS", "60")
@@ -58,15 +68,17 @@ def test_mac_studio_health_uses_longer_timeout_and_ttl_cache(monkeypatch):
     dual_node_config.reset_mac_studio_health_cache()
 
     assert dual_node_config.is_mac_studio_available(force_refresh=True) is True
-    assert dual_node_config.is_mac_studio_available() is True
-    assert len(session.get_calls) == 1
-    assert session.get_calls[0][1] == 6.5
+    assert dual_node_config.is_mac_studio_available() is True     # 캐시 적중
+    assert [url.rsplit("/", 1)[-1] for url, _ in session.get_calls] == ["tags", "ps"]
+    assert all(timeout == 6.5 for _, timeout in session.get_calls)
 
 
 def test_mac_studio_health_requires_consecutive_failures(monkeypatch):
     session = _Session()
     session.get_responses.extend([
-        _Response(200),
+        _Response(200),                                      # /api/tags
+        _Response(200, {"models": [                           # /api/ps
+            {"name": "qwen2.5:32b", "size": 1000, "size_vram": 990}]}),
         TimeoutError("busy"),
         TimeoutError("still busy"),
     ])

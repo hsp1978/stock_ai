@@ -91,6 +91,11 @@ class Settings(BaseSettings):
     MAC_STUDIO_HEALTH_TIMEOUT: float = Field(default=7.0, ge=0.1, le=60)
     MAC_STUDIO_HEALTH_FAILURE_THRESHOLD: int = Field(default=2, ge=1, le=20)
     MAC_STUDIO_MAX_INFLIGHT: int = Field(default=4, ge=1, le=32)
+    # 도달성만으로 노드를 '가용'이라 부르지 않는다. /api/ps 의 size_vram 이 0 이면
+    # CPU 폴백이고, 32B 모델 기준 GPU 대비 1/19 속도다 (2026-09-14 실측 0.5 vs 9.4 tok/s).
+    # 그 상태로 4개 에이전트를 보내면 타임아웃만 쌓인다 — 차라리 RTX 단독이 낫다.
+    MAC_STUDIO_REQUIRE_GPU: bool = True
+    MAC_STUDIO_MIN_GPU_FRACTION: float = Field(default=0.5, ge=0.0, le=1.0)
     RTX_5070_MAX_INFLIGHT: int = Field(default=2, ge=1, le=32)
     LLM_NODE_MAX_INFLIGHT: int = Field(default=2, ge=1, le=32)
     LLM_NODE_FAILURE_THRESHOLD: int = Field(default=2, ge=1, le=20)
@@ -347,6 +352,8 @@ MAC_STUDIO_IP = settings.MAC_STUDIO_IP
 MAC_STUDIO_URL = settings.MAC_STUDIO_URL
 MAC_STUDIO_HEALTH_TTL_SECONDS = settings.MAC_STUDIO_HEALTH_TTL_SECONDS
 MAC_STUDIO_HEALTH_TIMEOUT = settings.MAC_STUDIO_HEALTH_TIMEOUT
+MAC_STUDIO_REQUIRE_GPU = settings.MAC_STUDIO_REQUIRE_GPU
+MAC_STUDIO_MIN_GPU_FRACTION = settings.MAC_STUDIO_MIN_GPU_FRACTION
 MAC_STUDIO_HEALTH_FAILURE_THRESHOLD = settings.MAC_STUDIO_HEALTH_FAILURE_THRESHOLD
 MAC_STUDIO_MAX_INFLIGHT = settings.MAC_STUDIO_MAX_INFLIGHT
 RTX_5070_MAX_INFLIGHT = settings.RTX_5070_MAX_INFLIGHT
