@@ -16,6 +16,10 @@ from typing import Any
 
 from config import OUTPUT_DIR
 
+from logging_setup import get_logger
+
+logger = get_logger("stock_auto.db")
+
 DB_PATH = os.path.join(OUTPUT_DIR, "scan_log.db")
 _CONNECT_TIMEOUT_SECONDS = 30.0
 _BUSY_TIMEOUT_MS = 30_000
@@ -282,7 +286,7 @@ def _migrate_signal_outcomes(conn: sqlite3.Connection) -> None:
     if cols and "signal_id" not in cols:
         conn.execute("DROP TABLE IF EXISTS signal_outcomes_legacy")
         conn.execute("ALTER TABLE signal_outcomes RENAME TO signal_outcomes_legacy")
-        print("[DB] signal_outcomes 구 스키마 → signal_outcomes_legacy 백업")
+        logger.info("[DB] signal_outcomes 구 스키마 → signal_outcomes_legacy 백업")
         return
     # Step 12: signal_std, agreement_level / 2026-09: eval_state 컬럼 추가 (기존 DB 호환)
     for col, coltype in [
@@ -327,7 +331,7 @@ def init_db():
     conn.executescript(_CREATE_INDEX)
     conn.commit()
     conn.close()
-    print(f"[DB] 초기화 완료: {DB_PATH}")
+    logger.info(f"[DB] 초기화 완료: {DB_PATH}")
 
 
 # ─── 앱 런타임 상태 ─────────────────────────────────────
@@ -786,7 +790,7 @@ def insert_user_action(
         conn.close()
         return int(new_id)
     except Exception as exc:
-        print(f"[DB] user_action_log insert 실패: {exc}")
+        logger.error(f"[DB] user_action_log insert 실패: {exc}")
         return 0
 
 

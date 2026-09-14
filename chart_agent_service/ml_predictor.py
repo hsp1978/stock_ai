@@ -11,6 +11,10 @@ from typing import Optional, Tuple
 
 from config import RSI_PERIOD, BOLLINGER_PERIOD, BOLLINGER_STD, ADX_PERIOD
 
+from logging_setup import get_logger
+
+logger = get_logger("stock_auto.ml_predictor")
+
 
 _tf_gpu_initialized = False
 
@@ -634,21 +638,21 @@ def run_ml_prediction(ticker: str, df: pd.DataFrame, ensemble: bool = True) -> d
             if not lgb_result.get("error"):
                 results["lgb_5d"] = lgb_result
         except Exception as e:
-            print(f"  [LightGBM 오류] {e}")
+            logger.error(f"  [LightGBM 오류] {e}")
 
         try:
             xgb_result = train_predict_xgb(ticker, df, horizon=5)
             if not xgb_result.get("error"):
                 results["xgb_5d"] = xgb_result
         except Exception as e:
-            print(f"  [XGBoost 오류] {e}")
+            logger.error(f"  [XGBoost 오류] {e}")
 
         try:
             lstm_result = train_predict_lstm(ticker, df, horizon=5)
             if not lstm_result.get("error"):
                 results["lstm_5d"] = lstm_result
         except Exception as e:
-            print(f"  [LSTM 오류] {e}")
+            logger.error(f"  [LSTM 오류] {e}")
 
     # 앙상블 예측 (성능 기반 가중 평균)
     valid_models = [r for r in results.values() if not r.get("error")]

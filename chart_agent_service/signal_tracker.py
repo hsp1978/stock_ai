@@ -21,6 +21,10 @@ from typing import Dict, List, Optional, Tuple
 
 from db import _get_conn
 
+from logging_setup import get_logger
+
+logger = get_logger("stock_auto.signal_tracker")
+
 # 평가 horizon (영업일 기준 근사: 7/14/30 캘린더 일)
 HORIZONS = [7, 14, 30]
 
@@ -314,7 +318,7 @@ def prefetch_price_history(needs: Dict[str, Tuple[datetime, datetime]]) -> Dict:
                 continue
             frames[ticker] = frame
         except Exception as exc:  # 개별 티커 실패가 런 전체를 죽이지 않게 한다
-            print(f"[signal_tracker] {ticker} 시세 배치 조회 실패: {exc}")
+            logger.error(f"[signal_tracker] {ticker} 시세 배치 조회 실패: {exc}")
             failed.append(ticker)
     _PRICE_CACHE.frames = frames
     _PRICE_CACHE.requested = set(needs)
@@ -704,7 +708,7 @@ def evaluate_past_signals(
                         marked_unresolved += 1
                         unresolved_tickers.add(ticker)
                     except Exception as exc:
-                        print(f"[signal_tracker] {ticker} ({signal_id}) 종결 실패: {exc}")
+                        logger.error(f"[signal_tracker] {ticker} ({signal_id}) 종결 실패: {exc}")
                         errors += 1
             else:
                 skipped_not_due += 1
@@ -749,7 +753,7 @@ def evaluate_past_signals(
             )
             updated += 1
         except Exception as exc:
-            print(f"[signal_tracker] {ticker} ({signal_id}) 평가 실패: {exc}")
+            logger.error(f"[signal_tracker] {ticker} ({signal_id}) 평가 실패: {exc}")
             errors += 1
 
     conn.commit()
@@ -1432,28 +1436,28 @@ def run_daily_validation(
 
 if __name__ == "__main__":
     # 수동 실행 테스트
-    print("=" * 60)
-    print("Signal Tracker — 수동 실행")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("Signal Tracker — 수동 실행")
+    logger.info("=" * 60)
 
-    print("\n1) 과거 신호 평가 실행 중...")
+    logger.info("\n1) 과거 신호 평가 실행 중...")
     stats = evaluate_past_signals(limit=100)
-    print(f"  처리: {stats['processed']}, 업데이트: {stats['updated']}")
-    print(f"  엔트리가 없음: {stats['skipped_no_entry']}, 에러: {stats['errors']}")
+    logger.info(f"  처리: {stats['processed']}, 업데이트: {stats['updated']}")
+    logger.error(f"  엔트리가 없음: {stats['skipped_no_entry']}, 에러: {stats['errors']}")
 
-    print("\n2) 7일 horizon 정확도 통계...")
+    logger.info("\n2) 7일 horizon 정확도 통계...")
     acc = get_accuracy_stats(days_back=180)
-    print(f"  총 평가: {acc['total_evaluated']}건")
-    print(
+    logger.info(f"  총 평가: {acc['total_evaluated']}건")
+    logger.info(
         f"  방향 적중률: {acc['direction_hit_rate_pct']}% "
         f"(방향보정 기대값 {acc['avg_signed_return_pct']}%, "
         f"원시 {acc['avg_raw_return_pct']}%)"
     )
     for sig, s in acc["by_signal"].items():
         if s["total"]:
-            print(f"    {sig}: {s['direction_hit_rate_pct']}% (n={s['total']})")
+            logger.info(f"    {sig}: {s['direction_hit_rate_pct']}% (n={s['total']})")
 
-    print("\n3) 신뢰도 칼리브레이터 재학습...")
+    logger.info("\n3) 신뢰도 칼리브레이터 재학습...")
     calib = get_calibrator()
     calib.refit()
-    print(f"  상태: {calib.status()}")
+    logger.info(f"  상태: {calib.status()}")

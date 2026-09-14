@@ -661,7 +661,7 @@ win 정의가 "신호 방향으로 ±2% 이상"이었는데 **±2%에 근거가 
 |---|---|---|
 | 1 | `webui.py` God file | **해소** (2026-09-14): 6,482 → 350 라인(−95%). `ui/` 공용 8모듈 + `ui/pages/` 17페이지 — 아래 §13.9a |
 | 2 | 이중 호출 경로 (직접 import + HTTP) | `/paper`·`/trading`·`/gpu`만 HTTP 강제. 나머지는 여전히 이중. 단 판정 지점은 1곳으로 합침 — `webui.py` 에 있던 두 번째 `_USE_LOCAL_ENGINE` 제거 (2026-09-14) |
-| 3 | `print()` 기반 로깅 | 미해결 |
+| 3 | `print()` 기반 로깅 | **agent-api 해소** (2026-09-14): `logging_setup.py` + 188건 전환. `stock_analyzer/` 385건은 미전환 — 아래 §13.9c |
 | 4 | 양방향 `sys.path` 주입 | 미해결 (webui↔agent 상호 import) |
 | 5 | ~~분석 결과 JSON 무한 누적~~ | **해소** (2026-09-14): `output_retention` 잡 (JSON·PNG 30일, 03:30). 적발 시점 70,771개/1.58 GB, 하루 361개 증가 — 아래 §13.9b |
 | 6 | DB 마이그레이션 도구 부재 | Alembic 미도입 |
@@ -776,6 +776,50 @@ CLAUDE.md Don't #7 은 **"30일 이상 파일 자동 정리 cron 유지"** 라�
    모른 채로 지우면 화면이 깨진다
 
 실측 (dry-run): 삭제 예정 **61,627개 / 1.24 GB**, 참조 중 차트 15개 보존.
+
+#### 13.9c 로깅 (2026-09-14)
+
+`print()` 573건이 문제로 적혀 있었지만, 실제 결함은 그보다 컸다: **로깅이 설정된 적이
+없다.** `basicConfig`/`dictConfig` 호출이 리포지토리 어디에도 없었다. 그래서 이미
+`logger.info(...)` 를 쓰고 있던 `data_collector`·`llm/router`·`llm_calibrator`·
+`ic_ensemble` 의 로그가 **전부 버려지고 있었다** (루트 기본 레벨 WARNING).
+
+로그를 남기는 것처럼 보이는 코드가 아무것도 남기지 않는 상태 — §13 의 전형이다.
+`service.log` 도 2026-04-29 이후 갱신되지 않은 5MB 파일이 '최근 로그'처럼 남아 있었다.
+
+`chart_agent_service/logging_setup.py`:
+- 레벨·포맷(text/json)·회전 파일 핸들러를 env 로 설정, **적용 결과를 반환**한다
+  (파일 핸들러가 실패해도 스트림 로깅은 유지하되 사유를 남긴다)
+- uvicorn 핸들러 정리 — 같은 줄이 두 번 찍히지 않는다
+- agent-api `print` 188건 → `logger.{info,warning,error}` (error 58 / warning 13 / info 117)
+
+##### 로깅을 켜자 비밀이 새기 시작했다
+
+켜자마자 첫 로그에 이게 찍혔다:
+
+```
+WARNING [data_collector] fundamentals failed via fmp: 403 ... ?apikey=svo6...
+```
+
+**로깅을 켠 것이 곧 자격증명을 유출하는 일이 됐다** (CLAUDE.md §6-2 위반).
+`SecretRedactingFilter` 로 차단한다 — 쿼리스트링(`apikey`/`token`/`secret`/`password`),
+`Bearer` 토큰, 그리고 **환경변수에 있는 실제 값**(8자 이상)을 마스킹한다.
+
+마스킹은 필터가 아니라 **포맷 결과**에 건다. 필터가 도는 시점에 `record.exc_text` 는
+아직 None 이고 트레이스백은 포맷 단계에서 만들어진다 — 테스트에서 실제로
+`RuntimeError: https://...?apikey=...` 가 그대로 새어 나갔다. 예외 메시지야말로 URL 이
+통째로 실리는 자리다.
+
+실측: `apikey=***` 로 마스킹되고 `403` 진단 정보는 남는다.
+
+##### 켜자마자 드러난 운영 사실 2건 (별도 과제)
+
+1. `fundamentals failed via fmp: 403 Forbidden` — 한국 종목 펀더멘털이 FMP 에서
+   계속 거절된다. data-health 의 `fundamentals_missing` 과 연결된다.
+2. `dart_client get_corp_code 실패: pickle data was truncated` — DART corp_code
+   캐시 파일이 손상돼 있다.
+
+둘 다 이전에도 일어나고 있었지만 **아무 데도 남지 않았다.**
 
 ### 13.10 데이터 품질 위험
 

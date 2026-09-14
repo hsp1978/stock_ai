@@ -26,6 +26,10 @@ from brokers.safety import get_safety, TradingSafety
 from execution.approval_queue import get_approval_queue
 from execution.audit_log import get_audit_log
 
+from logging_setup import get_logger
+
+logger = get_logger("stock_auto.execution.order_router")
+
 
 @dataclass
 class RoutingResult:
@@ -96,7 +100,7 @@ class OrderRouter:
         if entry_plan.get("stop_loss") is None:
             # 사유를 버리지 않는다 — 빈 리스트만 돌려주면 '주문할 게 없었다'와
             # 구별되지 않는다.
-            print(
+            logger.info(
                 f"[order_router] {ticker} ({source}) 주문 생성 거부 — "
                 "손절가 없는 진입 계획"
             )

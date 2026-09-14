@@ -27,6 +27,10 @@ if _SVC_DIR not in sys.path:
 
 from db import _get_conn  # noqa: E402
 
+from logging_setup import get_logger
+
+logger = get_logger("stock_auto.jobs.evaluate_signal_outcomes")
+
 
 # ── 가격 조회 헬퍼 ────────────────────────────────────────────────────
 
@@ -129,7 +133,7 @@ def evaluate_pending_outcomes(db_path: Optional[str] = None) -> dict:
             )
             processed += 1
         except Exception as exc:
-            print(f"[evaluate] {ticker} ({signal_id}): {exc}")
+            logger.info(f"[evaluate] {ticker} ({signal_id}): {exc}")
             errors += 1
 
     conn.commit()
@@ -142,7 +146,7 @@ def evaluate_pending_outcomes(db_path: Optional[str] = None) -> dict:
         "errors": errors,
         "evaluated_at": now.isoformat(),
     }
-    print(f"[evaluate_signal_outcomes] {result}")
+    logger.info(f"[evaluate_signal_outcomes] {result}")
     return result
 
 
@@ -161,14 +165,14 @@ def get_performance_summary(db_path: Optional[str] = None) -> pd.DataFrame:
 # ── 진입점 ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("signal_outcomes 배치 평가 시작")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("signal_outcomes 배치 평가 시작")
+    logger.info("=" * 60)
     stats = evaluate_pending_outcomes()
-    print(f"\n결과: {stats}")
-    print("\nsignal_performance_summary:")
+    logger.info(f"\n결과: {stats}")
+    logger.info("\nsignal_performance_summary:")
     summary = get_performance_summary()
     if not summary.empty:
-        print(summary.to_string(index=False))
+        logger.info(summary.to_string(index=False))
     else:
-        print("  (데이터 없음 — 30일 경과 후 갱신)")
+        logger.warning("  (데이터 없음 — 30일 경과 후 갱신)")

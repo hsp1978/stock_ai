@@ -11,6 +11,10 @@ import os
 import numpy as np
 import yfinance as yf
 
+from logging_setup import get_logger
+
+logger = get_logger("stock_auto.sector_compare")
+
 
 # ── 피어 그룹 매핑 ────────────────────────────────────────────────
 
@@ -37,7 +41,7 @@ def _load_sector_peers() -> Dict[str, List[str]]:
                 result.update(data["industries"])
             return result
     except Exception as e:
-        print(f"Warning: Failed to load sector_tickers.json: {e}")
+        logger.info(f"Warning: Failed to load sector_tickers.json: {e}")
         # 파일 로드 실패시 기본값 반환
         return {
             "Technology": ["AAPL", "MSFT", "GOOGL", "META", "NVDA"],

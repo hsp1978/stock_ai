@@ -32,6 +32,10 @@ from config import (
     POSITION_TRANCHE_1_PCT, POSITION_TRANCHE_2_PCT, POSITION_TRANCHE_3_PCT,
 )
 
+from logging_setup import get_logger
+
+logger = get_logger("stock_auto.analysis_tools")
+
 
 # ═══════════════════════════════════════════════════════════════
 #  공통 헬퍼: timezone-aware 시점 비교
@@ -2991,7 +2995,7 @@ class ChartAnalysisAgent:
     def _run_gpt4o_agent(self) -> dict:
         """GPT-4o function calling + vision 기반 에이전트"""
         if not OPENAI_API_KEY:
-            print("  [경고] OPENAI_API_KEY 없음. 전수 분석 모드로 전환.")
+            logger.warning("  [경고] OPENAI_API_KEY 없음. 전수 분석 모드로 전환.")
             return self.compute_composite_score()
 
         messages = [
@@ -3030,7 +3034,7 @@ class ChartAnalysisAgent:
 
                 for tc in msg["tool_calls"]:
                     fn_name = tc["function"]["name"]
-                    print(f"    → tool: {fn_name}")
+                    logger.info(f"    → tool: {fn_name}")
                     tool_result = self._execute_tool(fn_name)
                     all_tool_results.append(tool_result)
                     messages.append({
@@ -3040,7 +3044,7 @@ class ChartAnalysisAgent:
                     })
 
             except Exception as e:
-                print(f"  [GPT-4o 에이전트 오류] {e}")
+                logger.error(f"  [GPT-4o 에이전트 오류] {e}")
                 llm_conclusion = f"[오류] {e}"
                 break
         else:
@@ -3053,7 +3057,7 @@ class ChartAnalysisAgent:
         if chart_path and os.path.exists(chart_path):
             composite["chart_path"] = chart_path
             try:
-                print("    [Vision] 차트 이미지를 GPT-4o에 전달하여 패턴 분석...")
+                logger.info("    [Vision] 차트 이미지를 GPT-4o에 전달하여 패턴 분석...")
                 with open(chart_path, "rb") as f:
                     img_b64 = base64.b64encode(f.read()).decode("utf-8")
                 vision_resp = httpx.post(
@@ -3079,9 +3083,9 @@ class ChartAnalysisAgent:
                 vision_resp.raise_for_status()
                 vision_text = vision_resp.json()["choices"][0]["message"]["content"]
                 llm_conclusion = f"{llm_conclusion}\n\n## 차트 패턴 분석 (Vision)\n{vision_text}"
-                print("    [Vision] 차트 패턴 분석 완료")
+                logger.info("    [Vision] 차트 패턴 분석 완료")
             except Exception as e:
-                print(f"    [Vision 오류] {e}")
+                logger.error(f"    [Vision 오류] {e}")
 
         composite["llm_conclusion"] = llm_conclusion
         composite["agent_mode"] = "gpt4o"
@@ -3094,15 +3098,15 @@ class ChartAnalysisAgent:
             if resp.status_code != 200:
                 raise ConnectionError("Ollama 서버 응답 없음")
         except Exception:
-            print("  [경고] Ollama 서버 연결 실패. 전수 분석 모드로 전환.")
+            logger.error("  [경고] Ollama 서버 연결 실패. 전수 분석 모드로 전환.")
             return self.compute_composite_score()
 
         # Step 1: 전체 tool 실행 (Ollama는 function calling 미지원 모델이 많으므로)
-        print(f"    [Step 1] {len(TOOL_DEFINITIONS)}개 분석 도구 + 진입 계획 실행...")
+        logger.info(f"    [Step 1] {len(TOOL_DEFINITIONS)}개 분석 도구 + 진입 계획 실행...")
         self.run_all_tools()
 
         for r in self.tool_results:
-            print(f"      ✓ {r.get('name', r.get('tool', '?'))}: {r.get('signal', '?')} (점수: {r.get('score', 0)})")
+            logger.info(f"      ✓ {r.get('name', r.get('tool', '?'))}: {r.get('signal', '?')} (점수: {r.get('score', 0)})")
 
         # Step 2: 결과를 Ollama에 전달하여 종합 판단 요청
         composite = self.compute_composite_score()
@@ -3141,7 +3145,7 @@ class ChartAnalysisAgent:
 [포지션 사이징 결과 기반 진입/손절/익절 가격, 분할 매수 계획, 경고 사항]"""
 
         try:
-            print("    [Step 2] LLM 종합 판단 요청 중...")
+            logger.info("    [Step 2] LLM 종합 판단 요청 중...")
             resp = httpx.post(
                 f"{OLLAMA_BASE_URL}/api/generate",
                 json={
@@ -3161,7 +3165,7 @@ class ChartAnalysisAgent:
             resp.raise_for_status()
             llm_conclusion = resp.json().get("response", "[응답 없음]")
         except Exception as e:
-            print(f"  [Ollama 종합 판단 오류] {e}")
+            logger.error(f"  [Ollama 종합 판단 오류] {e}")
             llm_conclusion = f"[LLM 오류] {e}\n\n시스템 자동 판단: {composite['final_signal']} (점수: {composite['composite_score']})"
 
         composite["llm_conclusion"] = llm_conclusion
@@ -3321,5 +3325,5 @@ def generate_agent_chart(ticker: str, df: pd.DataFrame, composite: dict, save_pa
         return save_path
 
     except Exception as e:
-        print(f"  [에이전트 차트 생성 오류] {e}")
+        logger.error(f"  [에이전트 차트 생성 오류] {e}")
         return None

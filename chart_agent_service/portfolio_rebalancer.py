@@ -18,6 +18,10 @@ from config import OUTPUT_DIR
 from paper_trader import get_portfolio_status, execute_paper_order, update_position_prices
 from portfolio_optimizer import markowitz_optimize, risk_parity_optimize
 
+from logging_setup import get_logger
+
+logger = get_logger("stock_auto.portfolio_rebalancer")
+
 
 # 상태 파일
 REBALANCE_STATE_FILE = os.path.join(OUTPUT_DIR, "rebalance_state.json")
@@ -412,40 +416,40 @@ def get_rebalance_status() -> dict:
 
 def test_rebalancing():
     """리밸런싱 테스트"""
-    print("=" * 70)
-    print("Portfolio Rebalancing Test")
-    print("=" * 70)
+    logger.info("=" * 70)
+    logger.info("Portfolio Rebalancing Test")
+    logger.info("=" * 70)
 
     # Dry-run 테스트
-    print("\n1. Dry-Run 테스트...")
+    logger.info("\n1. Dry-Run 테스트...")
     result = execute_rebalancing(method="markowitz", dry_run=True)
 
-    print(f"  상태: {result['status']}")
-    print(f"  사유: {result['reason']}")
-    print(f"  Drift: {result.get('drift', 0):.2%}")
+    logger.info(f"  상태: {result['status']}")
+    logger.info(f"  사유: {result['reason']}")
+    logger.info(f"  Drift: {result.get('drift', 0):.2%}")
 
     if result.get("orders"):
-        print(f"\n  주문 {len(result['orders'])}개:")
+        logger.info(f"\n  주문 {len(result['orders'])}개:")
         for order in result['orders']:
-            print(f"    - {order['action']} {order['ticker']} {order['qty']}주 @ ${order['price']:.2f}")
-            print(f"      (현재 {order['current_weight']:.1%} → 목표 {order['target_weight']:.1%})")
+            logger.info(f"    - {order['action']} {order['ticker']} {order['qty']}주 @ ${order['price']:.2f}")
+            logger.info(f"      (현재 {order['current_weight']:.1%} → 목표 {order['target_weight']:.1%})")
 
     # 상태 조회
-    print("\n2. 리밸런싱 상태...")
+    logger.info("\n2. 리밸런싱 상태...")
     status = get_rebalance_status()
-    print(f"  총 리밸런싱: {status['rebalance_count']}회")
-    print(f"  총 거래비용: ${status['total_transaction_costs']:.2f}")
-    print(f"  현재 Drift: {status['current_drift']:.2%}")
-    print(f"  리밸런싱 필요: {status['needs_rebalance']}")
+    logger.info(f"  총 리밸런싱: {status['rebalance_count']}회")
+    logger.info(f"  총 거래비용: ${status['total_transaction_costs']:.2f}")
+    logger.info(f"  현재 Drift: {status['current_drift']:.2%}")
+    logger.info(f"  리밸런싱 필요: {status['needs_rebalance']}")
 
     # 히스토리
-    print("\n3. 리밸런싱 히스토리...")
+    logger.info("\n3. 리밸런싱 히스토리...")
     history = get_rebalance_history(limit=5)
-    print(f"  총 히스토리: {history['count']}건")
+    logger.info(f"  총 히스토리: {history['count']}건")
     for h in history['history'][-3:]:
-        print(f"    - {h['timestamp'][:19]}: {h['method']}, drift={h['drift']:.2%}, 주문={h['orders_count']}개")
+        logger.info(f"    - {h['timestamp'][:19]}: {h['method']}, drift={h['drift']:.2%}, 주문={h['orders_count']}개")
 
-    print("\n" + "=" * 70)
+    logger.info("\n" + "=" * 70)
 
 
 if __name__ == "__main__":
