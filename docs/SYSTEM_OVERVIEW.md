@@ -821,6 +821,50 @@ WARNING [data_collector] fundamentals failed via fmp: 403 ... ?apikey=svo6...
 
 둘 다 이전에도 일어나고 있었지만 **아무 데도 남지 않았다.**
 
+#### 13.9d 펀더멘털 다중 소스 (2026-09-14)
+
+로깅을 켠 첫 성과(§13.9c)를 따라간 결과다. `fundamentals failed via fmp: 403` 하나를
+쫓다가 **5개 소스 중 4개가 죽어 있는 것**을 발견했다.
+
+| 소스 | 상태 (적발 시점) | 원인 |
+|---|---|---|
+| naver | 빈 dict | `finance.naver.com/item/main.naver` 가 클라이언트 렌더링으로 바뀌어 HTML 에 PER·PBR·EPS 문자열이 **아예 없다** (HTTP 200, 119KB, 마커 0건) |
+| finnhub | 빈 dict | 키 미설정 |
+| alphavantage | 빈 dict | 키 미설정 |
+| fmp | 403 | `/api/v3/` 가 legacy 로 폐기. 키는 유효하다 |
+| yfinance | 동작 | 유일. KR 은 16/20 부분 |
+
+빈 결과는 `continue` 로 흘러 아무 기록도 남지 않았다. 그래서 '다중 소스 폴백'이
+실제로는 **yfinance 단일 소스**였다. CLAUDE.md §5-5 의 "다중 소스" 전제가 깨져 있었다.
+
+**수정**
+- naver → `m.stock.naver.com/api/stock/{code}/integration` (JSON). 한국 시총 표기
+  `1,455조 7,234억` 을 파싱한다
+- fmp → `/stable/` 엔드포인트. 402(플랜 미포함)는 `PlanRestricted` 로 분리해 오류에
+  쌓지 않는다. KRX 심볼은 402 확정이라 호출 자체를 하지 않는다
+- 소스별 결말을 `_source_status` 로 보고: `ok` / `not_configured` / `plan_restricted` /
+  `no_data` / `no_usable_fields` / `error`
+
+**측정 (실 컨테이너)**
+
+| 종목 | 전 | 후 |
+|---|---|---|
+| 005930.KS | partial 16/20 (yfinance) | **full 19/20** (naver+yfinance) |
+| 049430.KQ | partial | partial 9/20 + **왜 부분인지 명시** |
+| AAPL | full 20/20 | full 20/20 (변화 없음) |
+
+##### 배당수익률 단위가 소스마다 달랐다
+
+`dividend_yield` 한 필드에 세 가지 단위가 섞여 있었다 — yfinance 퍼센트(0.33),
+alphavantage 분수(0.0044), 그리고 **FMP 는 배당 '금액'($1.06)을 수익률 자리에 넣고
+있었다**(=106%). 현재 소비처가 0이라 드러나지 않았을 뿐이다.
+
+분수로 통일하되 **단위를 값 크기로 추측하지 않는다.** 처음엔 "1을 넘으면 퍼센트"
+규칙을 썼는데 네이버의 `0.67%` 가 이미 분수로 읽혔다 — 1% 미만 배당은 흔하다.
+소스가 아는 것을 소스가 선언한다(`_as_yield_fraction(value, unit)`).
+
+실측: AAPL 0.0033 / 005930.KS 0.0067 / 049430.KQ 0.0315 — 전부 분수.
+
 ### 13.10 데이터 품질 위험
 
 - OHLCV 캐시는 TTL 메타(`fetched_at`, `latest_bar_date`, `source`)를 갖지만,

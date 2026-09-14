@@ -12,6 +12,7 @@ Step 3: CacheEntry(TTL 메타) + tenacity retry + 다중 소스 fallback 추가.
 
 import logging
 import os
+import re
 import threading
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -826,6 +827,53 @@ def _empty_fundamentals() -> dict[str, Any]:
     return {field: None for field in _FUNDAMENTAL_FIELDS}
 
 
+def _as_yield_fraction(value: Any, unit: str) -> float | None:
+    """배당수익률을 **분수**(0.0067 = 0.67%)로 통일한다.
+
+    소스마다 단위가 달랐다 (2026-09-14 확인):
+      yfinance      퍼센트 (AAPL 0.33 = 0.33%, 실제 배당수익률 약 0.4%)
+      finnhub       퍼센트지만 호출부에서 이미 0.01 배율 → 분수
+      alphavantage  분수 (DividendYield 0.0044)
+      naver         퍼센트 ('0.67%')
+      fmp           **배당 금액**($1.06)을 수익률 자리에 넣고 있었다 — 값 자체가 틀렸다
+
+    단위를 **값 크기로 추측하지 않는다.** 처음엔 '1을 넘으면 퍼센트' 규칙을 썼는데
+    네이버의 0.67%(=0.67)가 이미 분수인 것으로 읽혔다. 1% 미만 배당은 흔하다.
+    소스가 아는 것을 소스가 선언한다.
+
+    `dividend_yield` 는 현재 어떤 판단에도 쓰이지 않지만(소비처 0), 단위가 섞인
+    채로 두면 처음 쓰는 쪽이 조용히 100배 틀린다.
+    """
+    parsed = _safe_float(value)
+    if parsed is None or parsed < 0:
+        return None
+    if unit == "percent":
+        return parsed / 100.0
+    if unit == "fraction":
+        return parsed
+    raise ValueError(f"알 수 없는 배당수익률 단위: {unit}")
+
+
+def _source_needs_key(source_name: str) -> bool:
+    """빈 응답이 '키 미설정' 때문인지 구분한다.
+
+    키가 없어 시작도 못 한 것과 응답이 실제로 빈 것은 다른 문제다. 둘을 같은
+    '없음'으로 적으면 키를 넣어야 할 상황을 영영 못 본다 (CLAUDE.md §13-2).
+    """
+    key_by_source = {
+        "fmp": settings.FMP_API_KEY or os.getenv("FMP_API_KEY", ""),
+        "finnhub": getattr(settings, "FINNHUB_API_KEY", "") or os.getenv("FINNHUB_API_KEY", ""),
+        "alphavantage": (
+            getattr(settings, "ALPHAVANTAGE_API_KEY", "")
+            or os.getenv("ALPHAVANTAGE_API_KEY", "")
+            or os.getenv("ALPHA_VANTAGE_API_KEY", "")
+        ),
+    }
+    if source_name not in key_by_source:
+        return False
+    return not key_by_source[source_name]
+
+
 def _fundamental_quality(data: dict[str, Any]) -> str:
     present = sum(1 for key in _FUNDAMENTAL_QUALITY_FIELDS if data.get(key) is not None)
     if present >= 5:
@@ -852,7 +900,7 @@ def _normalize_yfinance_fundamentals(info: dict[str, Any]) -> dict[str, Any]:
         "forward_pe": info.get("forwardPE"),
         "peg_ratio": info.get("pegRatio"),
         "price_to_book": info.get("priceToBook"),
-        "dividend_yield": info.get("dividendYield"),
+        "dividend_yield": _as_yield_fraction(info.get("dividendYield"), "percent"),
         "eps": info.get("trailingEps"),
         "revenue_growth": info.get("revenueGrowth"),
         "profit_margin": info.get("profitMargins"),
@@ -900,7 +948,10 @@ def _fetch_finnhub_fundamentals(ticker: str) -> dict[str, Any]:
         "pe_ratio": _safe_float(metric.get("peTTM")),
         "forward_pe": _safe_float(metric.get("forwardPEAnnual")),
         "price_to_book": _safe_float(metric.get("pbAnnual")),
-        "dividend_yield": _safe_float(metric.get("dividendYieldIndicatedAnnual"), 0.01),
+        # 호출부에서 이미 0.01 을 곱해 분수로 바꾼다
+        "dividend_yield": _as_yield_fraction(
+            _safe_float(metric.get("dividendYieldIndicatedAnnual"), 0.01), "fraction"
+        ),
         "eps": _safe_float(metric.get("epsTTM")),
         "revenue_growth": _safe_float(metric.get("revenueGrowthTTMYoy"), 0.01),
         "profit_margin": _safe_float(metric.get("netProfitMarginTTM"), 0.01),
@@ -933,7 +984,7 @@ def _fetch_alphavantage_fundamentals(ticker: str) -> dict[str, Any]:
         "forward_pe": _safe_float(payload.get("ForwardPE")),
         "peg_ratio": _safe_float(payload.get("PEGRatio")),
         "price_to_book": _safe_float(payload.get("PriceToBookRatio")),
-        "dividend_yield": _safe_float(payload.get("DividendYield")),
+        "dividend_yield": _as_yield_fraction(payload.get("DividendYield"), "fraction"),
         "eps": _safe_float(payload.get("EPS")),
         "revenue_growth": _safe_float(payload.get("QuarterlyRevenueGrowthYOY")),
         "profit_margin": _safe_float(payload.get("ProfitMargin")),
@@ -946,95 +997,160 @@ def _fetch_alphavantage_fundamentals(ticker: str) -> dict[str, Any]:
     }
 
 
+class PlanRestricted(RuntimeError):
+    """구독 플랜이 이 심볼/엔드포인트를 포함하지 않는다 — 장애가 아니다."""
+
+
+def _fmp_get(path: str, params: dict[str, Any]) -> Any:
+    """FMP stable API 호출. 플랜 제한(402)은 오류와 구분한다.
+
+    `/api/v3/` 는 2026-09-14 기준 **legacy 로 폐기**됐다 — 유효한 키로도 403 이
+    떨어지고 본문에 "Legacy Endpoint ... no longer supported" 가 온다. 그동안
+    모든 FMP 호출이 실패하고 있었지만 로깅이 꺼져 있어 아무 데도 남지 않았다.
+    """
+    response = requests.get(
+        f"https://financialmodelingprep.com/stable/{path}", params=params, timeout=10
+    )
+    if response.status_code == 402:
+        raise PlanRestricted(f"{path}: 현재 FMP 플랜에 포함되지 않는 심볼/엔드포인트")
+    response.raise_for_status()
+    return response.json()
+
+
 def _fetch_fmp_fundamentals(ticker: str) -> dict[str, Any]:
     api_key = settings.FMP_API_KEY or os.getenv("FMP_API_KEY", "")
     if not api_key:
         return {}
+    if _is_korean_ticker(ticker):
+        # KRX 심볼은 현재 플랜에서 402 가 확정이다. 매번 때려서 오류를 쌓지 않는다.
+        raise PlanRestricted("KRX 심볼은 현재 FMP 플랜 미포함")
 
+    symbol = ticker.upper()
     result: dict[str, Any] = {}
-    profile_payload = _request_json(
-        f"https://financialmodelingprep.com/api/v3/profile/{ticker.upper()}",
-        {"apikey": api_key},
-    )
+
+    profile_payload = _fmp_get("profile", {"symbol": symbol, "apikey": api_key})
     profile = profile_payload[0] if isinstance(profile_payload, list) and profile_payload else {}
     if isinstance(profile, dict):
         result.update(
             {
-                "market_cap": _safe_int(profile.get("mktCap")),
-                "dividend_yield": _safe_float(profile.get("lastDiv")),
+                "market_cap": _safe_int(profile.get("marketCap")),
+                # lastDividend 는 주당 배당 '금액'이다. 종전 코드는 이걸
+                # dividend_yield 에 넣어 AAPL 의 배당수익률을 1.06(=106%)으로
+                # 보고했다. 수익률 필드는 비워 둔다 — 틀린 값보다 없는 게 낫다.
                 "beta": _safe_float(profile.get("beta")),
-                "avg_volume": _safe_int(profile.get("volAvg")),
+                "avg_volume": _safe_int(profile.get("averageVolume")),
                 "sector": profile.get("sector"),
                 "industry": profile.get("industry"),
                 "current_price": _safe_float(profile.get("price")),
             }
         )
 
-    ratios_payload = _request_json(
-        f"https://financialmodelingprep.com/api/v3/ratios-ttm/{ticker.upper()}",
-        {"apikey": api_key},
-    )
+    ratios_payload = _fmp_get("ratios-ttm", {"symbol": symbol, "apikey": api_key})
     ratios = ratios_payload[0] if isinstance(ratios_payload, list) and ratios_payload else {}
     if isinstance(ratios, dict):
         result.update(
             {
-                "pe_ratio": _safe_float(ratios.get("peRatioTTM")),
-                "peg_ratio": _safe_float(ratios.get("pegRatioTTM")),
                 "price_to_book": _safe_float(ratios.get("priceToBookRatioTTM")),
-                "dividend_yield": result.get("dividend_yield")
-                or _safe_float(ratios.get("dividendYielTTM")),
                 "profit_margin": _safe_float(ratios.get("netProfitMarginTTM")),
                 "return_on_equity": _safe_float(ratios.get("returnOnEquityTTM")),
-                "debt_to_equity": _safe_float(ratios.get("debtEquityRatioTTM")),
+                "debt_to_equity": _safe_float(ratios.get("debtToEquityRatioTTM")),
             }
         )
-    return result
+
+    metrics_payload = _fmp_get("key-metrics-ttm", {"symbol": symbol, "apikey": api_key})
+    metrics = metrics_payload[0] if isinstance(metrics_payload, list) and metrics_payload else {}
+    if isinstance(metrics, dict):
+        result.update(
+            {
+                "free_cash_flow": _safe_float(metrics.get("freeCashFlowTTM")),
+                "peg_ratio": _safe_float(metrics.get("pegRatioTTM")),
+            }
+        )
+    return {k: v for k, v in result.items() if v is not None}
+
+
+_NAVER_FIELD_MAP = {
+    "per": "pe_ratio",
+    "pbr": "price_to_book",
+    "eps": "eps",
+    "dividendYieldRatio": "dividend_yield",
+    "marketValue": "market_cap",
+    "highPriceOf52Weeks": "52w_high",
+    "lowPriceOf52Weeks": "52w_low",
+    "accumulatedTradingVolume": "avg_volume",
+    "lastClosePrice": "current_price",
+}
+
+#: "1,455조 7,234억" 같은 표기를 숫자로. 한국 시총은 이 형태로만 온다.
+_KRW_UNITS = (("조", 1_000_000_000_000), ("억", 100_000_000), ("만", 10_000))
+
+
+def _parse_korean_number(raw: str) -> float | None:
+    """'1,455조 7,234억' / '11.17배' / '0.67%' / '22,292원' → float."""
+    if raw is None:
+        return None
+    text = str(raw).strip().replace(",", "")
+    if not text:
+        return None
+
+    total = 0.0
+    matched = False
+    for unit, scale in _KRW_UNITS:
+        m = re.search(rf"(-?\d+(?:\.\d+)?)\s*{unit}", text)
+        if m:
+            total += float(m.group(1)) * scale
+            matched = True
+            text = text.replace(m.group(0), " ")
+    if matched:
+        leftover = re.search(r"(-?\d+(?:\.\d+)?)", text)
+        if leftover:
+            total += float(leftover.group(1))
+        return total
+
+    m = re.search(r"(-?\d+(?:\.\d+)?)", text)
+    return float(m.group(1)) if m else None
 
 
 def _fetch_naver_fundamentals(ticker: str) -> dict[str, Any]:
+    """네이버 금융 종목 요약 (JSON API).
+
+    종전에는 `finance.naver.com/item/main.naver` 를 BeautifulSoup 으로 긁었다.
+    그 페이지는 클라이언트 렌더링으로 바뀌어 **PER·PBR·EPS 문자열이 HTML 에 아예
+    없다** — 2026-09-14 확인: HTTP 200, 119KB, 마커 0건. 즉 이 소스는 오래전부터
+    조용히 빈 dict 만 돌려주고 있었고, 폴백 체인은 5개 소스를 가진 것처럼 보였다.
+
+    `m.stock.naver.com/api/stock/{code}/integration` 은 같은 값을 JSON 으로 준다.
+    """
     if not _is_korean_ticker(ticker):
         return {}
     code = ticker.upper().split(".")[0]
     response = requests.get(
-        f"https://finance.naver.com/item/main.naver?code={code}",
+        f"https://m.stock.naver.com/api/stock/{code}/integration",
         headers={"User-Agent": "Mozilla/5.0"},
         timeout=8,
     )
     response.raise_for_status()
-    try:
-        from bs4 import BeautifulSoup
-    except Exception:
-        return {}
+    payload = response.json()
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    text = soup.get_text(" ", strip=True)
+    rows = payload.get("totalInfos") or []
+    raw = {row.get("code"): row.get("value") for row in rows if isinstance(row, dict)}
+
     result: dict[str, Any] = {}
-
-    marker_map = {
-        "PER": "pe_ratio",
-        "PBR": "price_to_book",
-        "EPS": "eps",
-        "배당수익률": "dividend_yield",
-    }
-    parts = text.replace("l", " ").split()
-    for idx, token in enumerate(parts):
-        key = marker_map.get(token)
-        if not key:
+    for source_key, field in _NAVER_FIELD_MAP.items():
+        value = _parse_korean_number(raw.get(source_key))
+        if value is None:
             continue
-        for candidate in parts[idx + 1: idx + 5]:
-            parsed = _safe_float(candidate)
-            if parsed is not None:
-                result[key] = parsed / 100.0 if key == "dividend_yield" else parsed
-                break
+        if field == "dividend_yield":
+            value = _as_yield_fraction(value, "percent")   # '0.67%' → 0.0067
+            if value is None:
+                continue
+        if field in ("market_cap", "avg_volume"):
+            value = int(value)
+        result[field] = value
 
-    market_sum = soup.select_one("#_market_sum")
-    if market_sum:
-        unit = market_sum.find_next(string=lambda value: value and "억원" in value)
-        market_cap_100m = _safe_float(market_sum.get_text(strip=True))
-        if market_cap_100m is not None:
-            result["market_cap"] = int(market_cap_100m * 100_000_000)
-        elif unit:
-            result["market_cap"] = None
+    name = payload.get("stockName")
+    if name:
+        result["company_name"] = name
     return result
 
 
@@ -1066,27 +1182,50 @@ def fetch_fundamentals(ticker: str) -> dict:
     attempted: list[str] = []
     used: list[str] = []
     errors: list[str] = []
+    # 소스별 결말을 남긴다. 종전에는 빈 결과를 `continue` 로 흘려서, 5개 소스 중
+    # 4개가 죽어 있어도 '다중 소스 폴백'처럼 보였다 (2026-09-14: naver 파서 무효화,
+    # finnhub·alphavantage 키 미설정, fmp legacy 폐기 — 실제로는 yfinance 단일).
+    source_status: dict[str, str] = {}
 
     for source_name, fetcher in source_fns:
         attempted.append(source_name)
         try:
             data = fetcher(ticker)
-            normalized = {field: data.get(field) for field in _FUNDAMENTAL_FIELDS}
-            if _fundamental_quality(normalized) == "empty":
-                continue
-            merged = _merge_fundamentals(merged, normalized)
-            used.append(source_name)
-            if _fundamental_quality(merged) == "full":
-                break
+        except PlanRestricted as exc:
+            source_status[source_name] = "plan_restricted"
+            logger.debug("[%s] fundamentals %s 미제공: %s", ticker, source_name, exc)
+            continue
         except Exception as exc:
+            source_status[source_name] = "error"
             errors.append(f"{source_name}: {str(exc)[:160]}")
             logger.warning("[%s] fundamentals failed via %s: %s", ticker, source_name, exc)
+            continue
+
+        if not data:
+            # 빈 dict 는 두 가지다 — 키가 없어서 시작도 못 했거나, 응답이 비었거나.
+            source_status[source_name] = (
+                "not_configured" if _source_needs_key(source_name) else "no_data"
+            )
+            continue
+
+        normalized = {field: data.get(field) for field in _FUNDAMENTAL_FIELDS}
+        if _fundamental_quality(normalized) == "empty":
+            source_status[source_name] = "no_usable_fields"
+            continue
+
+        merged = _merge_fundamentals(merged, normalized)
+        used.append(source_name)
+        source_status[source_name] = "ok"
+        if _fundamental_quality(merged) == "full":
+            break
 
     quality = _fundamental_quality(merged)
     result = {
         **merged,
         "_source": "+".join(used) if used else "none",
         "_sources_attempted": attempted,
+        "_source_status": source_status,
+        "_sources_ok": len(used),
         "_errors": errors,
         "_fetched_at": now.isoformat(),
         "_cache_hit": False,
