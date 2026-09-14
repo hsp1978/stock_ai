@@ -18,6 +18,7 @@ import sys
 import time
 import threading
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -50,6 +51,8 @@ from config import (
     DATA_HEALTH_CHECK_MINUTES, DATA_HEALTH_ALERT_STALE_HOURS,
     DATA_HEALTH_RECENT_ANALYSIS_DAYS, POSITION_MARK_INTERVAL_MINUTES,
     OUTPUT_RETENTION_ENABLED, OUTPUT_RETENTION_HOUR, OUTPUT_RETENTION_MINUTE,
+    STATE_BACKUP_DIR, STATE_BACKUP_ENABLED, STATE_BACKUP_HOUR,
+    STATE_BACKUP_KEEP, STATE_BACKUP_MINUTE,
     OPS_ALERT_DEDUPE_MINUTES, DEFAULT_HISTORY_PERIOD,
     SCREENER_BATCH_ENABLED, SCREENER_BATCH_HOUR, SCREENER_BATCH_MINUTE,
     SIGNAL_EVAL_DAYS_BACK, SIGNAL_EVAL_BACKLOG_ALERT,
@@ -350,6 +353,7 @@ _KNOWN_OPS_JOBS = {
     "data_health_check": "Data Health Check",
     "position_mark_to_market": "Position Mark-to-Market",
     "output_retention": "Output Retention",
+    "state_backup": "State Backup",
     "multi_agent_batch": "Multi-Agent Batch",
 }
 
@@ -1985,6 +1989,49 @@ def run_output_retention(dry_run: bool = False) -> dict:
         return {"status": "error", "error": str(exc)}
 
 
+def run_state_backup() -> dict:
+    """스케줄 잡 — 운영 상태 백업.
+
+    '백업했다'가 아니라 '복원 가능하다'를 확인한다. 만든 직후 아카이브를 풀어
+    체크섬·`integrity_check` 까지 돌린다 — 복구가 필요한 날에야 깨진 걸 알면
+    백업이 없는 것과 같다 (§13-4: 미검증을 성공으로 덮지 말 것).
+    """
+    started_at = _record_job_start("state_backup", _KNOWN_OPS_JOBS["state_backup"])
+    try:
+        from state_backup import create_backup, verify_backup
+
+        result = create_backup(STATE_BACKUP_DIR, keep=STATE_BACKUP_KEEP)
+        verification = verify_backup(result["archive"])
+        result["verification"] = verification
+
+        if verification["status"] != "ok":
+            result["status"] = "error"
+            _send_ops_alert(
+                "State backup verification failed",
+                f"archive={result['archive']} | " + "; ".join(verification["problems"][:5]),
+                severity="error",
+                dedupe_key="state_backup:corrupt",
+            )
+        elif result["missing"]:
+            result["status"] = "degraded"
+            _send_ops_alert(
+                "State backup incomplete",
+                f"누락: {', '.join(result['missing'])}",
+                severity="warning",
+                dedupe_key="state_backup:missing",
+            )
+
+        _record_job_success("state_backup", started_at, result)
+        return result
+    except Exception as exc:
+        _record_job_error("state_backup", started_at, exc)
+        _send_ops_alert(
+            "State backup failed", str(exc)[:300], severity="error",
+            dedupe_key="state_backup:error",
+        )
+        return {"status": "error", "error": str(exc)}
+
+
 def run_data_health_check() -> dict:
     """데이터 freshness SLO를 평가하고 stale/degraded 상태를 알린다."""
     started_at = _record_job_start("data_health_check", _KNOWN_OPS_JOBS["data_health_check"])
@@ -2074,6 +2121,15 @@ def _start_background_scheduler(run_initial_scan: bool = False) -> None:
             hour=OUTPUT_RETENTION_HOUR,
             minute=OUTPUT_RETENTION_MINUTE,
             id='output_retention',
+            replace_existing=True,
+        )
+    if STATE_BACKUP_ENABLED:
+        scheduler.add_job(
+            run_state_backup,
+            'cron',
+            hour=STATE_BACKUP_HOUR,
+            minute=STATE_BACKUP_MINUTE,
+            id='state_backup',
             replace_existing=True,
         )
     if SCREENER_BATCH_ENABLED:
@@ -2567,6 +2623,40 @@ def ops_jobs():
     }
 
 
+@app.get("/ops/backups")
+def ops_backups():
+    """백업 현황 — **최신본이 실제로 복원 가능한지**까지 확인한다.
+
+    개수와 용량만 보여주면 '백업이 있다'는 착시가 된다.
+    """
+    from state_backup import latest_backup, verify_backup
+
+    directory = Path(STATE_BACKUP_DIR)
+    archives = sorted(directory.glob("stock_auto_state_*.tar.gz"), reverse=True)
+    latest = latest_backup(directory) if archives else None
+
+    return JSONResponse(content=_sanitize({
+        "directory": str(directory),
+        "count": len(archives),
+        "total_bytes": sum(a.stat().st_size for a in archives),
+        "archives": [
+            {
+                "name": a.name,
+                "bytes": a.stat().st_size,
+                "modified_at": datetime.fromtimestamp(a.stat().st_mtime).isoformat(),
+                "age_hours": round(
+                    (datetime.now() - datetime.fromtimestamp(a.stat().st_mtime))
+                    .total_seconds() / 3600, 1
+                ),
+            }
+            for a in archives[:20]
+        ],
+        "latest_verification": verify_backup(latest) if latest else None,
+        # 같은 디스크에 두면 SPOF 를 못 벗어난다 — 운영자가 이 사실을 잊지 않게 싣는다
+        "offsite_note": "같은 노드에만 있으면 SPOF 대비가 아니다 — docs/RUNBOOK_BACKUP.md",
+    }))
+
+
 @app.get("/ops/output-retention/preview")
 def ops_output_retention_preview():
     """보존 정책이 **무엇을 지울지** 미리 본다 (삭제하지 않음).
@@ -2606,6 +2696,8 @@ def ops_run_job(job_id: str, force: bool = False):
         return run_position_mark_to_market()
     if normalized in {"output_retention", "retention", "cleanup"}:
         return run_output_retention()
+    if normalized in {"state_backup", "backup"}:
+        return run_state_backup()
     raise HTTPException(404, f"Unknown ops job: {job_id}")
 
 

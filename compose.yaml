@@ -30,6 +30,9 @@ services:
       - ./chart_agent_service/output:/app/chart_agent_service/output
       - ./chart_agent_service/data:/app/chart_agent_service/data
       - ./chart_agent_service/charts:/app/chart_agent_service/charts
+      # 백업은 컨테이너 밖(호스트)에 남아야 한다 — 컨테이너를 지워도 살아남는다.
+      # 같은 디스크이므로 SPOF 대비는 아니다. 다른 노드 복사는 docs/RUNBOOK_BACKUP.md
+      - ${STATE_BACKUP_DIR:-/home/ubuntu/stock_auto_backups}:${STATE_BACKUP_DIR:-/home/ubuntu/stock_auto_backups}
       # multi_agent.py + 그 의존 모듈들. 이미지에도 COPY되어 있지만, 코드만
       # 바뀐 경우 재빌드 없이 컨테이너 재시작만으로 반영하기 위한 read-only mount.
       - ./stock_analyzer:/app/stock_analyzer:ro

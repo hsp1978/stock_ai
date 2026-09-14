@@ -40,3 +40,13 @@ shell-agent:    ## agent-api 컨테이너 shell
 
 shell-webui:    ## webui 컨테이너 shell
 	docker exec -it stock-auto-webui bash
+
+backup:         ## 운영 상태 백업 (DB·페이퍼·워치리스트). 분석 JSON 은 제외
+	@curl -s -X POST localhost:8100/ops/jobs/state_backup/run | python3 -m json.tool
+
+backup-verify:  ## 최신 백업이 실제로 복원 가능한지 확인 (체크섬 + integrity_check)
+	@curl -s localhost:8100/ops/backups | python3 -m json.tool
+
+
+backup-drill:   ## 복구 리허설 — 운영 파일을 건드리지 않고 실제로 복원해 대조
+	docker exec stock-auto-agent-api python /app/scripts/restore_drill.py

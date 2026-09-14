@@ -96,6 +96,11 @@ docker images stock-auto/{webui,agent-api}
 # 로그 (로테이션 없음, 주의)
 tail -f chart_agent_service/service.log
 
+# 백업·복구 (docs/RUNBOOK_BACKUP.md)
+make backup          # 상태 백업 (매일 04:00 자동)
+make backup-verify   # 최신본이 복원 가능한지
+make backup-drill    # 복구 리허설 (운영 파일 미변경)
+
 # Makefile 타깃
 make help
 ```
@@ -160,6 +165,7 @@ make help
    **print() 로 우회하면 이 보호가 적용되지 않는다** — 라이브러리 경로에서는 logger 를 쓸 것
    (webui 는 `stock_analyzer/app_logging.py`). `__main__` 블록의 CLI 출력은 print 가 맞다.
 3. **`paper_trading_state.json`을 직접 편집하지 말 것.** API 또는 SQLite 마이그레이션 후 DB로 처리.
+   복구 시에도 손으로 고치지 말 것 — `docs/RUNBOOK_BACKUP.md` §4 절차를 따른다.
 4. **백테스트 결과의 Sharpe·수익률을 그대로 신뢰하지 말 것.** DSR + PBO 보정 필수.
 5. **새 LLM provider 직접 SDK 호출 추가하지 말 것.** LiteLLM Router 통한 등록만 허용.
 6. **`from X import *` 금지.**
@@ -350,6 +356,7 @@ PR 머지 시:
 - `docs/ARCHITECTURE_BRIEF.md` — 사용자 작성 시스템 브리프
 - `docs/BACKTEST_ASSUMPTIONS.md` — Slippage/수수료/rf 가정 (Step 10)
 - `docs/USER_MANUAL.md` — WebUI 사용법 (사이드바=이동 전용, 커맨드바=조작, GPU 해제)
+- `docs/RUNBOOK_BACKUP.md` — 백업 대상·복구 절차·리허설 기록 (SPOF 대비)
 - `docs/PHASE_1_MAC_STUDIO.md` / `PHASE_3_OPERATION.md` — 듀얼 노드 셋업/운영
 - `docs/DESIGN_SYSTEM.md` — 화면 토큰·컴포넌트 규격 v1.0 + Streamlit 구현 함정.
   `:root` 토큰은 `stock_analyzer/ui/theme.py`에 있고 `tests/unit/test_design_system.py`가
