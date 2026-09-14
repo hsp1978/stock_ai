@@ -662,7 +662,7 @@ win 정의가 "신호 방향으로 ±2% 이상"이었는데 **±2%에 근거가 
 | 1 | `webui.py` God file | **해소** (2026-09-14): 6,482 → 350 라인(−95%). `ui/` 공용 8모듈 + `ui/pages/` 17페이지 — 아래 §13.9a |
 | 2 | 이중 호출 경로 (직접 import + HTTP) | `/paper`·`/trading`·`/gpu`만 HTTP 강제. 나머지는 여전히 이중. 단 판정 지점은 1곳으로 합침 — `webui.py` 에 있던 두 번째 `_USE_LOCAL_ENGINE` 제거 (2026-09-14) |
 | 3 | `print()` 기반 로깅 | **해소** (2026-09-14): agent-api 188건 + webui 라이브러리 경로 179건 전환. CLI 블록 206건은 **의도적으로 유지** — 아래 §13.9c |
-| 4 | 양방향 `sys.path` 주입 | 미해결 (webui↔agent 상호 import) |
+| 4 | 양방향 `sys.path` 주입 | 구조는 그대로. 단 **동명 모듈 충돌은 제거·차단** (2026-09-14, `test_module_shadowing.py`) — 아래 §13.9f |
 | 5 | ~~분석 결과 JSON 무한 누적~~ | **해소** (2026-09-14): `output_retention` 잡 (JSON·PNG 30일, 03:30). 적발 시점 70,771개/1.58 GB, 하루 361개 증가 — 아래 §13.9b |
 | 6 | DB 마이그레이션 도구 부재 | Alembic 미도입 |
 | 7 | FastAPI 전 핸들러 sync + blocking I/O | `httpx.AsyncClient` 단계 전환 미착수 |
@@ -929,6 +929,44 @@ score 0이 되어 신호를 희석한다.
 - 손상 캐시 주입 → 경고 로그 후 삭제·재생성(8,584,967 bytes), 조회 성공
 - 캐시 삭제 후 병렬 5회 첫 호출 → 생성 1회, 결과 일치, 1.3초
 - 반복 20회: 0.71초 → **0.072초** (절대값은 작다. 요점은 경합·손상 제거다)
+
+#### 13.9f 모듈 가림 (2026-09-14)
+
+§13.9c 로 webui 로깅을 켠 직후 나온 줄:
+
+```
+ERROR [stock_auto.local_engine] news_analyzer import 실패 (HTTP fallback):
+  cannot import name 'fetch_news_with_sentiment' from 'news_analyzer'
+  (/app/stock_analyzer/news_analyzer.py)
+```
+
+`stock_analyzer/` 와 `chart_agent_service/` 가 **둘 다 sys.path 에 들어간다**
+(안티패턴 #5). 같은 파일명이 양쪽에 있으면 어느 쪽이 잡힐지는 **import 순서**가 정한다.
+겹치던 이름은 하나였다 — `news_analyzer`.
+
+| | 잡힌 모듈 | 결과 |
+|---|---|---|
+| webui | `stock_analyzer/news_analyzer.py` | `_DIRECT_NEWS=False` → 뉴스는 늘 HTTP 폴백. **`GeopoliticalAnalyst._fetch_news_context` 는 항상 `{'error': ...}`** → `_context_available` False → **뉴스 없이 지정학 분석** |
+| agent-api | `chart_agent_service/news_analyzer.py` | 우연히 정상 — `service.py` 가 먼저 import 해 `sys.modules` 에 올려둔 덕이다. 순서가 바뀌면 같이 깨진다 |
+
+`stock_analyzer/news_analyzer.py` 는 **아무도 import 하지 않는 레거시**였다
+(`NewsAnalyzer`/`IntegratedAnalyzer` 참조 0). 즉 죽은 코드가 살아 있는 모듈을 가렸다.
+
+기존 테스트 3개(`test_agent_groups`, `test_price_source_verification`,
+`test_signal_outcome_recording`)가 이미 "stock_analyzer 를 앞에 넣으면 동명 모듈이
+잘못 로드된다"는 주석과 함께 sys.path 순서를 조심하고 있었다 — **증상은 알려져
+있었지만 원인을 없애지 않았다.**
+
+**수정**: `legacy_news_analyzer.py` 로 개명(삭제하지 않고 경위를 docstring 에 기록) +
+`tests/unit/test_module_shadowing.py` 로 재발 차단.
+
+**실측 (webui, 수리 후)**
+
+| | 전 | 후 |
+|---|---|---|
+| `news_analyzer.__file__` | `stock_analyzer/…` | `chart_agent_service/…` |
+| `local_engine._DIRECT_NEWS` | `False` | **`True`** |
+| `_fetch_news_context` | `{'error': …}` | 기사 **15건**, `_context_available=True` |
 
 ### 13.10 데이터 품질 위험
 

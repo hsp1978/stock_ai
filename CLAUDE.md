@@ -306,7 +306,7 @@ PR 머지 시:
 | 2 | Dual call path (in-proc + HTTP) | P2 (HTTP 단일화). `/paper`·`/trading`·`/gpu`는 강제 HTTP. 판정은 `ui/api_client.USE_LOCAL_ENGINE` 한 곳 (webui 중복 제거 2026-09-14) |
 | 3 | ~~`print()` 기반 로깅~~ ✅ 완료 (2026-09-14). agent-api 188건 + webui 라이브러리 179건. CLI 블록 206건은 의도적 유지 |
 | 4 | `paper_state.json` 무락 | 시스템 P0 |
-| 5 | 양방향 sys.path 주입 | P2 |
+| 5 | 양방향 sys.path 주입 | 구조는 P2. **동명 모듈은 금지** — `tests/unit/test_module_shadowing.py` 가 차단 (2026-09-14) |
 | 6 | 모델 버전 미핀 (`qwen3:14b-q4_K_M`) | P2 |
 | 7 | 매직 포트 8080 (3곳 흩어짐) | P2 |
 | 8 | ~~CI 부재~~ ✅ GitHub Actions (`.github/workflows/ci.yml`: lint + test + dep smoke, 2026-05-19) | 완료 |
