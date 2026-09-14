@@ -160,7 +160,11 @@ make help
 4. **백테스트 결과의 Sharpe·수익률을 그대로 신뢰하지 말 것.** DSR + PBO 보정 필수.
 5. **새 LLM provider 직접 SDK 호출 추가하지 말 것.** LiteLLM Router 통한 등록만 허용.
 6. **`from X import *` 금지.**
-7. **차트 PNG 무한 누적 방치 금지.** 30일 이상 파일 자동 정리 cron 유지.
+7. **`output/` 산출물 무한 누적 방치 금지.** 정리는 `output_retention` 스케줄 잡이 한다
+   (기본 03:30, JSON·PNG 30일). 지우기 전에 `/ops/output-retention/preview` 로 확인할 것.
+   차트 PNG 는 화면이 읽으므로 **참조 중인 것은 나이와 무관하게 남는다**.
+   ※ 2026-09-14 이전 이 항목은 "자동 정리 cron 유지"라고 적혀 있었으나 **그 cron 은
+   존재한 적이 없다** — JSON 이 70,771개/1.58 GB 까지 쌓였다.
 8. **DB 직접 SQL 변경 금지.** Alembic migration 도입 후 마이그레이션 스크립트로만.
 9. **README 라우팅 표 수정 시 `dual_node_config.py` 코드와 일치 확인.**
 10. **`webui.py`에 페이지를 다시 들이지 말 것.** 화면은 `ui/pages/`, 공용은 `ui/*.py`.
@@ -303,7 +307,7 @@ PR 머지 시:
 | 6 | 모델 버전 미핀 (`qwen3:14b-q4_K_M`) | P2 |
 | 7 | 매직 포트 8080 (3곳 흩어짐) | P2 |
 | 8 | ~~CI 부재~~ ✅ GitHub Actions (`.github/workflows/ci.yml`: lint + test + dep smoke, 2026-05-19) | 완료 |
-| 9 | 차트 PNG 무한 누적 | 시스템 P1 |
+| 9 | ~~산출물 무한 누적~~ ✅ `output_retention` 잡 (JSON·PNG 30일, 2026-09-14) | 완료 |
 | 10 | README ↔ 코드 라우팅 불일치 | P2 |
 | 11 | 프롬프트 인젝션 표면 | Step 9 (structured output) |
 | 12 | **실패 은폐** — 광범위 `except`가 사유를 버리고, '조건 충족'을 '결과 성공'으로 기록 | 2026-08 다수 수정, 아래 §13 참조 |

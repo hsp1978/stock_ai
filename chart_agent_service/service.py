@@ -49,6 +49,7 @@ from config import (
     CORPORATE_ACTION_CHECK_HOUR, CORPORATE_ACTION_CHECK_MINUTE,
     DATA_HEALTH_CHECK_MINUTES, DATA_HEALTH_ALERT_STALE_HOURS,
     DATA_HEALTH_RECENT_ANALYSIS_DAYS, POSITION_MARK_INTERVAL_MINUTES,
+    OUTPUT_RETENTION_ENABLED, OUTPUT_RETENTION_HOUR, OUTPUT_RETENTION_MINUTE,
     OPS_ALERT_DEDUPE_MINUTES, DEFAULT_HISTORY_PERIOD,
     SCREENER_BATCH_ENABLED, SCREENER_BATCH_HOUR, SCREENER_BATCH_MINUTE,
     SIGNAL_EVAL_DAYS_BACK, SIGNAL_EVAL_BACKLOG_ALERT,
@@ -341,6 +342,7 @@ _KNOWN_OPS_JOBS = {
     "corporate_actions": "Corporate Actions",
     "data_health_check": "Data Health Check",
     "position_mark_to_market": "Position Mark-to-Market",
+    "output_retention": "Output Retention",
     "multi_agent_batch": "Multi-Agent Batch",
 }
 
@@ -1949,6 +1951,33 @@ def run_position_mark_to_market() -> dict:
         return {"status": "error", "error": str(exc)}
 
 
+def run_output_retention(dry_run: bool = False) -> dict:
+    """스케줄 잡 — 보존 기간이 지난 분석 산출물 정리.
+
+    삭제는 되돌릴 수 없으므로 결과를 숫자로 남긴다. 무엇을 몇 바이트 지웠는지
+    기록하지 않으면, 디스크가 준 이유가 정리인지 장애인지 알 수 없다.
+    """
+    started_at = _record_job_start("output_retention", _KNOWN_OPS_JOBS["output_retention"])
+    try:
+        from output_retention import cleanup_outputs
+
+        result = cleanup_outputs(dry_run=dry_run)
+        if result["status"] in {"degraded", "error"}:
+            _send_ops_alert(
+                "Output retention incomplete",
+                f"status={result['status']}, deleted={result['deleted']}, "
+                f"failed={result['failed']} | "
+                + "; ".join(f"{f['name']}({f['error']})" for f in result["failures"][:5]),
+                severity="error" if result["status"] == "error" else "warning",
+                dedupe_key=f"output_retention:{result['status']}",
+            )
+        _record_job_success("output_retention", started_at, result)
+        return result
+    except Exception as exc:
+        _record_job_error("output_retention", started_at, exc)
+        return {"status": "error", "error": str(exc)}
+
+
 def run_data_health_check() -> dict:
     """데이터 freshness SLO를 평가하고 stale/degraded 상태를 알린다."""
     started_at = _record_job_start("data_health_check", _KNOWN_OPS_JOBS["data_health_check"])
@@ -2031,6 +2060,15 @@ def _start_background_scheduler(run_initial_scan: bool = False) -> None:
         next_run_time=datetime.now() + timedelta(seconds=30),
         replace_existing=True,
     )
+    if OUTPUT_RETENTION_ENABLED:
+        scheduler.add_job(
+            run_output_retention,
+            'cron',
+            hour=OUTPUT_RETENTION_HOUR,
+            minute=OUTPUT_RETENTION_MINUTE,
+            id='output_retention',
+            replace_existing=True,
+        )
     if SCREENER_BATCH_ENABLED:
         scheduler.add_job(
             run_screener_batch,
@@ -2522,6 +2560,17 @@ def ops_jobs():
     }
 
 
+@app.get("/ops/output-retention/preview")
+def ops_output_retention_preview():
+    """보존 정책이 **무엇을 지울지** 미리 본다 (삭제하지 않음).
+
+    삭제는 되돌릴 수 없다. 기간을 바꾸기 전에 이걸로 확인한다.
+    """
+    from output_retention import cleanup_outputs
+
+    return JSONResponse(content=_sanitize(cleanup_outputs(dry_run=True)))
+
+
 @app.get("/ops/data-health")
 def ops_data_health(refresh: bool = False):
     """데이터 freshness SLO 상태 조회."""
@@ -2548,6 +2597,8 @@ def ops_run_job(job_id: str, force: bool = False):
         return run_screener_batch()
     if normalized in {"position_mark_to_market", "position_mtm", "mark_to_market"}:
         return run_position_mark_to_market()
+    if normalized in {"output_retention", "retention", "cleanup"}:
+        return run_output_retention()
     raise HTTPException(404, f"Unknown ops job: {job_id}")
 
 
