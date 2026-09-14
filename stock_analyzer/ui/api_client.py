@@ -34,7 +34,11 @@ except ImportError:
 AGENT_API_URL = os.getenv("AGENT_API_URL", f"http://{AGENT_API_HOST}:{AGENT_API_PORT}")
 
 try:
-    from local_engine import engine_dispatch_get, engine_dispatch_post
+    from local_engine import (
+        engine_dispatch_get,
+        engine_dispatch_post,
+        engine_get_chart_path,
+    )
 
     USE_LOCAL_ENGINE = True
 except ImportError:  # webui 컨테이너에 서비스 모듈이 없으면 HTTP 전용
@@ -167,3 +171,8 @@ def log_action(
         pass  # 로깅 실패가 UI를 막지 않도록
 
 
+def get_chart_url(ticker: str) -> str:
+    """local_engine 모드: 파일 경로 반환 / HTTP 모드: URL 반환"""
+    if USE_LOCAL_ENGINE:
+        return engine_get_chart_path(ticker) or ""
+    return f"{AGENT_API_URL}/chart/{ticker}"

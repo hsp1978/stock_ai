@@ -34,3 +34,11 @@ def _fmt_price(price, ticker: str, decimals: int = None) -> str:
         decimals = 0 if _is_korean_stock(ticker) else 2
 
     return f"{currency}{price:,.{decimals}f}"
+
+
+def _fmt_num(v, decimals=2):
+    if v is None:
+        return "—"
+    if isinstance(v, str):
+        return v
+    return f"{v:,.{decimals}f}"
