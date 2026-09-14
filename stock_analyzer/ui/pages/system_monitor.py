@@ -200,11 +200,42 @@ def render_system_monitor():
 
     with tab_data:
         if data_health:
-            d1, d2, d3, d4 = st.columns(4)
+            d1, d2, d3, d4, d5 = st.columns(5)
             d1.metric("Status", str(data_health.get("status", "unknown")).upper())
             d2.metric("Tickers", f"{data_health.get('ticker_count', 0):,}")
             d3.metric("Stale", f"{data_health.get('stale_count', 0):,}")
             d4.metric("Degraded", f"{data_health.get('degraded_count', 0):,}")
+            d5.metric("Warming", f"{data_health.get('warming_count', 0):,}")
+
+            warmup = data_health.get("warmup") or {}
+            if warmup.get("warming"):
+                st.info(
+                    f"기동 {warmup.get('uptime_sec', 0) / 60:.0f}분 — OHLCV·뉴스 캐시는 "
+                    "인메모리라 첫 스캔 전까지 비어 있다. 미수집은 장애가 아니다."
+                )
+
+            # 점검 범위를 화면에도 적는다 — 무엇을 안 보고 있는지가 보이지 않으면
+            # 'OK' 가 '괜찮다'인지 '안 봤다'인지 구분할 수 없다.
+            scope = data_health.get("scope") or {}
+            if scope:
+                counts = scope.get("counts") or {}
+                label = " · ".join(f"{k} {v}" for k, v in sorted(counts.items())) or "없음"
+                st.caption(
+                    f"점검 범위: {label}"
+                    f" · 최근 분석 창 {scope.get('recent_analysis_window_days', 0):g}일"
+                    f" · 제외 {scope.get('excluded_count', 0)}건"
+                )
+                excluded = scope.get("excluded") or []
+                if excluded:
+                    with st.expander(f"범위 밖 {len(excluded)}종목 (사유 포함)", expanded=False):
+                        st.dataframe(
+                            pd.DataFrame([{
+                                "Ticker": r.get("ticker"),
+                                "Reason": r.get("reason"),
+                                "Days Ago": r.get("last_analyzed_days_ago"),
+                            } for r in excluded]),
+                            use_container_width=True, row_height=44, hide_index=True,
+                        )
 
             rows = data_health.get("rows") or []
             if rows:
@@ -212,6 +243,7 @@ def render_system_monitor():
                 for row in rows:
                     freshness_rows.append({
                         "Ticker": row.get("ticker"),
+                        "Scope": row.get("scope") or "",
                         "Severity": str(row.get("severity", "")).upper(),
                         "Reasons": ", ".join(row.get("reasons") or []),
                         "OHLCV Source": row.get("ohlcv_source") or "",

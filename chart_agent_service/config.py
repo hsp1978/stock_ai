@@ -116,6 +116,11 @@ class Settings(BaseSettings):
     CORPORATE_ACTION_CHECK_MINUTE: int = Field(default=5, ge=0, le=59)
     DATA_HEALTH_CHECK_MINUTES: int = Field(default=60, ge=5)
     DATA_HEALTH_ALERT_STALE_HOURS: float = Field(default=24.0, ge=0)
+    # 데이터 신선도 점검 대상 범위. 워치리스트·보유 포지션은 항상 포함하고,
+    # 과거 1회성 분석 종목은 이 일수 안에 분석된 것만 본다. 종전에는 프로세스가
+    # 기억하는 모든 종목을 봐서, 워치리스트에서 빠진 지 한 달 넘은 종목 15건이
+    # 영구 stale 로 남아 **경보가 항상 켜져 있었다** (2026-09-14).
+    DATA_HEALTH_RECENT_ANALYSIS_DAYS: int = Field(default=3, ge=0)
     OPS_ALERT_DEDUPE_MINUTES: int = Field(default=60, ge=1)
     # 일일 멀티에이전트(V2) 배치 — signal_outcomes 표본 자동 축적용.
     # 시각은 서버 로컬 시간 기준. 기본 17:30 (KRX 마감 15:30 이후).
@@ -264,6 +269,7 @@ CORPORATE_ACTION_CHECK_HOUR = settings.CORPORATE_ACTION_CHECK_HOUR
 CORPORATE_ACTION_CHECK_MINUTE = settings.CORPORATE_ACTION_CHECK_MINUTE
 DATA_HEALTH_CHECK_MINUTES = settings.DATA_HEALTH_CHECK_MINUTES
 DATA_HEALTH_ALERT_STALE_HOURS = settings.DATA_HEALTH_ALERT_STALE_HOURS
+DATA_HEALTH_RECENT_ANALYSIS_DAYS = settings.DATA_HEALTH_RECENT_ANALYSIS_DAYS
 OPS_ALERT_DEDUPE_MINUTES = settings.OPS_ALERT_DEDUPE_MINUTES
 SCREENER_BATCH_ENABLED = settings.SCREENER_BATCH_ENABLED
 SCREENER_BATCH_HOUR = settings.SCREENER_BATCH_HOUR

@@ -127,7 +127,9 @@ def test_data_health_degrades_on_silent_tracking():
     import service
 
     with (
-        patch.object(service, "_collect_data_health_tickers", lambda tickers=None: ["AAPL"]),
+        # 2026-09-14: (대상, scope, 제외) 3-튜플로 바뀌었다 — 범위의 근거를 함께 돌려준다
+        patch.object(service, "_collect_data_health_tickers",
+                     lambda tickers=None: (["AAPL"], {"AAPL": "requested"}, [])),
         patch.object(service, "get_data_cache_status", lambda tickers, period=None: {
             "tickers": {"AAPL": {
                 "ohlcv": {"present": True, "fresh": True, "age_sec": 60},
