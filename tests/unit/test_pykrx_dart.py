@@ -15,12 +15,28 @@ import sys
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
 
 _AGENT_DIR = os.path.join(os.path.dirname(__file__), "../../chart_agent_service")
 if _AGENT_DIR not in sys.path:  # noqa: E402
     sys.path.insert(0, _AGENT_DIR)
 
 from analysis_tools import AnalysisTools  # noqa: E402
+
+
+
+@pytest.fixture(autouse=True)
+def _reset_dart_caches():
+    """DART 리더·corpCode 프레임은 **하루 단위로 캐시된다** (2026-09-14, 경합 수리).
+
+    테스트마다 다른 가짜 라이브러리를 sys.modules 에 꽂으므로, 캐시를 비우지 않으면
+    앞 테스트의 리더가 그대로 재사용돼 엉뚱한 것을 검증하게 된다.
+    """
+    import dart_client
+
+    dart_client.reset_corp_frame_cache()
+    yield
+    dart_client.reset_corp_frame_cache()
 
 
 def _make_ohlcv(n: int = 50) -> pd.DataFrame:
@@ -200,7 +216,12 @@ class _FakeOpenDartReader:
 
 
 def test_fetch_disclosures_uses_correct_library_contract():
-    """`import OpenDartReader` 결과를 그대로 호출해야 한다 (모듈 취급 금지)."""
+    """`import OpenDartReader` 결과를 그대로 호출해야 한다 (모듈 취급 금지).
+
+    2026-09-14: 리더가 하루 단위로 캐시되므로 테스트 간 격리를 위해 비운다
+    (`reset_corp_frame_cache`). corpCode 사전 생성은 이 가짜 라이브러리에서
+    실패하고 폴백 경로를 탄다 — 그 동작도 여기서 함께 고정된다.
+    """
     import dart_client
 
     with patch.dict(os.environ, {"DART_API_KEY": "dummy-key"}, clear=False), \
