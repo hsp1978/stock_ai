@@ -53,6 +53,7 @@ from config import (
     OUTPUT_RETENTION_ENABLED, OUTPUT_RETENTION_HOUR, OUTPUT_RETENTION_MINUTE,
     STATE_BACKUP_DIR, STATE_BACKUP_ENABLED, STATE_BACKUP_HOUR,
     STATE_BACKUP_KEEP, STATE_BACKUP_MINUTE,
+    OFFSITE_BACKUP_DEST, OFFSITE_BACKUP_TIMEOUT_SEC,
     OPS_ALERT_DEDUPE_MINUTES, DEFAULT_HISTORY_PERIOD,
     SCREENER_BATCH_ENABLED, SCREENER_BATCH_HOUR, SCREENER_BATCH_MINUTE,
     SIGNAL_EVAL_DAYS_BACK, SIGNAL_EVAL_BACKLOG_ALERT,
@@ -2021,6 +2022,29 @@ def run_state_backup() -> dict:
                 dedupe_key="state_backup:missing",
             )
 
+        # 검증을 통과한 백업만 밖으로 내보낸다. 깨진 사본을 복제하면
+        # 오프사이트에도 깨진 것이 쌓인다.
+        if verification["status"] == "ok":
+            from offsite_backup import replicate
+
+            offsite = replicate(
+                STATE_BACKUP_DIR,
+                OFFSITE_BACKUP_DEST,
+                timeout_sec=OFFSITE_BACKUP_TIMEOUT_SEC,
+            )
+            result["offsite"] = offsite
+            if offsite["status"] in {"degraded", "error"}:
+                # 백업 자체는 됐다. 다만 이 노드 밖에는 없다 — 다른 사실이다.
+                if result["status"] == "completed":
+                    result["status"] = "degraded"
+                _send_ops_alert(
+                    "Offsite backup replication failed",
+                    f"status={offsite['status']}, dest={offsite.get('dest')} | "
+                    f"{offsite.get('detail', '')}",
+                    severity="error" if offsite["status"] == "error" else "warning",
+                    dedupe_key=f"offsite_backup:{offsite['status']}",
+                )
+
         _record_job_success("state_backup", started_at, result)
         return result
     except Exception as exc:
@@ -2653,7 +2677,16 @@ def ops_backups():
         ],
         "latest_verification": verify_backup(latest) if latest else None,
         # 같은 디스크에 두면 SPOF 를 못 벗어난다 — 운영자가 이 사실을 잊지 않게 싣는다
-        "offsite_note": "같은 노드에만 있으면 SPOF 대비가 아니다 — docs/RUNBOOK_BACKUP.md",
+        "offsite": {
+            "configured": bool(OFFSITE_BACKUP_DEST),
+            "dest": OFFSITE_BACKUP_DEST or None,
+            "note": (
+                "설정됨 — 매 백업 후 복제하고 목적지 체크섬까지 대조한다"
+                if OFFSITE_BACKUP_DEST
+                else "미설정 — 백업이 이 노드에만 있다. SPOF 대비가 아니다"
+            ),
+        },
+        "runbook": "docs/RUNBOOK_BACKUP.md",
     }))
 
 

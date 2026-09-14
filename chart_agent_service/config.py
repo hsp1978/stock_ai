@@ -148,6 +148,13 @@ class Settings(BaseSettings):
     STATE_BACKUP_KEEP: int = Field(default=7, ge=1)
     STATE_BACKUP_HOUR: int = Field(default=4, ge=0, le=23)
     STATE_BACKUP_MINUTE: int = Field(default=0, ge=0, le=59)
+    # 오프사이트 복제 — 백업이 같은 디스크에만 있으면 SPOF 를 못 벗어난다.
+    # **목적지는 코드가 정하지 않는다.** 비어 있으면 아무 데도 보내지 않고
+    # 'disabled' 로 보고한다 — 설정 안 됨을 성공으로 덮지 않기 위해서다.
+    #   /mnt/backup/stock_auto        로컬·마운트 경로
+    #   user@host:/path/stock_auto    rsync over SSH (키 인증)
+    OFFSITE_BACKUP_DEST: str = ""
+    OFFSITE_BACKUP_TIMEOUT_SEC: int = Field(default=900, ge=30)
     OPS_ALERT_DEDUPE_MINUTES: int = Field(default=60, ge=1)
     # 일일 멀티에이전트(V2) 배치 — signal_outcomes 표본 자동 축적용.
     # 시각은 서버 로컬 시간 기준. 기본 17:30 (KRX 마감 15:30 이후).
@@ -308,6 +315,8 @@ STATE_BACKUP_DIR = settings.STATE_BACKUP_DIR
 STATE_BACKUP_KEEP = settings.STATE_BACKUP_KEEP
 STATE_BACKUP_HOUR = settings.STATE_BACKUP_HOUR
 STATE_BACKUP_MINUTE = settings.STATE_BACKUP_MINUTE
+OFFSITE_BACKUP_DEST = settings.OFFSITE_BACKUP_DEST
+OFFSITE_BACKUP_TIMEOUT_SEC = settings.OFFSITE_BACKUP_TIMEOUT_SEC
 OPS_ALERT_DEDUPE_MINUTES = settings.OPS_ALERT_DEDUPE_MINUTES
 SCREENER_BATCH_ENABLED = settings.SCREENER_BATCH_ENABLED
 SCREENER_BATCH_HOUR = settings.SCREENER_BATCH_HOUR

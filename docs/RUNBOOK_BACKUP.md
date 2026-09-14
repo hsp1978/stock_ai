@@ -116,4 +116,8 @@ curl -s 'localhost:8100/signal-accuracy' | jq '.sampling'
 - 백업 주기는 24시간이다. 최악의 경우 하루치 스캔·평가가 사라진다
 - `.env` 를 백업에 넣지 않으면 키는 별도로 보관해야 한다. 어디에 두는지 정하는 것도
   복구 절차의 일부다 — 지금은 정해져 있지 않다
-- 같은 노드에만 두면 아무 것도 대비되지 않는다 (§3 참조)
+- **오프사이트 목적지가 아직 설정되지 않았다** (`OFFSITE_BACKUP_DEST=`). 복제 기능은
+  있지만 목적지가 비어 있으면 아무 데도 보내지 않는다 — 설정 전까지 백업은 이 노드에만
+  있고 SPOF 는 그대로다. `/ops/backups` 의 `offsite.configured` 가 이 사실을 보고한다
+- 문서상 듀얼 노드 파트너인 `hsptest-macstudio` 가 **5일째 offline** 이다
+  (2026-09-14 확인, `is_mac_studio_available()` False). 목적지를 정할 때 함께 볼 것
