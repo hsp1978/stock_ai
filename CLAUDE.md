@@ -62,7 +62,8 @@ stock_auto/
 │  ├ db.py (SQLite WAL)
 │  └ data_sources/  brokers/  execution/
 ├ stock_analyzer/                       # Streamlit webui + scanner
-│  ├ webui.py (5,136 lines, 리팩터 대상)
+│  ├ webui.py (350 lines — 부팅·내비·커맨드바·라우팅)
+│  ├ ui/ (공용 8모듈 + pages/ 17페이지 — 분해 완료 2026-09-14)
 │  ├ multi_agent.py (8 agents Orchestrator)
 │  ├ enhanced_decision_maker.py
 │  ├ dual_node_config.py (라우팅/폴백)
@@ -162,7 +163,8 @@ make help
 7. **차트 PNG 무한 누적 방치 금지.** 30일 이상 파일 자동 정리 cron 유지.
 8. **DB 직접 SQL 변경 금지.** Alembic migration 도입 후 마이그레이션 스크립트로만.
 9. **README 라우팅 표 수정 시 `dual_node_config.py` 코드와 일치 확인.**
-10. **5,136 라인 `webui.py`를 한 번에 분리하지 말 것.** P2 단계에서 페이지 단위 점진 분리.
+10. **`webui.py`에 페이지를 다시 들이지 말 것.** 화면은 `ui/pages/`, 공용은 `ui/*.py`.
+    새 페이지 분리는 `scripts/extract_webui_page.py` 사용 (자유변수 분석으로 import 생성).
 
 ---
 
@@ -293,8 +295,8 @@ PR 머지 시:
 
 | # | 안티패턴 | 처리 단계 |
 |---|---|---|
-| 1 | God file (`webui.py` **6,379 라인**) | P2 — 포맷 로직은 `report_format.py`로 분리 시작 |
-| 2 | Dual call path (in-proc + HTTP) | P2 (HTTP 단일화). `/paper`·`/trading`·`/gpu`는 강제 HTTP |
+| 1 | ~~God file (`webui.py`)~~ ✅ 6,482 → **350 라인** (`ui/` 공용 8모듈 + `pages/` 17페이지, 2026-09-14) | 완료 |
+| 2 | Dual call path (in-proc + HTTP) | P2 (HTTP 단일화). `/paper`·`/trading`·`/gpu`는 강제 HTTP. 판정은 `ui/api_client.USE_LOCAL_ENGINE` 한 곳 (webui 중복 제거 2026-09-14) |
 | 3 | `print()` 기반 로깅 | 시스템 P1 |
 | 4 | `paper_state.json` 무락 | 시스템 P0 |
 | 5 | 양방향 sys.path 주입 | P2 |
@@ -324,6 +326,7 @@ PR 머지 시:
 | 승률 44.9% (n=4,272) | 하루 48회 반복 기록을 독립 표본으로 셈 | 표본 단위 `ticker_day` + 블록 기준 CI (2026-09-10) |
 | 평균수익 −0.35% | 매도가 맞을수록 내려가는 원시 평균 | 방향 보정 키 분리 (2026-09-10) |
 | IC weight 전부 0.0 | 가중 자체가 비활성(59일<60일)인데 '제외'로 표기 | `active`/`inactive_reason` 명시 (2026-09-10) |
+| 한국장 도구 섹션 없음 | 모듈 import 실패를 print 로 삼키고 섹션을 통째로 숨김 | `ui/korean_optional.py` 사유 보존 + 항상 렌더 (2026-09-14) |
 
 **작업 시 원칙**:
 1. `except`에서 사유를 버리지 말 것. 최소한 로그에 남긴다.
@@ -342,7 +345,8 @@ PR 머지 시:
 - `docs/USER_MANUAL.md` — WebUI 사용법 (사이드바=이동 전용, 커맨드바=조작, GPU 해제)
 - `docs/PHASE_1_MAC_STUDIO.md` / `PHASE_3_OPERATION.md` — 듀얼 노드 셋업/운영
 - `docs/DESIGN_SYSTEM.md` — 화면 토큰·컴포넌트 규격 v1.0 + Streamlit 구현 함정.
-  `:root` 토큰은 `webui.py`에 이식돼 있고 `tests/unit/test_design_system.py`가 정합을 고정한다.
+  `:root` 토큰은 `stock_analyzer/ui/theme.py`에 있고 `tests/unit/test_design_system.py`가
+  정합을 고정한다 (컴포넌트 규칙은 `webui.py` + `ui/**` 전체를 훑는다 — 위치 고정 금지).
   (원본 HTML 4.1MB는 폰트 임베드 번들이라 gitignore)
 
 > 위 브리프·PHASE 문서는 **작성 시점 기록**이다. 현재 동작은 코드와
