@@ -121,6 +121,11 @@ class Settings(BaseSettings):
     # 기억하는 모든 종목을 봐서, 워치리스트에서 빠진 지 한 달 넘은 종목 15건이
     # 영구 stale 로 남아 **경보가 항상 켜져 있었다** (2026-09-14).
     DATA_HEALTH_RECENT_ANALYSIS_DAYS: int = Field(default=3, ge=0)
+    # 보유 포지션 시가평가 주기. 손절·익절·트레일링·시간청산은 전부
+    # `update_position_prices()` 안에서만 평가되므로, 이 주기가 곧 **청산 규칙이
+    # 검토되는 주기**다. 2026-09-14 이전에는 스케줄 등록 자체가 없어 수동 버튼을
+    # 누를 때만 돌았다 (실측: 144일간 미평가).
+    POSITION_MARK_INTERVAL_MINUTES: int = Field(default=30, ge=1)
     OPS_ALERT_DEDUPE_MINUTES: int = Field(default=60, ge=1)
     # 일일 멀티에이전트(V2) 배치 — signal_outcomes 표본 자동 축적용.
     # 시각은 서버 로컬 시간 기준. 기본 17:30 (KRX 마감 15:30 이후).
@@ -270,6 +275,7 @@ CORPORATE_ACTION_CHECK_MINUTE = settings.CORPORATE_ACTION_CHECK_MINUTE
 DATA_HEALTH_CHECK_MINUTES = settings.DATA_HEALTH_CHECK_MINUTES
 DATA_HEALTH_ALERT_STALE_HOURS = settings.DATA_HEALTH_ALERT_STALE_HOURS
 DATA_HEALTH_RECENT_ANALYSIS_DAYS = settings.DATA_HEALTH_RECENT_ANALYSIS_DAYS
+POSITION_MARK_INTERVAL_MINUTES = settings.POSITION_MARK_INTERVAL_MINUTES
 OPS_ALERT_DEDUPE_MINUTES = settings.OPS_ALERT_DEDUPE_MINUTES
 SCREENER_BATCH_ENABLED = settings.SCREENER_BATCH_ENABLED
 SCREENER_BATCH_HOUR = settings.SCREENER_BATCH_HOUR
