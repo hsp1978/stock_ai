@@ -48,7 +48,7 @@ from config import (
     SERVICE_SCHEDULER_ENABLED, SIGNAL_VALIDATION_HOUR, SIGNAL_VALIDATION_MINUTE,
     CORPORATE_ACTION_CHECK_HOUR, CORPORATE_ACTION_CHECK_MINUTE,
     DATA_HEALTH_CHECK_MINUTES, DATA_HEALTH_ALERT_STALE_HOURS,
-    DATA_HEALTH_RECENT_ANALYSIS_DAYS,
+    DATA_HEALTH_RECENT_ANALYSIS_DAYS, POSITION_MARK_INTERVAL_MINUTES,
     OPS_ALERT_DEDUPE_MINUTES, DEFAULT_HISTORY_PERIOD,
     SCREENER_BATCH_ENABLED, SCREENER_BATCH_HOUR, SCREENER_BATCH_MINUTE,
     SIGNAL_EVAL_DAYS_BACK, SIGNAL_EVAL_BACKLOG_ALERT,
@@ -340,6 +340,7 @@ _KNOWN_OPS_JOBS = {
     "daily_signal_validation": "Signal Validation",
     "corporate_actions": "Corporate Actions",
     "data_health_check": "Data Health Check",
+    "position_mark_to_market": "Position Mark-to-Market",
     "multi_agent_batch": "Multi-Agent Batch",
 }
 
@@ -729,7 +730,8 @@ def _position_price_freshness() -> dict[str, dict]:
     for ticker, pos in positions.items():
         if not isinstance(pos, dict):
             continue
-        stamp = pos.get("last_updated")
+        # paper_trader 가 쓰는 키는 price_updated_at. last_updated 는 과거 형식이다.
+        stamp = pos.get("price_updated_at") or pos.get("last_updated")
         age_sec = None
         if stamp:
             try:
@@ -740,7 +742,7 @@ def _position_price_freshness() -> dict[str, dict]:
             except (TypeError, ValueError):
                 age_sec = None
         result[str(ticker).upper().strip()] = {
-            "last_updated": stamp,
+            "price_updated_at": stamp,
             "age_sec": age_sec,
             "never_marked": not stamp,
             "entry_date": pos.get("entry_date"),
@@ -1855,6 +1857,98 @@ def run_screener_batch() -> dict:
         return {"status": "error", "error": str(exc)}
 
 
+def mark_positions_to_market() -> dict:
+    """보유 포지션의 현재가를 갱신하고 청산 규칙을 평가한다.
+
+    손절·익절·트레일링·시간 청산은 `update_position_prices()` 안에서만 평가된다.
+    즉 **이 함수가 안 돌면 청산 규칙이 존재하지 않는 것과 같다.** 2026-09-14
+    실측: 스케줄 등록이 없어 두 포지션이 144일간 진입가에 멈춰 있었고 그동안
+    어떤 청산도 평가되지 않았다.
+
+    시세를 못 받은 종목은 조용히 건너뛰지 않는다 — 갱신된 척하면 데이터 헬스가
+    다시 거짓 OK 를 보고한다 (CLAUDE.md §13-2).
+    """
+    state = _get_paper_state()
+    tickers = list((state.get("positions") or {}).keys())
+    if not tickers:
+        return {
+            "status": "empty",
+            "updated": 0,
+            "failed": 0,
+            "prices": {},
+            "failures": [],
+            "auto_closed": [],
+        }
+
+    prices: dict[str, float] = {}
+    failures: list[dict] = []
+    for ticker in tickers:
+        try:
+            df = fetch_ohlcv(ticker, period="5d")
+        except Exception as exc:
+            failures.append({"ticker": ticker, "error": f"{type(exc).__name__}: {exc}"[:160]})
+            continue
+        if df is None or df.empty:
+            failures.append({"ticker": ticker, "error": "no_price_data"})
+            continue
+        try:
+            prices[ticker] = float(df["Close"].iloc[-1])
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            failures.append({"ticker": ticker, "error": f"bad_close: {exc}"[:160]})
+
+    auto_closed = update_position_prices(prices) if prices else []
+
+    if failures and not prices:
+        status = "error"
+    elif failures:
+        status = "degraded"
+    else:
+        status = "completed"
+
+    return {
+        "status": status,
+        "updated": len(prices),
+        "failed": len(failures),
+        "position_count": len(tickers),
+        "prices": prices,
+        "failures": failures,
+        "auto_closed": auto_closed,
+    }
+
+
+def run_position_mark_to_market() -> dict:
+    """스케줄 잡 — 보유 포지션 시가평가."""
+    started_at = _record_job_start(
+        "position_mark_to_market", _KNOWN_OPS_JOBS["position_mark_to_market"]
+    )
+    try:
+        result = mark_positions_to_market()
+        if result["status"] in {"degraded", "error"}:
+            _send_ops_alert(
+                "Position mark-to-market incomplete",
+                f"status={result['status']}, updated={result['updated']}, "
+                f"failed={result['failed']} | "
+                + "; ".join(f"{f['ticker']}({f['error']})" for f in result["failures"][:5]),
+                severity="error" if result["status"] == "error" else "warning",
+                dedupe_key=f"position_mtm:{result['status']}",
+            )
+        if result["auto_closed"]:
+            _send_ops_alert(
+                "Paper positions auto-closed",
+                "; ".join(
+                    f"{o.get('ticker')} {o.get('qty')}주 — {o.get('reason', '')}"
+                    for o in result["auto_closed"][:5]
+                ),
+                severity="warning",
+                dedupe_key=None,
+            )
+        _record_job_success("position_mark_to_market", started_at, result)
+        return result
+    except Exception as exc:
+        _record_job_error("position_mark_to_market", started_at, exc)
+        return {"status": "error", "error": str(exc)}
+
+
 def run_data_health_check() -> dict:
     """데이터 freshness SLO를 평가하고 stale/degraded 상태를 알린다."""
     started_at = _record_job_start("data_health_check", _KNOWN_OPS_JOBS["data_health_check"])
@@ -1929,6 +2023,14 @@ def _start_background_scheduler(run_initial_scan: bool = False) -> None:
         id='data_health_check',
         replace_existing=True,
     )
+    scheduler.add_job(
+        run_position_mark_to_market,
+        'interval',
+        minutes=POSITION_MARK_INTERVAL_MINUTES,
+        id='position_mark_to_market',
+        next_run_time=datetime.now() + timedelta(seconds=30),
+        replace_existing=True,
+    )
     if SCREENER_BATCH_ENABLED:
         scheduler.add_job(
             run_screener_batch,
@@ -1950,6 +2052,10 @@ def _start_background_scheduler(run_initial_scan: bool = False) -> None:
     scheduler.start()
     _SCHEDULER = scheduler
     print(f"[스케줄러] {SCAN_INTERVAL_MINUTES}분 간격 스캔 등록 완료")
+    print(
+        f"[스케줄러] 포지션 시가평가 {POSITION_MARK_INTERVAL_MINUTES}분 간격 등록 완료 "
+        "— 손절·익절·트레일링은 이 잡에서만 평가된다"
+    )
     print(
         f"[스케줄러] 일일 신호 검증 등록 완료 "
         f"({SIGNAL_VALIDATION_HOUR:02d}:{SIGNAL_VALIDATION_MINUTE:02d})\n"
@@ -2440,6 +2546,8 @@ def ops_run_job(job_id: str, force: bool = False):
         return run_multi_agent_batch()
     if normalized in {"screener_batch", "screener"}:
         return run_screener_batch()
+    if normalized in {"position_mark_to_market", "position_mtm", "mark_to_market"}:
+        return run_position_mark_to_market()
     raise HTTPException(404, f"Unknown ops job: {job_id}")
 
 
@@ -2689,30 +2797,12 @@ def api_paper_quote(ticker: str):
 
 @app.post("/paper/update-prices")
 def api_update_prices():
-    """
-    보유 포지션의 현재가를 일괄 갱신 + trailing/time/SL/TP 체크.
-    WebUI에서 "가격 갱신" 버튼으로 수동 호출 가능.
-    """
-    state = _get_paper_state()
-    tickers = list(state.get("positions", {}).keys())
-    if not tickers:
-        return {"updated": 0, "auto_closed": [], "positions": {}}
+    """보유 포지션 시가평가 + trailing/time/SL/TP 평가 (수동 호출).
 
-    prices = {}
-    for t in tickers:
-        try:
-            df = fetch_ohlcv(t, period="5d")
-            if df is not None and not df.empty:
-                prices[t] = float(df["Close"].iloc[-1])
-        except Exception:
-            continue
-
-    auto_closed = update_position_prices(prices)
-    return {
-        "updated": len(prices),
-        "prices": prices,
-        "auto_closed": auto_closed,
-    }
+    스케줄 잡 `position_mark_to_market` 과 **같은 함수**를 쓴다. 수동 경로와
+    자동 경로가 갈라지면 둘 중 하나만 고쳐지는 일이 생긴다.
+    """
+    return JSONResponse(content=_sanitize(mark_positions_to_market()))
 
 
 @app.post("/paper/corporate-actions/adjust")

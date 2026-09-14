@@ -274,6 +274,7 @@ def get_portfolio_status() -> dict:
                 "qty": p["qty"],
                 "entry_price": p["entry_price"],
                 "current_price": p.get("current_price", p["entry_price"]),
+                "price_updated_at": p.get("price_updated_at"),
                 "pnl": round((p.get("current_price", p["entry_price"]) - p["entry_price"]) * p["qty"], 2),
                 "pnl_pct": round((p.get("current_price", p["entry_price"]) / p["entry_price"] - 1) * 100, 2),
                 "entry_date": p.get("entry_date", ""),
@@ -343,6 +344,7 @@ def execute_paper_order(ticker: str, action: str, qty: int,
                 "qty": total_qty,
                 "entry_price": round(avg_price, 4),
                 "current_price": price,
+                "price_updated_at": datetime.now().isoformat(),
                 "peak_price": max(existing.get("peak_price", price), price),
                 "entry_date": existing.get("entry_date", datetime.now().isoformat()),
                 "trailing_stop_pct": trailing_stop_pct or existing.get("trailing_stop_pct", 0.0),
@@ -355,6 +357,7 @@ def execute_paper_order(ticker: str, action: str, qty: int,
                 "qty": qty,
                 "entry_price": price,
                 "current_price": price,
+                "price_updated_at": datetime.now().isoformat(),
                 "peak_price": price,
                 "entry_date": datetime.now().isoformat(),
                 "trailing_stop_pct": trailing_stop_pct,
@@ -398,6 +401,7 @@ def execute_paper_order(ticker: str, action: str, qty: int,
         if remaining > 0:
             positions[ticker]["qty"] = remaining
             positions[ticker]["current_price"] = price
+            positions[ticker]["price_updated_at"] = datetime.now().isoformat()
         else:
             del positions[ticker]
 
@@ -451,7 +455,15 @@ def process_agent_signal(ticker: str, result: dict, current_price: float) -> Opt
 
 
 def update_position_prices(prices: dict[str, float]) -> list[dict]:
-    """포지션 가격 업데이트 + Trailing Stop/시간 기반 자동 청산
+    """포지션 시가평가 + Trailing Stop/손절/익절/시간 청산 평가.
+
+    **청산 규칙은 전부 이 함수 안에서만 평가된다.** 이 함수가 안 돌면 손절도
+    익절도 트레일링도 영원히 걸리지 않는다 — 2026-09-14 실측에서 두 포지션이
+    2026-04-23 진입 이후 144일간 `current_price == entry_price` 였고, 그동안
+    어떤 청산 규칙도 평가된 적이 없었다.
+
+    갱신한 종목에는 `price_updated_at` 을 남긴다. 남기지 않으면 '평가했다'와
+    '평가한 적 없다'를 구분할 수 없다 (CLAUDE.md §13-2).
 
     Returns:
         자동 청산된 주문 목록
@@ -460,6 +472,7 @@ def update_position_prices(prices: dict[str, float]) -> list[dict]:
     _apply_corporate_actions_to_state(state, tickers=list(prices.keys()))
     positions = state.get("positions", {})
     auto_closed = []
+    now_iso = datetime.now().isoformat()
 
     for ticker, price in prices.items():
         if ticker not in positions:
@@ -467,6 +480,7 @@ def update_position_prices(prices: dict[str, float]) -> list[dict]:
 
         pos = positions[ticker]
         pos["current_price"] = price
+        pos["price_updated_at"] = now_iso
 
         # Peak price 업데이트 (trailing stop 기준)
         peak = pos.get("peak_price", pos.get("entry_price", price))

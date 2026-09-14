@@ -227,7 +227,10 @@ def render_virtual_trade():
                         st.write(f"  • {ac.get('ticker')} — {ac.get('reason', '?')}")
             st.rerun()
     with col_info:
-        st.caption("손절/익절/trailing/시간 조건이 충족되면 자동으로 청산됩니다.")
+        st.caption(
+            "손절/익절/trailing/시간 조건은 **현재가 갱신 시에만** 평가됩니다. "
+            "자동 갱신은 `position_mark_to_market` 잡이 담당합니다."
+        )
 
     if not positions_map:
         st.info("📭 보유 포지션 없음. 위 폼에서 첫 가상 매수를 시작하세요.")
@@ -257,6 +260,14 @@ def render_virtual_trade():
                            delta=f"{pnl_pct:+.2f}%",
                            delta_color="normal" if pnl_pct >= 0 else "inverse")
                 cc4.metric("손익", f"{cur}{pnl:+,.2f}")
+
+                # 언제 평가된 손익인지 — 시각이 없으면 진입가 그대로일 수 있다.
+                # 2026-09-14 이전에는 갱신 잡이 없어 144일간 진입가에 멈춰 있었다.
+                stamp = p.get("price_updated_at")
+                if stamp:
+                    st.caption(f"현재가 갱신: {str(stamp)[:19].replace('T', ' ')}")
+                else:
+                    st.warning("현재가가 한 번도 갱신되지 않았습니다 — 손익은 진입가 기준입니다.")
 
                 # 진입일/경과일
                 entry_date = p.get("entry_date", "")
