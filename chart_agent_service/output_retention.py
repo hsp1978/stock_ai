@@ -36,6 +36,10 @@ from config import (
     OUTPUT_JSON_RETENTION_DAYS,
 )
 
+from logging_setup import get_logger
+
+logger = get_logger("stock_auto.output_retention")
+
 #: 지워도 되는 파일 패턴. 여기에 없으면 건드리지 않는다 (allowlist).
 JSON_PATTERNS = ("*_agent_*.json", "*_quant_*.json")
 CHART_PATTERNS = ("*.png",)
@@ -81,7 +85,7 @@ def _referenced_charts() -> set[str]:
         if raw:
             _collect(json.loads(raw) if isinstance(raw, str) else raw)
     except Exception as exc:
-        print(f"[output-retention] 참조 차트 복원 실패 — 차트는 건드리지 않는다: {exc}")
+        logger.error(f"[output-retention] 참조 차트 복원 실패 — 차트는 건드리지 않는다: {exc}")
         raise RuntimeError("referenced charts unknown") from exc
 
     return referenced

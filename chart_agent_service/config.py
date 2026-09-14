@@ -11,6 +11,10 @@ from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from logging_setup import get_logger
+
+logger = get_logger("stock_auto.config")
+
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ROOT_ENV = _PROJECT_ROOT / ".env"
@@ -43,7 +47,7 @@ def find_duplicate_env_keys(path: Path) -> list[str]:
 
 _DUPLICATE_ENV_KEYS = find_duplicate_env_keys(_ROOT_ENV)
 if _DUPLICATE_ENV_KEYS:
-    print(
+    logger.warning(
         "[config] 경고 — .env에 중복 선언된 키가 있습니다 (뒤 선언이 실효값): "
         + ", ".join(_DUPLICATE_ENV_KEYS)
     )

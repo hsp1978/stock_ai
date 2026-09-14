@@ -55,6 +55,13 @@ from config import (
     SIGNAL_EVAL_DAYS_BACK, SIGNAL_EVAL_BACKLOG_ALERT,
     MULTI_AGENT_BATCH_ENABLED, MULTI_AGENT_BATCH_HOUR, MULTI_AGENT_BATCH_MINUTE,
 )
+
+from logging_setup import configure_logging, get_logger
+
+# 로깅은 모듈 적재 시 한 번 설정한다. 종전에는 설정이 아예 없어
+# data_collector·llm/router 등이 남기던 logger.info 가 전부 버려졌다.
+configure_logging()
+logger = get_logger("stock_auto.service")
 from safety.kill_switch import KillSwitchASGIMiddleware
 from data_collector import (
     calculate_indicators,
@@ -93,7 +100,7 @@ try:
     from multi_agent import MultiAgentOrchestrator
 except ImportError:
     MultiAgentOrchestrator = None
-    print("[WARNING] Multi-Agent module not available")
+    logger.warning("Multi-Agent 모듈을 사용할 수 없다 — V2 배치가 비활성화된다")
 
 
 def _resolve_signal_price(ticker: str, *results: dict) -> float:
@@ -138,7 +145,7 @@ def _try_insert_group_outcomes(ticker: str, result: dict) -> None:
 
     price = _resolve_signal_price(ticker, result, fd)
     if price <= 0:
-        print(f"  [{ticker}] signal_outcome 기록 불가: 가격 해석 실패")
+        logger.error(f"  [{ticker}] signal_outcome 기록 불가: 가격 해석 실패")
         return
 
     regime = fd.get("regime") or result.get("regime")
@@ -161,7 +168,7 @@ def _try_insert_group_outcomes(ticker: str, result: dict) -> None:
                 agreement_level=agreement_level,
             )
         except Exception as exc:
-            print(f"  [{ticker}] final_outcome insert 실패: {exc}")
+            logger.error(f"  [{ticker}] final_outcome insert 실패: {exc}")
 
     for group_name, gr in group_results.items():
         signal = gr.get("signal", "neutral")
@@ -179,7 +186,7 @@ def _try_insert_group_outcomes(ticker: str, result: dict) -> None:
                 agreement_level=agreement_level,
             )
         except Exception as exc:
-            print(f"  [{ticker}] group_outcome insert 실패({group_name}): {exc}")
+            logger.error(f"  [{ticker}] group_outcome insert 실패({group_name}): {exc}")
 
 
 def _try_insert_signal_outcome(ticker: str, result: dict) -> None:
@@ -190,7 +197,7 @@ def _try_insert_signal_outcome(ticker: str, result: dict) -> None:
             return
         price = _resolve_signal_price(ticker, result)
         if price <= 0:
-            print(f"  [{ticker}] signal_outcome 기록 불가: 가격 해석 실패")
+            logger.error(f"  [{ticker}] signal_outcome 기록 불가: 가격 해석 실패")
             return
         insert_signal_outcome(
             ticker=ticker,
@@ -200,7 +207,7 @@ def _try_insert_signal_outcome(ticker: str, result: dict) -> None:
             price_at_signal=price,
         )
     except Exception as exc:
-        print(f"  [{ticker}] signal_outcome insert 실패: {exc}")
+        logger.error(f"  [{ticker}] signal_outcome insert 실패: {exc}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -259,7 +266,7 @@ def _gpu_pause_until() -> Optional[datetime]:
     try:
         raw = get_app_state(_STATE_GPU_PAUSE, None)
     except Exception as exc:
-        print(f"  [GPU] 해제 상태 조회 실패 — 정상 동작으로 간주: {type(exc).__name__}: {exc}")
+        logger.error(f"  [GPU] 해제 상태 조회 실패 — 정상 동작으로 간주: {type(exc).__name__}: {exc}")
         return None
     if not raw:
         return None
@@ -306,7 +313,7 @@ def _unload_ollama_model(verify_seconds: float = 10.0) -> bool:
             try:
                 httpx.post(f"{OLLAMA_BASE_URL}{path}", json=payload, timeout=20)
             except Exception as exc:
-                print(f"  [GPU] 언로드 요청 실패({path}): {type(exc).__name__}: {exc}")
+                logger.error(f"  [GPU] 언로드 요청 실패({path}): {type(exc).__name__}: {exc}")
 
     deadline = time.time() + verify_seconds
     while time.time() < deadline:
@@ -315,7 +322,7 @@ def _unload_ollama_model(verify_seconds: float = 10.0) -> bool:
         time.sleep(1.0)
 
     remaining = _loaded_model_names()
-    print(f"  [GPU] 언로드 후에도 적재 유지: {remaining}")
+    logger.warning(f"  [GPU] 언로드 후에도 적재 유지: {remaining}")
     return False
 
 
@@ -373,7 +380,7 @@ def _persist_cooling_off_state() -> None:
         with _STATE_LOCK:
             set_app_state(_STATE_COOLING_OFF, cooling_off_state)
     except Exception as exc:
-        print(f"[상태 저장] cooling_off_state 저장 실패: {exc}")
+        logger.error(f"[상태 저장] cooling_off_state 저장 실패: {exc}")
 
 
 def _persist_latest_result_summary(ticker: str | None = None) -> None:
@@ -392,7 +399,7 @@ def _persist_latest_result_summary(ticker: str | None = None) -> None:
                 )
                 set_app_state(_STATE_LATEST_RESULTS, _LATEST_SUMMARY_CACHE)
     except Exception as exc:
-        print(f"[상태 저장] latest_results 저장 실패: {exc}")
+        logger.error(f"[상태 저장] latest_results 저장 실패: {exc}")
 
 
 def _stage_latest_result_summary(ticker: str) -> None:
@@ -408,7 +415,7 @@ def _flush_latest_result_summaries() -> None:
         with _STATE_LOCK:
             set_app_state(_STATE_LATEST_RESULTS, _LATEST_SUMMARY_CACHE)
     except Exception as exc:
-        print(f"[상태 저장] latest_results batch 저장 실패: {exc}")
+        logger.error(f"[상태 저장] latest_results batch 저장 실패: {exc}")
 
 
 def _persist_scan_history() -> None:
@@ -416,7 +423,7 @@ def _persist_scan_history() -> None:
         with _STATE_LOCK:
             set_app_state(_STATE_SCAN_HISTORY, scan_history[-100:])
     except Exception as exc:
-        print(f"[상태 저장] scan_history 저장 실패: {exc}")
+        logger.error(f"[상태 저장] scan_history 저장 실패: {exc}")
 
 
 def _parse_iso_datetime(value: str | None) -> datetime | None:
@@ -436,7 +443,7 @@ def _persist_job_status() -> None:
         with _STATE_LOCK:
             set_app_state(_STATE_JOB_STATUS, _JOB_STATUS)
     except Exception as exc:
-        print(f"[상태 저장] job_status 저장 실패: {exc}")
+        logger.error(f"[상태 저장] job_status 저장 실패: {exc}")
 
 
 def _persist_data_health() -> None:
@@ -444,7 +451,7 @@ def _persist_data_health() -> None:
         with _STATE_LOCK:
             set_app_state(_STATE_DATA_HEALTH, _LAST_DATA_HEALTH)
     except Exception as exc:
-        print(f"[상태 저장] data_health 저장 실패: {exc}")
+        logger.error(f"[상태 저장] data_health 저장 실패: {exc}")
 
 
 def _persist_ops_alerts() -> None:
@@ -452,7 +459,7 @@ def _persist_ops_alerts() -> None:
         with _STATE_LOCK:
             set_app_state(_STATE_OPS_ALERTS, _OPS_ALERTS)
     except Exception as exc:
-        print(f"[상태 저장] ops_alerts 저장 실패: {exc}")
+        logger.error(f"[상태 저장] ops_alerts 저장 실패: {exc}")
 
 
 def _summarize_job_result(result: Any) -> Any:
@@ -683,14 +690,14 @@ def _collect_data_health_tickers(
         for ticker in _load_watchlist_files():
             _mark(ticker, "watchlist")
     except Exception as exc:
-        print(f"[data-health] 워치리스트 로드 실패: {exc}")
+        logger.error(f"[data-health] 워치리스트 로드 실패: {exc}")
 
     try:
         positions = (get_portfolio_status() or {}).get("positions") or {}
         for ticker in positions:
             _mark(ticker, "position")
     except Exception as exc:
-        print(f"[data-health] 포지션 조회 실패: {exc}")
+        logger.error(f"[data-health] 포지션 조회 실패: {exc}")
 
     excluded = []
     max_age = float(DATA_HEALTH_RECENT_ANALYSIS_DAYS)
@@ -724,7 +731,7 @@ def _position_price_freshness() -> dict[str, dict]:
     try:
         positions = (get_portfolio_status() or {}).get("positions") or {}
     except Exception as exc:
-        print(f"[data-health] 포지션 시세 상태 조회 실패: {exc}")
+        logger.error(f"[data-health] 포지션 시세 상태 조회 실패: {exc}")
         return {}
 
     now = datetime.now()
@@ -1007,7 +1014,7 @@ def _restore_runtime_state() -> None:
             if isinstance(ops_alerts, dict):
                 _OPS_ALERTS.clear()
                 _OPS_ALERTS.update(ops_alerts)
-        print(
+        logger.info(
             f"[상태 복원] cooling_off={len(cooling_off_state)}, "
             f"latest={len(latest_results)}, history={len(scan_history)}, "
             f"jobs={len(_JOB_STATUS)}"
@@ -1015,7 +1022,7 @@ def _restore_runtime_state() -> None:
     except Exception as exc:
         with _STATE_LOCK:
             _RUNTIME_STATE_RESTORED = False
-        print(f"[상태 복원] 실패: {exc}")
+        logger.error(f"[상태 복원] 실패: {exc}")
 
 
 def _fetch_in_worker_scope(fetch_fn, ticker: str):
@@ -1030,7 +1037,7 @@ def _fetch_in_worker_scope(fetch_fn, ticker: str):
 
 def _fetch_analysis_inputs(ticker: str):
     """OHLCV와 보조 API를 병렬 수집한다. OHLCV만 필수 데이터로 취급한다."""
-    print(f"  [{ticker}] 데이터 병렬 수집...")
+    logger.info(f"  [{ticker}] 데이터 병렬 수집...")
     executor = ThreadPoolExecutor(max_workers=4)
     futures = {
         "ohlcv": executor.submit(_fetch_in_worker_scope, fetch_ohlcv, ticker),
@@ -1052,10 +1059,10 @@ def _fetch_analysis_inputs(ticker: str):
             try:
                 values[name] = futures[name].result(timeout=_AUX_FETCH_TIMEOUT)
             except FutureTimeoutError:
-                print(f"  [{ticker}] {name} 수집 시간 초과")
+                logger.warning(f"  [{ticker}] {name} 수집 시간 초과")
                 values[name] = default
             except Exception as exc:
-                print(f"  [{ticker}] {name} 수집 실패: {exc}")
+                logger.error(f"  [{ticker}] {name} 수집 실패: {exc}")
                 values[name] = default
 
         return df, values["fundamentals"], values["options_pcr"], values["insider_trades"]
@@ -1074,7 +1081,7 @@ def _record_telegram_failure(reason: str) -> None:
 
         _record_send_failure(reason)
     except Exception:
-        print(f"[텔레그램 오류] {reason[:200]}")
+        logger.error(f"[텔레그램 오류] {reason[:200]}")
 
 
 def _record_telegram_success() -> None:
@@ -1099,7 +1106,7 @@ def _telegram_delivery_status() -> dict:
 def send_telegram(text: str, parse_mode: str = "HTML") -> bool:
     """텔레그램 메시지 전송"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[텔레그램] 미설정. 알림 건너뜀.")
+        logger.warning("[텔레그램] 미설정. 알림 건너뜀.")
         return False
     try:
         resp = httpx.post(
@@ -1139,7 +1146,7 @@ def send_telegram_image(image_path: str, caption: str = "") -> bool:
             )
         return resp.status_code == 200
     except Exception as e:
-        print(f"[텔레그램 이미지 오류] {e}")
+        logger.error(f"[텔레그램 이미지 오류] {e}")
         return False
 
 
@@ -1196,7 +1203,7 @@ def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
     try:
         df, fundamentals, options_pcr, insider_trades = _fetch_analysis_inputs(ticker)
 
-        print(f"  [{ticker}] 분석 도구 실행...")
+        logger.info(f"  [{ticker}] 분석 도구 실행...")
         agent = ChartAnalysisAgent(ticker, df)
         result = agent.run(mode=ai_mode)
 
@@ -1225,7 +1232,7 @@ def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
                 risks = list(result.get("critical_risks") or [])
                 risks.append(f"가격 소스 불일치 — {pv.detail}")
                 result["critical_risks"] = risks
-                print(f"  [{ticker}] 경고: {pv.detail}")
+                logger.warning(f"  [{ticker}] 경고: {pv.detail}")
         except Exception as exc:
             result["price_verification"] = {
                 "status": "unavailable",
@@ -1237,7 +1244,7 @@ def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
             chart_path = generate_agent_chart(ticker, df, result)
             result["chart_path"] = chart_path
         except Exception as e:
-            print(f"  [{ticker}] 차트 생성 실패: {e}")
+            logger.error(f"  [{ticker}] 차트 생성 실패: {e}")
 
         json_path = os.path.join(OUTPUT_DIR, f"{ticker}_agent_{datetime.now().strftime('%Y%m%d_%H%M')}.json")
         with open(json_path, 'w', encoding='utf-8') as f:
@@ -1246,11 +1253,11 @@ def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
         result["json_path"] = json_path
         result["analyzed_at"] = datetime.now().isoformat()
 
-        print(f"  [{ticker}] 완료: {result.get('final_signal')} (점수: {result.get('composite_score')})")
+        logger.info(f"  [{ticker}] 완료: {result.get('final_signal')} (점수: {result.get('composite_score')})")
         return result
 
     except Exception as e:
-        print(f"  [{ticker}] 분석 실패: {e}")
+        logger.error(f"  [{ticker}] 분석 실패: {e}")
         return None
 
 
@@ -1267,7 +1274,7 @@ def analyze_quant_ticker(ticker: str, benchmark: str = "") -> dict:
     ticker = ticker.upper()
     benchmark = (benchmark or _default_benchmark_ticker(ticker)).upper()
     try:
-        print(f"  [{ticker}] 퀀트 지표 데이터 수집...")
+        logger.info(f"  [{ticker}] 퀀트 지표 데이터 수집...")
         df = fetch_ohlcv(ticker)
         df = calculate_indicators(df)
 
@@ -1276,7 +1283,7 @@ def analyze_quant_ticker(ticker: str, benchmark: str = "") -> dict:
             try:
                 benchmark_df = fetch_ohlcv(benchmark)
             except Exception as exc:
-                print(f"  [{ticker}] 벤치마크 {benchmark} 수집 실패: {exc}")
+                logger.error(f"  [{ticker}] 벤치마크 {benchmark} 수집 실패: {exc}")
 
         result = analyze_quant_indicators(ticker, df, benchmark_df=benchmark_df)
         result["benchmark_ticker"] = benchmark if benchmark_df is not None else None
@@ -1288,7 +1295,7 @@ def analyze_quant_ticker(ticker: str, benchmark: str = "") -> dict:
         }
         return _sanitize(result)
     except Exception as exc:
-        print(f"  [{ticker}] 퀀트 분석 실패: {exc}")
+        logger.error(f"  [{ticker}] 퀀트 분석 실패: {exc}")
         return {"ticker": ticker, "status": "error", "error": str(exc)}
 
 
@@ -1312,7 +1319,7 @@ def check_alert_condition(ticker: str, result: dict) -> Optional[dict]:
             reason.append(f"신뢰도 부족({confidence}<{MIN_CONFIDENCE})")
         if SELL_THRESHOLD < score < BUY_THRESHOLD:
             reason.append(f"점수 범위 밖({SELL_THRESHOLD}<{score}<{BUY_THRESHOLD})")
-        print(f"  [{ticker}] 알림 조건 미충족: {', '.join(reason)}")
+        logger.info(f"  [{ticker}] 알림 조건 미충족: {', '.join(reason)}")
         return None
 
     # 1.5) 냉각기 체크 — 손절(SELL) 알림 이후 COOLING_OFF_DAYS 동안 BUY 알림 억제
@@ -1321,7 +1328,7 @@ def check_alert_condition(ticker: str, result: dict) -> Optional[dict]:
         elapsed_days = (datetime.now() - datetime.fromisoformat(cool["triggered_at"])).total_seconds() / 86400
         if elapsed_days < COOLING_OFF_DAYS:
             remaining = COOLING_OFF_DAYS - elapsed_days
-            print(f"  [{ticker}] 냉각기 활성 중 ({remaining:.1f}일 남음, SELL 이후 BUY 억제)")
+            logger.info(f"  [{ticker}] 냉각기 활성 중 ({remaining:.1f}일 남음, SELL 이후 BUY 억제)")
             return None
         else:
             del cooling_off_state[ticker]
@@ -1343,10 +1350,10 @@ def check_alert_condition(ticker: str, result: dict) -> Optional[dict]:
     if prev_signal == signal and prev_time:
         elapsed = (datetime.now() - datetime.fromisoformat(prev_time)).total_seconds()
         if elapsed < COOLDOWN_SECONDS:
-            print(f"  [{ticker}] 중복 알림 억제 ({signal}, {elapsed/3600:.1f}시간 전 발송)")
+            logger.info(f"  [{ticker}] 중복 알림 억제 ({signal}, {elapsed/3600:.1f}시간 전 발송)")
             return None
 
-    print(f"  [{ticker}] ⚡ 기준치 도달! {signal} (점수: {score}, 신뢰도: {confidence})")
+    logger.info(f"  [{ticker}] ⚡ 기준치 도달! {signal} (점수: {score}, 신뢰도: {confidence})")
     return {
         "ticker": ticker,
         "signal": signal,
@@ -1385,7 +1392,7 @@ def send_summary_alert(alerts: list) -> bool:
             })
         delivered = bool(send_daily_digest(digest_rows, top_n=10, min_confidence=0.0))
     except Exception as exc:
-        print(f"  [알림] digest 포맷 실패 → 기본 포맷 폴백: {type(exc).__name__}: {exc}")
+        logger.error(f"  [알림] digest 포맷 실패 → 기본 포맷 폴백: {type(exc).__name__}: {exc}")
         # 새 모듈 실패 시 기본 포맷으로 폴백
         buy_alerts = [a for a in alerts if a["signal"] == "BUY"]
         sell_alerts = [a for a in alerts if a["signal"] == "SELL"]
@@ -1405,7 +1412,7 @@ def send_summary_alert(alerts: list) -> bool:
     if not delivered:
         # 전송 실패 시 중복 억제 타임스탬프를 남기면 다음 1시간 알림까지 막힌다.
         # 기록하지 않아 다음 스캔이 재시도하게 한다.
-        print("  ⚠️ [알림] 텔레그램 전송 실패 — scan_log.alert_sent=0, 다음 스캔에서 재시도")
+        logger.error("  ⚠️ [알림] 텔레그램 전송 실패 — scan_log.alert_sent=0, 다음 스캔에서 재시도")
         return False
 
     # 알림 발송 시간 기록 (중복 억제용) — 전송 성공 시에만
@@ -1464,19 +1471,19 @@ def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
     # VRAM을 도로 점유하고, LLM 호출은 타임아웃으로 실패한다.
     until = _gpu_pause_until()
     if until:
-        print(f"  [GPU] 일시 해제 중 — 스캔 건너뜀 (복귀 예정 {until.strftime('%H:%M')})")
+        logger.warning(f"  [GPU] 일시 해제 중 — 스캔 건너뜀 (복귀 예정 {until.strftime('%H:%M')})")
         return {"status": "skipped", "reason": "gpu_paused", "resume_at": until.isoformat()}
 
     tickers = override_tickers if override_tickers else _load_watchlist_files()
     max_workers = int(_os.getenv("SCAN_PARALLEL_WORKERS", "3"))
 
     t_scan_start = time.time()
-    print(f"\n{'='*60}")
-    print(f"  스캔 시작: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"  종목: {len(tickers)}개 - {', '.join(tickers)}")
-    print(f"  병렬 워커: {max_workers}개")
-    print(f"  임계값: 매수≥{BUY_THRESHOLD}, 매도≤{SELL_THRESHOLD}, 신뢰도≥{MIN_CONFIDENCE}")
-    print(f"{'='*60}\n")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"  스캔 시작: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    logger.info(f"  종목: {len(tickers)}개 - {', '.join(tickers)}")
+    logger.info(f"  병렬 워커: {max_workers}개")
+    logger.info(f"  임계값: 매수≥{BUY_THRESHOLD}, 매도≤{SELL_THRESHOLD}, 신뢰도≥{MIN_CONFIDENCE}")
+    logger.info(f"{'='*60}\n")
 
     # ── 단계 1: yfinance 배치 사전 다운로드 ──────────────────
     from data_collector import prefetch_ohlcv_batch, clear_ohlcv_cache
@@ -1507,7 +1514,7 @@ def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
             try:
                 ticker, result = future.result()
             except Exception as e:
-                print(f"  [{ticker}] 오류: {e}")
+                logger.error(f"  [{ticker}] 오류: {e}")
                 result = None
 
             if result:
@@ -1543,24 +1550,24 @@ def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
     try:
         build_data_health()
     except Exception as exc:
-        print(f"  [data_health] 스캔 후 갱신 실패: {exc}")
+        logger.error(f"  [data_health] 스캔 후 갱신 실패: {exc}")
 
     elapsed = time.time() - t_scan_start
     avg = elapsed / len(tickers) if tickers else 0
-    print(f"\n  ✅ 스캔 완료: {len(tickers)}개 종목 / {elapsed:.1f}s "
+    logger.info(f"\n  ✅ 스캔 완료: {len(tickers)}개 종목 / {elapsed:.1f}s "
           f"(종목당 평균 {avg:.1f}s)")
 
     # 스캔 완료 후 기준치 도달 종목을 요약 1건으로 전송
     if pending_alerts:
-        print(f"\n  📨 알림 대상: {len(pending_alerts)}개 종목")
+        logger.info(f"\n  📨 알림 대상: {len(pending_alerts)}개 종목")
         delivered = send_summary_alert(pending_alerts)
         try:
             set_alert_sent(alerted_row_ids, delivered)
         except Exception as exc:
-            print(f"  [알림] scan_log.alert_sent 갱신 실패: {exc}")
-        print(f"  📨 전송 결과: {'성공' if delivered else '실패'}")
+            logger.error(f"  [알림] scan_log.alert_sent 갱신 실패: {exc}")
+        logger.error(f"  📨 전송 결과: {'성공' if delivered else '실패'}")
     else:
-        print(f"\n  알림 대상 없음")
+        logger.warning("알림 대상 없음")
 
     # 히스토리 저장 (최근 100건)
     scan_history.append(scan_entry)
@@ -1569,8 +1576,8 @@ def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
     _flush_latest_result_summaries()
     _persist_scan_history()
 
-    print(f"\n  스캔 완료: {datetime.now().strftime('%H:%M')}")
-    print(f"{'='*60}\n")
+    logger.info(f"\n  스캔 완료: {datetime.now().strftime('%H:%M')}")
+    logger.info(f"{'='*60}\n")
     return {
         "status": "completed",
         "ticker_count": len(tickers),
@@ -1638,9 +1645,9 @@ def _signal_eval_backlog_status(ev: dict) -> dict:
 def _run_signal_validation_impl():
     """일일 신호 사후 평가 + 신뢰도 칼리브레이션."""
     started_at = datetime.now().isoformat()
-    print(f"\n{'='*60}")
-    print(f"  신호 사후 검증 시작: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"{'='*60}\n")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"  신호 사후 검증 시작: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    logger.info(f"{'='*60}\n")
     try:
         from signal_tracker import run_daily_validation
 
@@ -1660,13 +1667,13 @@ def _run_signal_validation_impl():
             _LAST_SIGNAL_VALIDATION.clear()
             _LAST_SIGNAL_VALIDATION.update(payload)
             set_app_state(_STATE_SIGNAL_VALIDATION, _LAST_SIGNAL_VALIDATION)
-        print(
+        logger.error(
             f"  신호 검증 완료: 처리 {ev.get('processed', 0)}건, "
             f"업데이트 {ev.get('updated', 0)}건, 오류 {ev.get('errors', 0)}건, "
             f"잔량 {ev.get('pending_due', 0)}건"
         )
         if backlog["degraded"]:
-            print(f"  [경고] 평가 큐 적체: {backlog['detail']}")
+            logger.warning(f"평가 큐 적체: {backlog['detail']}")
             _send_ops_alert(
                 "Signal evaluation backlog",
                 backlog["detail"],
@@ -1687,8 +1694,8 @@ def _run_signal_validation_impl():
                 set_app_state(_STATE_SIGNAL_VALIDATION, _LAST_SIGNAL_VALIDATION)
             except Exception:
                 pass
-        print(f"  신호 검증 실패: {exc}")
-    print(f"{'='*60}\n")
+        logger.error(f"  신호 검증 실패: {exc}")
+    logger.info(f"{'='*60}\n")
     return payload
 
 
@@ -1721,7 +1728,7 @@ def _run_multi_agent_batch_impl(tickers: "list[str] | None" = None) -> dict:
 
     until = _gpu_pause_until()
     if until:
-        print(f"  [GPU] 일시 해제 중 — V2 배치 건너뜀 (복귀 예정 {until.strftime('%H:%M')})")
+        logger.warning(f"  [GPU] 일시 해제 중 — V2 배치 건너뜀 (복귀 예정 {until.strftime('%H:%M')})")
         return {"status": "skipped", "reason": "gpu_paused", "resume_at": until.isoformat()}
 
     targets = tickers or _load_watchlist_files()
@@ -1733,9 +1740,9 @@ def _run_multi_agent_batch_impl(tickers: "list[str] | None" = None) -> dict:
         "signals": {},
         "errors": {},
     }
-    print(f"\n{'='*60}")
-    print(f"  Multi-Agent 배치 시작: {datetime.now().strftime('%Y-%m-%d %H:%M')} — {len(targets)}종목")
-    print(f"{'='*60}\n")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"  Multi-Agent 배치 시작: {datetime.now().strftime('%Y-%m-%d %H:%M')} — {len(targets)}종목")
+    logger.info(f"{'='*60}\n")
 
     for ticker in targets:
         summary["processed"] += 1
@@ -1749,15 +1756,15 @@ def _run_multi_agent_batch_impl(tickers: "list[str] | None" = None) -> dict:
                 "confidence": fd.get("final_confidence"),
             }
             summary["succeeded"] += 1
-            print(f"  [{ticker}] V2 배치 완료: {fd.get('final_signal')} ({fd.get('final_confidence')})")
+            logger.info(f"  [{ticker}] V2 배치 완료: {fd.get('final_signal')} ({fd.get('final_confidence')})")
         except Exception as exc:
             summary["failed"] += 1
             summary["errors"][ticker] = str(exc)[:200]
-            print(f"  [{ticker}] V2 배치 실패: {exc}")
+            logger.error(f"  [{ticker}] V2 배치 실패: {exc}")
 
     if summary["failed"] and not summary["succeeded"]:
         summary["status"] = "error"
-    print(f"\n  Multi-Agent 배치 종료: 성공 {summary['succeeded']} / 실패 {summary['failed']}\n")
+    logger.error(f"\n  Multi-Agent 배치 종료: 성공 {summary['succeeded']} / 실패 {summary['failed']}\n")
     return summary
 
 
@@ -1810,7 +1817,7 @@ def run_multi_agent_batch(tickers: "list[str] | None" = None) -> dict:
             try:
                 send_telegram(_format_batch_summary(result))
             except Exception as exc:
-                print(f"  [batch] 텔레그램 요약 전송 실패: {exc}")
+                logger.error(f"  [batch] 텔레그램 요약 전송 실패: {exc}")
         return result
     except Exception as exc:
         _record_job_error("multi_agent_batch", started_at, exc)
@@ -2015,7 +2022,7 @@ def _start_background_scheduler(run_initial_scan: bool = False) -> None:
     """FastAPI 프로세스 내 백그라운드 스케줄러를 1회만 시작한다."""
     global _SCHEDULER
     if not SERVICE_SCHEDULER_ENABLED:
-        print("[스케줄러] SERVICE_SCHEDULER_ENABLED=false — 자동 작업 비활성화")
+        logger.info("[스케줄러] SERVICE_SCHEDULER_ENABLED=false — 자동 작업 비활성화")
         return
     if _SCHEDULER is not None and _SCHEDULER.running:
         return
@@ -2089,20 +2096,20 @@ def _start_background_scheduler(run_initial_scan: bool = False) -> None:
         )
     scheduler.start()
     _SCHEDULER = scheduler
-    print(f"[스케줄러] {SCAN_INTERVAL_MINUTES}분 간격 스캔 등록 완료")
-    print(
+    logger.info(f"[스케줄러] {SCAN_INTERVAL_MINUTES}분 간격 스캔 등록 완료")
+    logger.info(
         f"[스케줄러] 포지션 시가평가 {POSITION_MARK_INTERVAL_MINUTES}분 간격 등록 완료 "
         "— 손절·익절·트레일링은 이 잡에서만 평가된다"
     )
-    print(
+    logger.info(
         f"[스케줄러] 일일 신호 검증 등록 완료 "
         f"({SIGNAL_VALIDATION_HOUR:02d}:{SIGNAL_VALIDATION_MINUTE:02d})\n"
     )
-    print(
+    logger.info(
         f"[스케줄러] Corporate Actions 등록 완료 "
         f"({CORPORATE_ACTION_CHECK_HOUR:02d}:{CORPORATE_ACTION_CHECK_MINUTE:02d})"
     )
-    print(f"[스케줄러] Data Health Check {DATA_HEALTH_CHECK_MINUTES}분 간격 등록 완료\n")
+    logger.info(f"[스케줄러] Data Health Check {DATA_HEALTH_CHECK_MINUTES}분 간격 등록 완료\n")
 
 
 def _sanitize(obj):
@@ -2416,7 +2423,7 @@ def gpu_pause(body: GpuPauseRequest):
     until = datetime.now() + timedelta(minutes=body.minutes)
     set_app_state(_STATE_GPU_PAUSE, until.isoformat())
     unloaded = _unload_ollama_model()
-    print(
+    logger.error(
         f"  [GPU] 일시 해제 {body.minutes}분 — 복귀 예정 {until.strftime('%H:%M')} "
         f"(VRAM 반환 {'성공' if unloaded else '실패'})"
     )
@@ -2447,7 +2454,7 @@ def gpu_extend(body: GpuPauseRequest):
     new_until = min(until + timedelta(minutes=body.minutes), hard_limit)
     capped = new_until < until + timedelta(minutes=body.minutes)
     set_app_state(_STATE_GPU_PAUSE, new_until.isoformat())
-    print(
+    logger.info(
         f"  [GPU] 해제 연장 +{body.minutes}분 — 복귀 예정 "
         f"{until.strftime('%H:%M')} → {new_until.strftime('%H:%M')}"
         f"{' (상한 적용)' if capped else ''}"
@@ -2467,7 +2474,7 @@ def gpu_extend(body: GpuPauseRequest):
 def gpu_resume():
     """즉시 복구. 다음 스캔부터 모델이 다시 적재된다."""
     set_app_state(_STATE_GPU_PAUSE, None)
-    print("  [GPU] 일시 해제 종료 — 다음 스캔부터 정상 동작")
+    logger.info("  [GPU] 일시 해제 종료 — 다음 스캔부터 정상 동작")
     return gpu_pause_status()
 
 
@@ -3026,13 +3033,13 @@ def get_multi_agent_analysis(ticker: str):
         raise HTTPException(503, "Multi-Agent module not available")
 
     try:
-        print(f"\n[Multi-Agent] Starting analysis for {ticker}")
+        logger.info(f"\n[Multi-Agent] Starting analysis for {ticker}")
 
         # Multi-Agent 분석 실행
         orchestrator = MultiAgentOrchestrator()
         result = orchestrator.analyze(ticker)
 
-        print(f"[Multi-Agent] Analysis complete for {ticker}")
+        logger.info(f"[Multi-Agent] Analysis complete for {ticker}")
 
         # 그룹별 시그널 signal_outcomes에 기록
         _try_insert_group_outcomes(ticker, result)
@@ -3043,7 +3050,7 @@ def get_multi_agent_analysis(ticker: str):
         return JSONResponse(content=sanitized_result)
 
     except Exception as e:
-        print(f"[Multi-Agent] Error analyzing {ticker}: {e}")
+        logger.error(f"[Multi-Agent] Error analyzing {ticker}: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(500, f"Multi-Agent 분석 실패: {e}")
@@ -3654,9 +3661,9 @@ def api_calibrator_status():
 @app.post("/restart")
 def restart_service():
     """서비스 자체 재시작. 현재 프로세스를 동일 인자로 다시 실행."""
-    print(f"\n{'='*60}")
-    print(f"  재시작 요청 수신: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'='*60}\n")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"  재시작 요청 수신: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"{'='*60}\n")
 
     def _restart():
         time.sleep(1)
@@ -3673,14 +3680,14 @@ def restart_service():
 
 def main():
     global _RUN_INITIAL_SCAN_ON_STARTUP
-    print(f"\n{'='*60}")
-    print(f"  차트 분석 에이전트 서비스 시작")
-    print(f"  API: http://{API_HOST}:{API_PORT}")
-    print(f"  모델: {OLLAMA_MODEL}")
-    print(f"  스캔 주기: {SCAN_INTERVAL_MINUTES}분")
-    print(f"  종목: {WATCHLIST}")
-    print(f"  매수 임계: ≥{BUY_THRESHOLD}, 매도 임계: ≤{SELL_THRESHOLD}")
-    print(f"{'='*60}\n")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"  차트 분석 에이전트 서비스 시작")
+    logger.info(f"  API: http://{API_HOST}:{API_PORT}")
+    logger.info(f"  모델: {OLLAMA_MODEL}")
+    logger.info(f"  스캔 주기: {SCAN_INTERVAL_MINUTES}분")
+    logger.info(f"  종목: {WATCHLIST}")
+    logger.info(f"  매수 임계: ≥{BUY_THRESHOLD}, 매도 임계: ≤{SELL_THRESHOLD}")
+    logger.info(f"{'='*60}\n")
 
     # DB 초기화
     init_db()

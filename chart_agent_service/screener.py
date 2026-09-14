@@ -41,6 +41,10 @@ from decision_context import (
 # ─────────────────────────────────────────────────────────
 import os as _os
 
+from logging_setup import get_logger
+
+logger = get_logger("stock_auto.screener")
+
 MIN_MARKET_CAP_KRW = float(_os.getenv("SCREENER_MIN_MARKET_CAP_KRW", "200_000_000_000"))  # 2천억
 TOP_N_RESULTS = int(_os.getenv("SCREENER_TOP_N", "20"))
 
@@ -241,7 +245,7 @@ def load_kr_universe(min_market_cap: float = MIN_MARKET_CAP_KRW) -> pd.DataFrame
     except ImportError:
         pass
     except Exception as e:
-        print(f"[screener] pykrx 오류, FDR로 폴백: {e}")
+        logger.error(f"[screener] pykrx 오류, FDR로 폴백: {e}")
 
     # 2순위: FinanceDataReader
     try:
@@ -262,7 +266,7 @@ def load_kr_universe(min_market_cap: float = MIN_MARKET_CAP_KRW) -> pd.DataFrame
                 break
 
         if not cap_col:
-            print("[screener] FDR에 시총 컬럼 없음 — pykrx 설치 필요")
+            logger.warning("[screener] FDR에 시총 컬럼 없음 — pykrx 설치 필요")
             return pd.DataFrame()
 
         filtered = krx[krx[cap_col] >= min_market_cap]
@@ -281,18 +285,18 @@ def load_kr_universe(min_market_cap: float = MIN_MARKET_CAP_KRW) -> pd.DataFrame
     except ImportError:
         pass
     except Exception as e:
-        print(f"[screener] FDR 오류: {e}")
+        logger.error(f"[screener] FDR 오류: {e}")
 
     # 3순위: Naver Finance 시가총액 페이지
     try:
         naver = _load_kr_universe_from_naver(min_market_cap)
         if not naver.empty:
-            print(f"[screener] Naver 시총 fallback 사용: {len(naver)}개")
+            logger.info(f"[screener] Naver 시총 fallback 사용: {len(naver)}개")
             return naver
     except ImportError:
         pass
     except Exception as e:
-        print(f"[screener] Naver 시총 fallback 오류: {e}")
+        logger.error(f"[screener] Naver 시총 fallback 오류: {e}")
 
     return pd.DataFrame()
 
@@ -713,7 +717,7 @@ def record_screener_outcomes(results: List[Dict], limit: int = RECORD_TOP_N) -> 
             )
             stats["recorded"] += 1
         except Exception as exc:  # 개별 실패가 스크리너 전체를 죽이지 않게
-            print(f"[screener] 표본 적립 실패 {item.get('ticker')}: {exc}")
+            logger.error(f"[screener] 표본 적립 실패 {item.get('ticker')}: {exc}")
             stats["errors"] += 1
     return stats
 
@@ -732,7 +736,7 @@ def run_screener(
     t_start = datetime.now()
     run_id = t_start.strftime("%Y%m%d_%H%M%S_%f")
 
-    print(f"[screener] 실행 {run_id} 시작")
+    logger.info(f"[screener] 실행 {run_id} 시작")
 
     # 1. 유니버스 로드
     universe = load_kr_universe(min_market_cap)
@@ -744,7 +748,7 @@ def run_screener(
             "universe_size": 0,
             "results": [],
         }
-    print(f"[screener] 유니버스: {len(universe)}개 (시총 {min_market_cap/1e8:.0f}억+)")
+    logger.info(f"[screener] 유니버스: {len(universe)}개 (시총 {min_market_cap/1e8:.0f}억+)")
 
     # 2. OHLCV 준비
     tickers = universe['ticker'].tolist()
@@ -757,7 +761,7 @@ def run_screener(
     if us_batch_tickers:
         prefetch_ohlcv_batch(us_batch_tickers, period="1y")
     if len(us_batch_tickers) != len(tickers):
-        print("[screener] 한국 종목 OHLCV는 pykrx/FDR 우선순위 보존을 위해 개별 조회")
+        logger.info("[screener] 한국 종목 OHLCV는 pykrx/FDR 우선순위 보존을 위해 개별 조회")
 
     # 3. 각 종목 점수 계산
     scored = []
@@ -825,7 +829,7 @@ def run_screener(
             pass
 
     if _disqualified:
-        print(f"[screener] 펀더멘털 실격: {_disqualified}개 (적자+고PBR)")
+        logger.info(f"[screener] 펀더멘털 실격: {_disqualified}개 (적자+고PBR)")
 
     # 5. 정렬 + 상위 N
     scored.sort(key=lambda x: x['score'], reverse=True)
@@ -834,22 +838,22 @@ def run_screener(
         item['rank'] = i
 
     elapsed = (datetime.now() - t_start).total_seconds()
-    print(f"[screener] 완료: {len(scored)}종목 분석 / 실패 {failed} / {elapsed:.1f}s")
+    logger.error(f"[screener] 완료: {len(scored)}종목 분석 / 실패 {failed} / {elapsed:.1f}s")
 
     # 5. DB 저장
     if save_db and top:
         try:
             from db import insert_screener_results
             insert_screener_results(run_id, top)
-            print(f"[screener] DB 저장 완료: screener_results")
+            logger.info(f"[screener] DB 저장 완료: screener_results")
         except Exception as e:
-            print(f"[screener] DB 저장 실패: {e}")
+            logger.error(f"[screener] DB 저장 실패: {e}")
 
     # 6. 표본 적립 — 사후 평가 파이프라인이 수익률·벤치마크·역행폭을 채운다.
     outcome_stats = {"recorded": 0, "skipped_non_directional": 0, "errors": 0}
     if save_db and top and RECORD_OUTCOMES:
         outcome_stats = record_screener_outcomes(top, limit=RECORD_TOP_N)
-        print(
+        logger.error(
             f"[screener] 표본 적립: {outcome_stats['recorded']}건 "
             f"(방향성 없음 {outcome_stats['skipped_non_directional']}, "
             f"오류 {outcome_stats['errors']})"
@@ -935,7 +939,7 @@ def run_screener_with_multiagent(
     from db import worker_connection_scope
 
     # ── 1단계: 스크리너 ──────────────────────
-    print(f"\n[파이프라인] 1단계: 스크리너 실행")
+    logger.info(f"\n[파이프라인] 1단계: 스크리너 실행")
     screener_result = run_screener(
         min_market_cap=min_market_cap,
         top_n=top_n,
@@ -952,7 +956,7 @@ def run_screener_with_multiagent(
 
     analyze_top = min(analyze_top, len(candidates))
     to_analyze = candidates[:analyze_top]
-    print(f"[파이프라인] 2단계: Multi-Agent 심층 분석 상위 {analyze_top}개 병렬 실행")
+    logger.info(f"[파이프라인] 2단계: Multi-Agent 심층 분석 상위 {analyze_top}개 병렬 실행")
 
     # ── 2단계: Multi-Agent 병렬 분석 ──────────
     ma_results = {}
@@ -989,7 +993,7 @@ def run_screener_with_multiagent(
                 ma_results[futures[future]] = {"error": str(e)}
 
     ma_elapsed = (datetime.now() - t_ma_start).total_seconds()
-    print(f"[파이프라인] Multi-Agent 완료: {len(ma_results)}개 / {ma_elapsed:.1f}s")
+    logger.info(f"[파이프라인] Multi-Agent 완료: {len(ma_results)}개 / {ma_elapsed:.1f}s")
 
     # ── 3단계: 합의도 분석 (combined view) ────
     combined_view = []
@@ -1080,16 +1084,16 @@ def run_screener_with_multiagent(
 if __name__ == "__main__":
     # 수동 실행 테스트
     result = run_screener(top_n=10, save_db=False)
-    print()
-    print("=" * 70)
-    print(f"스크리너 실행: {result['run_id']}")
-    print(f"유니버스: {result.get('universe_size', 0)}개")
-    print(f"소요: {result.get('elapsed_seconds', 0)}s")
-    print("=" * 70)
-    print()
-    print(f"{'순위':<4} {'종목':<20} {'점수':<6} {'등급':<4} {'시총(억)':<12} {'현재가':<10}")
-    print("-" * 70)
+    logger.info()
+    logger.info("=" * 70)
+    logger.info(f"스크리너 실행: {result['run_id']}")
+    logger.info(f"유니버스: {result.get('universe_size', 0)}개")
+    logger.info(f"소요: {result.get('elapsed_seconds', 0)}s")
+    logger.info("=" * 70)
+    logger.info()
+    logger.info(f"{'순위':<4} {'종목':<20} {'점수':<6} {'등급':<4} {'시총(억)':<12} {'현재가':<10}")
+    logger.info("-" * 70)
     for r in result.get("results", []):
         cap_bn = r['market_cap'] / 1e8
-        print(f"{r['rank']:<4} {r['name'][:15]:<20} {r['score']:<6.1f} {r['grade']:<4} "
+        logger.info(f"{r['rank']:<4} {r['name'][:15]:<20} {r['score']:<6.1f} {r['grade']:<4} "
               f"{cap_bn:>10,.0f} ₩{r['current_price']:>8,.0f}")

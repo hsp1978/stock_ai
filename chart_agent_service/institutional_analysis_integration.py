@@ -11,6 +11,10 @@ from typing import Dict, Optional
 from institutional_scoring import InstitutionalTechnicalScoring
 from risk_management import ATRRiskManager
 
+from logging_setup import get_logger
+
+logger = get_logger("stock_auto.institutional_analysis_integration")
+
 
 class InstitutionalAnalyzer:
     """기관급 종합 분석 시스템"""
@@ -374,4 +378,4 @@ if __name__ == "__main__":
 
     # 분석 실행
     analyzer = InstitutionalAnalyzer(test_df, ticker="TEST.KS")
-    print(analyzer.generate_report())
+    logger.info(analyzer.generate_report())
