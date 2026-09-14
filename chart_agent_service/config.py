@@ -126,6 +126,16 @@ class Settings(BaseSettings):
     # 검토되는 주기**다. 2026-09-14 이전에는 스케줄 등록 자체가 없어 수동 버튼을
     # 누를 때만 돌았다 (실측: 144일간 미평가).
     POSITION_MARK_INTERVAL_MINUTES: int = Field(default=30, ge=1)
+    # 산출물 보존 — output/ 는 2026-09-14 기준 JSON 70,771개 / 1.58 GB 였고
+    # 하루 361개씩 늘고 있었다. 정리 주체가 없었다 (crontab 비어 있음).
+    # JSON 은 쓰기 전용이라(json_path 를 다시 여는 코드가 없다) 짧게 잡아도
+    # 기능에 영향이 없지만, 사후 감사 여지를 두고 기본 30일로 둔다.
+    # 차트 PNG 는 화면이 읽으므로 현재 참조 중인 것은 나이와 무관하게 남는다.
+    OUTPUT_RETENTION_ENABLED: bool = True
+    OUTPUT_JSON_RETENTION_DAYS: int = Field(default=30, ge=1)
+    OUTPUT_CHART_RETENTION_DAYS: int = Field(default=30, ge=1)
+    OUTPUT_RETENTION_HOUR: int = Field(default=3, ge=0, le=23)
+    OUTPUT_RETENTION_MINUTE: int = Field(default=30, ge=0, le=59)
     OPS_ALERT_DEDUPE_MINUTES: int = Field(default=60, ge=1)
     # 일일 멀티에이전트(V2) 배치 — signal_outcomes 표본 자동 축적용.
     # 시각은 서버 로컬 시간 기준. 기본 17:30 (KRX 마감 15:30 이후).
@@ -276,6 +286,11 @@ DATA_HEALTH_CHECK_MINUTES = settings.DATA_HEALTH_CHECK_MINUTES
 DATA_HEALTH_ALERT_STALE_HOURS = settings.DATA_HEALTH_ALERT_STALE_HOURS
 DATA_HEALTH_RECENT_ANALYSIS_DAYS = settings.DATA_HEALTH_RECENT_ANALYSIS_DAYS
 POSITION_MARK_INTERVAL_MINUTES = settings.POSITION_MARK_INTERVAL_MINUTES
+OUTPUT_RETENTION_ENABLED = settings.OUTPUT_RETENTION_ENABLED
+OUTPUT_JSON_RETENTION_DAYS = settings.OUTPUT_JSON_RETENTION_DAYS
+OUTPUT_CHART_RETENTION_DAYS = settings.OUTPUT_CHART_RETENTION_DAYS
+OUTPUT_RETENTION_HOUR = settings.OUTPUT_RETENTION_HOUR
+OUTPUT_RETENTION_MINUTE = settings.OUTPUT_RETENTION_MINUTE
 OPS_ALERT_DEDUPE_MINUTES = settings.OPS_ALERT_DEDUPE_MINUTES
 SCREENER_BATCH_ENABLED = settings.SCREENER_BATCH_ENABLED
 SCREENER_BATCH_HOUR = settings.SCREENER_BATCH_HOUR
