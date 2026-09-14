@@ -1,3 +1,27 @@
+"""[미사용/레거시] 독립 뉴스 감성 분석기 — 2026-09-14 에 이름을 바꿨다.
+
+**이 모듈은 아무도 import 하지 않는다.** 그런데 이름이 `news_analyzer` 라서
+`chart_agent_service/news_analyzer.py` 를 **가리고 있었다**:
+
+  webui 컨테이너:  sys.path 에 stock_analyzer 가 먼저 오므로 이쪽이 잡혔다
+    local_engine._DIRECT_NEWS = False      → 뉴스는 늘 HTTP 폴백 (in-proc 경로 미사용)
+    GeopoliticalAnalyst._fetch_news_context
+      → {'error': "cannot import name 'fetch_news_with_sentiment' ..."}
+      → _context_available False → **뉴스 없이 지정학 분석을 했다**
+
+  agent-api:      service.py 가 먼저 import 해 sys.modules 에 올려둔 덕에
+                  우연히 올바른 모듈이 잡혔다 — 순서가 바뀌면 같이 깨진다
+                  (tests/unit/test_agent_groups.py 주석이 그 사고를 기록하고 있다)
+
+폴백이 동작해 화면은 멀쩡했고, 로깅이 꺼져 있어 사유도 남지 않았다 (#61 에서 로깅을
+켠 뒤에야 드러났다). 안티패턴 #5(양방향 sys.path 주입)의 실제 피해다.
+
+여기 있는 `NewsAnalyzer`/`IntegratedAnalyzer` 는 agent-api 의
+`news_analyzer.fetch_news_with_sentiment` 와 별개 구현이다. 참조가 0이라 지워도
+되지만, 되살릴 여지를 남겨 이름만 바꿨다. `tests/unit/test_module_shadowing.py` 가
+두 패키지 사이 이름 충돌을 막는다.
+"""
+
 #!/usr/bin/env python3
 """
 News Sentiment Analysis Module
