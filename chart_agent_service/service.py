@@ -48,6 +48,7 @@ from config import (
     SERVICE_SCHEDULER_ENABLED, SIGNAL_VALIDATION_HOUR, SIGNAL_VALIDATION_MINUTE,
     CORPORATE_ACTION_CHECK_HOUR, CORPORATE_ACTION_CHECK_MINUTE,
     DATA_HEALTH_CHECK_MINUTES, DATA_HEALTH_ALERT_STALE_HOURS,
+    DATA_HEALTH_RECENT_ANALYSIS_DAYS,
     OPS_ALERT_DEDUPE_MINUTES, DEFAULT_HISTORY_PERIOD,
     SCREENER_BATCH_ENABLED, SCREENER_BATCH_HOUR, SCREENER_BATCH_MINUTE,
     SIGNAL_EVAL_DAYS_BACK, SIGNAL_EVAL_BACKLOG_ALERT,
@@ -204,6 +205,11 @@ def _try_insert_signal_outcome(ticker: str, result: dict) -> None:
 # ═══════════════════════════════════════════════════════════════
 #  전역 상태 저장소
 # ═══════════════════════════════════════════════════════════════
+
+# 프로세스 기동 시각. OHLCV/펀더멘털 캐시는 **인메모리**라 재시작하면 비워진다.
+# 이걸 모르면 데이터 헬스가 재시작 직후 전 종목을 stale 로 보고한다 — 낡은 게
+# 아니라 아직 한 번도 안 받은 것이다 (2026-09-14).
+SERVICE_STARTED_AT = datetime.now()
 
 # 최신 분석 결과 캐시 {ticker: {result, timestamp, alert_sent}}
 latest_results: dict = {}
@@ -621,30 +627,126 @@ def _send_ops_alert(
     return {"sent": sent, "dedupe_key": key}
 
 
-def _collect_data_health_tickers(tickers: list[str] | None = None) -> list[str]:
-    if tickers:
-        source = tickers
-    else:
-        source = []
-        try:
-            source.extend(_load_watchlist_files())
-        except Exception:
-            pass
-        source.extend(latest_results.keys())
-        try:
-            portfolio = get_portfolio_status()
-            positions = portfolio.get("positions") or {}
-            source.extend(positions.keys())
-        except Exception:
-            pass
+def _analysis_age_days(entry: dict) -> float | None:
+    """latest_results 항목의 마지막 분석 경과일. 해석 불가면 None."""
+    stamp = (entry or {}).get("timestamp") or ((entry or {}).get("result") or {}).get(
+        "analyzed_at"
+    )
+    if not stamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return max(0.0, (datetime.now() - parsed).total_seconds() / 86400.0)
 
-    result = []
-    seen = set()
-    for ticker in source:
-        t = str(ticker).upper().strip()
-        if t and t not in seen:
-            result.append(t)
-            seen.add(t)
+
+def _collect_data_health_tickers(
+    tickers: list[str] | None = None,
+) -> tuple[list[str], dict[str, str], list[dict]]:
+    """점검 대상과 그 **근거**를 함께 돌려준다.
+
+    Returns: (대상 티커, {티커: scope}, 제외 목록)
+
+    scope 는 왜 이 종목의 신선도가 중요한지다:
+      watchlist  — 매일 분석·주문 후보
+      position   — 보유 중. 시세가 멈추면 평가액·손절이 틀어진다
+      recent     — 최근 DATA_HEALTH_RECENT_ANALYSIS_DAYS 일 내 분석 (스크리너 등)
+      requested  — 호출자가 명시한 티커
+
+    범위를 좁히되 **숨기지 않는다.** 제외한 종목은 사유·마지막 분석 시각과 함께
+    excluded 로 돌려준다 (CLAUDE.md §13: 조용히 사라지는 것은 고친 게 아니다).
+    """
+    if tickers:
+        seen: set[str] = set()
+        targets = []
+        for ticker in tickers:
+            norm = str(ticker).upper().strip()
+            if norm and norm not in seen:
+                targets.append(norm)
+                seen.add(norm)
+        return targets, dict.fromkeys(targets, "requested"), []
+
+    scopes: dict[str, str] = {}
+
+    def _mark(raw, scope: str) -> None:
+        norm = str(raw).upper().strip()
+        if norm and norm not in scopes:      # 먼저 잡힌 scope 가 이긴다
+            scopes[norm] = scope
+
+    try:
+        for ticker in _load_watchlist_files():
+            _mark(ticker, "watchlist")
+    except Exception as exc:
+        print(f"[data-health] 워치리스트 로드 실패: {exc}")
+
+    try:
+        positions = (get_portfolio_status() or {}).get("positions") or {}
+        for ticker in positions:
+            _mark(ticker, "position")
+    except Exception as exc:
+        print(f"[data-health] 포지션 조회 실패: {exc}")
+
+    excluded = []
+    max_age = float(DATA_HEALTH_RECENT_ANALYSIS_DAYS)
+    for ticker, entry in latest_results.items():
+        norm = str(ticker).upper().strip()
+        if not norm or norm in scopes:
+            continue
+        age = _analysis_age_days(entry if isinstance(entry, dict) else {})
+        if age is not None and age <= max_age:
+            scopes[norm] = "recent"
+            continue
+        excluded.append({
+            "ticker": norm,
+            "reason": "analysis_older_than_window" if age is not None else "analysis_time_unknown",
+            "last_analyzed_days_ago": round(age, 1) if age is not None else None,
+            "window_days": max_age,
+        })
+
+    return list(scopes.keys()), scopes, sorted(excluded, key=lambda r: r["ticker"])
+
+
+def _position_price_freshness() -> dict[str, dict]:
+    """보유 포지션의 시가평가 상태.
+
+    OHLCV 캐시가 신선해도 **포지션에 반영되지 않으면** 평가액·손절 판단은 진입가
+    그대로다. 2026-09-14 실측: 2종목이 2026-04-23 진입 이후 144일간
+    `current_price == entry_price`, `last_updated` 가 None 이었다. 종전 데이터
+    헬스는 이 사실을 볼 수 없었고, 워치리스트에서 빠진 15종목의 stale 경보에
+    묻혀 있었다.
+    """
+    try:
+        positions = (get_portfolio_status() or {}).get("positions") or {}
+    except Exception as exc:
+        print(f"[data-health] 포지션 시세 상태 조회 실패: {exc}")
+        return {}
+
+    now = datetime.now()
+    result = {}
+    for ticker, pos in positions.items():
+        if not isinstance(pos, dict):
+            continue
+        stamp = pos.get("last_updated")
+        age_sec = None
+        if stamp:
+            try:
+                parsed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+                if parsed.tzinfo is not None:
+                    parsed = parsed.astimezone().replace(tzinfo=None)
+                age_sec = max(0.0, (now - parsed).total_seconds())
+            except (TypeError, ValueError):
+                age_sec = None
+        result[str(ticker).upper().strip()] = {
+            "last_updated": stamp,
+            "age_sec": age_sec,
+            "never_marked": not stamp,
+            "entry_date": pos.get("entry_date"),
+            "entry_price": pos.get("entry_price"),
+            "current_price": pos.get("current_price"),
+        }
     return result
 
 
@@ -672,14 +774,21 @@ def _price_verification_for(ticker: str) -> dict | None:
 
 def build_data_health(tickers: list[str] | None = None) -> dict:
     """현재 캐시 기준 데이터 freshness SLO 스냅샷을 만든다."""
-    target_tickers = _collect_data_health_tickers(tickers)
+    target_tickers, scopes, excluded = _collect_data_health_tickers(tickers)
     cache_status = get_data_cache_status(target_tickers, period=DEFAULT_HISTORY_PERIOD)
     news_status = get_news_cache_status(target_tickers)
     stale_after_sec = DATA_HEALTH_ALERT_STALE_HOURS * 3600.0
+    position_prices = _position_price_freshness()
+
+    # 첫 스캔 주기가 아직 안 지났으면 빈 캐시를 장애로 읽지 않는다.
+    uptime_sec = max(0.0, (datetime.now() - SERVICE_STARTED_AT).total_seconds())
+    warmup_sec = SCAN_INTERVAL_MINUTES * 60.0
+    warming = uptime_sec < warmup_sec
 
     rows = []
     stale = []
     degraded = []
+    warming_rows = []
     for ticker in target_tickers:
         market = (cache_status.get("tickers") or {}).get(ticker, {})
         news = (news_status.get("tickers") or {}).get(ticker, {})
@@ -691,8 +800,15 @@ def build_data_health(tickers: list[str] | None = None) -> dict:
 
         ohlcv_age = ohlcv.get("age_sec")
         if not ohlcv.get("present"):
-            severity = "stale"
-            reasons.append("ohlcv_missing")
+            # 캐시는 인메모리다. 기동 직후 비어 있는 것은 '낡음'이 아니라
+            # '아직 안 받음' — 첫 스캔 주기가 지나기 전까지는 구분해서 보고한다.
+            if warming:
+                if severity == "ok":
+                    severity = "warming"
+                reasons.append("cache_not_warmed")
+            else:
+                severity = "stale"
+                reasons.append("ohlcv_missing")
         elif ohlcv.get("fresh") is False and (
             ohlcv_age is None or ohlcv_age >= stale_after_sec
         ):
@@ -701,18 +817,35 @@ def build_data_health(tickers: list[str] | None = None) -> dict:
 
         fundamental_quality = fundamentals.get("data_quality")
         if not fundamentals.get("present") or fundamental_quality in {"missing", "empty"}:
-            if severity != "stale":
-                severity = "degraded"
-            reasons.append("fundamentals_missing")
+            if warming:
+                reasons.append("fundamentals_not_warmed")
+            else:
+                if severity != "stale":
+                    severity = "degraded"
+                reasons.append("fundamentals_missing")
         elif fundamentals.get("fresh") is False:
             if severity != "stale":
                 severity = "degraded"
             reasons.append("fundamentals_stale")
 
         if not news.get("present"):
-            reasons.append("news_not_cached")
+            reasons.append("news_not_warmed" if warming else "news_not_cached")
         elif not news.get("fresh"):
             reasons.append("news_stale")
+
+        # 보유 포지션은 시가평가까지 확인한다 — 캐시가 신선해도 포지션에
+        # 반영되지 않으면 평가액·손절이 진입가 기준으로 굳는다.
+        position_price = position_prices.get(ticker)
+        if scopes.get(ticker) == "position" and position_price is not None:
+            if position_price["never_marked"]:
+                severity = "stale"
+                reasons.append("position_never_marked_to_market")
+            elif (
+                position_price["age_sec"] is not None
+                and position_price["age_sec"] >= stale_after_sec
+            ):
+                severity = "stale"
+                reasons.append("position_price_stale")
 
         # 가격 소스 교차검증 — 폴백은 '한 소스가 죽었을 때'를 처리하지만
         # 두 소스가 다른 값을 줄 때는 잡지 못한다. 캐시가 있을 때만 확인한다
@@ -730,6 +863,7 @@ def build_data_health(tickers: list[str] | None = None) -> dict:
 
         row = {
             "ticker": ticker,
+            "scope": scopes.get(ticker, "unknown"),
             "severity": severity,
             "reasons": reasons,
             "ohlcv_source": ohlcv.get("source"),
@@ -743,12 +877,15 @@ def build_data_health(tickers: list[str] | None = None) -> dict:
             "fundamental_age_sec": fundamentals.get("age_sec"),
             "news_present": news.get("present", False),
             "news_fresh": news.get("fresh", False),
+            "position_price": position_price,
         }
         rows.append(row)
         if severity == "stale":
             stale.append(row)
         elif severity == "degraded":
             degraded.append(row)
+        elif severity == "warming":
+            warming_rows.append(row)
 
     # signal_outcomes 추적 파이프라인 생존 체크 (2026-07 무기록 버그 재발 감지)
     try:
@@ -763,6 +900,8 @@ def build_data_health(tickers: list[str] | None = None) -> dict:
         status = "stale"
     elif degraded:
         status = "degraded"
+    elif warming_rows:
+        status = "warming"
     else:
         status = "ok"
 
@@ -774,9 +913,29 @@ def build_data_health(tickers: list[str] | None = None) -> dict:
         "status": status,
         "generated_at": datetime.now().isoformat(),
         "ticker_count": len(target_tickers),
+        # 왜 이 종목들만 보는지, 무엇을 왜 뺐는지를 같은 응답에 싣는다.
+        # 범위를 좁힌 사실이 안 보이면 그건 '고침'이 아니라 '숨김'이다.
+        "scope": {
+            "counts": {
+                name: sum(1 for s in scopes.values() if s == name)
+                for name in sorted(set(scopes.values()))
+            },
+            "recent_analysis_window_days": float(DATA_HEALTH_RECENT_ANALYSIS_DAYS),
+            "excluded_count": len(excluded),
+            "excluded": excluded[:50],
+        },
         "ok_count": sum(1 for row in rows if row["severity"] == "ok"),
         "stale_count": len(stale),
         "degraded_count": len(degraded),
+        "warming_count": len(warming_rows),
+        # 캐시가 인메모리라 재시작하면 첫 스캔 전까지 비어 있다. 그 구간을
+        # stale 로 부르면 재시작마다 거짓 경보가 난다.
+        "warmup": {
+            "warming": warming,
+            "uptime_sec": round(uptime_sec, 1),
+            "warmup_sec": warmup_sec,
+            "note": "OHLCV/뉴스 캐시는 인메모리 — 첫 스캔 주기 전까지는 미수집이 정상",
+        },
         "stale": stale[:20],
         "degraded": degraded[:20],
         "rows": rows,
@@ -1702,11 +1861,19 @@ def run_data_health_check() -> dict:
     try:
         result = build_data_health()
         if result.get("status") in {"stale", "degraded"}:
+            # 어떤 종목이 왜인지까지 실어야 알림을 보고 바로 움직일 수 있다.
+            # 종전에는 개수만 나갔고, 그 개수의 대부분이 워치리스트에서 빠진
+            # 종목이라 알림이 무시되고 있었다 (2026-09-14).
+            offenders = "; ".join(
+                f"{row.get('ticker')}({row.get('scope')}: {','.join(row.get('reasons') or [])})"
+                for row in (result.get("stale") or [])[:5]
+            )
             detail = (
                 f"status={result.get('status')}, "
                 f"tickers={result.get('ticker_count')}, "
                 f"stale={result.get('stale_count')}, "
                 f"degraded={result.get('degraded_count')}"
+                + (f" | {offenders}" if offenders else "")
             )
             _send_ops_alert(
                 "Data freshness degraded",

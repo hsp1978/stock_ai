@@ -29,6 +29,13 @@ def test_job_status_records_success(monkeypatch):
 def test_build_data_health_marks_missing_ohlcv_as_stale(monkeypatch):
     import service
 
+    # 2026-09-14: 캐시가 인메모리라 기동 직후 '없음'은 워밍업으로 본다.
+    # 이 테스트는 **첫 스캔 주기가 지난 뒤**의 판정을 고정한다 —
+    # 그때도 비어 있으면 스캔이 안 도는 것이다 (test_data_health_scope.py 참조).
+    from datetime import datetime, timedelta
+
+    monkeypatch.setattr(service, "SERVICE_STARTED_AT",
+                        datetime.now() - timedelta(hours=3))
     monkeypatch.setattr(service, "set_app_state", lambda *args, **kwargs: None)
     monkeypatch.setattr(service, "_load_watchlist_files", lambda: ["AAPL"])
     monkeypatch.setattr(service, "latest_results", {})
