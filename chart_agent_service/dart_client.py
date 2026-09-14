@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import logging
 import os
+import pickle
+import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -51,6 +53,132 @@ def _prune_corp_code_cache() -> None:
             logger.info("오래된 DART corpCode 캐시 삭제: %s", stale.name)
     except OSError as exc:  # 캐시 정리 실패가 공시 조회를 막아서는 안 된다
         logger.debug("corpCode 캐시 정리 건너뜀: %s", exc)
+
+
+#: corpCode 스냅샷은 119,183행 / 8.5MB 다. 매 호출마다 OpenDartReader 를 새로
+#: 만들면 그때마다 이걸 통째로 파싱한다. 프로세스 수명 동안 하루치 한 번만 읽는다.
+#: 재진입 가능해야 한다 — `get_dart_reader()` 가 락을 잡은 채 `_load_corp_frame()` 을
+#: 부른다. 일반 Lock 이면 그 자리에서 교착이고, 스캔 스레드가 통째로 멈춘다
+#: (2026-09-14 테스트에서 적발).
+_CORP_FRAME_LOCK = threading.RLock()
+_corp_frame: tuple[str, Any] | None = None      # (yyyymmdd, DataFrame)
+
+_CORRUPT_ERRORS = (pickle.UnpicklingError, EOFError, ValueError, AttributeError, ImportError)
+
+
+def _corp_cache_path(day: str) -> Path:
+    return Path(_CORP_CACHE_DIR) / f"opendartreader_corp_codes_{day}.pkl"
+
+
+def _build_corp_cache(api_key: str, path: Path) -> Any:
+    """corpCode 스냅샷을 **원자적으로** 만든다.
+
+    2026-09-14 진단: `get_corp_code(...) 실패: pickle data was truncated`.
+    OpenDartReader 의 생성자는 이렇게 되어 있다:
+
+        if not os.path.exists(fn_cache):
+            df = dart_list.corp_codes(api_key)
+            df.to_pickle(fn_cache)      # 8.5MB 를 최종 경로에 직접 쓴다
+        self.corp_codes = pd.read_pickle(fn_cache)
+
+    `to_pickle` 이 도는 동안 파일은 이미 **존재한다.** 병렬 스캔(워커 3)에서 다른
+    스레드가 `os.path.exists` 를 True 로 보고 반쯤 쓰인 파일을 읽는다. 게다가 한 번
+    잘린 파일이 남으면 그날 내내 존재하므로 **하루 종일 DART 가 죽는다.**
+
+    임시 파일에 쓰고 `os.replace` 로 갈아끼운다 — 같은 디렉토리 안에서는 원자적이라
+    반쯤 쓰인 파일이 보이는 순간이 없다.
+    """
+    from OpenDartReader import dart_list  # type: ignore[import-untyped]
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame = dart_list.corp_codes(api_key)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        frame.to_pickle(tmp)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    logger.info("DART corpCode 스냅샷 생성: %s (%d행)", path.name, len(frame))
+    return frame
+
+
+def _load_corp_frame(api_key: str) -> Any:
+    """오늘자 corpCode 프레임. 손상된 캐시는 지우고 다시 만든다."""
+    global _corp_frame
+
+    import pandas as pd
+
+    day = datetime.today().strftime("%Y%m%d")
+    cached = _corp_frame
+    if cached is not None and cached[0] == day:
+        return cached[1]
+
+    with _CORP_FRAME_LOCK:
+        cached = _corp_frame                     # 락 안에서 다시 확인
+        if cached is not None and cached[0] == day:
+            return cached[1]
+
+        path = _corp_cache_path(day)
+        frame = None
+        if path.exists():
+            try:
+                frame = pd.read_pickle(path)
+            except _CORRUPT_ERRORS as exc:
+                # 손상된 캐시를 남겨두면 그날 내내 같은 실패가 반복된다.
+                logger.warning(
+                    "DART corpCode 캐시 손상 — 삭제 후 재생성 (%s): %s", path.name, exc
+                )
+                path.unlink(missing_ok=True)
+                frame = None
+
+        if frame is None:
+            frame = _build_corp_cache(api_key, path)
+
+        _corp_frame = (day, frame)
+        return frame
+
+
+_dart_reader: tuple[str, Any] | None = None
+
+
+def get_dart_reader(api_key: str) -> Any:
+    """OpenDartReader 인스턴스. 하루 한 번만 만든다.
+
+    생성자가 corpCode 스냅샷을 **직접 내려받아 최종 경로에 쓰는** 경로를 타지
+    않도록, 먼저 `_load_corp_frame()` 으로 캐시 파일을 원자적으로 보장한다.
+    그러면 생성자는 완성된 파일을 읽기만 한다 — 경합이 사라진다.
+    """
+    global _dart_reader
+
+    import OpenDartReader  # type: ignore[import-untyped]
+
+    day = datetime.today().strftime("%Y%m%d")
+    cached = _dart_reader
+    if cached is not None and cached[0] == day:
+        return cached[1]
+
+    with _CORP_FRAME_LOCK:
+        cached = _dart_reader
+        if cached is not None and cached[0] == day:
+            return cached[1]
+        try:
+            _load_corp_frame(api_key)      # 완성된 캐시 파일 보장
+        except Exception as exc:
+            # 사전 생성이 실패하면 라이브러리가 스스로 받게 둔다. 경합 가능성이
+            # 돌아오지만 조회 자체를 막는 것보다는 낫다 — 사유는 남긴다.
+            logger.warning("corpCode 사전 생성 실패 — 라이브러리 경로로 폴백: %s", exc)
+        reader = OpenDartReader(api_key)
+        _dart_reader = (day, reader)
+        return reader
+
+
+def reset_corp_frame_cache() -> None:
+    """테스트·운영 점검용 — 프로세스 캐시를 비운다."""
+    global _corp_frame, _dart_reader
+    with _CORP_FRAME_LOCK:
+        _corp_frame = None
+        _dart_reader = None
 
 
 class DartUnavailable(RuntimeError):
@@ -99,8 +227,12 @@ def _get_dart_api_key() -> Optional[str]:
 
 
 def get_corp_code(ticker: str) -> Optional[str]:
-    """
-    6자리 종목코드 → DART 고유번호 변환.
+    """6자리 종목코드 → DART 고유번호 8자리.
+
+    종전에는 호출마다 `OpenDartReader(api_key)` 를 새로 만들었다. 생성자가 8.5MB
+    스냅샷을 매번 파싱했고, 스냅샷이 없는 날 첫 호출들이 서로 경합해 반쯤 쓰인
+    파일을 읽었다 (`pickle data was truncated`). 이제 프레임을 하루 한 번만 읽고
+    조회는 메모리에서 한다.
 
     Args:
         ticker: "005930" 또는 "005930.KS" 형식
@@ -113,21 +245,13 @@ def get_corp_code(ticker: str) -> Optional[str]:
         logger.debug("DART_API_KEY 없음 — get_corp_code 건너뜀")
         return None
 
+    code = ticker.upper().split(".")[0]  # "005930.KS" → "005930"
     try:
-        # 이 패키지는 sys.modules 항목을 클래스로 치환한다 — `import OpenDartReader`가
-        # 모듈이 아니라 클래스를 바인딩하므로 그대로 호출해야 한다.
-        # `odr.OpenDartReader(...)`는 AttributeError, `from X import X`는 ImportError.
-        import OpenDartReader  # type: ignore[import-untyped]
-
-        code = ticker.upper().split(".")[0]  # "005930.KS" → "005930"
-        dart = OpenDartReader(api_key)
-        result = dart.find_corp_code(code)
-        if result and len(result) > 0:
-            return (
-                str(result.iloc[0]["corp_code"])
-                if hasattr(result, "iloc")
-                else str(result)
-            )
+        frame = _load_corp_frame(api_key)
+        matched = frame[frame["stock_code"] == code]
+        if len(matched) > 0:
+            return str(matched.iloc[0]["corp_code"])
+        logger.debug("DART corpCode 미등록 종목: %s", ticker)
     except Exception as exc:
         logger.warning("get_corp_code(%s) 실패: %s", ticker, exc)
     return None
@@ -159,7 +283,7 @@ def fetch_recent_disclosures(
 
     try:
         # 클래스 바인딩 주의 — get_corp_code 주석 참조.
-        import OpenDartReader  # type: ignore[import-untyped]
+        import OpenDartReader  # type: ignore[import-untyped]  # noqa: F401
     except ImportError as exc:
         raise DartUnavailable(f"OpenDartReader 미설치: {exc}") from exc
 
@@ -167,7 +291,7 @@ def fetch_recent_disclosures(
 
     try:
         code = ticker.upper().split(".")[0]
-        dart = OpenDartReader(api_key)
+        dart = get_dart_reader(api_key)
 
         end_date = date.today()
         start_date = end_date - timedelta(days=days_back)

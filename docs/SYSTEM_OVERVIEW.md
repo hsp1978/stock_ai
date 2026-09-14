@@ -865,6 +865,42 @@ alphavantage 분수(0.0044), 그리고 **FMP 는 배당 '금액'($1.06)을 수�
 
 실측: AAPL 0.0033 / 005930.KS 0.0067 / 049430.KQ 0.0315 — 전부 분수.
 
+#### 13.9e DART corpCode 캐시 경합 (2026-09-14)
+
+로깅을 켠 뒤 나온 두 번째 줄(§13.9c): `get_corp_code(049430.KQ) 실패: pickle data
+was truncated`.
+
+원인은 OpenDartReader 생성자다:
+
+```python
+if not os.path.exists(fn_cache):
+    df = dart_list.corp_codes(api_key)
+    df.to_pickle(fn_cache)      # 8.5MB 를 최종 경로에 직접 쓴다
+self.corp_codes = pd.read_pickle(fn_cache)
+```
+
+`to_pickle` 이 도는 동안 파일은 **이미 존재한다.** 병렬 스캔(워커 3)의 다른 스레드가
+`os.path.exists` 를 True 로 보고 반쯤 쓰인 파일을 읽는다. 게다가 잘린 파일은 그날 내내
+남으므로 **하루 종일 DART 조회가 죽는다** — 그리고 DART 도구는 방향성 도구라 조용히
+score 0이 되어 신호를 희석한다.
+
+`get_corp_code()` 가 호출마다 `OpenDartReader(api_key)` 를 새로 만든 것도 겹쳤다.
+119,183행 스냅샷을 매번 파싱했다.
+
+**수정**
+- 캐시 생성은 임시 파일 → `os.replace` (같은 디렉토리 내 원자적 교체). 반쯤 쓰인
+  파일이 보이는 순간이 없다
+- 손상된 캐시는 **지우고 다시 만든다** — 그날 내내 같은 실패를 반복하지 않는다
+- 스냅샷은 프로세스당 하루 1회만 읽고 조회는 메모리에서. 리더 인스턴스도 하루 1회
+- 락은 `RLock` — `get_dart_reader()` 가 락을 잡은 채 `_load_corp_frame()` 을 부른다.
+  일반 `Lock` 이면 그 자리에서 교착이고 스캔 스레드가 통째로 멈춘다
+  (테스트가 120초 타임아웃으로 잡아냈다)
+
+**실측 (실 컨테이너)**
+- 손상 캐시 주입 → 경고 로그 후 삭제·재생성(8,584,967 bytes), 조회 성공
+- 캐시 삭제 후 병렬 5회 첫 호출 → 생성 1회, 결과 일치, 1.3초
+- 반복 20회: 0.71초 → **0.072초** (절대값은 작다. 요점은 경합·손상 제거다)
+
 ### 13.10 데이터 품질 위험
 
 - OHLCV 캐시는 TTL 메타(`fetched_at`, `latest_bar_date`, `source`)를 갖지만,
