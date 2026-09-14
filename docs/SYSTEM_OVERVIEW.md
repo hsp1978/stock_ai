@@ -661,7 +661,7 @@ win 정의가 "신호 방향으로 ±2% 이상"이었는데 **±2%에 근거가 
 |---|---|---|
 | 1 | `webui.py` God file | **해소** (2026-09-14): 6,482 → 350 라인(−95%). `ui/` 공용 8모듈 + `ui/pages/` 17페이지 — 아래 §13.9a |
 | 2 | 이중 호출 경로 (직접 import + HTTP) | `/paper`·`/trading`·`/gpu`만 HTTP 강제. 나머지는 여전히 이중. 단 판정 지점은 1곳으로 합침 — `webui.py` 에 있던 두 번째 `_USE_LOCAL_ENGINE` 제거 (2026-09-14) |
-| 3 | `print()` 기반 로깅 | **agent-api 해소** (2026-09-14): `logging_setup.py` + 188건 전환. `stock_analyzer/` 385건은 미전환 — 아래 §13.9c |
+| 3 | `print()` 기반 로깅 | **해소** (2026-09-14): agent-api 188건 + webui 라이브러리 경로 179건 전환. CLI 블록 206건은 **의도적으로 유지** — 아래 §13.9c |
 | 4 | 양방향 `sys.path` 주입 | 미해결 (webui↔agent 상호 import) |
 | 5 | ~~분석 결과 JSON 무한 누적~~ | **해소** (2026-09-14): `output_retention` 잡 (JSON·PNG 30일, 03:30). 적발 시점 70,771개/1.58 GB, 하루 361개 증가 — 아래 §13.9b |
 | 6 | DB 마이그레이션 도구 부재 | Alembic 미도입 |
@@ -820,6 +820,35 @@ WARNING [data_collector] fundamentals failed via fmp: 403 ... ?apikey=svo6...
    캐시 파일이 손상돼 있다.
 
 둘 다 이전에도 일어나고 있었지만 **아무 데도 남지 않았다.**
+
+##### webui 쪽 (2026-09-14 후속)
+
+`stock_analyzer/` 의 print 385건은 성격이 둘로 갈린다:
+
+| 위치 | 건수 | 처리 |
+|---|---|---|
+| 라이브러리 경로 (webui·agent 가 import) | 179 | → `logger` |
+| `if __name__ == "__main__":` 아래 | 206 | **유지** — 사람이 스크립트를 직접 돌릴 때 보라고 있는 출력이다 |
+
+전부 지우는 게 목표가 아니다. 테스트가 양쪽을 **모두** 고정한다 — 라이브러리 경로
+print 0건, CLI print 100건 이상(일괄 치환으로 CLI 출력까지 사라지는 것을 막는다).
+
+설정은 `stock_analyzer/app_logging.py` 가 `chart_agent_service/logging_setup.py` 를
+**그대로 재사용**한다 (동일 함수 객체임을 테스트로 고정). 설정을 두 벌 두면 한쪽만
+고쳐지고, 비밀값 마스킹이 한쪽에만 걸린다. 실측: webui 컨테이너에서
+`redaction: enabled`, `apikey=***`.
+
+##### webui 로깅을 켜자 드러난 것 (별도 과제)
+
+```
+ERROR [stock_auto.local_engine] news_analyzer import 실패 (HTTP fallback):
+  cannot import name 'fetch_news_with_sentiment' from 'news_analyzer'
+  (/app/stock_analyzer/news_analyzer.py)
+```
+
+`stock_analyzer/news_analyzer.py` 가 `chart_agent_service/news_analyzer.py` 를 가린다
+(안티패턴 #5, 양방향 `sys.path` 주입). 폴백이 동작하므로 기능은 돌지만 **in-proc
+경로는 한 번도 쓰인 적이 없다.** 이전에는 이 사실이 아무 데도 남지 않았다.
 
 #### 13.9d 펀더멘털 다중 소스 (2026-09-14)
 

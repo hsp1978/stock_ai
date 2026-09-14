@@ -364,3 +364,74 @@ def test_exception_text_is_scrubbed(monkeypatch, capsys):
 def test_redaction_is_reported_as_enabled(monkeypatch):
     _env(monkeypatch)
     assert logging_setup.configure_logging(force=True)["redaction"] == "enabled"
+
+
+# ── stock_analyzer 쪽 ─────────────────────────────────────────────
+#
+# 2026-09-14 후속: agent-api 를 옮긴 뒤 webui·스캐너 차례. 다만 여기엔 **CLI 성격
+# 스크립트가 섞여 있다.** `if __name__ == "__main__":` 아래 출력은 사람이 직접
+# 돌릴 때 보라고 있는 것이므로 stdout 이 맞다. 옮기는 대상은 라이브러리 경로다.
+
+
+def _analyzer_dir():
+    return os.path.join(os.path.dirname(__file__), "../../stock_analyzer")
+
+
+def _split_prints(path: str) -> tuple[int, int]:
+    """(라이브러리 경로 print, __main__ 블록 print)."""
+    import re
+
+    lines = open(path, encoding="utf-8").read().split("\n")
+    guard = next(
+        (i for i, ln in enumerate(lines) if re.match(r"^if __name__\s*==", ln)),
+        len(lines),
+    )
+    lib = sum(1 for i, ln in enumerate(lines) if re.match(r"^\s*print\(", ln) and i < guard)
+    cli = sum(1 for i, ln in enumerate(lines) if re.match(r"^\s*print\(", ln) and i >= guard)
+    return lib, cli
+
+
+def test_library_paths_in_stock_analyzer_use_logger():
+    """webui·agent 가 import 해서 쓰는 코드에는 print 가 남으면 안 된다."""
+    import glob
+
+    offenders = {}
+    for path in glob.glob(os.path.join(_analyzer_dir(), "**", "*.py"), recursive=True):
+        lib, _ = _split_prints(path)
+        if lib:
+            offenders[os.path.relpath(path, _analyzer_dir())] = lib
+
+    assert not offenders, f"라이브러리 경로 print 잔존: {offenders}"
+
+
+def test_cli_prints_are_deliberately_kept():
+    """전부 지우는 게 목표가 아니다 — CLI 출력은 stdout 이 맞다.
+
+    이 테스트는 '남아 있어야 한다'를 고정한다. 누군가 일괄 치환으로 CLI 출력까지
+    로거로 바꾸면 스크립트를 직접 돌릴 때 화면이 비어 버린다.
+    """
+    import glob
+
+    kept = sum(
+        _split_prints(path)[1]
+        for path in glob.glob(os.path.join(_analyzer_dir(), "**", "*.py"), recursive=True)
+    )
+
+    assert kept > 100, "CLI 블록의 print 가 사라졌다"
+
+
+def test_app_logging_shares_the_agent_configuration():
+    """설정이 두 벌이면 한쪽만 고쳐진다."""
+    sys.path.insert(0, os.path.abspath(_analyzer_dir()))
+    import app_logging
+
+    assert app_logging.get_logger is logging_setup.get_logger
+    assert app_logging.configure_logging is logging_setup.configure_logging
+
+
+def test_webui_configures_logging_before_rendering():
+    src = open(os.path.join(_analyzer_dir(), "webui.py"), encoding="utf-8").read()
+
+    assert "\nconfigure_logging()\n" in src
+    # UI 를 그리기 전이어야 한다 — 그 전에 난 로그는 사라진다
+    assert src.index("configure_logging()") < src.index("st.set_page_config")

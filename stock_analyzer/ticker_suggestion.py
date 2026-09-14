@@ -336,12 +336,12 @@ class TickerSuggestion:
         # 최고 점수가 임계값 이상이면 자동 선택
         if suggestions[0]['score'] >= auto_select_threshold:
             best = suggestions[0]
-            print(f"✅ 자동 선택: {best['name']} ({best['ticker']})")
+            logger.info(f"✅ 자동 선택: {best['name']} ({best['ticker']})")
             return best['ticker']
 
         # 수동 선택 필요
-        print("\n" + self.format_suggestions(suggestions))
-        print("\n번호를 입력하여 선택하거나, 0을 입력하여 취소하세요.")
+        logger.info("\n" + self.format_suggestions(suggestions))
+        logger.info("\n번호를 입력하여 선택하거나, 0을 입력하여 취소하세요.")
 
         # CLI 환경에서 선택 (API에서는 다른 방식 필요)
         try:
@@ -352,7 +352,7 @@ class TickerSuggestion:
             idx = int(choice) - 1
             if 0 <= idx < len(suggestions):
                 selected = suggestions[idx]
-                print(f"✅ 선택됨: {selected['name']} ({selected['ticker']})")
+                logger.info(f"✅ 선택됨: {selected['name']} ({selected['ticker']})")
                 return selected['ticker']
         except (ValueError, IndexError, EOFError):
             pass

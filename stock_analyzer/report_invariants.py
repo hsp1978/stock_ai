@@ -20,6 +20,10 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from app_logging import get_logger
+
+logger = get_logger("stock_auto.report_invariants")
+
 # 부동소수 합산 오차 허용치. 점수는 소수 1자리로 표기되므로 그보다 작게 잡는다.
 TOLERANCE = 0.05
 
@@ -232,5 +236,5 @@ def enforce_report_invariants(report: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(report.get(key), (int, float)):
             report[key] = min(float(report[key]), 3.0)
 
-    print(f"[report_invariants] 위반 {len(messages)}건: {'; '.join(messages)}")
+    logger.info(f"[report_invariants] 위반 {len(messages)}건: {'; '.join(messages)}")
     return report

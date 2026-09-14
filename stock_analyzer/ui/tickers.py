@@ -32,6 +32,10 @@ except ImportError:
 
 from ui.market import KR_NAME_TO_TICKER
 
+from app_logging import get_logger
+
+logger = get_logger("stock_auto.ui.tickers")
+
 _KR_LOOKUP = {k.lower(): v for k, v in KR_NAME_TO_TICKER.items()}
 
 
@@ -71,7 +75,7 @@ def resolve_ticker(user_input: str) -> tuple[str, str]:
                 name = result['suggestions'][0].get('name', text)
                 return ticker, f"{text} → {ticker} ({name})"
         except Exception as e:
-            print(f"ticker_suggestion 오류: {e}")
+            logger.error(f"ticker_suggestion 오류: {e}")
 
     # 기존 미국 주식 한글 매핑 확인
     query = text.lower()
@@ -452,15 +456,15 @@ def _validate_ticker_webui_impl(ticker_input: str, ticker: str) -> tuple[bool, s
             if result['found'] and result['best_match']:
                 # 95% 이상 매치로 자동 선택된 경우
                 ticker = result['best_match']
-                print(f"✅ 종목 자동 선택: {result['suggestions'][0]['name']} ({ticker})")
+                logger.info(f"✅ 종목 자동 선택: {result['suggestions'][0]['name']} ({ticker})")
             elif result['found'] and result['suggestions']:
                 # 여러 제안이 있는 경우 첫번째 사용 (또는 UI에서 선택하게 할 수 있음)
                 ticker = result['suggestions'][0]['ticker']
-                print(f"✅ 종목 선택: {result['suggestions'][0]['name']} ({ticker})")
+                logger.info(f"✅ 종목 선택: {result['suggestions'][0]['name']} ({ticker})")
             else:
                 return False, f"❌ '{ticker_input}'를 찾을 수 없습니다. 정확한 종목명이나 종목코드를 입력하세요."
         except Exception as e:
-            print(f"한국 주식 이름 검색 오류: {e}")
+            logger.error(f"한국 주식 이름 검색 오류: {e}")
 
     if len(ticker) > 10:  # 대부분의 티커는 10자 이내
         return False, f"종목 코드가 너무 깁니다: {ticker}"

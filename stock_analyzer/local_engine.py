@@ -122,6 +122,10 @@ from portfolio_rebalancer import (
     execute_rebalancing, get_rebalance_history, get_rebalance_status,
 )
 
+from app_logging import get_logger
+
+logger = get_logger("stock_auto.local_engine")
+
 # DB 초기화 (import 시 1회)
 init_db()
 
@@ -135,25 +139,25 @@ try:
     from news_analyzer import fetch_news_with_sentiment, get_news_cache_status
     _DIRECT_NEWS = True
 except ImportError as e:
-    print(f"[local_engine] news_analyzer import 실패 (HTTP fallback): {e}")
+    logger.error(f"[local_engine] news_analyzer import 실패 (HTTP fallback): {e}")
 
 try:
     from chart_pattern import detect_chart_patterns
     _DIRECT_CHART_PATTERN = True
 except ImportError as e:
-    print(f"[local_engine] chart_pattern import 실패 (HTTP fallback): {e}")
+    logger.error(f"[local_engine] chart_pattern import 실패 (HTTP fallback): {e}")
 
 try:
     from sector_compare import compare_sector
     _DIRECT_SECTOR = True
 except ImportError as e:
-    print(f"[local_engine] sector_compare import 실패 (HTTP fallback): {e}")
+    logger.error(f"[local_engine] sector_compare import 실패 (HTTP fallback): {e}")
 
 try:
     from macro_context import fetch_macro_context
     _DIRECT_MACRO = True
 except ImportError as e:
-    print(f"[local_engine] macro_context import 실패 (HTTP fallback): {e}")
+    logger.error(f"[local_engine] macro_context import 실패 (HTTP fallback): {e}")
 
 
 # Mac Studio API URL (HTTP fallback용)
@@ -215,7 +219,7 @@ def _persist_latest_result_summary(ticker: str | None = None) -> None:
                 )
                 set_app_state(_STATE_LATEST_RESULTS, _LATEST_SUMMARY_CACHE)
     except Exception as exc:
-        print(f"[local_engine] latest_results 저장 실패: {exc}")
+        logger.error(f"[local_engine] latest_results 저장 실패: {exc}")
 
 
 def _stage_latest_result_summary(ticker: str) -> None:
@@ -231,7 +235,7 @@ def _flush_latest_result_summaries() -> None:
         with _STATE_LOCK:
             set_app_state(_STATE_LATEST_RESULTS, _LATEST_SUMMARY_CACHE)
     except Exception as exc:
-        print(f"[local_engine] latest_results batch 저장 실패: {exc}")
+        logger.error(f"[local_engine] latest_results batch 저장 실패: {exc}")
 
 
 def _persist_scan_history() -> None:
@@ -239,7 +243,7 @@ def _persist_scan_history() -> None:
         with _STATE_LOCK:
             set_app_state(_STATE_SCAN_HISTORY, scan_history[-100:])
     except Exception as exc:
-        print(f"[local_engine] scan_history 저장 실패: {exc}")
+        logger.error(f"[local_engine] scan_history 저장 실패: {exc}")
 
 
 def _restore_runtime_state() -> None:
@@ -261,16 +265,16 @@ def _restore_runtime_state() -> None:
             if isinstance(history, list):
                 scan_history.clear()
                 scan_history.extend(history[-100:])
-        print(
+        logger.info(
             f"[local_engine] 상태 복원: cooling_off={len(cooling_off_state)}, "
             f"latest={len(latest_results)}, history={len(scan_history)}"
         )
     except Exception as exc:
-        print(f"[local_engine] 상태 복원 실패: {exc}")
+        logger.error(f"[local_engine] 상태 복원 실패: {exc}")
 
 
 def _fetch_analysis_inputs(ticker: str):
-    print(f"  [{ticker}] 데이터 병렬 수집...")
+    logger.info(f"  [{ticker}] 데이터 병렬 수집...")
     executor = ThreadPoolExecutor(max_workers=4)
     futures = {
         "ohlcv": executor.submit(_fetch_in_worker_scope, fetch_ohlcv, ticker),
@@ -292,10 +296,10 @@ def _fetch_analysis_inputs(ticker: str):
             try:
                 values[name] = futures[name].result(timeout=_AUX_FETCH_TIMEOUT)
             except FutureTimeoutError:
-                print(f"  [{ticker}] {name} 수집 시간 초과")
+                logger.warning(f"  [{ticker}] {name} 수집 시간 초과")
                 values[name] = default
             except Exception as exc:
-                print(f"  [{ticker}] {name} 수집 실패: {exc}")
+                logger.error(f"  [{ticker}] {name} 수집 실패: {exc}")
                 values[name] = default
 
         return df, values["fundamentals"], values["options_pcr"], values["insider_trades"]
@@ -351,7 +355,7 @@ def _http_get(path: str, timeout: int = 30) -> Optional[dict]:
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        print(f"[HTTP fallback 오류] {path}: {e}")
+        logger.error(f"[HTTP fallback 오류] {path}: {e}")
         return None
 
 
@@ -736,7 +740,7 @@ def engine_scan_ticker(
     try:
         df, fundamentals, options_pcr, insider_trades = _fetch_analysis_inputs(ticker)
 
-        print(f"  [{ticker}] 분석 도구 실행...")
+        logger.info(f"  [{ticker}] 분석 도구 실행...")
         agent = ChartAnalysisAgent(ticker, df)
         result = agent.run(mode=ai_mode)
 
@@ -749,7 +753,7 @@ def engine_scan_ticker(
             chart_path = generate_agent_chart(ticker, df, result)
             result["chart_path"] = chart_path
         except Exception as e:
-            print(f"  [{ticker}] 차트 생성 실패: {e}")
+            logger.error(f"  [{ticker}] 차트 생성 실패: {e}")
 
         json_path = os.path.join(
             OUTPUT_DIR,
@@ -775,11 +779,11 @@ def engine_scan_ticker(
         # DB 기록
         insert_scan(ticker, result)
 
-        print(f"  [{ticker}] 완료: {result.get('final_signal')} ({result.get('composite_score')})")
+        logger.info(f"  [{ticker}] 완료: {result.get('final_signal')} ({result.get('composite_score')})")
         return _sanitize(result)
 
     except Exception as e:
-        print(f"  [{ticker}] 분석 실패: {e}")
+        logger.error(f"  [{ticker}] 분석 실패: {e}")
         return {"error": str(e)}
 
 
@@ -794,11 +798,11 @@ def engine_scan_all(tickers: Optional[list] = None) -> dict:
     max_workers = int(os.getenv("SCAN_PARALLEL_WORKERS", "3"))
 
     t_start = time.time()
-    print(f"\n{'='*60}")
-    print(f"  스캔 시작: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"  종목: {len(tickers)}개 — {', '.join(tickers)}")
-    print(f"  병렬 워커: {max_workers}개")
-    print(f"{'='*60}\n")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"  스캔 시작: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    logger.info(f"  종목: {len(tickers)}개 — {', '.join(tickers)}")
+    logger.info(f"  병렬 워커: {max_workers}개")
+    logger.info(f"{'='*60}\n")
 
     # OHLCV 배치 사전 다운로드
     try:
@@ -807,7 +811,7 @@ def engine_scan_all(tickers: Optional[list] = None) -> dict:
         clear_ohlcv_cache()
         prefetch_ohlcv_batch(tickers)
     except Exception as e:
-        print(f"  [배치] 사전 다운로드 실패, 개별 조회: {e}")
+        logger.error(f"  [배치] 사전 다운로드 실패, 개별 조회: {e}")
 
     scan_entry = {
         "timestamp": datetime.now().isoformat(),
@@ -827,7 +831,7 @@ def engine_scan_all(tickers: Optional[list] = None) -> dict:
             try:
                 ticker, result = future.result()
             except Exception as e:
-                print(f"  [{futures[future]}] 오류: {e}")
+                logger.error(f"  [{futures[future]}] 오류: {e}")
                 continue
             if result and not result.get("error"):
                 with lock:
@@ -851,7 +855,7 @@ def engine_scan_all(tickers: Optional[list] = None) -> dict:
         _persist_scan_history()
 
     elapsed = time.time() - t_start
-    print(f"\n  ✅ 스캔 완료: {len(tickers)}개 / {elapsed:.1f}s "
+    logger.info(f"\n  ✅ 스캔 완료: {len(tickers)}개 / {elapsed:.1f}s "
           f"(종목당 평균 {elapsed/len(tickers):.1f}s)")
     return {"status": "completed", "results": engine_get_all_results()}
 
@@ -1007,7 +1011,7 @@ def engine_quant_analyze(ticker: str, benchmark: str = "") -> dict:
             try:
                 benchmark_df = fetch_ohlcv(benchmark)
             except Exception as exc:
-                print(f"[local_engine] benchmark fetch failed ({benchmark}): {exc}")
+                logger.info(f"[local_engine] benchmark fetch failed ({benchmark}): {exc}")
 
         result = analyze_quant_indicators(ticker, df, benchmark_df=benchmark_df)
         result["benchmark_ticker"] = benchmark if benchmark_df is not None else None
@@ -1117,7 +1121,7 @@ def engine_fetch_news(ticker: str) -> dict:
         try:
             return _sanitize(fetch_news_with_sentiment(ticker))
         except Exception as e:
-            print(f"[news 직접호출 실패, HTTP fallback] {e}")
+            logger.error(f"[news 직접호출 실패, HTTP fallback] {e}")
     return _http_get(f"/news/{ticker}", timeout=120) or {"error": "뉴스 수집 실패"}
 
 
@@ -1131,7 +1135,7 @@ def engine_chart_pattern(ticker: str) -> dict:
             chart_path = latest_results.get(ticker, {}).get("result", {}).get("chart_path")
             return _sanitize(detect_chart_patterns(ticker, df, chart_path))
         except Exception as e:
-            print(f"[chart_pattern 직접호출 실패, HTTP fallback] {e}")
+            logger.error(f"[chart_pattern 직접호출 실패, HTTP fallback] {e}")
     return _http_get(f"/chart-pattern/{ticker}", timeout=60) or {"error": "차트 패턴 분석 실패"}
 
 
@@ -1142,7 +1146,7 @@ def engine_sector_compare(ticker: str) -> dict:
         try:
             return _sanitize(compare_sector(ticker))
         except Exception as e:
-            print(f"[sector 직접호출 실패, HTTP fallback] {e}")
+            logger.error(f"[sector 직접호출 실패, HTTP fallback] {e}")
     return _http_get(f"/sector/{ticker}", timeout=30) or {"error": "섹터 비교 실패"}
 
 
@@ -1152,7 +1156,7 @@ def engine_macro_context() -> dict:
         try:
             return _sanitize(fetch_macro_context())
         except Exception as e:
-            print(f"[macro 직접호출 실패, HTTP fallback] {e}")
+            logger.error(f"[macro 직접호출 실패, HTTP fallback] {e}")
     return _http_get("/macro", timeout=15) or {"error": "매크로 데이터 수집 실패"}
 
 
@@ -1201,7 +1205,7 @@ def _call_gemini(prompt: str) -> Optional[str]:
         text = data["candidates"][0]["content"]["parts"][0]["text"]
         return f"<!-- llm_meta:{GEMINI_MODEL} -->\n{text}"
     except Exception as e:
-        print(f"[Gemini 오류] {e}")
+        logger.error(f"[Gemini 오류] {e}")
         return None
 
 
@@ -1224,7 +1228,7 @@ def _call_ollama(prompt: str) -> Optional[str]:
             return f"<!-- llm_meta:Ollama {OLLAMA_MODEL} -->\n{text}"
         return None
     except Exception as e:
-        print(f"[Ollama 오류] {e}")
+        logger.error(f"[Ollama 오류] {e}")
         return None
 
 
@@ -1255,7 +1259,7 @@ def _call_openai(prompt: str) -> Optional[str]:
         text = resp.json()["choices"][0]["message"]["content"]
         return f"<!-- llm_meta:GPT-4o -->\n{text}"
     except Exception as e:
-        print(f"[OpenAI 오류] {e}")
+        logger.error(f"[OpenAI 오류] {e}")
         return None
 
 
@@ -1280,7 +1284,7 @@ def _call_llm(prompt: str, provider: str = "auto") -> str:
         result = fn(prompt)
         if result:
             return result
-        print(f"  [{name}] 실패, 다음 LLM으로 전환...")
+        logger.error(f"  [{name}] 실패, 다음 LLM으로 전환...")
 
     return "[오류] 모든 LLM 호출 실패"
 
@@ -1359,7 +1363,7 @@ def _gather_extra_context(ticker: str) -> str:
                 f"BUY {stats.get('buy_cnt', 0)} / SELL {stats.get('sell_cnt', 0)} / HOLD {stats.get('hold_cnt', 0)}"
             )
     except Exception as e:
-        print(f"  [{ticker}] 주간 트렌드 수집 실패: {e}")
+        logger.error(f"  [{ticker}] 주간 트렌드 수집 실패: {e}")
 
     news = engine_fetch_news(ticker)
     if news and not news.get("error"):
@@ -1779,7 +1783,7 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
                 signal = path.split("signal=")[1].split("&")[0] or None
             return engine_signal_accuracy(horizon, min_confidence, signal, days_back)
     except Exception as e:
-        print(f"[dispatch_get 오류] {path}: {e}")
+        logger.error(f"[dispatch_get 오류] {path}: {e}")
         return {"error": str(e)}
     return None
 
@@ -1807,7 +1811,7 @@ def engine_dispatch_post(
                 resp.raise_for_status()
                 return resp.json()
             except Exception as e:
-                print(f"[local_engine] screener API 호출 실패: {e}")
+                logger.error(f"[local_engine] screener API 호출 실패: {e}")
                 return {"error": str(e)}
         elif path.startswith("/ops/jobs/") and "/run" in path:
             job_id = path.split("/ops/jobs/")[1].split("/run")[0]
@@ -1890,6 +1894,6 @@ def engine_dispatch_post(
                 "message": "Local engine — restart not applicable",
             }
     except Exception as e:
-        print(f"[dispatch_post 오류] {path}: {e}")
+        logger.error(f"[dispatch_post 오류] {path}: {e}")
         return {"error": str(e)}
     return None
