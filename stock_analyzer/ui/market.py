@@ -262,3 +262,31 @@ KR_NAME_TO_TICKER = {
     "마리어트": "MAR",
 }
 
+
+def fetch_index_history(symbol: str, period: str = "6mo") -> "pd.DataFrame | None":
+    """지수/환율 차트용 이력. 원화 교차 환율은 base 페어에서 계산한다."""
+    try:
+        if symbol in KRW_CROSS:
+            spec = KRW_CROSS[symbol]
+            bases = [t for t in (spec["num"], spec["den"]) if t]
+            closes = {}
+            for t in bases:
+                h = yf.Ticker(t).history(period=period)
+                if h is None or h.empty:
+                    return None
+                closes[t] = h["Close"].dropna()
+            series = _krw_cross_series(lambda t: closes.get(t), symbol)
+            if series is None or series.empty:
+                return None
+            return pd.DataFrame({"Close": series})
+
+        hist = yf.Ticker(symbol).history(period=period)
+        if hist is None or hist.empty:
+            return None
+        return hist
+    except Exception:
+        return None
+
+
+_INDEX_PERIODS = {"1개월": "1mo", "3개월": "3mo", "6개월": "6mo", "1년": "1y", "5년": "5y"}
+"""차트 기간 프리셋 — 라벨은 화면 표기, 값은 yfinance period."""

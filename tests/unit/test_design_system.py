@@ -153,6 +153,28 @@ def _ui_source():
     return _webui() + "\n" + open(_THEME, encoding="utf-8").read()
 
 
+def _screen_source():
+    """webui.py + ui/ 전체 — 페이지가 계속 이동하므로 위치를 고정하지 않는다.
+
+    종전에는 컴포넌트 규칙을 `webui.py` 안에서만 찾아서, 분해로 함수가 옮겨질
+    때마다 규칙이 깨진 게 아니라 **검사가** 깨졌다 (2026-09-14 ticker_chip_html).
+    """
+    import glob
+
+    ui_dir = os.path.join(os.path.dirname(__file__), "../../stock_analyzer/ui")
+    parts = [_webui()]
+    for path in sorted(glob.glob(os.path.join(ui_dir, "**", "*.py"), recursive=True)):
+        parts.append(open(path, encoding="utf-8").read())
+    return "\n".join(parts)
+
+
+def _function_body(src: str, name: str) -> str:
+    """최상위 함수 본문 — 다음 최상위 def 앞까지 (없으면 파일 끝까지)."""
+    body = src[src.index(f"def {name}("):]
+    nxt = body.find("\n\ndef ", 1)
+    return body if nxt < 0 else body[:nxt]
+
+
 def test_nav_has_three_groups():
     """14개 항목을 ANALYSIS / OPERATIONS / TRADING 3그룹으로 분류."""
     src = _webui()
@@ -224,18 +246,15 @@ def test_command_bar_exists():
 
 def test_ticker_chip_puts_ticker_first():
     """회사 명칭을 칩 본문에 넣으면 폭이 들쭉날쭉해진다 — 명칭은 툴팁."""
-    src = _webui()
+    src = _screen_source()
     assert "def ticker_chip_html" in src
-    fn = src[src.index("def ticker_chip_html"):]
-    fn = fn[: fn.index("\n\ndef ")]
+    fn = _function_body(src, "ticker_chip_html")
     assert 'title="{title}"' in fn, "명칭 툴팁 없음"
     assert "{ticker}</span>" in fn, "티커가 칩 본문에 없음"
 
 
 def test_ticker_chip_has_market_badge():
-    src = _webui()
-    fn = src[src.index("def ticker_chip_html"):]
-    fn = fn[: fn.index("\n\ndef ")]
+    fn = _function_body(_screen_source(), "ticker_chip_html")
     assert '"KR" if is_kr else "US"' in fn
 
 
@@ -247,7 +266,7 @@ def test_ticker_chip_spec_dimensions():
 
 def test_datatable_row_height():
     """DS §05 DataTable: 행 h44."""
-    assert "row_height=44" in _webui()
+    assert "row_height=44" in _screen_source()
 
 
 # ── 모듈 실행 순서 (2026-08-05 회귀) ────────────────────────────
