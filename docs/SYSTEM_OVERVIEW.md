@@ -664,7 +664,7 @@ win 정의가 "신호 방향으로 ±2% 이상"이었는데 **±2%에 근거가 
 | 3 | `print()` 기반 로깅 | **해소** (2026-09-14): agent-api 188건 + webui 라이브러리 경로 179건 전환. CLI 블록 206건은 **의도적으로 유지** — 아래 §13.9c |
 | 4 | 양방향 `sys.path` 주입 | 구조는 그대로. 단 **동명 모듈 충돌은 제거·차단** (2026-09-14, `test_module_shadowing.py`) — 아래 §13.9f |
 | 5 | ~~분석 결과 JSON 무한 누적~~ | **해소** (2026-09-14): `output_retention` 잡 (JSON·PNG 30일, 03:30). 적발 시점 70,771개/1.58 GB, 하루 361개 증가 — 아래 §13.9b |
-| 6 | DB 마이그레이션 도구 부재 | Alembic 미도입 |
+| 6 | ~~DB 마이그레이션 도구 부재~~ | **해소** (2026-09-15): Alembic 도입, 리비전 4개. 운영 DB 채택 완료 — 아래 §13.9k |
 | 7 | FastAPI 전 핸들러 sync + blocking I/O | `httpx.AsyncClient` 단계 전환 미착수 |
 | 8 | 모델 버전 태그 핀 | `qwen3:14b-q4_K_M` 등 태그 고정이나 digest 핀은 아님 |
 | 9 | 백테스트 Composite 전략의 과거 replay 제외 | look-ahead 회피 목적. 도구 신호의 역사적 성능은 미측정 |
@@ -1174,6 +1174,64 @@ tier 를 넣었다 — deadline 예산(#14)·노드 가용성·타임아웃 상�
 
 40회/일도 넉넉하지 않다. 종목이 늘거나 스캔이 Gemini 를 쓰면 다시 넘친다. 구조적
 해법은 유료 등급이다 — 28회/일 규모에서는 비용이 미미하다.
+
+#### 13.9k 스키마 마이그레이션 (2026-09-15)
+
+CLAUDE.md Don't #8 은 "Alembic migration 도입 후 마이그레이션 스크립트로만" 을
+규정하고 있었지만 **도구가 없었다.** `init_db()` 가 이렇게 했다:
+
+```python
+conn.execute(_CREATE_TABLE)              # CREATE TABLE IF NOT EXISTS
+try:
+    conn.execute("ALTER TABLE signal_outcomes ADD COLUMN ...")
+except sqlite3.OperationalError:
+    pass    # 이미 존재
+```
+
+문제 셋:
+1. **버전 기록이 없다** — 어떤 DB 가 어디까지 왔는지 알 방법이 없었다
+2. **실패가 숨는다** — "이미 존재"와 진짜 오류가 같은 처리다 (§13-1)
+3. 데이터 마이그레이션(백필·값 변환)을 넣을 자리가 없었다
+
+##### SQLAlchemy 모델은 도입하지 않았다
+
+DB 계층 전체가 raw `sqlite3` 다. 모델이 없으니 `--autogenerate` 는 쓸 수 없고,
+마이그레이션은 `op.exec_driver_sql()` 로 직접 쓴다. Alembic 은 **버전 관리와 순서
+보장**만 담당한다 — 그게 없던 부분이다. (alembic·SQLAlchemy 는 litellm 이 이미
+transitive 로 끌어오고 있었지만, 이제 직접 의존이므로 requirements 에 명시했다.)
+
+| 리비전 | 내용 |
+|---|---|
+| `0001_baseline` | 현재 스키마 전체. SQL 은 `db.py` 의 `_CREATE_*` 상수를 **그대로** 실행한다 (복사하면 갈린다) |
+| `0002_signal_outcomes_columns` | Step 12 / 2026-09 에 손으로 추가했던 컬럼 10개 |
+| `0003_scan_log_entry_price` | `scan_log.entry_price` |
+| `0004_indexes` | 인덱스 — 컬럼 리비전 이후에 만든다 |
+
+##### 두 번 틀렸고, 둘 다 테스트가 잡았다
+
+**(1) 기존 DB 를 stamp 로 채택하려 했다.** "이미 최신이면 head, 아니면 베이스라인으로
+stamp" 로 짰는데, 스키마가 **일부만** 있는 DB 에서 깨졌다 — stamp 는 0001 을
+건너뛰므로 없는 테이블이 영영 안 만들어진다. `test_direction_adjusted_metrics` 가
+잡았다. 어느 리비전이 이 DB 의 모양과 맞는지 **추측하는 것 자체가 틀린 접근**이었다.
+지금은 채택 시에도 처음부터 올린다: 0001 은 전부 `IF NOT EXISTS`, 0002·0003 은 컬럼
+존재를 직접 확인하므로 기존 데이터에 안전하고 빠진 것만 채운다.
+
+**(2) 인덱스를 베이스라인에 뒀다.** `_CREATE_INDEX` 에 `signal_outcomes(regime)` 처럼
+후속 컬럼을 참조하는 인덱스가 있어, 옛 DB 에서 컬럼이 생기기 전에 실행돼
+`no such column: regime` 으로 죽었다. 마지막 리비전(0004)으로 분리했다.
+
+##### 운영 DB 채택 결과
+
+적용 전 백업(오프사이트 복제 포함)을 복구 지점으로 잡고 실행했다.
+
+```
+mode     : adopt → revision 0004_indexes
+scan_log : 71,143행 (변화 없음)
+signal_outcomes : 5,525행 (변화 없음)
+integrity: ok     view: 존재
+```
+
+재실행은 `mode: upgrade` 로 멱등이다. 확인: `make db-revision` / `make db-history`.
 
 ### 13.10 데이터 품질 위험
 
