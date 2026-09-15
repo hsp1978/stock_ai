@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, TypeVar
 
@@ -180,11 +181,19 @@ def call_agent_llm(
     Pydantic 모델로 검증된 응답을 반환한다.
 
     파싱 실패 시 neutral 안전 응답을 반환하므로 호출자에서 예외 처리 불필요.
+
+    timeout_seconds는 이 호출 **전체**의 예산이다. 후보 모델 폴백(3) × 파싱
+    재시도(2)가 각각 timeout_seconds를 다시 쓰면 최악 6배까지 늘어나므로,
+    진입 시 deadline을 고정하고 매 시도마다 남은 시간으로 잘라 쓴다.
     """
     if timeout_seconds is not None and timeout_seconds <= 0:
         return _safe_response(
             response_model, "deadline_exceeded_before_call", ["LLM_DEADLINE_EXCEEDED"]
         )
+
+    deadline = (
+        time.monotonic() + float(timeout_seconds) if timeout_seconds is not None else None
+    )
 
     schema = response_model.model_json_schema()
     required_keys = schema.get("required") or list(
@@ -210,6 +219,10 @@ def call_agent_llm(
     last_exc: Exception | None = None
 
     for model_name in model_candidates:
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            last_exc = last_exc or TimeoutError("deadline_exceeded")
+            break
+
         if not _node_available_for_model(model_name):
             last_exc = RuntimeError(f"node_unavailable:{_node_for_model(model_name)}")
             logger.warning(
@@ -232,11 +245,15 @@ def call_agent_llm(
                     completion_kwargs = {
                         "response_format": {"type": "json_object"},
                     }
-                    if timeout_seconds is not None:
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            last_exc = TimeoutError("deadline_exceeded")
+                            break
                         completion_kwargs["timeout"] = max(
                             1,
                             min(
-                                float(timeout_seconds),
+                                remaining,
                                 _model_timeout_cap(model_name),
                                 300.0,
                             ),
@@ -279,6 +296,10 @@ def call_agent_llm(
     if isinstance(last_exc, ValidationError):
         return _safe_response(
             response_model, f"parse_error: {last_exc}", ["LLM_PARSE_ERROR"]
+        )
+    if isinstance(last_exc, TimeoutError):
+        return _safe_response(
+            response_model, "deadline_exceeded", ["LLM_DEADLINE_EXCEEDED"]
         )
     return _safe_response(
         response_model, f"call_error: {last_exc}", ["LLM_CALL_ERROR"]

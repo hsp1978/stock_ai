@@ -7,6 +7,8 @@
 import copy
 import os
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, List, Dict
 
@@ -101,8 +103,22 @@ def get_news_cache_status(tickers: list[str] | None = None) -> dict[str, Any]:
 # ── LiteLLM Router 감성 분석 (Step 9: Ollama 직접 호출 → Router) ──
 
 
-def _analyze_sentiment_ollama(title: str, text: str) -> Dict:
-    """LiteLLM Router를 통해 뉴스 감성 분석. 실패 시 neutral 반환."""
+_NEUTRAL_SENTIMENT: Dict = {
+    "sentiment": "neutral",
+    "score": 0.0,
+    "summary": "",
+    "keywords": [],
+}
+
+
+def _analyze_sentiment_ollama(
+    title: str, text: str, timeout_seconds: float | None = None
+) -> Dict:
+    """Analyze one article's sentiment via LiteLLM Router. Returns neutral on failure.
+
+    timeout_seconds bounds the single call; the router clamps it to the
+    per-model cap. None keeps the model default (240s for Ollama).
+    """
     prompt = (
         f"다음 주식 뉴스를 분석하고 반드시 JSON만 응답하라. 다른 텍스트 없이 JSON만.\n\n"
         f"뉴스 제목: {title}\n"
@@ -118,7 +134,11 @@ def _analyze_sentiment_ollama(title: str, text: str) -> Dict:
         from llm.schemas import NewsSentimentResponse
 
         result = call_agent_llm(
-            get_router(), "news sentiment analyzer", prompt, NewsSentimentResponse
+            get_router(),
+            "news sentiment analyzer",
+            prompt,
+            NewsSentimentResponse,
+            timeout_seconds=timeout_seconds,
         )
         return {
             "sentiment": result.sentiment,
@@ -128,7 +148,44 @@ def _analyze_sentiment_ollama(title: str, text: str) -> Dict:
         }
     except Exception:
         pass
-    return {"sentiment": "neutral", "score": 0.0, "summary": "", "keywords": []}
+    return dict(_NEUTRAL_SENTIMENT)
+
+
+def _analyze_articles_bounded(articles: list[dict]) -> list[Dict]:
+    """Analyze sentiment for articles under a wall-clock budget.
+
+    Runs calls concurrently and derives each call's timeout from the remaining
+    budget, so the whole phase stays bounded even when the LLM router falls
+    back to slow local Ollama nodes. Articles that do not finish in time get
+    the neutral fallback. Result order matches the input order.
+    """
+    budget = float(settings.NEWS_SENTIMENT_BUDGET_SEC)
+    workers = max(1, min(int(settings.NEWS_SENTIMENT_WORKERS), len(articles)))
+    deadline = time.monotonic() + budget
+    results: list[Dict] = [dict(_NEUTRAL_SENTIMENT) for _ in articles]
+
+    def _worker(index: int, article: dict) -> tuple[int, Dict]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return index, dict(_NEUTRAL_SENTIMENT)
+        return index, _analyze_sentiment_ollama(
+            article["title"], article["_text"], timeout_seconds=remaining
+        )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(_worker, idx, article) for idx, article in enumerate(articles)
+        ]
+        for future in futures:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                idx, sentiment = future.result(timeout=remaining or 0.01)
+                results[idx] = sentiment
+            except Exception:
+                # 예산 초과/호출 실패 — 해당 기사는 neutral 유지
+                future.cancel()
+
+    return results
 
 
 # ── yfinance 뉴스 수집 ────────────────────────────────────────────
@@ -342,14 +399,16 @@ def fetch_news_with_sentiment(ticker: str, analyze_sentiment: bool = True) -> Di
 
     combined, used_sources = _collect_articles(ticker)
 
-    # 감성 분석
+    # 감성 분석 — 상위 N건만, 전체 예산 안에서 병렬 처리
+    if analyze_sentiment and combined:
+        max_articles = int(settings.NEWS_SENTIMENT_MAX_ARTICLES)
+        combined = combined[:max_articles]
+        sentiments = _analyze_articles_bounded(combined)
+    else:
+        sentiments = [dict(_NEUTRAL_SENTIMENT) for _ in combined]
+
     analyzed = []
-    for a in combined:
-        sentiment_data = (
-            _analyze_sentiment_ollama(a["title"], a["_text"])
-            if analyze_sentiment
-            else {"sentiment": "neutral", "score": 0.0, "summary": "", "keywords": []}
-        )
+    for a, sentiment_data in zip(combined, sentiments):
         analyzed.append(
             {
                 "title": a["title"],
