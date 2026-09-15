@@ -140,16 +140,57 @@ def test_confidence_interval_uses_independent_blocks_not_rows(db):
     assert hi - lo > 40, (lo, hi)   # 블록 1~2개면 구간이 넓어야 정직하다
 
 
+def _same_block_offsets(horizon: int = 7) -> tuple[int, int]:
+    """같은 horizon 블록에 확실히 들어가는 '며칠 전' 두 값을 찾는다.
+
+    블록 인덱스는 **epoch(1970-01-01) 기준 절대 격자**다
+    (`_horizon_block`: `(issued_at - epoch).days // horizon`). 상대적인
+    '며칠 전'이 아니다. 그래서 "20일 전과 19일 전은 같은 블록"은 **오늘이 격자
+    어디에 있느냐에 따라 달라진다** — 7일 중 1일은 경계라 갈라진다.
+
+    2026-09-15 에 이 테스트가 그렇게 깨졌다 (main 에서도 실패). 구현이 아니라
+    테스트의 가정이 틀렸다. 절대 격자는 의도된 설계다 — 그래야 질의 시점과
+    무관하게 블록 경계가 일정하다.
+    """
+    from signal_tracker import _horizon_block
+
+    now = datetime.now(timezone.utc)
+    for day in range(15, 60):
+        a = _horizon_block((now - timedelta(days=day)).isoformat(), horizon)
+        b = _horizon_block((now - timedelta(days=day - 1)).isoformat(), horizon)
+        if a == b:
+            return day, day - 1
+    raise AssertionError("같은 블록에 드는 인접 이틀을 찾지 못했다")
+
+
 def test_non_overlapping_mode_keeps_one_row_per_horizon_block(db):
-    _scan_day(db, day=20, ret=0.05)
-    _scan_day(db, day=19, ret=0.05)
-    _scan_day(db, day=5, ret=0.05)
+    """같은 블록의 행은 하나로 접힌다 — 수익률 구간이 겹치기 때문이다."""
+    older, newer = _same_block_offsets(horizon=7)
+    _scan_day(db, day=older, ret=0.05)
+    _scan_day(db, day=newer, ret=0.05)
+    _scan_day(db, day=5, ret=0.05)          # 충분히 떨어진 다른 블록
 
     blocks = _stats(db, horizon=7, days_back=90, dedupe="ticker_horizon")
 
     assert blocks["sampling"]["mode"] == "ticker_horizon"
-    # 20·19일 전은 같은 7일 블록, 5일 전은 다른 블록
-    assert blocks["total_evaluated"] == 2
+    assert blocks["total_evaluated"] == 2, (older, newer)
+
+
+def test_horizon_block_grid_is_anchored_to_the_epoch_not_to_now():
+    """격자 기준점이 '지금'이면 같은 행이 질의 시점마다 다른 블록에 든다."""
+    from signal_tracker import _horizon_block
+
+    base = datetime(2026, 9, 15, tzinfo=timezone.utc)
+    # 1970-01-01 부터 센 일수를 7로 나눈 몫이어야 한다
+    expected = (base - datetime(1970, 1, 1, tzinfo=timezone.utc)).days // 7
+    assert _horizon_block(base.isoformat(), 7) == expected
+
+    # 하루씩 밀면 7일마다 블록이 바뀐다 (경계는 고정돼 있다)
+    blocks = [
+        _horizon_block((base + timedelta(days=d)).isoformat(), 7) for d in range(15)
+    ]
+    assert len(set(blocks)) == 3
+    assert blocks == sorted(blocks)
 
 
 def test_dominant_source_share_is_reported(db):

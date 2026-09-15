@@ -119,9 +119,20 @@ class Settings(BaseSettings):
     SCAN_INTERVAL_MINUTES: int = Field(default=30, ge=1)
     SCAN_PARALLEL_WORKERS: int = Field(default=3, ge=1, le=16)
     SERVICE_SCHEDULER_ENABLED: bool = True
-    SIGNAL_VALIDATION_HOUR: int = Field(default=23, ge=0, le=23)
+    # ── 스케줄 시각은 모두 **UTC** 다 ──────────────────────────────
+    # 컨테이너에 TZ 를 주지 않으므로 APScheduler 도 Etc/UTC 로 돈다. KST 로 읽으면
+    # 9시간 어긋난다 — 2026-09-15 확인: 주석은 "서버 로컬 시간 기준"이라고 적혀
+    # 있었지만 screener_batch(16:30)가 실제로는 KST 01:30(다음날)에 돌아, 9/13
+    # 장 마감 표본이 9/14 날짜로 적립되고 있었다 (ticker_day·horizon 하루 밀림).
+    #
+    # TZ=Asia/Seoul 로 바꾸지 않는 이유: datetime.now() 가 KST naive 를 뱉게 되고
+    # DB 에 이미 쌓인 UTC aware 타임스탬프와 섞인다. horizon 계산이 조용히 틀어지는
+    # 쪽이 시각 환산보다 훨씬 위험하다 (CLAUDE.md §5.5 "내부 저장은 UTC aware").
+    #
+    # 값을 바꿀 때는 KST 의도에서 9를 빼라.  KST 17:30 → UTC 08:30
+    SIGNAL_VALIDATION_HOUR: int = Field(default=14, ge=0, le=23)
     SIGNAL_VALIDATION_MINUTE: int = Field(default=0, ge=0, le=59)
-    CORPORATE_ACTION_CHECK_HOUR: int = Field(default=0, ge=0, le=23)
+    CORPORATE_ACTION_CHECK_HOUR: int = Field(default=15, ge=0, le=23)
     CORPORATE_ACTION_CHECK_MINUTE: int = Field(default=5, ge=0, le=59)
     DATA_HEALTH_CHECK_MINUTES: int = Field(default=60, ge=5)
     DATA_HEALTH_ALERT_STALE_HOURS: float = Field(default=24.0, ge=0)
@@ -143,7 +154,7 @@ class Settings(BaseSettings):
     OUTPUT_RETENTION_ENABLED: bool = True
     OUTPUT_JSON_RETENTION_DAYS: int = Field(default=30, ge=1)
     OUTPUT_CHART_RETENTION_DAYS: int = Field(default=30, ge=1)
-    OUTPUT_RETENTION_HOUR: int = Field(default=3, ge=0, le=23)
+    OUTPUT_RETENTION_HOUR: int = Field(default=18, ge=0, le=23)
     OUTPUT_RETENTION_MINUTE: int = Field(default=30, ge=0, le=59)
     # 상태 백업 — 단일 노드 SPOF 대비. 잃으면 재생성 불가한 것만 담는다
     # (scan_log/signal_outcomes, 페이퍼 상태, 워치리스트). 분석 JSON·차트는 제외.
@@ -151,7 +162,7 @@ class Settings(BaseSettings):
     STATE_BACKUP_ENABLED: bool = True
     STATE_BACKUP_DIR: str = "/home/ubuntu/stock_auto_backups"
     STATE_BACKUP_KEEP: int = Field(default=7, ge=1)
-    STATE_BACKUP_HOUR: int = Field(default=4, ge=0, le=23)
+    STATE_BACKUP_HOUR: int = Field(default=19, ge=0, le=23)
     STATE_BACKUP_MINUTE: int = Field(default=0, ge=0, le=59)
     # 오프사이트 복제 — 백업이 같은 디스크에만 있으면 SPOF 를 못 벗어난다.
     # **목적지는 코드가 정하지 않는다.** 비어 있으면 아무 데도 보내지 않고
@@ -162,16 +173,16 @@ class Settings(BaseSettings):
     OFFSITE_BACKUP_TIMEOUT_SEC: int = Field(default=900, ge=30)
     OPS_ALERT_DEDUPE_MINUTES: int = Field(default=60, ge=1)
     # 일일 멀티에이전트(V2) 배치 — signal_outcomes 표본 자동 축적용.
-    # 시각은 서버 로컬 시간 기준. 기본 17:30 (KRX 마감 15:30 이후).
+    # 시각은 **UTC** (위 주석 참조). 기본 08:30 UTC = 17:30 KST (KRX 마감 15:30 이후).
     # 일일 스크리너 — 표본 적립원. 워치리스트 7종목만으로는 독립 블록이 모이지
     # 않아(2026-09-12 진단), KOSPI+KOSDAQ 스크리너 결과를 매일 표본으로 쌓는다.
     # KRX 마감(15:30) 이후, 멀티에이전트 배치(17:30) 앞에 둔다.
     SCREENER_BATCH_ENABLED: bool = True
-    SCREENER_BATCH_HOUR: int = Field(default=16, ge=0, le=23)
+    SCREENER_BATCH_HOUR: int = Field(default=7, ge=0, le=23)
     SCREENER_BATCH_MINUTE: int = Field(default=30, ge=0, le=59)
 
     MULTI_AGENT_BATCH_ENABLED: bool = True
-    MULTI_AGENT_BATCH_HOUR: int = Field(default=17, ge=0, le=23)
+    MULTI_AGENT_BATCH_HOUR: int = Field(default=8, ge=0, le=23)
     MULTI_AGENT_BATCH_MINUTE: int = Field(default=30, ge=0, le=59)
 
     WATCHLIST: str = ""
