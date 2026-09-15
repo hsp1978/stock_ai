@@ -326,7 +326,7 @@ PR 머지 시:
 | 3 | ~~`print()` 기반 로깅~~ ✅ 완료 (2026-09-14). agent-api 188건 + webui 라이브러리 179건. CLI 블록 206건은 의도적 유지 |
 | 4 | `paper_state.json` 무락 | 시스템 P0 |
 | 5 | 양방향 sys.path 주입 | 구조는 P2. **동명 모듈은 금지** — `tests/unit/test_module_shadowing.py` 가 차단 (2026-09-14) |
-| 6 | 모델 버전 미핀 (`qwen3:14b-q4_K_M`) | P2 |
+| 6 | 모델 버전 미핀 | **변경 감지로 해소** (2026-09-15). Ollama 는 digest 참조 불가 — `model_pin.py` 가 기대 digest 와 대조, `/health.model_pin` |
 | 7 | 매직 포트 8080 (3곳 흩어짐) | P2 |
 | 8 | ~~CI 부재~~ ✅ GitHub Actions (`.github/workflows/ci.yml`: lint + test + dep smoke, 2026-05-19) | 완료 |
 | 9 | ~~산출물 무한 누적~~ ✅ `output_retention` 잡 (JSON·PNG 30일, 2026-09-14) | 완료 |

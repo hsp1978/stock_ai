@@ -56,3 +56,6 @@ db-revision:    ## 현재 스키마 리비전 (Alembic)
 
 db-history:     ## 마이그레이션 이력
 	@docker exec -w /app/chart_agent_service stock-auto-agent-api python -m alembic history --verbose
+
+model-pin:      ## 적재된 모델 digest 확인 + .env 에 넣을 줄 출력
+	@docker exec -w /app/chart_agent_service stock-auto-agent-api python model_pin.py

@@ -214,23 +214,23 @@ def test_noisy_libraries_are_quieted(monkeypatch):
 # ── service.py 전환 ───────────────────────────────────────────────
 
 
-def test_agent_service_modules_have_no_bare_print():
-    """agent-api 전체 — print 는 레벨도 타임스탬프도 없어 걸러낼 수 없다.
+def test_agent_service_library_paths_have_no_bare_print():
+    """agent-api 라이브러리 경로 — print 는 레벨도 타임스탬프도 없어 걸러낼 수 없다.
 
-    webui 쪽(`stock_analyzer/`)은 아직 남아 있다. CLI 성격 스크립트가 섞여 있어
-    한 번에 옮기지 않는다 (CLAUDE.md §6-10 과 같은 이유).
+    `if __name__ == "__main__":` 아래는 예외다. 사람이 스크립트를 직접 돌릴 때 보라고
+    있는 출력이라 stdout 이 맞다 — `stock_analyzer/` 에 적용한 것과 같은 기준이다
+    (`test_cli_prints_are_deliberately_kept`). 2026-09-15 에 `model_pin.py` 가 CLI
+    블록을 갖게 되면서 이 구분이 agent 쪽에도 필요해졌다.
     """
     import glob
-    import re
 
     offenders = {}
     for path in glob.glob(os.path.join(_AGENT_DIR, "**", "*.py"), recursive=True):
-        src = open(path, encoding="utf-8").read()
-        hits = re.findall(r"^\s*print\(", src, re.M)
-        if hits:
-            offenders[os.path.relpath(path, _AGENT_DIR)] = len(hits)
+        lib, _cli = _split_prints(path)
+        if lib:
+            offenders[os.path.relpath(path, _AGENT_DIR)] = lib
 
-    assert not offenders, f"print 잔존: {offenders}"
+    assert not offenders, f"라이브러리 경로 print 잔존: {offenders}"
 
 
 def test_service_module_has_no_bare_print():
