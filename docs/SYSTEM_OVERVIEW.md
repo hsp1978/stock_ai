@@ -1029,6 +1029,53 @@ DB 는 WAL 모드다. 실행 중에 `cp` 하면 `.db` 와 `-wal` 이 서로 다�
 - 서비스를 실제로 정지하고 갈아끼우는 전체 복구 절차는 **아직 돌려본 적 없다**
 - `.env` 를 백업에 넣지 않으면 키 보관 장소를 따로 정해야 한다 — 지금은 정해져 있지 않다
 
+#### 13.9h Mac Studio 가용 판정 — 도달성 ≠ 사용 가능 (2026-09-14)
+
+`is_mac_studio_available()` 이 `/api/tags` 200 만 보고 **5일 내내 True** 를 돌려주는
+동안, 그 노드는 32B 모델을 **CPU 로** 돌리고 있었다.
+
+```
+2026-09-09 13:50:37  openclaw-gateway 기동 (launchd KeepAlive, CPU 98% 점유)
+2026-09-09 13:51:19  Ollama "failure during GPU discovery
+                     — failed to finish discovery before timeout"
+                     → load_tensors: offloaded 0/65 layers to GPU
+```
+
+Metal 자체는 정상 인식됐다 (`using device Metal (Apple M1 Max) - 25557 MiB free`).
+CPU 포화 때문에 **기동 시점의 GPU 탐지가 타임아웃**됐고, 그 판정을 5일간 들고 있었다.
+
+| | CPU 폴백 중 | 복구 후 |
+|---|---|---|
+| 32B q4 추론 | **0.5 tok/s** | **9.4 tok/s** (약 19배) |
+| `/api/ps` `size_vram` | 0.0 GB | 25.8 GB (98%) |
+| `/api/tags` | 200 | 200 ← **구분 불가** |
+
+그동안 8개 중 4개 에이전트(Technical/Quant/Risk/ML)가 이 노드로 갔다. LLM 타임아웃은
+240초, 전체 300초다 — 0.5 tok/s 로는 수백 토큰 응답이 전부 타임아웃이다.
+
+##### 같은 검사가 이미 다른 노드에는 있었다
+
+`service._ollama_runtime_status()` (#15) 가 로컬 RTX 노드에 대해 똑같이 `/api/ps` 의
+`size_vram` 으로 CPU 폴백을 잡고 있었다. **한 노드에서 배운 것을 다른 노드에 옮기지
+않은 것**이 이 결함의 정체다.
+
+**수정**: `dual_node_config.mac_studio_runtime_status()` 추가. 도달성 확인 뒤
+`/api/ps` 로 `gpu` / `cpu_fallback` / `idle` / `unknown` 을 판정하고,
+`cpu_fallback` 이면 가용에서 뺀다 → 라우팅이 RTX 단독으로 돌아간다 (실측 확인).
+
+- CPU 폴백은 **연결 실패가 아니다** — 연속 실패 카운터(`failures`)로 덮지 않는다
+- 적재 모델이 없으면 `idle` = **판정 불가**이지 '정상'이 아니다. 이때는 도달성만으로
+  가용을 유지한다 (기동 직후마다 노드가 빠지는 것을 막는다)
+- `MAC_STUDIO_REQUIRE_GPU=false` 로 끌 수 있고, `MAC_STUDIO_MIN_GPU_FRACTION`
+  (기본 0.5)로 부분 오프로드 허용 범위를 정한다
+- System Monitor 화면에 `runtime` 을 띄운다 — CPU 폴백이면 빨간 경고
+
+##### 복구 시 주의
+
+`brew services restart ollama` 는 SSH 비대화형 세션에서 서비스를 되살리지 못했다
+(`Bootstrap failed: 5: Input/output error`). `launchctl kickstart -k
+gui/$(id -u)/homebrew.mxcl.ollama` 로 복구했다. 그 사이 몇 분간 8080 이 죽어 있었다.
+
 ### 13.10 데이터 품질 위험
 
 - OHLCV 캐시는 TTL 메타(`fetched_at`, `latest_bar_date`, `source`)를 갖지만,

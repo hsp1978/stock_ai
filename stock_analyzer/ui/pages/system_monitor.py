@@ -99,6 +99,21 @@ def render_system_monitor():
                 h1.metric("Mac Studio", "ONLINE" if mac_health.get("available") else "OFFLINE")
                 h2.metric("Failures", str(mac_health.get("failures", 0)))
                 h3.metric("Last Status", str(mac_health.get("last_status") or "n/a"))
+
+                # 도달성만 보면 CPU 폴백 노드를 ONLINE 으로 읽는다 (2026-09-14:
+                # 5일간 32B 모델이 CPU 에서 0.5 tok/s 로 돌았다). 가속기 상태를 같이 띄운다.
+                runtime = mac_health.get("runtime")
+                if runtime == "cpu_fallback":
+                    st.error(
+                        "Mac Studio 가 **CPU 폴백** 중입니다 — GPU 미적재: "
+                        f"{', '.join(mac_health.get('cpu_only_models') or [])}. "
+                        "라우팅에서 제외됩니다 (RTX 단독). Ollama 재기동이 필요합니다."
+                    )
+                elif runtime == "idle":
+                    st.caption("Runtime: idle — 적재된 모델이 없어 가속기 상태는 판정 불가")
+                elif runtime:
+                    st.caption(f"Runtime: {runtime}")
+
                 if mac_health.get("last_error"):
                     st.caption(f"Last error: {mac_health.get('last_error')}")
         else:
