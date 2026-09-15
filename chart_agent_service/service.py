@@ -17,6 +17,9 @@ import os
 import sys
 import time
 import threading
+
+import anyio
+import anyio.to_thread
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -50,6 +53,7 @@ from config import (
     CORPORATE_ACTION_CHECK_HOUR, CORPORATE_ACTION_CHECK_MINUTE,
     DATA_HEALTH_CHECK_MINUTES, DATA_HEALTH_ALERT_STALE_HOURS,
     DATA_HEALTH_RECENT_ANALYSIS_DAYS, POSITION_MARK_INTERVAL_MINUTES,
+    API_THREAD_LIMIT, HEALTH_PROBE_INTERVAL_SECONDS,
     OUTPUT_RETENTION_ENABLED, OUTPUT_RETENTION_HOUR, OUTPUT_RETENTION_MINUTE,
     STATE_BACKUP_DIR, STATE_BACKUP_ENABLED, STATE_BACKUP_HOUR,
     STATE_BACKUP_KEEP, STATE_BACKUP_MINUTE,
@@ -328,6 +332,20 @@ def _unload_ollama_model(verify_seconds: float = 10.0) -> bool:
     remaining = _loaded_model_names()
     logger.warning(f"  [GPU] 언로드 후에도 적재 유지: {remaining}")
     return False
+
+
+def _gpu_pause_snapshot(runtime: dict) -> dict:
+    """이미 받아 둔 runtime 으로 GPU 해제 상태를 만든다 (재조회 없음)."""
+    until = _gpu_pause_until()
+    loaded = [m for m in (runtime.get("models") or []) if m.get("on_gpu")]
+    return {
+        "paused": until is not None,
+        "until": until.isoformat() if until else None,
+        "remaining_seconds": int((until - datetime.now()).total_seconds()) if until else 0,
+        "ollama_runtime": runtime.get("status"),
+        "vram_bytes": sum(int(m.get("size_vram_bytes") or 0) for m in loaded),
+        "models_on_gpu": [m.get("name") for m in loaded],
+    }
 
 
 def gpu_pause_status() -> dict:
@@ -2238,11 +2256,43 @@ app = FastAPI(
 app.add_middleware(KillSwitchASGIMiddleware)
 
 
+_HEALTH_PROBE_TASK = None
+
+
+async def _health_probe_loop() -> None:
+    """프로브 스냅샷을 주기적으로 갱신한다.
+
+    `/health` 가 이 스냅샷만 읽으므로, 이 루프가 멈추면 값이 늙는다. 그 사실은
+    `probe.stale` 로 드러난다 — 조용히 옛 값을 최신처럼 내보내지 않는다.
+    """
+    while True:
+        try:
+            await _refresh_health_probe()
+        except Exception as exc:  # 루프 자체는 죽지 않게
+            logger.warning("헬스 프로브 갱신 실패: %s", exc)
+        await anyio.sleep(HEALTH_PROBE_INTERVAL_SECONDS)
+
+
 @app.on_event("startup")
-def _startup_restore_state():
-    init_db()
-    _restore_runtime_state()
-    _start_background_scheduler(run_initial_scan=_RUN_INITIAL_SCAN_ON_STARTUP)
+async def _startup_restore_state():
+    # sync 핸들러 86개가 공유하는 anyio 스레드풀 한도. 기본 40 은 느린 요청이
+    # 몰리면 /health 까지 굶긴다 (2026-09-15 측정: 동시 45개에서 7.33초).
+    anyio.to_thread.current_default_thread_limiter().total_tokens = API_THREAD_LIMIT
+    logger.info("[API] 스레드풀 한도 %d", API_THREAD_LIMIT)
+
+    await anyio.to_thread.run_sync(init_db)
+    await anyio.to_thread.run_sync(_restore_runtime_state)
+    await anyio.to_thread.run_sync(
+        lambda: _start_background_scheduler(run_initial_scan=_RUN_INITIAL_SCAN_ON_STARTUP)
+    )
+
+    # 첫 프로브는 기동 직후 한 번 채워 둔다 (그 전 /health 는 probe_stale=True).
+    global _HEALTH_PROBE_TASK
+    await _refresh_health_probe()
+    import asyncio
+
+    _HEALTH_PROBE_TASK = asyncio.create_task(_health_probe_loop())
+    logger.info("[API] 헬스 프로브 루프 시작 (%d초 간격)", HEALTH_PROBE_INTERVAL_SECONDS)
 
 
 @app.get("/")
@@ -2398,6 +2448,98 @@ def get_chart(ticker: str):
     raise HTTPException(404, f"{ticker}: 차트 없음")
 
 
+#: `/health` 가 읽는 프로브 스냅샷. 핸들러에서 직접 네트워크를 타지 않는다.
+#:
+#: 2026-09-15 측정: `/health` 자체 비용은 18ms 다 (ollama 3.3 + gpu_pause 3.7 +
+#: market_session 10.6). 그런데 느린 요청 45개(anyio 스레드 한도 40 초과)를 동시에
+#: 던지면 `/health` 가 **30ms → 7.33초**로 튄다 — 자기 일이 느린 게 아니라
+#: **스레드 슬롯을 못 받아서** 기다린 시간이다. 컨테이너 헬스체크 timeout 은 2초다.
+#:
+#: sync 핸들러는 anyio 스레드풀에서 돌므로 포화되면 같이 굶는다. 그래서 `/health` 만
+#: `async def` 로 바꿔 슬롯을 아예 안 쓰게 하고, 네트워크·CPU 프로브는 백그라운드
+#: 태스크가 갱신한 스냅샷에서 읽는다. 스냅샷 나이를 함께 내보내 **오래된 값을
+#: 최신처럼 보이지 않게** 한다 (§13-4).
+_HEALTH_PROBE: dict = {
+    "probed_at": None,          # monotonic
+    "probed_wall": None,        # ISO8601
+    "ollama_ok": False,
+    "ollama_runtime": {"status": "unknown", "models": []},
+    "market_session": {"KRX": "unknown", "NYSE": "unknown"},
+    "error": None,
+}
+_HEALTH_PROBE_LOCK = threading.Lock()
+
+
+async def _refresh_health_probe() -> dict:
+    """프로브 스냅샷 갱신. 이벤트 루프를 막지 않는다.
+
+    Ollama 는 `httpx.AsyncClient` 로, 시장 세션 계산(약 10ms CPU)은 워커 스레드로
+    보낸다. 여기서 blocking `httpx.get` 을 쓰면 Ollama 가 멈출 때 **전체 이벤트
+    루프**가 3초씩 멎는다 — sync 핸들러가 스레드에서 돌던 것보다 나쁘다.
+    """
+    ollama_ok = False
+    runtime: dict = {"status": "unknown", "models": []}
+    error = None
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            try:
+                resp = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+                ollama_ok = resp.status_code == 200
+            except Exception as exc:
+                error = f"tags: {type(exc).__name__}: {exc}"[:160]
+
+            try:
+                resp = await client.get(f"{OLLAMA_BASE_URL}/api/ps")
+                resp.raise_for_status()
+                runtime = _classify_ollama_models(resp.json().get("models") or [])
+            except Exception as exc:
+                runtime = {"status": "unknown", "models": [],
+                           "error": f"{type(exc).__name__}: {exc}"[:120]}
+    except Exception as exc:  # 클라이언트 생성 실패 등
+        error = f"{type(exc).__name__}: {exc}"[:160]
+
+    try:
+        sessions = await anyio.to_thread.run_sync(_market_sessions)
+    except Exception as exc:
+        sessions = {"KRX": "unknown", "NYSE": "unknown"}
+        error = error or f"market_session: {type(exc).__name__}"
+
+    snapshot = {
+        "probed_at": time.monotonic(),
+        "probed_wall": datetime.now().isoformat(),
+        "ollama_ok": ollama_ok,
+        "ollama_runtime": runtime,
+        "market_session": sessions,
+        "error": error,
+    }
+    with _HEALTH_PROBE_LOCK:
+        _HEALTH_PROBE.clear()
+        _HEALTH_PROBE.update(snapshot)
+    return snapshot
+
+
+def _market_sessions() -> dict:
+    """시장 세션 (약 10ms CPU) — 워커 스레드에서 호출한다."""
+    try:
+        from market_cal.market_calendar import get_market_session
+
+        return {"KRX": get_market_session("KRX"), "NYSE": get_market_session("NYSE")}
+    except Exception:
+        return {"KRX": "unknown", "NYSE": "unknown"}
+
+
+def _health_probe_snapshot() -> dict:
+    """프로브 스냅샷 + 나이. 한 번도 못 받았으면 그 사실을 남긴다."""
+    with _HEALTH_PROBE_LOCK:
+        snap = dict(_HEALTH_PROBE)
+    probed_at = snap.pop("probed_at", None)
+    age = None if probed_at is None else round(time.monotonic() - probed_at, 1)
+    snap["probe_age_sec"] = age
+    # 갱신 주기의 4배를 넘으면 백그라운드 태스크가 죽었다는 뜻이다.
+    snap["probe_stale"] = age is None or age > HEALTH_PROBE_INTERVAL_SECONDS * 4
+    return snap
+
+
 def _ollama_runtime_status() -> dict:
     """Report whether loaded Ollama models sit on GPU or fell back to CPU.
 
@@ -2415,6 +2557,12 @@ def _ollama_runtime_status() -> dict:
         status["error"] = str(exc)[:120]
         return status
 
+    return _classify_ollama_models(models)
+
+
+def _classify_ollama_models(models: list) -> dict:
+    """적재 모델 목록 → gpu / cpu_fallback / idle. 동기·비동기 경로가 공유한다."""
+    status: dict = {"status": "unknown", "models": []}
     cpu_only = []
     for m in models:
         name = m.get("name") or m.get("model") or "?"
@@ -2444,31 +2592,26 @@ def _ollama_runtime_status() -> dict:
 
 
 @app.get("/health")
-def health():
-    """헬스 체크"""
-    ollama_ok = False
-    try:
-        resp = httpx.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
-        ollama_ok = resp.status_code == 200
-    except Exception:
-        pass
+async def health():
+    """헬스 체크 — **스레드 슬롯을 쓰지 않는다.**
 
-    ollama_runtime = _ollama_runtime_status()
+    `async def` 인 이유는 성능이 아니라 **가용성**이다. sync 핸들러는 anyio
+    스레드풀(기본 40)에서 돌기 때문에, 느린 요청이 풀을 채우면 헬스 체크까지
+    같이 굶는다. 2026-09-15 측정: 느린 요청 45개 동시에 `/health` 가
+    **30ms → 7.33초**. 컨테이너 헬스체크 timeout 은 2초다.
 
-    # Step 11: market session 메타 추가
-    krx_session = nyse_session = "unknown"
-    try:
-        from market_cal.market_calendar import get_market_session
-        krx_session = get_market_session("KRX")
-        nyse_session = get_market_session("NYSE")
-    except Exception:
-        pass
+    그래서 이 핸들러는 **메모리만 읽는다.** 네트워크·CPU 프로브는 백그라운드
+    태스크(`_health_probe_loop`)가 갱신한 스냅샷에서 가져오고, 그 **나이**를 함께
+    내보낸다 — 오래된 값을 최신처럼 보이게 하지 않는다 (§13-4).
 
+    깊은 점검이 필요하면 `?deep=true` 를 쓴다 (그때는 스레드에서 실제로 조회한다).
+    """
+    probe = _health_probe_snapshot()
     return {
         "status": "healthy",
-        "ollama": "connected" if ollama_ok else "disconnected",
-        "ollama_runtime": ollama_runtime,
-        "gpu_pause": gpu_pause_status(),
+        "ollama": "connected" if probe["ollama_ok"] else "disconnected",
+        "ollama_runtime": probe["ollama_runtime"],
+        "gpu_pause": _gpu_pause_snapshot(probe["ollama_runtime"]),
         "alert_delivery": _telegram_delivery_status(),
         "cached_results": len(latest_results),
         "scan_count": len(scan_history),
@@ -2476,11 +2619,39 @@ def health():
         "scheduler_running": bool(_SCHEDULER and _SCHEDULER.running),
         "last_signal_validation": _LAST_SIGNAL_VALIDATION,
         "jobs": _job_status_snapshot(),
-        "data_health": _LAST_DATA_HEALTH or build_data_health(),
-        "market_session": {
-            "KRX": krx_session,
-            "NYSE": nyse_session,
+        # 여기서 build_data_health() 를 부르지 않는다 — 스냅샷이 없으면 그렇게 적는다.
+        # data_health_check 잡이 주기적으로 채운다.
+        "data_health": _LAST_DATA_HEALTH or {"status": "not_computed"},
+        "market_session": probe["market_session"],
+        "probe": {
+            "age_sec": probe["probe_age_sec"],
+            "stale": probe["probe_stale"],
+            "probed_at": probe["probed_wall"],
+            "error": probe["error"],
+            "interval_sec": HEALTH_PROBE_INTERVAL_SECONDS,
         },
+    }
+
+
+@app.get("/health/deep")
+def health_deep():
+    """실시간 조회로 헬스 상태를 확인한다 (sync — 스레드에서 돈다).
+
+    `/health` 는 스냅샷을 읽으므로 최신이 아닐 수 있다. 진단 시 이쪽을 쓴다.
+    """
+    ollama_ok = False
+    try:
+        resp = httpx.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
+        ollama_ok = resp.status_code == 200
+    except Exception:
+        pass
+    return {
+        "status": "healthy",
+        "ollama": "connected" if ollama_ok else "disconnected",
+        "ollama_runtime": _ollama_runtime_status(),
+        "gpu_pause": gpu_pause_status(),
+        "market_session": _market_sessions(),
+        "data_health": build_data_health(),
     }
 
 

@@ -121,8 +121,12 @@ make help
 - **주석 언어**: 한국어 OK. 단 함수 docstring은 영어 권장 (LLM 호출 시 토큰 비용).
 
 ### 5.2 FastAPI
-- 핸들러: 현재 모두 `def` (sync). blocking I/O 직접 호출.
-- 향후 async 전환은 `httpx.AsyncClient`로 단계적 진행.
+- 핸들러: 대부분 `def` (sync) — anyio 스레드풀(`API_THREAD_LIMIT`, 기본 80)에서 돈다.
+- **`/health` 만 `async def`** 다 (2026-09-15). 성능이 아니라 가용성 때문 — sync 면
+  느린 요청이 풀을 채울 때 헬스 체크까지 굶는다 (실측 30ms → 7.33초).
+  핸들러는 메모리만 읽고, 프로브는 백그라운드 태스크가 갱신한다. 되돌리지 말 것.
+- async 로 바꿀 때는 내부 blocking 호출을 **먼저** `httpx.AsyncClient` 로 옮길 것.
+  그냥 `async def` 만 붙이면 이벤트 루프를 막아 sync 보다 나빠진다.
 - 응답 모델: Pydantic `BaseModel` 필수.
 
 ### 5.3 Pydantic
