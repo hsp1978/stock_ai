@@ -73,7 +73,13 @@ class Settings(BaseSettings):
     OLLAMA_KEEP_ALIVE: str = "1h"
     OPENAI_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-2.0-flash"
+    # gemini-2.0-flash 는 2026-09-15 확인 시 **404 로 폐기**됐다
+    # ("no longer available ... use models/gemini-3.6-flash").
+    # 무료 등급 쿼터는 모델당 하루 20회이고, Gemini 에이전트 4개 × 7종목 =
+    # 배치 1회 28회라 한 모델로는 매일 끊긴다. FALLBACK 은 쿼터가 따로
+    # 계산되는 다른 모델이다 (llm/router.py 의 agent-llm-primary-alt).
+    GEMINI_MODEL: str = "gemini-3.6-flash"
+    GEMINI_FALLBACK_MODEL: str = "gemini-3.5-flash"
     GOOGLE_API_KEY: str = ""
     DEFAULT_LLM_PROVIDER: Literal["ollama", "gemini", "openai"] = "ollama"
 
@@ -318,6 +324,7 @@ OLLAMA_KEEP_ALIVE = settings.OLLAMA_KEEP_ALIVE
 OPENAI_API_KEY = settings.OPENAI_API_KEY
 GEMINI_API_KEY = settings.GEMINI_API_KEY
 GEMINI_MODEL = settings.GEMINI_MODEL
+GEMINI_FALLBACK_MODEL = settings.GEMINI_FALLBACK_MODEL
 TELEGRAM_BOT_TOKEN = settings.TELEGRAM_BOT_TOKEN
 TELEGRAM_CHAT_ID = settings.TELEGRAM_CHAT_ID
 API_HOST = settings.API_HOST

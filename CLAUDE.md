@@ -13,7 +13,10 @@
 **거래 모드**: `TRADING_MODE: Literal["paper", "dry_run", "approval", "live"]`, 기본 `paper`.
 
 **핵심 구조**:
-- 8 LLM 에이전트 (Gemini 4 + Ollama 4)
+- 8 LLM 에이전트 (Gemini 4 = `gemini-3.6-flash`, 쿼터 소진 시 `3.5-flash` + Ollama 4)
+  ※ 무료 등급 쿼터는 **모델당 하루 20회**다. 4 에이전트 × 7종목 = 배치 1회 28회라
+    한 모델로는 매일 끊긴다 (§13.9j). 모델을 바꿀 때 가용성 먼저 확인할 것 —
+    `gemini-2.0-flash` 는 2026-09-15 기준 404 로 폐기됐다.
 - 16 분석 도구 (`chart_agent_service/analysis_tools.py`)
 - 5 ML 앙상블 (RandomForest / GradientBoosting / LightGBM / XGBoost / LSTM)
 - EnhancedDecisionMaker (충돌 해결 + 평활화)
