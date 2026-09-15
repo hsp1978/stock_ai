@@ -176,6 +176,9 @@ make help
    존재한 적이 없다** — JSON 이 70,771개/1.58 GB 까지 쌓였다.
 8. **DB 직접 SQL 변경 금지.** Alembic migration 도입 후 마이그레이션 스크립트로만.
 9. **README 라우팅 표 수정 시 `dual_node_config.py` 코드와 일치 확인.**
+9-1. **스케줄 시각은 UTC 로 적을 것.** 컨테이너에 `TZ` 가 없어 APScheduler 는 `Etc/UTC` 다.
+    KST 의도에서 9를 뺀다 (KST 17:30 → `HOUR=8, MINUTE=30`). `TZ=Asia/Seoul` 을 넣으면
+    `datetime.now()` 가 KST naive 가 되어 DB 의 UTC aware 타임스탬프와 섞인다 (§5.5 위반).
 10. **`webui.py`에 페이지를 다시 들이지 말 것.** 화면은 `ui/pages/`, 공용은 `ui/*.py`.
     새 페이지 분리는 `scripts/extract_webui_page.py` 사용 (자유변수 분석으로 import 생성).
 
@@ -207,7 +210,7 @@ make help
 - 실측 결론: 방향 적중률 51.9% × payoff 0.66 = 구조적 적자. **손절 효과는 기간에 따라
   부호가 바뀐다** (급락장 +4.5%p / 최근 -0.6~-1.8%p) — 집계로 손절폭 고정 금지
 - 스크리너 결과를 `signal_outcomes`(`signal_source='screener'`)에 매일 적립
-  (16:30 `screener_batch`, 상위 10건). universe 910종목 → 하루 10종목씩 독립 표본
+  (`screener_batch` 07:30 UTC = 16:30 KST, 상위 10건). universe 910종목 → 하루 10종목씩 독립 표본
 - **2026-09-26 이전에는 국면별 손절·IC 가중 규칙을 정하지 말 것** (표본 축적 대기)
 
 ### 2026-09 방향 보정 (완료)
