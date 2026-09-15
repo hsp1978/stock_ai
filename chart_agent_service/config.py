@@ -102,6 +102,14 @@ class Settings(BaseSettings):
     # 그 상태로 4개 에이전트를 보내면 타임아웃만 쌓인다 — 차라리 RTX 단독이 낫다.
     MAC_STUDIO_REQUIRE_GPU: bool = True
     MAC_STUDIO_MIN_GPU_FRACTION: float = Field(default=0.5, ge=0.0, le=1.0)
+    # ── FastAPI 실행 특성 ─────────────────────────────────────────
+    # 핸들러 86개가 전부 sync(`def`) 라 anyio 스레드풀에서 돈다. 기본 한도는 40이고,
+    # 느린 요청이 그만큼 몰리면 **모든 엔드포인트가 슬롯을 기다린다** — 2026-09-15
+    # 측정: 동시 45개에서 /health 가 30ms → 7.33초 (컨테이너 헬스체크 timeout 2초).
+    # 핸들러는 I/O 대기가 대부분이라 스레드를 늘리는 비용은 낮다.
+    API_THREAD_LIMIT: int = Field(default=80, ge=8, le=512)
+    # /health 가 읽는 프로브 스냅샷 갱신 주기(초). 핸들러는 네트워크를 타지 않는다.
+    HEALTH_PROBE_INTERVAL_SECONDS: int = Field(default=15, ge=1, le=300)
     RTX_5070_MAX_INFLIGHT: int = Field(default=2, ge=1, le=32)
     LLM_NODE_MAX_INFLIGHT: int = Field(default=2, ge=1, le=32)
     LLM_NODE_FAILURE_THRESHOLD: int = Field(default=2, ge=1, le=20)
@@ -383,6 +391,8 @@ MAC_STUDIO_HEALTH_TTL_SECONDS = settings.MAC_STUDIO_HEALTH_TTL_SECONDS
 MAC_STUDIO_HEALTH_TIMEOUT = settings.MAC_STUDIO_HEALTH_TIMEOUT
 MAC_STUDIO_REQUIRE_GPU = settings.MAC_STUDIO_REQUIRE_GPU
 MAC_STUDIO_MIN_GPU_FRACTION = settings.MAC_STUDIO_MIN_GPU_FRACTION
+API_THREAD_LIMIT = settings.API_THREAD_LIMIT
+HEALTH_PROBE_INTERVAL_SECONDS = settings.HEALTH_PROBE_INTERVAL_SECONDS
 MAC_STUDIO_HEALTH_FAILURE_THRESHOLD = settings.MAC_STUDIO_HEALTH_FAILURE_THRESHOLD
 MAC_STUDIO_MAX_INFLIGHT = settings.MAC_STUDIO_MAX_INFLIGHT
 RTX_5070_MAX_INFLIGHT = settings.RTX_5070_MAX_INFLIGHT

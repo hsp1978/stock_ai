@@ -665,7 +665,7 @@ win 정의가 "신호 방향으로 ±2% 이상"이었는데 **±2%에 근거가 
 | 4 | 양방향 `sys.path` 주입 | 구조는 그대로. 단 **동명 모듈 충돌은 제거·차단** (2026-09-14, `test_module_shadowing.py`) — 아래 §13.9f |
 | 5 | ~~분석 결과 JSON 무한 누적~~ | **해소** (2026-09-14): `output_retention` 잡 (JSON·PNG 30일, 03:30). 적발 시점 70,771개/1.58 GB, 하루 361개 증가 — 아래 §13.9b |
 | 6 | ~~DB 마이그레이션 도구 부재~~ | **해소** (2026-09-15): Alembic 도입, 리비전 4개. 운영 DB 채택 완료 — 아래 §13.9k |
-| 7 | FastAPI 전 핸들러 sync + blocking I/O | `httpx.AsyncClient` 단계 전환 미착수 |
+| 7 | FastAPI 핸들러 sync + blocking I/O | **부분 해소** (2026-09-15): 스레드 한도 40→80, `/health` async 전환으로 포화 시 7.33초→0.35초. 나머지 85개는 sync 유지 — 아래 §13.9l |
 | 8 | 모델 버전 태그 핀 | `qwen3:14b-q4_K_M` 등 태그 고정이나 digest 핀은 아님 |
 | 9 | 백테스트 Composite 전략의 과거 replay 제외 | look-ahead 회피 목적. 도구 신호의 역사적 성능은 미측정 |
 | 10 | 단일 노드 SPOF | 구조는 그대로. **백업·복구 절차 추가** (2026-09-14): `state_backup` 잡(04:00) + `docs/RUNBOOK_BACKUP.md` + 복구 리허설 — 아래 §13.9g |
@@ -1232,6 +1232,64 @@ integrity: ok     view: 존재
 ```
 
 재실행은 `mode: upgrade` 로 멱등이다. 확인: `make db-revision` / `make db-history`.
+
+#### 13.9l FastAPI sync 핸들러 — 측정 후 범위를 좁혔다 (2026-09-15)
+
+핸들러 86개가 전부 `def` 다. FastAPI 는 sync 핸들러를 anyio 스레드풀(기본 **40**)에서
+돌리므로 이벤트 루프는 막히지 않는다. 그래서 먼저 **실제로 무엇이 문제인지 측정**했다.
+
+##### `/health` 는 느리지 않다 — 슬롯을 못 받는다
+
+```
+_ollama_runtime_status    3.27 ms   (httpx)
+gpu_pause_status          3.67 ms   (내부에서 또 httpx)
+get_market_session x2    10.63 ms   (CPU)
+나머지(메모리)              ~0 ms
+                        ─────────
+                        약 18 ms
+```
+
+그런데 느린 요청(`/sector` 11초) **45개**를 동시에 던지면:
+
+| | 이전 |
+|---|---|
+| `/health` 최대 지연 | **7.33초** |
+| 컨테이너 헬스체크 timeout | **2초** (compose.yaml) |
+
+자기 일이 느린 게 아니라 **스레드 슬롯 대기**다. `retries: 3`, `interval: 30s` 이므로
+90초 이상 부하가 지속되면 컨테이너가 unhealthy 로 떨어진다.
+
+##### 86개를 async 로 바꾸는 것은 해법이 아니다
+
+내부의 blocking 호출(httpx.get, sqlite, pandas)이 그대로면 `async def` 는 **이벤트
+루프를 막는다** — sync 로 스레드에서 돌던 것보다 나쁘다. 그래서 두 가지만 했다:
+
+1. **스레드풀 한도 40 → 80** (`API_THREAD_LIMIT`). 핸들러는 I/O 대기가 대부분이라
+   스레드 비용이 낮다.
+2. **`/health` 만 async 전환.** 슬롯을 아예 안 쓰게 하고 **메모리만 읽는다.**
+   - 네트워크·CPU 프로브는 백그라운드 태스크가 `HEALTH_PROBE_INTERVAL_SECONDS`
+     (기본 15초)마다 `httpx.AsyncClient` + 워커 스레드로 갱신
+   - 스냅샷 **나이**를 `probe.age_sec` / `probe.stale` 로 내보낸다 — 루프가 죽으면
+     옛 값이 최신처럼 보이지 않는다 (§13-4)
+   - `build_data_health()` 인라인 호출 제거. 스냅샷이 없으면 `not_computed` 로 적는다
+   - 실시간 조회가 필요하면 `/health/deep` (sync, 스레드에서 돈다)
+   - 부수 효과: `/health` 의 Ollama httpx 호출이 3회 → 0회
+
+##### 결과 (같은 부하 재측정)
+
+| 동시 요청 | `/health` 최대 | slow 전체 |
+|---|---|---|
+| 45 | 7.33초 → **0.353초** | 14.2초 → 11.3초 |
+| 90 | — → **0.114초** | 14.4초 |
+
+한도(80)를 넘는 90 동시에서도 `/health` 가 0.11초다 — 슬롯을 기다리지 않기 때문이다.
+
+##### 남은 것
+
+나머지 85개는 sync 다. 단일 사용자 환경에서 동시 요청이 40을 넘는 일은 거의 없고,
+스케줄 잡은 APScheduler 스레드에서 돌아 요청 풀을 쓰지 않는다. 추가 전환은
+**측정된 문제가 생길 때** 하는 게 맞다 — 지금 옮기면 blocking 호출이 이벤트 루프로
+올라가 더 나빠진다.
 
 ### 13.10 데이터 품질 위험
 
