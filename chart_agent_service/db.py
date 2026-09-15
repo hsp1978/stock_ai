@@ -278,59 +278,124 @@ def close_all_connections() -> None:
 atexit.register(close_all_connections)
 
 
-def _migrate_signal_outcomes(conn: sqlite3.Connection) -> None:
-    """signal_outcomes 구 스키마(scan_log_id 기반) → V2(signal_id UUID) 마이그레이션."""
+def _rename_pre_v2_signal_outcomes(conn: sqlite3.Connection) -> bool:
+    """V2 이전 스키마(scan_log_id 기반)를 옆으로 치운다.
+
+    Alembic 베이스라인은 `signal_id` 를 PK 로 하는 V2 테이블을 전제한다. 그보다
+    오래된 테이블이 남아 있으면 베이스라인이 만들 수 없으므로, **마이그레이션
+    이전 단계**로 이름을 바꿔 둔다.
+
+    Returns: 이름을 바꿨으면 True.
+    """
     cols = {
         row[1] for row in conn.execute("PRAGMA table_info(signal_outcomes)").fetchall()
     }
     if cols and "signal_id" not in cols:
         conn.execute("DROP TABLE IF EXISTS signal_outcomes_legacy")
         conn.execute("ALTER TABLE signal_outcomes RENAME TO signal_outcomes_legacy")
+        conn.commit()
         logger.info("[DB] signal_outcomes 구 스키마 → signal_outcomes_legacy 백업")
-        return
-    # Step 12: signal_std, agreement_level / 2026-09: eval_state 컬럼 추가 (기존 DB 호환)
-    for col, coltype in [
-        ("signal_std", "REAL"),
-        ("agreement_level", "TEXT"),
-        ("eval_state", "TEXT"),
-        # 2026-09: 시장 대비 초과수익 계산용
-        ("benchmark_symbol", "TEXT"),
-        ("benchmark_return_7d", "REAL"),
-        ("benchmark_return_14d", "REAL"),
-        ("benchmark_return_30d", "REAL"),
-        # 2026-09: 역행폭(손절 시뮬레이션용)
-        ("adverse_excursion_7d", "REAL"),
-        ("adverse_excursion_14d", "REAL"),
-        ("adverse_excursion_30d", "REAL"),
-    ]:
-        if col not in cols:
-            try:
-                conn.execute(f"ALTER TABLE signal_outcomes ADD COLUMN {col} {coltype}")
-            except sqlite3.OperationalError:
-                pass
+        return True
+    return False
+
+
+def _alembic_config(db_path: str):
+    """Alembic Config. 대상 DB 를 명시적으로 넘긴다 (테스트 격리)."""
+    from alembic.config import Config
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    cfg = Config(os.path.join(here, "alembic.ini"))
+    cfg.set_main_option("script_location", os.path.join(here, "migrations"))
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+    return cfg
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def current_revision(db_path: str | None = None) -> str | None:
+    """DB 에 기록된 현재 스키마 리비전. 없으면 None (= 미관리 DB)."""
+    target = db_path or DB_PATH
+    conn = sqlite3.connect(target)
+    try:
+        if not _table_exists(conn, "alembic_version"):
+            return None
+        row = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def run_migrations(db_path: str | None = None) -> dict:
+    """스키마를 최신 리비전으로 올린다. **적용 결과를 반환한다.**
+
+    세 경로가 있고, 어느 쪽을 탔는지 반환값에 남는다 — '이미 최신'과 '방금 만들었다'
+    와 '옛 DB 를 따라잡았다'는 서로 다른 사실이다 (CLAUDE.md §13-2).
+
+      fresh   : 빈 DB → 전체 리비전 적용
+      adopt   : Alembic 도입 이전 DB → 실제 스키마에 맞는 리비전으로 stamp 후 upgrade
+      upgrade : alembic_version 이 있는 DB → 남은 리비전만 적용
+    """
+    from alembic import command
+
+    target = db_path or DB_PATH
+    cfg = _alembic_config(target)
+
+    conn = sqlite3.connect(target)
+    try:
+        _rename_pre_v2_signal_outcomes(conn)
+        versioned = _table_exists(conn, "alembic_version")
+        has_core = _table_exists(conn, "scan_log") or _table_exists(conn, "signal_outcomes")
+    finally:
+        conn.close()
+
+    if versioned:
+        mode = "upgrade"
+    elif has_core:
+        mode = "adopt"
+    else:
+        mode = "fresh"
+
+    # 채택(adopt) 시에도 **stamp 하지 않고 처음부터 올린다.**
+    #
+    # 처음에는 "기존 DB 는 이미 최신이니 head 로 stamp" 로 짰다가, 스키마가 일부만
+    # 있는 DB 에서 깨졌다 — stamp 하면 0001 이 건너뛰어져 없는 테이블이 영영 안
+    # 만들어진다 (2026-09-15, test_direction_adjusted_metrics 가 잡았다).
+    # 어느 리비전이 이 DB 의 모양과 맞는지 추측하는 것 자체가 틀린 접근이었다.
+    #
+    # 0001 은 전부 `CREATE ... IF NOT EXISTS` 이고 0002·0003 은 컬럼 존재를 직접
+    # 확인한다. 그래서 처음부터 올려도 기존 데이터에 안전하고, 빠진 것만 채운다.
+    command.upgrade(cfg, "head")
+    current = current_revision(target)
+    result = {"mode": mode, "revision": current, "db_path": target}
+    logger.info("[DB] 스키마 리비전 %s (%s)", current, mode)
+    return result
 
 
 def init_db():
-    """테이블 생성 (서비스 시작 시 1회 호출)"""
+    """스키마를 최신으로 맞춘다 (서비스 시작 시 1회 호출).
+
+    2026-09-15 부터 Alembic 이 스키마를 소유한다 (CLAUDE.md Don't #8). 종전에는
+    이 함수가 `CREATE TABLE IF NOT EXISTS` 와 손으로 쓴 `ALTER TABLE` 을 직접
+    실행했고, 버전 기록이 없어 어떤 DB 가 어디까지 왔는지 알 수 없었다.
+
+    **스키마 변경은 이제 `migrations/versions/` 에 리비전으로 추가한다.**
+    여기에 `CREATE`/`ALTER` 를 다시 넣지 말 것.
+    """
+    result = run_migrations()
+    # VIEW 는 IF NOT EXISTS 가 옛 정의를 남기므로 기동마다 재생성한다.
+    # (정의가 바뀐 리비전을 놓친 DB 를 위한 안전망 — 2026-09 방향 보정에서 실제로 필요했다.)
     conn = _get_conn()
-    conn.execute(_CREATE_TABLE)
-    _migrate_signal_outcomes(conn)
-    conn.execute(_CREATE_OUTCOMES_TABLE)
-    # VIEW 정의가 바뀌어도 IF NOT EXISTS 는 옛 정의를 남긴다 — 매번 재생성한다.
     conn.execute("DROP VIEW IF EXISTS signal_performance_summary")
     conn.executescript(_CREATE_SIGNAL_PERF_VIEW)
-    conn.execute(_CREATE_SCREENER_TABLE)
-    conn.execute(_CREATE_USER_ACTION_TABLE)
-    conn.executescript(_CREATE_KILL_SWITCH_TABLE)
-    conn.execute(_CREATE_APP_STATE_TABLE)
-    # entry_price 컬럼 마이그레이션 (기존 DB 호환)
-    try:
-        conn.execute("ALTER TABLE scan_log ADD COLUMN entry_price REAL")
-    except sqlite3.OperationalError:
-        pass  # 이미 존재
-    conn.executescript(_CREATE_INDEX)
     conn.commit()
     conn.close()
+    return result
     logger.info(f"[DB] 초기화 완료: {DB_PATH}")
 
 

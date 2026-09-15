@@ -177,7 +177,10 @@ make help
    차트 PNG 는 화면이 읽으므로 **참조 중인 것은 나이와 무관하게 남는다**.
    ※ 2026-09-14 이전 이 항목은 "자동 정리 cron 유지"라고 적혀 있었으나 **그 cron 은
    존재한 적이 없다** — JSON 이 70,771개/1.58 GB 까지 쌓였다.
-8. **DB 직접 SQL 변경 금지.** Alembic migration 도입 후 마이그레이션 스크립트로만.
+8. **DB 직접 SQL 변경 금지.** 스키마는 Alembic 이 소유한다 (2026-09-15 도입).
+   변경은 `chart_agent_service/migrations/versions/` 에 리비전으로 추가한다.
+   `init_db()` 에 `CREATE`/`ALTER` 를 되돌리지 말 것 — 테스트가 막는다.
+   현재 리비전 확인: `make db-revision` / 이력: `make db-history`.
 9. **README 라우팅 표 수정 시 `dual_node_config.py` 코드와 일치 확인.**
 9-1. **스케줄 시각은 UTC 로 적을 것.** 컨테이너에 `TZ` 가 없어 APScheduler 는 `Etc/UTC` 다.
     KST 의도에서 9를 뺀다 (KST 17:30 → `HOUR=8, MINUTE=30`). `TZ=Asia/Seoul` 을 넣으면

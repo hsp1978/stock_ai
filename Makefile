@@ -50,3 +50,9 @@ backup-verify:  ## 최신 백업이 실제로 복원 가능한지 확인 (체크
 
 backup-drill:   ## 복구 리허설 — 운영 파일을 건드리지 않고 실제로 복원해 대조
 	docker exec stock-auto-agent-api python /app/scripts/restore_drill.py
+
+db-revision:    ## 현재 스키마 리비전 (Alembic)
+	@docker exec stock-auto-agent-api python -c "import sys;sys.path.insert(0,'/app/chart_agent_service');import db;print(db.current_revision())"
+
+db-history:     ## 마이그레이션 이력
+	@docker exec -w /app/chart_agent_service stock-auto-agent-api python -m alembic history --verbose
