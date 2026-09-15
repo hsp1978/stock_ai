@@ -59,6 +59,19 @@ def _int_setting(name: str, default: int) -> int:
         return default
 
 
+#: 기본 Gemini 모델. `gemini-2.0-flash` 는 2026-09-15 확인 시 **404 로 폐기**됐다
+#: ("no longer available ... use models/gemini-3.6-flash"). 죽은 모델을 기본값으로
+#: 두면 `.env` 가 없는 환경에서 Gemini tier 가 통째로 실패한다.
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+
+#: 쿼터가 소진됐을 때 쓸 두 번째 Gemini 모델. 무료 등급 한도는 **모델당** 계산되므로
+#: 다른 모델을 쓰면 예산이 따로 잡힌다 (20 + 20 = 40 > 배치 1회 28).
+DEFAULT_GEMINI_FALLBACK_MODEL = "gemini-3.5-flash"
+
+#: Gemini tier 의 model_name 들 (후보 순서·타임아웃·가용성 판정에서 함께 취급한다)
+GEMINI_TIERS = ("agent-llm-primary", "agent-llm-primary-alt")
+
+
 def _gemini_api_key() -> str:
     return _setting("GEMINI_API_KEY") or _setting("GOOGLE_API_KEY")
 
@@ -71,7 +84,8 @@ def build_router() -> Router:
     gemini_key = _gemini_api_key()
     mac_url = _setting("MAC_STUDIO_URL", "http://hsptest-macstudio:8080")
     rtx_url = _setting("OLLAMA_BASE_URL", "http://localhost:11434")
-    gemini_model = _setting("GEMINI_MODEL", "gemini-2.0-flash")
+    gemini_model = _setting("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+    gemini_alt_model = _setting("GEMINI_FALLBACK_MODEL", DEFAULT_GEMINI_FALLBACK_MODEL)
     mac_model = _setting("OLLAMA_MAC_MODEL", "qwen2.5:32b-instruct-q4_K_M")
     rtx_model = _setting("OLLAMA_MODEL", "qwen3:14b-q4_K_M")
     ollama_timeout = _int_setting("MULTI_AGENT_LLM_TIMEOUT", 240)
@@ -89,6 +103,25 @@ def build_router() -> Router:
                 },
             }
         )
+        # 무료 등급 쿼터는 **모델당** 하루 20회다
+        # (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`, 2026-09-15 실측).
+        # Gemini 에이전트 4개 × 워치리스트 7종목 = 배치 1회에 28회 —— 한 모델로는
+        # 매일 20회에서 끊긴다. 다른 모델은 쿼터가 따로 계산되므로 한 단계 더 둔다.
+        #
+        # Router 의 내부 재시도/폴백은 좀비 스레드 방지로 꺼져 있다(num_retries=0).
+        # 그래서 LiteLLM 에 맡기지 않고 `_model_candidates()` 의 외부 루프에
+        # 별도 tier 로 넣는다 — deadline 예산·노드 가용성 검사가 그대로 적용된다.
+        if gemini_alt_model and gemini_alt_model != gemini_model:
+            model_list.append(
+                {
+                    "model_name": "agent-llm-primary-alt",
+                    "litellm_params": {
+                        "model": f"gemini/{gemini_alt_model}",
+                        "api_key": gemini_key,
+                        "timeout": 30,
+                    },
+                }
+            )
 
     model_list.extend(
         [
@@ -315,7 +348,7 @@ def _node_for_model(model_name: str) -> str | None:
 
 
 def _model_timeout_cap(model_name: str) -> float:
-    if model_name == "agent-llm-primary":
+    if model_name in GEMINI_TIERS:
         return float(_int_setting("GEMINI_LLM_TIMEOUT", 30))
     return float(_int_setting("MULTI_AGENT_LLM_TIMEOUT", 240))
 
@@ -387,23 +420,21 @@ def _record_node_success_for_model(model_name: str) -> None:
         pass
 
 
+def _gemini_candidates() -> list[str]:
+    """등록된 Gemini tier 들. 쿼터 소진(429) 시 다음 모델로 넘어간다."""
+    registered = {entry["model_name"] for entry in get_router().model_list}
+    return [name for name in GEMINI_TIERS if name in registered]
+
+
 def _model_candidates(preferred_provider: str | None = None) -> list[str]:
     provider = (preferred_provider or "").lower().strip()
     has_primary = _has_primary()
+    gemini = _gemini_candidates() if has_primary else []
+    ollama = ["agent-llm-secondary", "agent-llm-tertiary"]
 
-    if provider == "gemini" and has_primary:
-        return ["agent-llm-primary", "agent-llm-secondary", "agent-llm-tertiary"]
     if provider == "ollama":
-        return (
-            ["agent-llm-secondary", "agent-llm-tertiary", "agent-llm-primary"]
-            if has_primary
-            else ["agent-llm-secondary", "agent-llm-tertiary"]
-        )
-    return (
-        ["agent-llm-primary", "agent-llm-secondary", "agent-llm-tertiary"]
-        if has_primary
-        else ["agent-llm-secondary", "agent-llm-tertiary"]
-    )
+        return ollama + gemini
+    return gemini + ollama
 
 
 def _has_primary() -> bool:

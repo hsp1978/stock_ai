@@ -23,7 +23,7 @@
 | 거래 단계 | `TRADING_MODE=paper` (실주문 없음). live 전환 전 60일 hit-rate 검증 게이트 존재 |
 | 워치리스트 | 7종목 — `049430.KQ 328130.KQ FCX IBM IONQ MSFT PLTR` (운영 중 자주 변경) |
 | 분석 주기 | 30분 스캔 + 매일 16:30 스크리너(표본 적립) + 17:30 멀티에이전트 배치 + 23:00 사후검증 |
-| LLM | 8 에이전트 = Gemini 4 (gemini-2.0-flash) + Ollama 4 (Mac Studio qwen2.5:32b) |
+| LLM | 8 에이전트 = Gemini 4 (gemini-3.6-flash, 폴백 3.5-flash) + Ollama 4 (Mac Studio qwen2.5:32b) |
 | 분석 도구 | 24개 (방향성 22 + 비방향성 2: `risk_position_sizing`, `entry_plan_analysis`) |
 | ML | 5모델 앙상블 (RF/GBM/LightGBM/XGBoost/LSTM) + SHAP + Optuna + Walk-Forward |
 | 코드 규모 | 프로덕션 Python 약 54,000 라인 / 최대 파일 `service.py` 3,192 라인 (`webui.py` 는 350) |
@@ -198,10 +198,10 @@ RTX 5070 qwen3:14b)로 종합 판단을 받는다. Ollama가 응답하지 않으
 | Quant Analyst | ollama / mac_studio | qwen2.5:32b | 통계·확률 |
 | Risk Manager | ollama / mac_studio | qwen2.5:32b | Kelly/ATR/Beta |
 | ML Specialist | ollama / mac_studio | qwen2.5:32b | 앙상블 예측 해석 |
-| Value Investor | gemini | gemini-2.0-flash | 재무제표·밸류에이션 |
-| Event Analyst | gemini | gemini-2.0-flash | 뉴스·내부자 거래 |
-| Geopolitical Analyst | gemini | gemini-2.0-flash | 거시·지정학·FX 노출 |
-| Decision Maker | gemini | gemini-2.0-flash | 충돌 해결·최종 판단 |
+| Value Investor | gemini | gemini-3.6-flash | 재무제표·밸류에이션 |
+| Event Analyst | gemini | gemini-3.6-flash | 뉴스·내부자 거래 |
+| Geopolitical Analyst | gemini | gemini-3.6-flash | 거시·지정학·FX 노출 |
+| Decision Maker | gemini | gemini-3.6-flash | 충돌 해결·최종 판단 |
 
 LLM 호출 규약: LiteLLM Router 3-tier 폴백(Gemini → Mac 32B → RTX 14B),
 Pydantic 스키마 강제(자유 텍스트 금지), 개별 타임아웃 Gemini 30s / Ollama 240s,
@@ -1126,6 +1126,55 @@ backup 19:00→04:00.
 같은 블록에 드는 인접 이틀을 실행 시점에 계산하도록 고쳤고, 격자 기준점이 epoch
 임을 고정하는 테스트를 추가했다.
 
+#### 13.9j Gemini — 죽은 기본 모델 + 워크로드가 쿼터를 넘는 구조 (2026-09-15)
+
+`fetch_news_with_sentiment` 검증 중 Gemini 가 429 를 뱉어 확인한 결과, 두 가지가
+겹쳐 있었다.
+
+##### 1. 기본 모델이 폐기됐다
+
+```
+gemini-2.0-flash → HTTP 404 NOT_FOUND
+"This model models/gemini-2.0-flash is no longer available.
+ Please update your code to use models/gemini-3.6-flash"
+```
+
+`config.GEMINI_MODEL` 기본값과 `router.build_router()` 의 폴백 기본값이 모두 이
+모델이었다. `.env` 가 `gemini-2.5-flash` 로 덮어써서 운영은 돌았지만, **`.env` 없는
+환경에서는 Gemini tier 가 통째로 실패**한다. 문서도 죽은 모델을 적고 있었다.
+
+##### 2. 쿼터는 모델당 하루 20회, 워크로드는 배치 1회 28회
+
+429 본문의 실제 쿼터:
+
+```
+quotaId    : GenerateRequestsPerDayPerProjectPerModel-FreeTier
+quotaValue : 20
+```
+
+Gemini 에이전트 4개(Decision Maker · Value · Event · Geopolitical) ×
+워치리스트 7종목 = **배치 한 번에 28회**. 스캔·뉴스 감성까지 더하면 배치 시작 전에
+소진돼 있을 수도 있다. **기다려서 풀리는 문제가 아니라 한도를 넘는 구조**다.
+
+##### 수정
+
+쿼터가 **모델당** 계산되는 점을 이용한다. `agent-llm-primary-alt` tier 를 추가해
+다른 모델(`gemini-3.5-flash`)을 한 단계 더 두면 예산이 따로 잡힌다 (20 + 20 = 40 > 28).
+
+Router 의 내부 재시도·폴백은 좀비 스레드 방지로 꺼져 있다 (`num_retries=0`,
+`fallbacks=[]`). 그래서 LiteLLM 에 맡기지 않고 `_model_candidates()` 의 **외부 루프**에
+tier 를 넣었다 — deadline 예산(#14)·노드 가용성·타임아웃 상한이 그대로 적용된다.
+
+후보 순서: `primary(3.6) → primary-alt(3.5) → secondary(Mac 32B) → tertiary(RTX 14B)`
+
+실측: 3.6-flash 가 503 을 준 호출이 자동으로 3.5-flash 로 넘어가 8.4초에
+`signal=buy, confidence=7.0` 을 받았다.
+
+##### 남은 한계
+
+40회/일도 넉넉하지 않다. 종목이 늘거나 스캔이 Gemini 를 쓰면 다시 넘친다. 구조적
+해법은 유료 등급이다 — 28회/일 규모에서는 비용이 미미하다.
+
 ### 13.10 데이터 품질 위험
 
 - OHLCV 캐시는 TTL 메타(`fetched_at`, `latest_bar_date`, `source`)를 갖지만,
@@ -1233,7 +1282,7 @@ DB 직접 SQL 변경, `webui.py` 일괄 분해.
 ```
 OLLAMA_BASE_URL / OLLAMA_MODEL / OLLAMA_NUM_CTX=8192 / OLLAMA_KEEP_ALIVE=1h
 MAC_STUDIO_URL=http://hsptest-macstudio:8080 (+헬스 TTL/threshold/inflight)
-GEMINI_MODEL=gemini-2.0-flash / DEFAULT_LLM_PROVIDER
+GEMINI_MODEL=gemini-3.6-flash / GEMINI_FALLBACK_MODEL / DEFAULT_LLM_PROVIDER
 SIGNAL_BUY_THRESHOLD=1.3 / SIGNAL_SELL_THRESHOLD=-0.5   ← .env와 config 양쪽 갱신 필요
 BUY_THRESHOLD=1.2 / SELL_THRESHOLD=-0.4 / MIN_CONFIDENCE=5.0
 TRADING_MODE=paper / BROKER_NAME / DATA_SOURCE=yfinance / APPROVAL_EXEC_MODE
