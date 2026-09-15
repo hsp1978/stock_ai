@@ -45,15 +45,63 @@ curl -s localhost:8100/ops/backups | jq    # 현황 + 최신본 검증 결과
 
 설정은 `.env` — `STATE_BACKUP_ENABLED` / `STATE_BACKUP_DIR` / `STATE_BACKUP_KEEP`.
 
-### 반드시 다른 노드로 옮길 것
+### 반드시 원본과 다른 디스크로 옮길 것
 
-기본 경로(`/home/ubuntu/stock_auto_backups`)는 **같은 디스크**다. 디스크가 죽으면
-백업도 같이 죽는다 — 그건 SPOF 대비가 아니다.
+기본 경로(`/home/ubuntu/stock_auto_backups`)는 운영 데이터와 **같은 디스크**다
+(`nvme0n1`). 디스크가 죽으면 백업도 같이 죽는다 — 그건 SPOF 대비가 아니다.
+
+목적지는 **운영자가 정한다** (`OFFSITE_BACKUP_DEST`). 비어 있으면 아무 데도 보내지
+않고 `/ops/backups` 가 `configured: false` 로 보고한다 — '설정 안 됨'을 성공으로
+덮지 않는다.
+
+| 형태 | 예 | 실행 주체 |
+|---|---|---|
+| 로컬·마운트 | `/db4/stock_auto_backups` | **agent-api 가 직접** (매 백업 후, 순수 Python) |
+| 원격 SSH | `user@host:~/stock_auto_backups` | **호스트** `scripts/offsite_sync.sh` (cron) |
+
+원격을 컨테이너에서 하지 않는 이유: SSH 개인키가 필요한데, 네트워크에 노출된 서비스
+컨테이너에 키를 마운트하면 백업으로 얻는 것보다 잃는 게 크다. agent-api 에는 `rsync`·
+`ssh` 를 넣지 않았고, 원격 목적지가 컨테이너에서 시도되면 **어디서 돌려야 하는지**를
+담은 에러로 끝난다.
 
 ```bash
-# macstudio 로 주기 복사 (키 인증 설정돼 있음)
-rsync -av --delete /home/ubuntu/stock_auto_backups/ macstudio:~/stock_auto_backups/
+# 원격을 쓸 때 — 호스트 cron (state_backup 04:00 직후)
+30 4 * * * /home/ubuntu/stock_auto/scripts/offsite_sync.sh >> /var/log/offsite_sync.log 2>&1
 ```
+
+**복사했다 ≠ 도착했다.** `rsync` 종료코드 0 은 전송이 끝났다는 뜻이지 반대편 파일이
+온전하다는 뜻이 아니다. 양쪽 경로 모두 복제 후 최신 아카이브의 sha256 을 목적지에서
+다시 계산해 대조하고, 불일치·확인 불가면 `degraded` 로 보고하고 알린다.
+
+#### 현재 설정 (2026-09-14)
+
+```
+OFFSITE_BACKUP_DEST=/db4/stock_auto_backups
+```
+
+`/db4` 는 `sda`(1.8T)로 **운영 데이터가 있는 `nvme0n1` 과 다른 물리 디스크**다.
+
+```bash
+df --output=source /home/ubuntu/stock_auto_backups   # /dev/mapper/ubuntu--vg-ubuntu--lv
+df --output=source /db4/stock_auto_backups           # /dev/sda          ← 달라야 한다
+```
+
+**경로를 바꿀 때는 반드시 이걸 확인할 것.** 같은 디스크 안의 다른 경로로 바꾸면 마운트도
+복제도 성공하고 `/ops/backups` 도 `configured: true` 로 보이지만, **대비는 사라진다.**
+
+| | |
+|---|---|
+| ✅ NVMe(`nvme0n1`) 고장 | 백업이 `sda` 에 살아남는다 |
+| ✅ 실수로 지운 경우 | 사본이 남는다 |
+| ❌ **머신 자체 손실** (화재·도난·메인보드) | 두 디스크가 같은 기계 안에 있다 |
+
+머신 손실까지 대비하려면 다른 노드가 필요하다. 후보 (2026-09-14 확인):
+
+| 노드 | 상태 |
+|---|---|
+| `hsptest-macstudio` (문서상 듀얼 노드 파트너) | **5일째 offline** — `is_mac_studio_available()` False |
+| `testmacstudio2-macstudio` (100.83.234.49) | SSH 포트 응답 |
+| `parkhongnas` (100.81.207.58) | SSH 응답. 단 `ubuntu` + `id_ed25519` 로는 거부 — 계정·키 배포 필요 |
 
 ## 4. 복구 절차
 
@@ -110,14 +158,14 @@ curl -s 'localhost:8100/signal-accuracy' | jq '.sampling'
   | 일시 | 아카이브 | 결과 |
   |---|---|---|
   | 2026-09-14 08:32 | `stock_auto_state_20260914_083210.tar.gz` (2.83 MB) | **성공** — DB 5개 integrity ok, scan_log 70,840 / signal_outcomes 5,442 / app_state 8 행 일치, 파일 2개 크기 일치 |
+  | 2026-09-14 09:23 | `stock_auto_state_20260914_092321.tar.gz` — **`/db4` 오프사이트 사본으로** | **성공** — DB 5개 integrity ok, scan_log 70,864 / signal_outcomes 5,446 행 일치 (운영과 차이 0) |
 
   다만 리허설은 **복원본이 온전한지**까지만 본다. 서비스를 실제로 정지하고 갈아끼우는
   §4 절차 전체를 돌려본 적은 아직 없다.
 - 백업 주기는 24시간이다. 최악의 경우 하루치 스캔·평가가 사라진다
 - `.env` 를 백업에 넣지 않으면 키는 별도로 보관해야 한다. 어디에 두는지 정하는 것도
   복구 절차의 일부다 — 지금은 정해져 있지 않다
-- **오프사이트 목적지가 아직 설정되지 않았다** (`OFFSITE_BACKUP_DEST=`). 복제 기능은
-  있지만 목적지가 비어 있으면 아무 데도 보내지 않는다 — 설정 전까지 백업은 이 노드에만
-  있고 SPOF 는 그대로다. `/ops/backups` 의 `offsite.configured` 가 이 사실을 보고한다
+- 오프사이트 사본은 `/db4`(다른 물리 디스크)에 있다. **같은 기계 안이다** — 디스크
+  고장은 대비되지만 머신 손실은 아니다. 다른 노드 복제는 아직 없다 (§3)
 - 문서상 듀얼 노드 파트너인 `hsptest-macstudio` 가 **5일째 offline** 이다
   (2026-09-14 확인, `is_mac_studio_available()` False). 목적지를 정할 때 함께 볼 것
