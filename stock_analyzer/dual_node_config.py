@@ -335,7 +335,9 @@ def mac_studio_runtime_status(timeout: float | None = None) -> Dict[str, Any]:
     # 모델 무관하게 60초 넘게 GPU 0% 였다 (runner 교착). CPU 폴백이 아니므로 위
     # 검사로는 잡히지 않는다. 그래서 1토큰 생성까지 확인한다.
     status["status"] = "gpu"
-    generation = probe_node_generation(mac_url, models[0].get("name"), timeout=timeout)
+    generation = probe_node_generation(
+        mac_url, models[0].get("name"), timeout=timeout, node="mac_studio"
+    )
     status["generation"] = generation
     if generation["status"] in ("stalled", "error"):
         status["status"] = "unusable"
@@ -343,18 +345,45 @@ def mac_studio_runtime_status(timeout: float | None = None) -> Dict[str, Any]:
     return status
 
 
+def node_is_busy(node: str) -> bool:
+    """이 노드가 **우리 요청**을 처리 중인가 (`node_slot` 집계 기준)."""
+    return node_load_snapshot().get(node, 0) > 0
+
+
 def probe_node_generation(
-    base_url: str, model: str | None, timeout: float | None = None
+    base_url: str,
+    model: str | None,
+    timeout: float | None = None,
+    node: str | None = None,
 ) -> Dict[str, Any]:
     """적재된 모델로 **1토큰만** 생성해 본다 — 노드를 실제로 쓸 수 있는지.
 
     모델이 적재돼 있을 때만 호출한다. 유휴 노드에 보내면 모델 로드(수십 초)를
     유발해 검사가 스스로 부하를 만든다.
 
+    `node` 를 주면 **그 노드가 이미 우리 요청을 처리 중일 때 건너뛴다.** 두
+    노드 모두 OLLAMA_NUM_PARALLEL=1 로 직렬 처리하므로, 바쁜 노드에 보낸 프로브는
+    큐 뒤에 줄을 서고 타임아웃한다 — 정상 노드가 `stalled` 로 보고된다. Mac 이면
+    `is_mac_studio_available()` 이 False 가 되어 **바쁠 때 정확히 라우팅에서
+    빠지는** 되먹임이 된다 (2026-09-16 실측: 스캔 중 RTX 가 GPU 98%·250W 로
+    일하는데 프로브는 90초 타임아웃).
+
+    처리 중이라는 사실 자체가 1토큰 합성 호출보다 강한 증거다 — 요청이 돌고
+    있으면 생성 경로는 살아 있다. 게다가 건너뛰면 프로브가 부하를 더하지 않는다.
+
     Returns: {"status": ok|stalled|skipped|error, "latency_ms": int|None, ...}
     """
     if not model:
         return {"status": "skipped", "reason": "model_name_unknown", "latency_ms": None}
+
+    if node and node_is_busy(node):
+        return {
+            "status": "skipped",
+            "reason": "node_busy",
+            "model": model,
+            "latency_ms": None,
+            "detail": "우리 요청을 처리 중 — 생성 경로가 살아 있다는 증거이므로 프로브를 건너뜀",
+        }
 
     budget = timeout if timeout is not None else _float_setting(
         "HEALTH_GENERATION_TIMEOUT_SECONDS", 20.0

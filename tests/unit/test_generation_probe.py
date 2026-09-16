@@ -254,7 +254,7 @@ def _mac_session(monkeypatch, *, ps_models, generation):
 
     monkeypatch.setattr(dn, "get_http_session", lambda: S())
     monkeypatch.setattr(dn, "probe_node_generation",
-                        lambda base_url, model, timeout=None: generation)
+                        lambda base_url, model, timeout=None, node=None: generation)
     monkeypatch.setenv("MAC_STUDIO_HEALTH_TTL_SECONDS", "0")
 
 
@@ -379,3 +379,136 @@ def test_rtx_stays_the_last_resort_node():
     assert rt._node_available_for_model("agent-llm-tertiary") is True
     src = __import__("inspect").getsource(rt._node_available_for_model)
     assert 'node != "rtx_5070"' in src
+
+
+# ── 바쁜 노드를 고장으로 읽지 않는다 (2026-09-16) ─────────────────
+#
+# 첫 구현은 부하를 고려하지 않아, 정상 노드가 일하는 중에 `stalled` 로 보고됐다.
+# 실측: 30분 스캔이 RTX 를 쓰는 동안 GPU 98%·250W 인데, 1토큰 프로브는 큐 뒤에
+# 줄을 서서 90초 타임아웃했다. 두 노드 모두 OLLAMA_NUM_PARALLEL=1 이라 구조적이다.
+#
+# Mac 이면 더 나쁘다 — `is_mac_studio_available()` 이 False 가 되어 **바쁠 때
+# 정확히 라우팅에서 빠진다.** 부하가 노드를 제거하고, 제거가 남은 노드의 부하를
+# 키우는 되먹임이다.
+#
+# 처리 중이라는 사실 자체가 1토큰 합성 호출보다 강한 증거다.
+
+
+@pytest.fixture
+def _no_load():
+    """다른 테스트가 남긴 in-flight 집계를 지운다."""
+    with dn._node_lock:
+        dn._node_inflight.clear()
+    yield
+    with dn._node_lock:
+        dn._node_inflight.clear()
+
+
+def test_busy_local_node_skips_the_probe_entirely(monkeypatch, _no_load):
+    """요청을 보내지 않아야 한다 — 보내면 검사가 스스로 부하를 더한다."""
+    calls = []
+    _patch_async(monkeypatch, lambda url, json: calls.append(url) or _Resp(200))
+
+    with dn.node_slot("rtx_5070", block=False) as acquired:
+        assert acquired is True
+        result = asyncio.run(service._probe_generation("http://rtx:11434", dict(_LOADED)))
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "node_busy"
+    assert calls == []
+
+
+def test_busy_skip_does_not_downgrade_runtime(monkeypatch, _no_load):
+    """바쁜 것은 고장이 아니다 — gpu 로 남아야 라우팅이 계속 쓴다."""
+    _patch_probe(monkeypatch, {"status": "skipped", "reason": "node_busy"})
+
+    snap = _refresh(monkeypatch)
+
+    assert snap["ollama_runtime"]["status"] == "gpu"
+    assert "unusable_reason" not in snap["ollama_runtime"]
+
+
+def test_probe_runs_again_once_the_node_is_free(monkeypatch, _no_load):
+    """건너뛰기는 부하 중에만이다 — 교착은 계속 잡아야 한다."""
+    def behavior(url, json):
+        raise service.httpx.TimeoutException("read timeout")
+
+    _patch_async(monkeypatch, behavior)
+
+    result = asyncio.run(service._probe_generation("http://rtx:11434", dict(_LOADED)))
+
+    assert result["status"] == "stalled"
+
+
+def test_busy_lookup_failure_is_treated_as_not_busy(monkeypatch, _no_load):
+    """조회가 깨져도 헬스 프로브가 멈추면 안 된다 — 종전 동작으로 떨어진다."""
+    monkeypatch.setattr(
+        dn, "node_load_snapshot", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+
+    assert service._local_node_is_busy() is False
+
+
+def test_mac_probe_skips_while_that_node_is_busy(_no_load, monkeypatch):
+    posted = []
+
+    class S:
+        def post(self, url, json=None, timeout=None):
+            posted.append(url)
+            return _Resp(200)
+
+    monkeypatch.setattr(dn, "get_http_session", lambda: S())
+
+    with dn.node_slot("mac_studio", block=False) as acquired:
+        assert acquired is True
+        result = dn.probe_node_generation(
+            "http://mac:8080", "qwen2.5:32b", timeout=1.0, node="mac_studio"
+        )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "node_busy"
+    assert posted == []
+
+
+def test_busy_on_one_node_does_not_skip_the_other(_no_load, monkeypatch):
+    """노드별로 봐야 한다 — RTX 가 바쁘다고 Mac 검사를 건너뛰면 안 된다."""
+    class S:
+        def post(self, url, json=None, timeout=None):
+            return _Resp(200)
+
+    monkeypatch.setattr(dn, "get_http_session", lambda: S())
+
+    with dn.node_slot("rtx_5070", block=False):
+        result = dn.probe_node_generation(
+            "http://mac:8080", "qwen2.5:32b", timeout=1.0, node="mac_studio"
+        )
+
+    assert result["status"] == "ok"
+
+
+def test_mac_gate_keeps_a_busy_node_available(_no_load, monkeypatch):
+    """되먹임 고리를 고정한다 — 바쁜 Mac 이 라우팅에서 빠지면 안 된다."""
+    class S:
+        def get(self, url, timeout=None):
+            if url.endswith("/api/ps"):
+                return _Resp(200, {"models": [
+                    {"name": "qwen2.5:32b", "size": 1000, "size_vram": 990}]})
+            return _Resp(200)
+
+        def post(self, url, json=None, timeout=None):
+            import requests
+
+            raise requests.exceptions.Timeout("큐 뒤에서 대기")
+
+    monkeypatch.setattr(dn, "get_http_session", lambda: S())
+    monkeypatch.setenv("MAC_STUDIO_HEALTH_TTL_SECONDS", "0")
+    dn.reset_mac_studio_health_cache()
+
+    with dn.node_slot("mac_studio", block=False) as acquired:
+        assert acquired is True
+        available = dn.is_mac_studio_available(force_refresh=True)
+
+    assert available is True
+    snap = dn.mac_studio_health_snapshot()
+    assert snap["runtime"] == "gpu"
+    assert snap["failures"] == 0
