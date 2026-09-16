@@ -208,6 +208,7 @@ def call_agent_llm(
     response_model: type[T] = AgentLLMResponse,  # type: ignore[assignment]
     preferred_provider: str | None = None,
     timeout_seconds: float | None = None,
+    preferred_node: str | None = None,
 ) -> T:
     """
     LiteLLM Router + circuit breaker를 통해 LLM을 호출하고
@@ -218,6 +219,13 @@ def call_agent_llm(
     timeout_seconds는 이 호출 **전체**의 예산이다. 후보 모델 폴백(3) × 파싱
     재시도(2)가 각각 timeout_seconds를 다시 쓰면 최악 6배까지 늘어나므로,
     진입 시 deadline을 고정하고 매 시도마다 남은 시간으로 잘라 쓴다.
+
+    preferred_node 는 Ollama tier 중 **먼저 시도할 노드**다 (`mac_studio` /
+    `rtx_5070`). 종전에는 provider 만 받아서 Ollama 에이전트 전부가
+    `agent-llm-secondary`(Mac Studio)를 먼저 쳤다 — 2026-09-15 실측으로
+    한 종목 분석에서 Mac 에 몰린 4개 에이전트가 90~147초를 쓰는 동안 RTX 는
+    거의 유휴였다 (§13.9o). 폴백 순서는 유지되므로 지정한 노드가 죽으면 다른
+    노드로 넘어간다.
     """
     if timeout_seconds is not None and timeout_seconds <= 0:
         return _safe_response(
@@ -248,7 +256,7 @@ def call_agent_llm(
         {"role": "user", "content": prompt},
     ]
 
-    model_candidates = _model_candidates(preferred_provider)
+    model_candidates = _model_candidates(preferred_provider, preferred_node)
     last_exc: Exception | None = None
 
     for model_name in model_candidates:
@@ -426,11 +434,37 @@ def _gemini_candidates() -> list[str]:
     return [name for name in GEMINI_TIERS if name in registered]
 
 
-def _model_candidates(preferred_provider: str | None = None) -> list[str]:
+#: Ollama tier ↔ 노드. `_node_for_model()` 과 같은 대응을 유지해야 한다.
+OLLAMA_TIER_BY_NODE = {
+    "mac_studio": "agent-llm-secondary",
+    "rtx_5070": "agent-llm-tertiary",
+}
+
+
+def _ollama_candidates(preferred_node: str | None = None) -> list[str]:
+    """Ollama tier 순서. `preferred_node` 가 있으면 그 노드를 먼저 시도한다.
+
+    종전에는 항상 `[secondary(Mac), tertiary(RTX)]` 였다. 그래서 Ollama 에이전트
+    4개가 전부 Mac Studio 를 먼저 쳤고, 한 종목 분석에서 그 4개가 90~147초를 쓰는
+    동안 RTX 는 거의 유휴였다 (2026-09-15 실측, §13.9o).
+
+    폴백 순서는 유지한다 — 지정 노드가 죽으면 다른 노드로 넘어간다.
+    """
+    default = ["agent-llm-secondary", "agent-llm-tertiary"]
+    tier = OLLAMA_TIER_BY_NODE.get((preferred_node or "").strip())
+    if tier is None:
+        return default
+    return [tier] + [name for name in default if name != tier]
+
+
+def _model_candidates(
+    preferred_provider: str | None = None,
+    preferred_node: str | None = None,
+) -> list[str]:
     provider = (preferred_provider or "").lower().strip()
     has_primary = _has_primary()
     gemini = _gemini_candidates() if has_primary else []
-    ollama = ["agent-llm-secondary", "agent-llm-tertiary"]
+    ollama = _ollama_candidates(preferred_node)
 
     if provider == "ollama":
         return ollama + gemini
