@@ -173,6 +173,23 @@ class AgentResult:
         return asdict(self)
 
 
+def _preferred_node_for(agent_name: str) -> Optional[str]:
+    """에이전트에 배정된 Ollama 노드 (`AGENT_LLM_MAPPING` 의 `node`).
+
+    종전에는 라우터에 provider 만 넘겨서 Ollama 에이전트 전부가 Mac Studio 를 먼저
+    쳤다 — 매핑의 `node` 필드가 사실상 무시됐다. 2026-09-15 실측: 한 종목 분석에서
+    Mac 에 몰린 4개 에이전트가 90~147초를 쓰는 동안 RTX 는 거의 유휴였다 (§13.9o).
+
+    Gemini 에이전트는 `node` 가 없어 None 을 돌려준다 (라우터가 무시한다).
+    """
+    try:
+        from dual_node_config import get_llm_config
+
+        return (get_llm_config(agent_name) or {}).get("node")
+    except Exception:
+        return None
+
+
 class BaseAgent:
     """에이전트 기본 클래스"""
 
@@ -442,6 +459,9 @@ class BaseAgent:
 
         return prompt
 
+    def _preferred_node(self) -> str | None:
+        return _preferred_node_for(self.name)
+
     def _call_llm(self, prompt: str) -> str:
         """LLM 호출 (LiteLLM Router 경유 — Step 9)."""
         try:
@@ -452,6 +472,7 @@ class BaseAgent:
                 prompt,
                 preferred_provider=self.llm_provider,
                 timeout_seconds=self._remaining_timeout(),
+                preferred_node=self._preferred_node(),
             )
             return json.dumps(
                 {
@@ -1535,6 +1556,10 @@ class DecisionMaker:
             return None
         return max(0.0, self.deadline_at - time.monotonic())
 
+    def _preferred_node(self) -> Optional[str]:
+        # BaseAgent 를 상속하지 않으므로 같은 헬퍼를 직접 쓴다.
+        return _preferred_node_for(self.name)
+
     def aggregate(self, ticker: str, agent_results: List[AgentResult]) -> Dict[str, Any]:
         """
         에이전트 결과 종합 및 최종 판단
@@ -1735,6 +1760,7 @@ class DecisionMaker:
                 DecisionMakerResponse,
                 preferred_provider=self.llm_provider,
                 timeout_seconds=self._remaining_timeout(),
+                preferred_node=self._preferred_node(),
             )
             return json.dumps(
                 {

@@ -99,23 +99,40 @@ AGENT_LLM_MAPPING = {
         "reason": "지정학·거시경제 복잡 관계 분석 — Gemini 지식 기반"
     },
 
-    # ── Mac Studio Ollama (qwen2.5:32b, 수치·통계 분석) ────────
+    # ── Mac Studio Ollama (qwen2.5:32b, 패턴·해석 중심) ────────
     "Technical Analyst": {
         "provider": "ollama",
         "node": "mac_studio",
         "model": "qwen_32b",
         "reason": "복잡한 기술 지표 패턴 분석"
     },
+
+    # ── Mac Studio Ollama (qwen2.5:32b, 수치 계산·ML 해석) ────
+    #
+    # 2026-09-15: 이 넷을 2:2 로 나눠 RTX 에 분산해 봤고 **더 느려져서 되돌렸다.**
+    #
+    #   에이전트          이전(Mac 4개)   RTX 분산 후
+    #   Technical         132.3초    →    45.5초   (Mac 부하 감소, 의도대로)
+    #   ML Specialist     146.7초    →    63.2초   (동일)
+    #   Quant  → RTX       46.8초    →   320.1초   ✗
+    #   Risk   → RTX       91.0초    →   279.1초   ✗
+    #   ─────────────────────────────────────────
+    #   한 종목 총        149.9초    →   322.6초   (2.2배 악화)
+    #
+    # Mac 쪽은 3배 빨라졌지만 RTX 로 옮긴 둘이 6배 느려졌다. RTX 5070(12GB)에
+    # qwen3:14b-q4_K_M(10.8GB)를 올리면 여유가 1.4GB 뿐이라, 동시 2요청의 KV 캐시를
+    # 감당하지 못한다. 게다가 측정 직후 RTX 는 8토큰 요청조차 90초 내에 끝내지
+    # 못했다 (GPU util 0%, 모델은 VRAM 100% 적재 — 원인 미규명, §13.9o 참조).
+    #
+    # 다시 시도하려면 `RTX_5070_MAX_INFLIGHT=1` 로 직렬화해 KV 캐시 1슬롯만 쓰게
+    # 하고, RTX 노드의 처리량을 먼저 확인할 것. 라우팅 기구(`preferred_node`)는
+    # 남아 있으므로 매핑만 바꾸면 된다.
     "Quant Analyst": {
         "provider": "ollama",
         "node": "mac_studio",
         "model": "qwen_32b",
         "reason": "통계적 계산 및 확률 분석"
     },
-
-    # ── Mac Studio Ollama (qwen2.5:32b, 수치 계산·ML 해석) ────
-    # RTX 5070 GPU 는 Ollama(qwen3:14b) 전용으로 비워 두고,
-    # Ollama 추론 작업 전부를 Mac Studio 로 집중.
     "Risk Manager": {
         "provider": "ollama",
         "node": "mac_studio",
