@@ -63,6 +63,18 @@ class Settings(BaseSettings):
 
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "qwen3:14b-q4_K_M"
+    # 같은 태그로 다른 가중치가 들어올 수 있다 (`ollama pull` 재실행). 그러면 신호
+    # 판단이 바뀌는데 아무 기록도 남지 않는다 — 60일 hit-rate 검증은 '같은 로직 +
+    # 같은 모델'을 전제하므로 모델이 바뀐 구간이 섞이면 통계가 무효다.
+    #
+    # Ollama 는 digest 로 **참조**할 수 없다 (2026-09-15 확인: model="sha256:..." →
+    # not found). 그래서 기대 digest 를 적어 두고 실제 적재본과 **대조**한다.
+    # 비워 두면 'unverified' 다 — ok 가 아니다. 현재 값은 `make model-pin` 으로.
+    OLLAMA_MODEL_DIGEST: str = ""
+    # Mac Studio 모델은 종전에 llm/router.py 의 하드코딩 기본값 + env 폴백으로만
+    # 존재했다 (설정 필드 없음). digest 대조 대상이므로 설정으로 올린다.
+    OLLAMA_MAC_MODEL: str = "qwen2.5:32b-instruct-q4_K_M"
+    OLLAMA_MAC_MODEL_DIGEST: str = ""
     OLLAMA_NUM_PARALLEL: int = 3
     # 종합 판단 프롬프트는 실측 4,700~5,000 토큰인데 Ollama 기본 컨텍스트는
     # 4,096이라 조용히 잘려나갔다(2026-07-29 하루에만 978건). keep=4 규칙상
@@ -332,6 +344,9 @@ settings = Settings()
 # ── 호환성: 기존 module-level 상수 그대로 export ────────────────────
 OLLAMA_BASE_URL = settings.OLLAMA_BASE_URL
 OLLAMA_MODEL = settings.OLLAMA_MODEL
+OLLAMA_MODEL_DIGEST = settings.OLLAMA_MODEL_DIGEST
+OLLAMA_MAC_MODEL = settings.OLLAMA_MAC_MODEL
+OLLAMA_MAC_MODEL_DIGEST = settings.OLLAMA_MAC_MODEL_DIGEST
 OLLAMA_NUM_PARALLEL = settings.OLLAMA_NUM_PARALLEL
 OLLAMA_NUM_CTX = settings.OLLAMA_NUM_CTX
 OLLAMA_KEEP_ALIVE = settings.OLLAMA_KEEP_ALIVE

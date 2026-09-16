@@ -666,7 +666,7 @@ win 정의가 "신호 방향으로 ±2% 이상"이었는데 **±2%에 근거가 
 | 5 | ~~분석 결과 JSON 무한 누적~~ | **해소** (2026-09-14): `output_retention` 잡 (JSON·PNG 30일, 03:30). 적발 시점 70,771개/1.58 GB, 하루 361개 증가 — 아래 §13.9b |
 | 6 | ~~DB 마이그레이션 도구 부재~~ | **해소** (2026-09-15): Alembic 도입, 리비전 4개. 운영 DB 채택 완료 — 아래 §13.9k |
 | 7 | FastAPI 핸들러 sync + blocking I/O | **부분 해소** (2026-09-15): 스레드 한도 40→80, `/health` async 전환으로 포화 시 7.33초→0.35초. 나머지 85개는 sync 유지 — 아래 §13.9l |
-| 8 | 모델 버전 태그 핀 | `qwen3:14b-q4_K_M` 등 태그 고정이나 digest 핀은 아님 |
+| 8 | 모델 버전 태그 핀 | **변경 감지로 해소** (2026-09-15): Ollama 는 digest 참조가 불가능해 기대 digest 대조 방식. `/health` 의 `model_pin` — 아래 §13.9m |
 | 9 | 백테스트 Composite 전략의 과거 replay 제외 | look-ahead 회피 목적. 도구 신호의 역사적 성능은 미측정 |
 | 10 | 단일 노드 SPOF | 구조는 그대로. **백업·복구 절차 추가** (2026-09-14): `state_backup` 잡(04:00) + `docs/RUNBOOK_BACKUP.md` + 복구 리허설 — 아래 §13.9g |
 
@@ -1291,6 +1291,59 @@ get_market_session x2    10.63 ms   (CPU)
 **측정된 문제가 생길 때** 하는 게 맞다 — 지금 옮기면 blocking 호출이 이벤트 루프로
 올라가 더 나빠진다.
 
+#### 13.9m 모델 가중치 고정 (2026-09-15)
+
+§13.9-8 의 "digest 핀은 아님". 먼저 **digest 로 참조가 가능한지** 확인했다.
+
+```
+POST /api/generate {"model": "sha256:bdbd181c33f2ed1b31c9"}
+→ {"error": "model 'sha256:...' not found"}
+```
+
+`/api/show` 도 digest 를 돌려주지 않는다 (`/api/tags` 만 준다). **Docker 식 불변 참조는
+Ollama 에 없다.** 그래서 방향을 바꿨다 — 고정이 아니라 **변경 감지**다.
+
+##### 왜 필요한가
+
+`ollama pull qwen3:14b-q4_K_M` 을 다시 하면 같은 태그로 **다른 가중치**가 들어올 수
+있다. 신호 판단이 바뀌는데 아무 기록이 남지 않는다. 60일 hit-rate 검증은 "같은 로직 +
+같은 모델" 을 전제하므로, 모델이 바뀐 구간이 섞이면 **그 통계는 무효**다.
+
+##### 구현
+
+`chart_agent_service/model_pin.py` — 기대 digest(`OLLAMA_MODEL_DIGEST`,
+`OLLAMA_MAC_MODEL_DIGEST`)를 실제 `/api/tags` 값과 대조한다.
+
+| 상태 | 의미 |
+|---|---|
+| `ok` | 양쪽 노드 모두 설정돼 있고 일치 |
+| `mismatch` | 다르다 — **같은 태그로 가중치가 바뀌었다** |
+| `model_absent` | 설정한 모델이 그 노드에 없다 (대조 불가와 구분) |
+| `unverified` | 기대 digest 미설정 — **`ok` 가 아니다** (§13-4) |
+| `error` | 조회 자체 실패 |
+
+- 접두 비교를 허용하되 **12자 미만은 거부**한다 (짧은 접두는 우연히 맞을 수 있다)
+- `/health` 의 `model_pin` 으로 노출 (프로브 스냅샷에 포함 — §13.9l)
+- `make model-pin` 이 현재 값을 `.env` 줄로 출력한다. 조회 실패는 빈 값이 아니라
+  주석으로 낸다 — '핀 없음'과 '조회 실패'는 다르다
+
+곁가지로 `OLLAMA_MAC_MODEL` 을 설정 필드로 올렸다. 종전에는 `llm/router.py` 의
+하드코딩 기본값 + env 폴백으로만 존재해 대조 대상으로 삼을 수 없었다.
+
+##### 현재 핀 값 (testdev)
+
+```
+OLLAMA_MODEL_DIGEST=bdbd181c33f2ed1b31c9        qwen3:14b-q4_K_M      (RTX 5070)
+OLLAMA_MAC_MODEL_DIGEST=9f13ba1299afea09d9a9    qwen2.5:32b-instruct-q4_K_M (Mac Studio)
+```
+
+`/health` 실측: `model_pin.status = ok`, 양쪽 `expected == actual`.
+
+##### 남은 것
+
+신호 행에 모델 digest 를 기록하면 과거 신호를 **어떤 가중치가 만들었는지** 소급해서
+가를 수 있다. 이제 Alembic(§13.9k)이 있으므로 컬럼 추가가 가능하다 — 다만 삽입 경로와
+평가 경로를 함께 손봐야 해서 별도 작업으로 남긴다. 지금은 "바뀌면 알 수 있다" 까지다.
 #### 13.9n Alembic 이 로깅 설정을 덮었다 (2026-09-15, #72 회귀)
 
 17:30 배치 소요를 조사하려고 로그를 읽는데 종목별 진행 로그가 없었다. 배치 종료 줄이

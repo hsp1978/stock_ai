@@ -2466,6 +2466,7 @@ _HEALTH_PROBE: dict = {
     "ollama_ok": False,
     "ollama_runtime": {"status": "unknown", "models": []},
     "market_session": {"KRX": "unknown", "NYSE": "unknown"},
+    "model_pin": {"status": "unknown", "nodes": {}},
     "error": None,
 }
 _HEALTH_PROBE_LOCK = threading.Lock()
@@ -2516,12 +2517,23 @@ async def _refresh_health_probe() -> dict:
         sessions = {"KRX": "unknown", "NYSE": "unknown"}
         error = error or f"market_session: {type(exc).__name__}"
 
+    # 모델 가중치가 같은 태그로 바뀌면 신호가 변하는데 기록이 남지 않는다.
+    # 기대 digest 와 대조한 결과를 헬스에 싣는다 (미설정은 unverified).
+    try:
+        from model_pin import verify_model_pins
+
+        pins = await anyio.to_thread.run_sync(verify_model_pins)
+    except Exception as exc:
+        pins = {"status": "error", "nodes": {},
+                "error": f"{type(exc).__name__}: {exc}"[:120]}
+
     snapshot = {
         "probed_at": time.monotonic(),
         "probed_wall": datetime.now().isoformat(),
         "ollama_ok": ollama_ok,
         "ollama_runtime": runtime,
         "market_session": sessions,
+        "model_pin": pins,
         "error": error,
     }
     with _HEALTH_PROBE_LOCK:
@@ -2702,6 +2714,7 @@ async def health():
         # data_health_check 잡이 주기적으로 채운다.
         "data_health": _LAST_DATA_HEALTH or {"status": "not_computed"},
         "market_session": probe["market_session"],
+        "model_pin": probe.get("model_pin", {"status": "unknown"}),
         "probe": {
             "age_sec": probe["probe_age_sec"],
             "stale": probe["probe_stale"],

@@ -149,16 +149,21 @@ def test_env_can_be_included_explicitly_and_is_flagged(env, tmp_path):
 
 
 def test_verify_detects_a_corrupted_archive(env, tmp_path):
-    """체크섬만 맞추고 끝내면 깨진 DB 를 '정상'이라 부른다."""
+    """깨진 아카이브는 풀리지 않는다 — 그 실패가 드러나야 한다.
+
+    처음에는 가운데 한 바이트를 뒤집었는데, deflate 스트림에서 그 바이트가 어디에
+    떨어지느냐에 따라 예외가 안 날 때가 있었다 (단독 실행은 통과, 전체 실행에서
+    실패). **잘라내기**는 결정적이고, 실제로도 흔한 손상 형태다 — 복사가 중간에
+    끊긴 경우.
+    """
     result = sb.create_backup(tmp_path / "backups")
     archive = tmp_path / "backups" / os.path.basename(result["archive"])
 
-    raw = bytearray(archive.read_bytes())
-    raw[len(raw) // 2] ^= 0xFF                     # 한 바이트 훼손
-    archive.write_bytes(bytes(raw))
+    raw = archive.read_bytes()
+    archive.write_bytes(raw[: int(len(raw) * 0.6)])   # 60% 에서 잘림
 
     with pytest.raises(Exception):
-        sb.verify_backup(archive)                  # 풀리지 않는다
+        sb.verify_backup(archive)
 
 
 def test_verify_detects_a_tampered_database(env, tmp_path):
