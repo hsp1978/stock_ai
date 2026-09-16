@@ -99,15 +99,29 @@ AGENT_LLM_MAPPING = {
         "reason": "지정학·거시경제 복잡 관계 분석 — Gemini 지식 기반"
     },
 
-    # ── Mac Studio Ollama (qwen2.5:32b, 패턴·해석 중심) ────────
+    # ── RTX 5070 Ollama (qwen3:14b, 무거운 쪽 2개) ─────────────
+    #
+    # 2026-09-16: Ollama 4개를 2:2 로 나눈다. 근거는 아래 A/B(정상 노드 실측).
+    # 무거운 둘(Technical·ML)을 빠른 노드로 보낸다 — #76 의 2:2 런에서 Mac 큐가
+    # 2개로 줄었을 때 Technical 45.5초·ML 63.2초로, 나머지 둘보다 무거웠다.
+    #
+    # **트레이드오프**: 이 둘은 qwen2.5:32b → qwen3:14b 로 모델이 바뀐다.
+    # 속도는 7배지만 파라미터는 절반 이하다. 품질 영향은 미측정 —
+    # `signal_outcomes` 를 소스별로 지켜볼 것. 나빠지면 매핑만 되돌리면 된다.
     "Technical Analyst": {
         "provider": "ollama",
-        "node": "mac_studio",
-        "model": "qwen_32b",
-        "reason": "복잡한 기술 지표 패턴 분석"
+        "node": "rtx_5070",
+        "model": "qwen3_14b",
+        "reason": "무거운 해석 — 빠른 노드로 (2026-09-16 분산). 품질은 관찰 중"
+    },
+    "ML Specialist": {
+        "provider": "ollama",
+        "node": "rtx_5070",
+        "model": "qwen3_14b",
+        "reason": "무거운 해석 — 빠른 노드로 (2026-09-16 분산). 품질은 관찰 중"
     },
 
-    # ── Mac Studio Ollama (qwen2.5:32b, 수치 계산·ML 해석) ────
+    # ── Mac Studio Ollama (qwen2.5:32b, 수치 계산·리스크) ─────
     #
     # 2026-09-15: 이 넷을 2:2 로 나눠 RTX 에 분산해 봤고 **더 느려져서 되돌렸다.**
     #
@@ -132,8 +146,18 @@ AGENT_LLM_MAPPING = {
     # 주석에 "측정 직후 8토큰도 90초 내에 못 끝냈다"고 적어두고도 측정값을 유효한
     # 것으로 읽은 것이 오류다 — **고장난 노드에서 잰 수치로 설계 결정을 내렸다.**
     #
-    # 따라서 분산 여부는 **아직 미결**이다. 정상 RTX 기준으로 다시 재야 한다.
-    # 라우팅 기구(`preferred_node`)는 남아 있으므로 매핑만 바꾸면 된다.
+    # 정상 RTX 에서 다시 쟀다 (Gemini 미사용, 실제 에이전트와 같은 호출 조건:
+    # think=False, temperature=0.0, num_thread=4, 프롬프트 ~900 tok):
+    #
+    #   A 현재(Mac 4)   벽시계 94.2초   34.2 / 54.2 / 74.2 / 94.2초
+    #                                   ← 20초 간격 = 완전 직렬 큐잉
+    #   B 2:2 분산      벽시계 40.3초   Mac 20.4·40.3 / RTX 5.9·8.4 (63 tok/s)
+    #   ─────────────────────────────────────────
+    #   한 종목 Ollama 구간  2.33배 **개선** (7종목 환산 11.0분 → 4.7분)
+    #
+    # 이득의 출처는 처리량이 아니라 **큐 길이**다. 두 노드 모두
+    # OLLAMA_NUM_PARALLEL=1 로 직렬 처리하므로, 4개를 한 노드에 몰면 마지막
+    # 에이전트가 3개분을 대기한다. 나누면 대기가 절반이 된다.
     "Quant Analyst": {
         "provider": "ollama",
         "node": "mac_studio",
@@ -145,12 +169,6 @@ AGENT_LLM_MAPPING = {
         "node": "mac_studio",
         "model": "qwen_32b",
         "reason": "Kelly/Beta 수치 계산 — Mac Studio 우선"
-    },
-    "ML Specialist": {
-        "provider": "ollama",
-        "node": "mac_studio",
-        "model": "qwen_32b",
-        "reason": "ML 예측 해석 정확도 — Mac Studio 우선"
     },
 }
 

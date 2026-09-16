@@ -12,6 +12,10 @@
 
 Mac Studio 단독 호출은 7.5초(9.7 tok/s)다. 4개를 한 노드에 몰아 큐가 쌓인 결과다.
 
+2026-09-16: 2:2 로 나눴다. 위 '분산이 더 느리다'는 측정은 교착된 RTX 에서 잰
+것이라 무효였고, 정상 노드 재측정은 94.2초 → 40.3초(2.33배 개선)다.
+`test_current_node_assignment_is_the_measured_one` 의 docstring 참조.
+
 원인이 둘이었다:
   1. `AGENT_LLM_MAPPING` 의 `node` 필드가 **라우터 경로에서 무시됐다** —
      `_call_llm` 이 provider 만 넘겨서 Ollama 에이전트 전부가
@@ -57,29 +61,38 @@ def _ollama_nodes() -> collections.Counter:
 def test_current_node_assignment_is_the_measured_one():
     """지금 배정은 **측정으로 고른 것**이다 — 바꾸려면 다시 재고 바꿔라.
 
-    2:2 분산을 실제로 시도했고 더 느려서 되돌렸다:
+    2026-09-15 에 2:2 분산을 시도했다가 "2.2배 악화"로 되돌렸고, 이 테스트는
+    `{"mac_studio": 4}` 를 고정하고 있었다. **그 측정이 무효였다.**
 
-        에이전트        Mac 4개 집중   RTX 2개 분산 후
-        Technical        132.3초   →    45.5초   (Mac 부하 감소, 의도대로)
-        ML Specialist    146.7초   →    63.2초   (동일)
-        Quant  → RTX      46.8초   →   320.1초   ✗
-        Risk   → RTX      91.0초   →   279.1초   ✗
-        ──────────────────────────────────────
-        한 종목 총       149.9초   →   322.6초   (2.2배 악화)
+    당시 RTX 는 이미 교착 중이었다 (§13.9p — VRAM 100% 적재인데 1토큰도 생성
+    못 하는 상태). Quant 320.1초·Risk 279.1초는 실효 ~2 tok/s 로, 정상 노드의
+    값이 아니다. 나는 같은 문서에 "측정 직후 RTX 는 8토큰 요청조차 90초 내에
+    끝내지 못했다"고 적어두고도, 그 관측이 **직전 측정을 소급 무효화한다**는
+    함의를 읽지 않았다.
 
-    RTX 5070(12GB)에 qwen3:14b-q4_K_M(10.8GB)을 올리면 여유가 1.4GB 뿐이라 동시
-    2요청의 KV 캐시를 감당하지 못한다.
+    `ollama serve` 재시작 후 정상 노드에서 다시 쟀다 (Gemini 미사용, 실제
+    에이전트와 같은 호출 조건: think=False, temperature=0.0, num_thread=4,
+    프롬프트 ~900 tok):
 
-    그래서 이 테스트는 '분산해야 한다'를 주장하지 않는다 — **현재 배정이 우연이
-    아니라는 것**을 고정한다. 다시 분산을 시도하려면 이 테스트를 함께 고쳐야 하고,
-    그때 위 숫자를 다시 재게 된다.
+        A 현재(Mac 4)   벽시계 94.2초   34.2 / 54.2 / 74.2 / 94.2초
+                                        ← 20초 간격 = 완전 직렬 큐잉
+        B 2:2 분산      벽시계 40.3초   Mac 20.4·40.3 / RTX 5.9·8.4 (63 tok/s)
+        ────────────────────────────────────────
+        한 종목 Ollama 구간  2.33배 **개선**
+
+    이득의 출처는 처리량이 아니라 **큐 길이**다. 두 노드 모두
+    OLLAMA_NUM_PARALLEL=1 로 직렬 처리하므로, 4개를 한 노드에 몰면 마지막
+    에이전트가 앞의 3개를 전부 기다린다.
+
+    이 테스트는 여전히 '분산이 옳다'를 주장하지 않는다 — **현재 배정이 우연이
+    아니라는 것**을 고정한다. 되돌리려면 그때의 실측을 근거로 함께 고칠 것.
     """
     counts = _ollama_nodes()
 
-    assert dict(counts) == {"mac_studio": 4}, (
+    assert dict(counts) == {"rtx_5070": 2, "mac_studio": 2}, (
         f"Ollama 노드 배정이 바뀌었다: {dict(counts)} — "
-        "RTX 분산은 2026-09-15 에 2.2배 악화로 되돌렸다. "
-        "재시도 시 RTX_5070_MAX_INFLIGHT=1 로 직렬화하고 처리량을 먼저 측정할 것"
+        "2:2 분산은 2026-09-16 정상 노드 실측(94.2초 → 40.3초)으로 고른 것이다. "
+        "되돌리려면 그때의 측정을 근거로 제시할 것"
     )
 
 
@@ -190,8 +203,8 @@ def test_agents_pass_preferred_node_to_the_router():
 
 
 @pytest.mark.parametrize("agent,expected", [
-    ("Technical Analyst", "mac_studio"),
-    ("ML Specialist", "mac_studio"),
+    ("Technical Analyst", "rtx_5070"),
+    ("ML Specialist", "rtx_5070"),
     ("Risk Manager", "mac_studio"),
     ("Quant Analyst", "mac_studio"),
     ("Value Investor", None),
