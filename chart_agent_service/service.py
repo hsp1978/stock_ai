@@ -54,6 +54,7 @@ from config import (
     DATA_HEALTH_CHECK_MINUTES, DATA_HEALTH_ALERT_STALE_HOURS,
     DATA_HEALTH_RECENT_ANALYSIS_DAYS, POSITION_MARK_INTERVAL_MINUTES,
     API_THREAD_LIMIT, HEALTH_PROBE_INTERVAL_SECONDS,
+    HEALTH_GENERATION_TIMEOUT_SECONDS,
     OUTPUT_RETENTION_ENABLED, OUTPUT_RETENTION_HOUR, OUTPUT_RETENTION_MINUTE,
     STATE_BACKUP_DIR, STATE_BACKUP_ENABLED, STATE_BACKUP_HOUR,
     STATE_BACKUP_KEEP, STATE_BACKUP_MINUTE,
@@ -2499,6 +2500,17 @@ async def _refresh_health_probe() -> dict:
     except Exception as exc:  # 클라이언트 생성 실패 등
         error = f"{type(exc).__name__}: {exc}"[:160]
 
+    # 적재 위치만 보면 **생성이 죽은 노드를 정상으로 읽는다.**
+    # 2026-09-16 실측: RTX 가 `/api/tags` 200(0.36ms), `/api/ps` vram 10.8GB,
+    # gpu_fraction 1.0 인데 `/api/generate` 는 모델 무관하게 60초 넘게 GPU 0% 로
+    # 아무것도 못 했다 (runner 교착). CLAUDE.md §13-3 이 경고한 형태다.
+    generation = await _probe_generation(OLLAMA_BASE_URL, runtime)
+    runtime["generation"] = generation
+    if generation["status"] in ("stalled", "error"):
+        # 적재는 됐지만 쓸 수 없다. gpu 로 남기면 라우팅이 계속 이 노드를 고른다.
+        runtime["status"] = "unusable"
+        runtime["unusable_reason"] = generation.get("detail") or generation["status"]
+
     try:
         sessions = await anyio.to_thread.run_sync(_market_sessions)
     except Exception as exc:
@@ -2528,6 +2540,73 @@ async def _refresh_health_probe() -> dict:
         _HEALTH_PROBE.clear()
         _HEALTH_PROBE.update(snapshot)
     return snapshot
+
+
+async def _probe_generation(base_url: str, runtime: dict) -> dict:
+    """적재된 모델로 **1토큰만** 생성해 본다 — 노드가 실제로 쓸 수 있는지.
+
+    `/api/tags` 200 과 `/api/ps` 의 `size_vram > 0` 은 **적재 위치**만 말한다.
+    2026-09-16 실측: RTX 5070 이 두 지표 모두 정상(`gpu_fraction 1.0`)인데
+    `/api/generate` 는 qwen3·llama3.1 어느 모델로도 60초 넘게 GPU 0% 였다
+    (runner 교착). `/health` 는 그 동안 `ollama: connected, runtime: gpu` 를
+    보고했다. §13.9h 의 CPU 폴백 게이트도 이건 못 잡는다 — CPU 폴백이 아니기
+    때문이다.
+
+    **모델이 적재돼 있을 때만** 시도한다. 유휴 노드에 요청을 보내면 모델 로드
+    (수십 초)를 유발해, 검사가 스스로 부하를 만든다.
+
+    Returns:
+        {"status": ok|stalled|skipped|error, "latency_ms": int|None, ...}
+          ok      — 1토큰을 예산 안에 받았다
+          stalled — 타임아웃. 적재는 됐는데 생성이 안 된다 (이번 사례)
+          skipped — 적재 모델 없음(idle) 또는 판정 불가. **정상이 아니다**
+          error   — 그 외 실패 (사유 포함)
+    """
+    models = runtime.get("models") or []
+    if not models:
+        return {"status": "skipped", "reason": "no_loaded_model", "latency_ms": None}
+
+    model = models[0].get("name")
+    if not model:
+        return {"status": "skipped", "reason": "model_name_unknown", "latency_ms": None}
+
+    budget = float(HEALTH_GENERATION_TIMEOUT_SECONDS)
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=budget) as client:
+            resp = await client.post(
+                f"{base_url.rstrip('/')}/api/generate",
+                json={
+                    "model": model,
+                    "prompt": "ok",
+                    "stream": False,
+                    # 1토큰이면 충분하다 — 생성 경로가 살아 있는지만 본다.
+                    "options": {"num_predict": 1},
+                },
+            )
+        latency_ms = int((time.monotonic() - started) * 1000)
+        if resp.status_code != 200:
+            return {
+                "status": "error",
+                "model": model,
+                "latency_ms": latency_ms,
+                "detail": f"HTTP {resp.status_code}",
+            }
+        return {"status": "ok", "model": model, "latency_ms": latency_ms}
+    except httpx.TimeoutException:
+        return {
+            "status": "stalled",
+            "model": model,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "detail": f"{budget:g}초 안에 1토큰도 생성하지 못했다 — 적재는 됐으나 생성 불가",
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "model": model,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "detail": f"{type(exc).__name__}: {exc}"[:160],
+        }
 
 
 def _market_sessions() -> dict:

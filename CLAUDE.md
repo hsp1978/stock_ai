@@ -353,6 +353,7 @@ PR 머지 시:
 | 평균수익 −0.35% | 매도가 맞을수록 내려가는 원시 평균 | 방향 보정 키 분리 (2026-09-10) |
 | IC weight 전부 0.0 | 가중 자체가 비활성(59일<60일)인데 '제외'로 표기 | `active`/`inactive_reason` 명시 (2026-09-10) |
 | Mac Studio "연결됨" | `/api/tags` 200 뒤에서 32B 모델이 CPU 로 5일간 0.5 tok/s | `/api/ps` 의 `size_vram` 게이트 (2026-09-14) |
+| RTX "runtime: gpu" | VRAM 100% 적재인데 1토큰도 생성 못 함 (runner 교착) | 1토큰 생성 검사 → `unusable` (2026-09-16) |
 | 한국장 도구 섹션 없음 | 모듈 import 실패를 print 로 삼키고 섹션을 통째로 숨김 | `ui/korean_optional.py` 사유 보존 + 항상 렌더 (2026-09-14) |
 
 **작업 시 원칙**:

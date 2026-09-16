@@ -122,6 +122,12 @@ class Settings(BaseSettings):
     API_THREAD_LIMIT: int = Field(default=80, ge=8, le=512)
     # /health 가 읽는 프로브 스냅샷 갱신 주기(초). 핸들러는 네트워크를 타지 않는다.
     HEALTH_PROBE_INTERVAL_SECONDS: int = Field(default=15, ge=1, le=300)
+    # 노드가 **실제로 생성할 수 있는지** 확인할 때 쓰는 예산(초). 적재된 모델로
+    # 1토큰만 만들어 본다. 적재 위치(`size_vram>0`)만 보면 생성이 죽은 노드를
+    # 정상으로 읽는다 — 2026-09-16 실측: RTX 가 gpu_fraction 1.0 인데
+    # /api/generate 는 모델 무관하게 60초 넘게 GPU 0% 였다 (runner 교착).
+    # 너무 짧으면 로드 직후 정상 노드를 unusable 로 오판하므로 여유를 둔다.
+    HEALTH_GENERATION_TIMEOUT_SECONDS: float = Field(default=20.0, ge=1.0, le=120.0)
     RTX_5070_MAX_INFLIGHT: int = Field(default=2, ge=1, le=32)
     LLM_NODE_MAX_INFLIGHT: int = Field(default=2, ge=1, le=32)
     LLM_NODE_FAILURE_THRESHOLD: int = Field(default=2, ge=1, le=20)
@@ -408,6 +414,7 @@ MAC_STUDIO_REQUIRE_GPU = settings.MAC_STUDIO_REQUIRE_GPU
 MAC_STUDIO_MIN_GPU_FRACTION = settings.MAC_STUDIO_MIN_GPU_FRACTION
 API_THREAD_LIMIT = settings.API_THREAD_LIMIT
 HEALTH_PROBE_INTERVAL_SECONDS = settings.HEALTH_PROBE_INTERVAL_SECONDS
+HEALTH_GENERATION_TIMEOUT_SECONDS = settings.HEALTH_GENERATION_TIMEOUT_SECONDS
 MAC_STUDIO_HEALTH_FAILURE_THRESHOLD = settings.MAC_STUDIO_HEALTH_FAILURE_THRESHOLD
 MAC_STUDIO_MAX_INFLIGHT = settings.MAC_STUDIO_MAX_INFLIGHT
 RTX_5070_MAX_INFLIGHT = settings.RTX_5070_MAX_INFLIGHT

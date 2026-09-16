@@ -1344,6 +1344,178 @@ OLLAMA_MAC_MODEL_DIGEST=9f13ba1299afea09d9a9    qwen2.5:32b-instruct-q4_K_M (Mac
 신호 행에 모델 digest 를 기록하면 과거 신호를 **어떤 가중치가 만들었는지** 소급해서
 가를 수 있다. 이제 Alembic(§13.9k)이 있으므로 컬럼 추가가 가능하다 — 다만 삽입 경로와
 평가 경로를 함께 손봐야 해서 별도 작업으로 남긴다. 지금은 "바뀌면 알 수 있다" 까지다.
+#### 13.9n Alembic 이 로깅 설정을 덮었다 (2026-09-15, #72 회귀)
+
+17:30 배치 소요를 조사하려고 로그를 읽는데 종목별 진행 로그가 없었다. 배치 종료 줄이
+**`ERROR [alembic]`** 으로 찍혀 있었다.
+
+Alembic 템플릿의 기본 `env.py` 는 `fileConfig(config.config_file_name)` 을 호출한다.
+그건 `alembic.ini` 의 `[loggers]`/`[handlers]`/`[formatters]` 로 **루트 로거를 통째로
+교체**한다. 서비스는 기동 시 `configure_logging()` 으로 로깅을 구성하는데, 그 직후
+`init_db()` → 마이그레이션이 돌아 설정이 덮였다.
+
+```
+configure_logging 직후 : root=INFO    formatter=[%(name)s]  filters=[SecretRedactingFilter]
+init_db(alembic) 이후  : root=WARNING formatter=[alembic]   filters=[]
+```
+
+피해 셋:
+
+1. **`logger.info` 전부 소실** — 배치 진행 로그를 못 봤고, §13.9c 에서 살려낸
+   `data_collector` INFO 도 다시 죽었다
+2. 모든 모듈 로그가 `[alembic]` 로 표기 (alembic.ini 포맷에 하드코딩돼 있었다)
+3. **API 키 마스킹 필터 제거** — §13.9c 에서 막은 유출이 되살아난 상태였다.
+   다행히 실제 노출은 0건이었다 (FMP 403 경로가 naver+yfinance 로 충족돼 호출되지
+   않았다). 운이 좋았을 뿐이다
+
+**수정**: `env.py` 가 `fileConfig` 를 부르지 않고, `alembic.ini` 에서 로깅 섹션을
+제거했다 (CLI 단독 실행에서도 덮지 않게). Alembic 로그는 `alembic.*` 로거로 나가고
+루트 설정을 상속한다. 회귀 테스트 3건으로 고정 — 레벨·포맷·필터가 마이그레이션 후에도
+동일해야 한다.
+
+실측(수정 후): `[stock_auto.*]` INFO 정상 출력, 잘못된 `[alembic]` 표기 0건,
+alembic 자체 로그는 `[alembic.runtime.plugins]` 로 나간다.
+
+##### 교훈
+
+§13.9c 에서 "로깅이 설정된 적이 없다" 를 고쳤는데, 3주도 안 되어 **다른 기능이 그
+설정을 조용히 되돌렸다.** 설정을 세우는 것과 세운 설정이 유지되는 것은 다른 문제다.
+그래서 이번에는 불변식을 테스트로 박았다.
+
+#### 13.9o 배치 소요의 병목 — 노드 분산을 시도했고 되돌렸다 (2026-09-15)
+
+17:30 배치가 7종목에 1,117초를 쓴다. Mac Studio 가 CPU 폴백(0.5 tok/s)이던 전날과
+GPU 복구(9.8 tok/s) 후가 같아서 원인을 측정했다.
+
+##### 측정: 한 종목(PLTR) 에이전트별
+
+| 에이전트 | 노드 | 소요 |
+|---|---|---|
+| ML Specialist | Mac | **146.7초** |
+| Technical Analyst | Mac | **132.3초** |
+| Risk Manager | Mac | **91.0초** |
+| Quant Analyst | Mac | **46.8초** |
+| Geopolitical Analyst | Gemini | 12.3초 |
+| Event Analyst | Gemini | 8.7초 |
+| Value Investor | Gemini | 6.5초 |
+
+**Ollama 4개 합 417초 / Gemini 3개 합 27.5초**, 총 소요 149.9초 (병렬이므로 가장
+느린 에이전트가 정한다). Mac 단독 호출은 7.5초(9.7 tok/s)다 — 4개를 한 노드에 몰아
+큐가 쌓인 결과다. 배치는 종목도 직렬(`for ticker in targets`)이라 7 × 약 159초가 된다.
+
+##### 원인 둘
+
+1. **`AGENT_LLM_MAPPING` 의 `node` 필드가 라우터 경로에서 무시됐다.** `_call_llm` 이
+   provider 만 넘겨서 Ollama 에이전트 전부가 `agent-llm-secondary`(Mac)를 먼저 쳤다.
+   매핑에 `node` 를 적어 둔 것이 장식이었다.
+2. 매핑 자체가 Ollama 4개를 모두 mac_studio 로 배정했다.
+
+##### 시도와 결과 — 2.2배 악화
+
+`preferred_node` 를 라우터에 전달하게 고치고(1번 해결), 매핑을 2:2 로 나눴다.
+
+| 에이전트 | Mac 4개 집중 | RTX 2개 분산 후 |
+|---|---|---|
+| Technical Analyst | 132.3초 | **45.5초** (의도대로) |
+| ML Specialist | 146.7초 | **63.2초** (의도대로) |
+| Quant Analyst → RTX | 46.8초 | **320.1초** ✗ |
+| Risk Manager → RTX | 91.0초 | **279.1초** ✗ |
+| **한 종목 총** | **149.9초** | **322.6초** |
+
+Mac 쪽은 3배 빨라졌는데 RTX 로 옮긴 둘이 6배 느려졌다. RTX 5070(12GB)에
+`qwen3:14b-q4_K_M`(10.8GB)을 올리면 **여유가 1.4GB 뿐**이라 동시 2요청의 KV 캐시를
+감당하지 못한다. `RTX_5070_MAX_INFLIGHT` 기본값이 2 인 것을 고려하지 않았다.
+
+**매핑은 되돌렸다.** 라우팅 기구(`preferred_node`)는 남긴다 — 그 자체는 맞는 수정이고
+(매핑의 `node` 가 이제 실제로 동작한다) 재시도 시 매핑만 바꾸면 된다.
+
+##### 곁에서 드러난 것 — RTX 노드도 false-green 이다
+
+측정 직후 RTX 는 **8토큰 요청조차 90초 내에 끝내지 못했다.** 그런데 상태는 전부
+정상으로 보인다:
+
+```
+/health  ollama=connected  runtime=gpu
+         qwen3:14b-q4_K_M  on_gpu=True  vram=10.8GB  gpu_fraction=1.0
+nvidia-smi  util 0%  memory 10,134/12,227 MiB
+```
+
+§13.9h 에서 Mac Studio 에 넣은 게이트는 `size_vram > 0` 으로 **CPU 폴백**을 잡는다.
+지금 RTX 는 CPU 폴백이 아니다 — GPU 에 올라가 있는데도 쓸 수 없다. **적재 위치가
+아니라 처리량을 봐야 잡히는 상태**이고, 현재 어떤 게이트도 이를 감지하지 못한다.
+원인 미규명 — 별도 과제다.
+
+##### 배치 시간을 줄이려면 (다음 후보)
+
+- `RTX_5070_MAX_INFLIGHT=1` 로 직렬화한 뒤 2:2 재시도. 단 위 RTX 이상을 먼저 규명해야
+  측정이 의미를 갖는다
+- 종목 병렬화 (현재 완전 직렬). Mac 에 요청이 2배로 몰리므로 노드 처리량이 먼저다
+- Mac Studio `OLLAMA_NUM_PARALLEL` 상향 (현재 미설정=1). 32GB 에 19.9GB 모델이라 KV
+  캐시 여유 확인 필요 + Ollama 재기동 시 §13.9h 의 GPU 탐지 실패 위험
+
+#### 13.9p 적재 위치가 아니라 생성 경로를 봐야 잡히는 상태 (2026-09-16)
+
+§13.9o 조사 중 RTX 5070 이 **8토큰 요청조차 끝내지 못하는** 상태를 발견했다. 그런데
+모든 지표가 정상이었다.
+
+| 지표 | 값 | 판정 |
+|---|---|---|
+| `/api/tags` | 200, 0.36ms | 정상 |
+| `/api/ps` `size_vram` | 10.8GB, `gpu_fraction 1.0` | 정상 |
+| `nvidia-smi` | util 0%, 8.8W, 10,134/12,227 MiB | 정상 |
+| `/api/generate` | **모델 무관하게 60초+ 아무것도 생성 못 함** | **불가** |
+| `/health` | `ollama: connected, runtime: gpu` | **거짓 정상** |
+
+`ollama.service` 는 4일 가동(CPU 11h50m, swap peak 1.4GB), runner 프로세스는 2일
+가동 중이었다. 10:32 KST 스캔은 성공했으므로 그 이후에 막혔다 — 진단 중 던진
+타임아웃 요청들이 방아쇠로 보인다.
+
+##### §13.9h 게이트가 이걸 못 잡는 이유
+
+Mac Studio 에 넣은 게이트는 `size_vram > 0` 으로 **CPU 폴백**을 판정한다. 지금 RTX 는
+CPU 폴백이 **아니다** — GPU 에 100% 올라가 있는데도 쓸 수 없다. 적재 위치는 맞고
+생성 경로가 죽은 것이라, 위치만 보는 검사로는 원리적으로 잡히지 않는다.
+
+CLAUDE.md §13-3 이 이 형태를 경고한다: *"응답 코드 200을 성공으로 읽지 말 것 —
+Ollama 언로드, 텔레그램 전송 모두 200과 실패가 공존한다."*
+
+##### 수정 — 1토큰 생성 검사
+
+두 노드 모두 프로브에 `num_predict: 1` 생성 호출을 추가했다.
+
+| 상태 | 의미 |
+|---|---|
+| `ok` | 1토큰을 예산 안에 받았다 (`latency_ms` 동봉) |
+| `stalled` | 타임아웃 — **적재는 됐으나 생성 불가**. 이번 사례 |
+| `skipped` | 적재 모델 없음(idle) 또는 모델명 불명. **'정상'이 아니다** |
+| `error` | 그 외 (HTTP 오류·연결 실패, 사유 포함) |
+
+설계에서 지킨 것:
+
+- **적재된 모델이 있을 때만** 시도한다. 유휴 노드에 보내면 모델 로드(수십 초)를
+  유발해 **검사가 스스로 부하를 만든다**
+- `stalled`/`error` 면 `runtime` 을 `unusable` 로 내린다. Mac 은
+  `is_mac_studio_available()` 이 False 가 되어 **라우팅에서 빠진다**
+- CPU 폴백 판정이 우선이다 — 더 구체적인 사유를 `unusable` 로 덮지 않는다
+- **RTX 는 라우팅에서 빼지 않는다.** `_node_available_for_model` 의 기존 결정
+  (로컬 최후 폴백)을 유지한다 — 여기까지 게이트하면 Mac·Gemini 동시 장애 시 전원
+  장애가 된다. `/health` 로 보이게만 한다
+- 예산은 `HEALTH_GENERATION_TIMEOUT_SECONDS`(기본 20초). 짧으면 로드 직후 정상
+  노드를 오판한다
+
+##### 실측 (교착된 RTX 그대로)
+
+```
+ollama          : connected          ← /api/tags 는 여전히 200
+runtime         : unusable           ← 종전에는 "gpu"
+generation      : stalled, 20,004ms, qwen3:14b-q4_K_M
+unusable_reason : 20초 안에 1토큰도 생성하지 못했다 — 적재는 됐으나 생성 불가
+```
+
+##### 남은 것
+
+RTX runner 교착의 **근본 원인은 미규명**이다. 재현 조건(버려진 요청 누적?)과
+`ollama serve` 재시작 외의 복구 방법이 필요하다. 이 게이트는 **드러내기**까지다.
 
 ### 13.10 데이터 품질 위험
 
