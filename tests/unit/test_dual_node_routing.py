@@ -142,6 +142,13 @@ def test_node_failure_opens_cooldown_and_success_resets(monkeypatch):
 
 
 def test_ollama_falls_back_when_mac_node_is_overloaded(monkeypatch):
+    """Mac 이 꽉 차면 RTX 로 넘어간다.
+
+    2026-09-16: 에이전트를 Technical → Quant 로 바꿨다. 2:2 분산으로 Technical 의
+    **기본 노드가 이미 RTX** 라 더 이상 'Mac 포화 → 폴백'을 검증하지 못한다
+    (test_agent_node_balance.py). Quant 는 Mac 에 남아 있고, `_call_ollama` 의
+    폴백 분기 대상 목록에도 들어 있다.
+    """
     session = _Session()
     session.post_responses.append(_Response(200, {"response": '{"signal":"neutral"}'}))
     monkeypatch.setattr(dual_node_config, "get_http_session", lambda: session)
@@ -149,7 +156,7 @@ def test_ollama_falls_back_when_mac_node_is_overloaded(monkeypatch):
     monkeypatch.setenv("RTX_5070_MAX_INFLIGHT", "1")
     _reset_node_slots()
 
-    agent = BaseAgent("Technical Analyst", [], "ollama")
+    agent = BaseAgent("Quant Analyst", [], "ollama")
 
     with dual_node_config.node_slot("mac_studio", block=False) as acquired:
         assert acquired is True
