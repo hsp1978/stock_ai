@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import os
 import sys
-from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy import create_engine, pool
@@ -41,8 +40,24 @@ if _SERVICE_DIR not in sys.path:
     sys.path.insert(0, _SERVICE_DIR)
 
 config = context.config
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name, disable_existing_loggers=False)
+
+# **`fileConfig()` 를 부르지 않는다.**
+#
+# Alembic 템플릿의 기본 env.py 는 `fileConfig(config.config_file_name)` 을 호출한다.
+# 그건 alembic.ini 의 [loggers]/[handlers]/[formatters] 로 **루트 로거를 통째로
+# 교체**한다. 이 서비스는 기동 시 `logging_setup.configure_logging()` 으로 이미
+# 로깅을 구성하는데, `init_db()` → 마이그레이션 순서 때문에 그 설정이 덮였다.
+#
+# 2026-09-15 실측 피해 (PR #72 회귀):
+#   configure_logging 직후 : root=INFO    formatter=[%(name)s]  filters=[SecretRedactingFilter]
+#   init_db(alembic) 이후  : root=WARNING formatter=[alembic]   filters=[]
+#
+#   → logger.info 전부 소실 (배치 진행 로그·data_collector INFO 가 다시 죽었다)
+#   → 모든 모듈 로그가 `[alembic]` 로 표기
+#   → **API 키 마스킹 필터가 제거됐다** (#61 에서 막은 유출이 되살아난 상태)
+#
+# Alembic 은 `alembic` 로거로 남기고, 그건 루트 설정을 상속하면 충분하다.
+# alembic.ini 에서도 로깅 섹션을 제거해 CLI 단독 실행 때도 덮지 않게 했다.
 
 
 def _db_url() -> str:

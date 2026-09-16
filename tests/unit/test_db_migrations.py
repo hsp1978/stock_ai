@@ -359,3 +359,73 @@ def test_baseline_downgrade_is_blocked(tmp_path):
     mod = importlib.import_module("0001_baseline_schema")
     with pytest.raises(NotImplementedError):
         mod.downgrade()
+
+
+# ── 로깅 설정을 덮지 않는다 ───────────────────────────────────────
+#
+# 2026-09-15 회귀 (PR #72 가 만든 것). Alembic 템플릿의 기본 env.py 는
+# `fileConfig(config.config_file_name)` 을 호출하는데, 그건 alembic.ini 의
+# 로깅 섹션으로 **루트 로거를 통째로 교체**한다. 서비스는 기동 시
+# `logging_setup.configure_logging()` 으로 로깅을 구성하고, 그 직후
+# `init_db()` → 마이그레이션이 돌기 때문에 설정이 덮였다.
+#
+#   configure_logging 직후 : root=INFO    formatter=[%(name)s]  filters=[SecretRedactingFilter]
+#   init_db(alembic) 이후  : root=WARNING formatter=[alembic]   filters=[]
+#
+# 피해 셋: logger.info 전부 소실(배치 진행 로그를 못 봤다), 모든 로그가 `[alembic]`
+# 로 표기, 그리고 **API 키 마스킹 필터 제거** — #61 에서 막은 유출이 되살아났다.
+
+
+def test_migrations_do_not_clobber_logging_config(tmp_path):
+    """레벨·포맷·마스킹 필터가 마이그레이션 후에도 살아 있어야 한다."""
+    import logging
+
+    sys.path.insert(0, _AGENT_DIR)
+    import logging_setup
+
+    logging_setup.configure_logging(force=True)
+    root = logging.getLogger()
+    handler = root.handlers[0]
+    before = (
+        root.level,
+        getattr(handler.formatter, "_fmt", None),
+        sorted(type(f).__name__ for f in handler.filters),
+    )
+    assert "SecretRedactingFilter" in before[2], "전제가 깨졌다 — 마스킹 필터가 없다"
+
+    db.run_migrations(str(tmp_path / "logging.db"))
+
+    root = logging.getLogger()
+    handler = root.handlers[0]
+    after = (
+        root.level,
+        getattr(handler.formatter, "_fmt", None),
+        sorted(type(f).__name__ for f in handler.filters),
+    )
+    assert after == before, f"마이그레이션이 로깅 설정을 바꿨다\n  전: {before}\n  후: {after}"
+
+
+def test_env_py_does_not_call_fileconfig():
+    """호출하면 루트 로거가 alembic.ini 설정으로 교체된다."""
+    src = open(os.path.join(_AGENT_DIR, "migrations", "env.py"), encoding="utf-8").read()
+    code = _code_without_docstrings(
+        os.path.join(_AGENT_DIR, "migrations", "env.py")
+    )
+
+    assert "fileConfig" not in code, "env.py 가 fileConfig 를 호출한다"
+    assert "logging" not in code.replace("logging_setup", ""), "env.py 가 로깅을 건드린다"
+    del src
+
+
+def test_alembic_ini_has_no_logging_sections():
+    """섹션이 있으면 CLI 단독 실행(`alembic upgrade`)에서 다시 덮인다.
+
+    ini 의 설명 주석이 `[loggers]` 를 인용하므로 **주석을 걷어내고** 본다.
+    """
+    lines = open(os.path.join(_AGENT_DIR, "alembic.ini"), encoding="utf-8").read().splitlines()
+    sections = {
+        line.strip() for line in lines
+        if line.strip().startswith("[") and not line.lstrip().startswith("#")
+    }
+
+    assert sections == {"[alembic]"}, f"로깅 섹션이 남아 있다: {sorted(sections)}"

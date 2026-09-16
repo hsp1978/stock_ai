@@ -1291,6 +1291,44 @@ get_market_session x2    10.63 ms   (CPU)
 **측정된 문제가 생길 때** 하는 게 맞다 — 지금 옮기면 blocking 호출이 이벤트 루프로
 올라가 더 나빠진다.
 
+#### 13.9n Alembic 이 로깅 설정을 덮었다 (2026-09-15, #72 회귀)
+
+17:30 배치 소요를 조사하려고 로그를 읽는데 종목별 진행 로그가 없었다. 배치 종료 줄이
+**`ERROR [alembic]`** 으로 찍혀 있었다.
+
+Alembic 템플릿의 기본 `env.py` 는 `fileConfig(config.config_file_name)` 을 호출한다.
+그건 `alembic.ini` 의 `[loggers]`/`[handlers]`/`[formatters]` 로 **루트 로거를 통째로
+교체**한다. 서비스는 기동 시 `configure_logging()` 으로 로깅을 구성하는데, 그 직후
+`init_db()` → 마이그레이션이 돌아 설정이 덮였다.
+
+```
+configure_logging 직후 : root=INFO    formatter=[%(name)s]  filters=[SecretRedactingFilter]
+init_db(alembic) 이후  : root=WARNING formatter=[alembic]   filters=[]
+```
+
+피해 셋:
+
+1. **`logger.info` 전부 소실** — 배치 진행 로그를 못 봤고, §13.9c 에서 살려낸
+   `data_collector` INFO 도 다시 죽었다
+2. 모든 모듈 로그가 `[alembic]` 로 표기 (alembic.ini 포맷에 하드코딩돼 있었다)
+3. **API 키 마스킹 필터 제거** — §13.9c 에서 막은 유출이 되살아난 상태였다.
+   다행히 실제 노출은 0건이었다 (FMP 403 경로가 naver+yfinance 로 충족돼 호출되지
+   않았다). 운이 좋았을 뿐이다
+
+**수정**: `env.py` 가 `fileConfig` 를 부르지 않고, `alembic.ini` 에서 로깅 섹션을
+제거했다 (CLI 단독 실행에서도 덮지 않게). Alembic 로그는 `alembic.*` 로거로 나가고
+루트 설정을 상속한다. 회귀 테스트 3건으로 고정 — 레벨·포맷·필터가 마이그레이션 후에도
+동일해야 한다.
+
+실측(수정 후): `[stock_auto.*]` INFO 정상 출력, 잘못된 `[alembic]` 표기 0건,
+alembic 자체 로그는 `[alembic.runtime.plugins]` 로 나간다.
+
+##### 교훈
+
+§13.9c 에서 "로깅이 설정된 적이 없다" 를 고쳤는데, 3주도 안 되어 **다른 기능이 그
+설정을 조용히 되돌렸다.** 설정을 세우는 것과 세운 설정이 유지되는 것은 다른 문제다.
+그래서 이번에는 불변식을 테스트로 박았다.
+
 ### 13.10 데이터 품질 위험
 
 - OHLCV 캐시는 TTL 메타(`fetched_at`, `latest_bar_date`, `source`)를 갖지만,
