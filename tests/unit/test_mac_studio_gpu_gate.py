@@ -59,8 +59,13 @@ def clean(monkeypatch):
     dn.reset_mac_studio_health_cache()
 
 
-def _session(monkeypatch, tags=_Resp(), ps=None):
-    """/api/tags 와 /api/ps 응답을 따로 준다."""
+def _session(monkeypatch, tags=_Resp(), ps=None, generate=None):
+    """/api/tags, /api/ps, /api/generate 응답을 따로 준다.
+
+    2026-09-16: 적재 위치(`size_vram>0`)만으로는 '생성이 죽은 노드'를 못 잡아
+    1토큰 생성 검사를 더했다 (test_generation_probe.py). 그래서 이 픽스처도
+    `/api/generate` 를 받아야 한다 — 없으면 전부 `unusable` 로 떨어진다.
+    """
     class S:
         def get(self, url, timeout=None):
             if url.endswith("/api/ps"):
@@ -70,6 +75,11 @@ def _session(monkeypatch, tags=_Resp(), ps=None):
             if isinstance(tags, Exception):
                 raise tags
             return tags
+
+        def post(self, url, json=None, timeout=None):
+            if isinstance(generate, Exception):
+                raise generate
+            return generate if generate is not None else _Resp(200, {"response": "ok"})
 
     monkeypatch.setattr(dn, "get_http_session", lambda: S())
 

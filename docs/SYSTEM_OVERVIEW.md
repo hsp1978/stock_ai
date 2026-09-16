@@ -1400,6 +1400,70 @@ nvidia-smi  util 0%  memory 10,134/12,227 MiB
 - Mac Studio `OLLAMA_NUM_PARALLEL` 상향 (현재 미설정=1). 32GB 에 19.9GB 모델이라 KV
   캐시 여유 확인 필요 + Ollama 재기동 시 §13.9h 의 GPU 탐지 실패 위험
 
+#### 13.9p 적재 위치가 아니라 생성 경로를 봐야 잡히는 상태 (2026-09-16)
+
+§13.9o 조사 중 RTX 5070 이 **8토큰 요청조차 끝내지 못하는** 상태를 발견했다. 그런데
+모든 지표가 정상이었다.
+
+| 지표 | 값 | 판정 |
+|---|---|---|
+| `/api/tags` | 200, 0.36ms | 정상 |
+| `/api/ps` `size_vram` | 10.8GB, `gpu_fraction 1.0` | 정상 |
+| `nvidia-smi` | util 0%, 8.8W, 10,134/12,227 MiB | 정상 |
+| `/api/generate` | **모델 무관하게 60초+ 아무것도 생성 못 함** | **불가** |
+| `/health` | `ollama: connected, runtime: gpu` | **거짓 정상** |
+
+`ollama.service` 는 4일 가동(CPU 11h50m, swap peak 1.4GB), runner 프로세스는 2일
+가동 중이었다. 10:32 KST 스캔은 성공했으므로 그 이후에 막혔다 — 진단 중 던진
+타임아웃 요청들이 방아쇠로 보인다.
+
+##### §13.9h 게이트가 이걸 못 잡는 이유
+
+Mac Studio 에 넣은 게이트는 `size_vram > 0` 으로 **CPU 폴백**을 판정한다. 지금 RTX 는
+CPU 폴백이 **아니다** — GPU 에 100% 올라가 있는데도 쓸 수 없다. 적재 위치는 맞고
+생성 경로가 죽은 것이라, 위치만 보는 검사로는 원리적으로 잡히지 않는다.
+
+CLAUDE.md §13-3 이 이 형태를 경고한다: *"응답 코드 200을 성공으로 읽지 말 것 —
+Ollama 언로드, 텔레그램 전송 모두 200과 실패가 공존한다."*
+
+##### 수정 — 1토큰 생성 검사
+
+두 노드 모두 프로브에 `num_predict: 1` 생성 호출을 추가했다.
+
+| 상태 | 의미 |
+|---|---|
+| `ok` | 1토큰을 예산 안에 받았다 (`latency_ms` 동봉) |
+| `stalled` | 타임아웃 — **적재는 됐으나 생성 불가**. 이번 사례 |
+| `skipped` | 적재 모델 없음(idle) 또는 모델명 불명. **'정상'이 아니다** |
+| `error` | 그 외 (HTTP 오류·연결 실패, 사유 포함) |
+
+설계에서 지킨 것:
+
+- **적재된 모델이 있을 때만** 시도한다. 유휴 노드에 보내면 모델 로드(수십 초)를
+  유발해 **검사가 스스로 부하를 만든다**
+- `stalled`/`error` 면 `runtime` 을 `unusable` 로 내린다. Mac 은
+  `is_mac_studio_available()` 이 False 가 되어 **라우팅에서 빠진다**
+- CPU 폴백 판정이 우선이다 — 더 구체적인 사유를 `unusable` 로 덮지 않는다
+- **RTX 는 라우팅에서 빼지 않는다.** `_node_available_for_model` 의 기존 결정
+  (로컬 최후 폴백)을 유지한다 — 여기까지 게이트하면 Mac·Gemini 동시 장애 시 전원
+  장애가 된다. `/health` 로 보이게만 한다
+- 예산은 `HEALTH_GENERATION_TIMEOUT_SECONDS`(기본 20초). 짧으면 로드 직후 정상
+  노드를 오판한다
+
+##### 실측 (교착된 RTX 그대로)
+
+```
+ollama          : connected          ← /api/tags 는 여전히 200
+runtime         : unusable           ← 종전에는 "gpu"
+generation      : stalled, 20,004ms, qwen3:14b-q4_K_M
+unusable_reason : 20초 안에 1토큰도 생성하지 못했다 — 적재는 됐으나 생성 불가
+```
+
+##### 남은 것
+
+RTX runner 교착의 **근본 원인은 미규명**이다. 재현 조건(버려진 요청 누적?)과
+`ollama serve` 재시작 외의 복구 방법이 필요하다. 이 게이트는 **드러내기**까지다.
+
 ### 13.10 데이터 품질 위험
 
 - OHLCV 캐시는 TTL 메타(`fetched_at`, `latest_bar_date`, `source`)를 갖지만,

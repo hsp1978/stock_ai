@@ -298,12 +298,78 @@ def mac_studio_runtime_status(timeout: float | None = None) -> Dict[str, Any]:
 
     if not models:
         status["status"] = "idle"
-    elif cpu_only:
+        return status
+
+    if cpu_only:
         status["status"] = "cpu_fallback"
         status["cpu_only_models"] = cpu_only
-    else:
-        status["status"] = "gpu"
+        return status
+
+    # 적재 위치가 맞아도 **생성이 죽어 있을 수 있다.**
+    # 2026-09-16 실측(RTX): /api/tags 200, gpu_fraction 1.0 인데 /api/generate 는
+    # 모델 무관하게 60초 넘게 GPU 0% 였다 (runner 교착). CPU 폴백이 아니므로 위
+    # 검사로는 잡히지 않는다. 그래서 1토큰 생성까지 확인한다.
+    status["status"] = "gpu"
+    generation = probe_node_generation(mac_url, models[0].get("name"), timeout=timeout)
+    status["generation"] = generation
+    if generation["status"] in ("stalled", "error"):
+        status["status"] = "unusable"
+        status["unusable_reason"] = generation.get("detail") or generation["status"]
     return status
+
+
+def probe_node_generation(
+    base_url: str, model: str | None, timeout: float | None = None
+) -> Dict[str, Any]:
+    """적재된 모델로 **1토큰만** 생성해 본다 — 노드를 실제로 쓸 수 있는지.
+
+    모델이 적재돼 있을 때만 호출한다. 유휴 노드에 보내면 모델 로드(수십 초)를
+    유발해 검사가 스스로 부하를 만든다.
+
+    Returns: {"status": ok|stalled|skipped|error, "latency_ms": int|None, ...}
+    """
+    if not model:
+        return {"status": "skipped", "reason": "model_name_unknown", "latency_ms": None}
+
+    budget = timeout if timeout is not None else _float_setting(
+        "HEALTH_GENERATION_TIMEOUT_SECONDS", 20.0
+    )
+    started = time.monotonic()
+    try:
+        response = get_http_session().post(
+            f"{base_url.rstrip('/')}/api/generate",
+            json={
+                "model": model,
+                "prompt": "ok",
+                "stream": False,
+                "options": {"num_predict": 1},
+            },
+            timeout=budget,
+        )
+    except requests.exceptions.Timeout:
+        return {
+            "status": "stalled",
+            "model": model,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "detail": f"{budget:g}초 안에 1토큰도 생성하지 못했다 — 적재는 됐으나 생성 불가",
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "model": model,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "detail": f"{type(exc).__name__}: {exc}"[:160],
+        }
+
+    latency_ms = int((time.monotonic() - started) * 1000)
+    if response.status_code != 200:
+        return {
+            "status": "error",
+            "model": model,
+            "latency_ms": latency_ms,
+            "detail": f"HTTP {response.status_code}",
+        }
+    return {"status": "ok", "model": model, "latency_ms": latency_ms}
 
 
 def is_mac_studio_available(force_refresh: bool = False) -> bool:
@@ -329,7 +395,11 @@ def is_mac_studio_available(force_refresh: bool = False) -> bool:
         require_gpu = _bool_setting("MAC_STUDIO_REQUIRE_GPU", True)
         if reachable:
             runtime = mac_studio_runtime_status(timeout=timeout)
-        degraded = require_gpu and runtime.get("status") == "cpu_fallback"
+        # 쓸 수 없는 두 가지를 모두 제외한다:
+        #   cpu_fallback — GPU 에 안 올라갔다 (2026-09-14, 0.5 tok/s)
+        #   unusable     — 올라갔는데 1토큰도 못 만든다 (2026-09-16, runner 교착)
+        runtime_status = runtime.get("status")
+        degraded = require_gpu and runtime_status in ("cpu_fallback", "unusable")
         available = reachable and not degraded
 
         with _mac_health_lock:
@@ -340,21 +410,24 @@ def is_mac_studio_available(force_refresh: bool = False) -> bool:
                     "failures": 0,
                     "last_error": None,
                     "last_status": response.status_code,
-                    "runtime": runtime.get("status"),
+                    "runtime": runtime_status,
                     "cpu_only_models": [],
                 })
             elif degraded:
                 # 연결 실패가 아니다 — 연속 실패 카운터로 덮지 않는다.
+                if runtime_status == "unusable":
+                    reason = "생성 불가 — " + str(runtime.get("unusable_reason") or "")
+                else:
+                    reason = "CPU 폴백 감지 — GPU 미적재: " + ", ".join(
+                        runtime.get("cpu_only_models") or []
+                    )
                 _mac_health_cache.update({
                     "checked_at": now,
                     "available": False,
                     "failures": 0,
-                    "last_error": (
-                        "CPU 폴백 감지 — GPU 미적재: "
-                        + ", ".join(runtime.get("cpu_only_models") or [])
-                    )[:200],
+                    "last_error": reason[:200],
                     "last_status": response.status_code,
-                    "runtime": "cpu_fallback",
+                    "runtime": runtime_status,
                     "cpu_only_models": runtime.get("cpu_only_models") or [],
                 })
             else:

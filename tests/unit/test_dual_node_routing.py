@@ -61,6 +61,9 @@ def test_mac_studio_health_uses_longer_timeout_and_ttl_cache(monkeypatch):
         _Response(200, {"models": [                          # /api/ps
             {"name": "qwen2.5:32b", "size": 1000, "size_vram": 990}]}),
     ])
+    # 2026-09-16: 적재 위치만으로는 '생성이 죽은 노드'를 못 잡아, 1토큰 생성 검사를
+    # 더했다 (test_generation_probe.py). 그래서 health 검사가 GET 2회 + POST 1회다.
+    session.post_responses.append(_Response(200, {"response": "ok"}))
     monkeypatch.setattr(dual_node_config, "get_http_session", lambda: session)
     monkeypatch.setenv("MAC_STUDIO_HEALTH_TIMEOUT", "6.5")
     monkeypatch.setenv("MAC_STUDIO_HEALTH_TTL_SECONDS", "60")
@@ -71,6 +74,9 @@ def test_mac_studio_health_uses_longer_timeout_and_ttl_cache(monkeypatch):
     assert dual_node_config.is_mac_studio_available() is True     # 캐시 적중
     assert [url.rsplit("/", 1)[-1] for url, _ in session.get_calls] == ["tags", "ps"]
     assert all(timeout == 6.5 for _, timeout in session.get_calls)
+    # 생성 검사는 한 번만 — TTL 안의 재호출은 네트워크를 타지 않는다
+    assert len(session.post_calls) == 1
+    assert session.post_calls[0][0].endswith("/api/generate")
 
 
 def test_mac_studio_health_requires_consecutive_failures(monkeypatch):
@@ -82,6 +88,7 @@ def test_mac_studio_health_requires_consecutive_failures(monkeypatch):
         TimeoutError("busy"),
         TimeoutError("still busy"),
     ])
+    session.post_responses.append(_Response(200, {"response": "ok"}))  # 1토큰 생성 검사
     monkeypatch.setattr(dual_node_config, "get_http_session", lambda: session)
     monkeypatch.setenv("MAC_STUDIO_HEALTH_FAILURE_THRESHOLD", "2")
 
