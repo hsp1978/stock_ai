@@ -2542,6 +2542,21 @@ async def _refresh_health_probe() -> dict:
     return snapshot
 
 
+def _local_node_is_busy() -> bool:
+    """로컬(RTX) 노드가 우리 LLM 요청을 처리 중인가.
+
+    배치·스캔은 이 프로세스 안에서 돌고 `node_slot` 으로 집계되므로 읽을 수 있다.
+    조회 자체가 헬스 프로브를 막으면 안 되므로 실패는 '바쁘지 않음'으로 떨어진다
+    — 그러면 최악의 경우 종전처럼 프로브를 한 번 더 보내는 것뿐이다.
+    """
+    try:
+        from dual_node_config import node_is_busy
+
+        return node_is_busy("rtx_5070")
+    except Exception:
+        return False
+
+
 async def _probe_generation(base_url: str, runtime: dict) -> dict:
     """적재된 모델로 **1토큰만** 생성해 본다 — 노드가 실제로 쓸 수 있는지.
 
@@ -2559,7 +2574,9 @@ async def _probe_generation(base_url: str, runtime: dict) -> dict:
         {"status": ok|stalled|skipped|error, "latency_ms": int|None, ...}
           ok      — 1토큰을 예산 안에 받았다
           stalled — 타임아웃. 적재는 됐는데 생성이 안 된다 (이번 사례)
-          skipped — 적재 모델 없음(idle) 또는 판정 불가. **정상이 아니다**
+          skipped — 적재 모델 없음(idle)·판정 불가·**노드가 이미 바쁨**.
+                    idle 은 '정상'이 아니다. node_busy 는 정상으로 읽어도 된다 —
+                    우리 요청이 실제로 처리되는 중이라는 뜻이다
           error   — 그 외 실패 (사유 포함)
     """
     models = runtime.get("models") or []
@@ -2569,6 +2586,21 @@ async def _probe_generation(base_url: str, runtime: dict) -> dict:
     model = models[0].get("name")
     if not model:
         return {"status": "skipped", "reason": "model_name_unknown", "latency_ms": None}
+
+    # 이 노드가 **이미 우리 요청을 처리 중**이면 건너뛴다. 두 노드 모두
+    # OLLAMA_NUM_PARALLEL=1 로 직렬 처리하므로 바쁜 노드에 보낸 프로브는 큐 뒤에
+    # 줄을 서고 타임아웃한다 — 정상 노드가 `stalled` 로 보고된다 (2026-09-16 실측:
+    # 30분 스캔 중 RTX 가 GPU 98%·250W 로 일하는데 프로브는 90초 타임아웃).
+    # 요청이 돌고 있다는 사실이 1토큰 합성 호출보다 강한 증거고, 건너뛰면
+    # 프로브가 부하를 더하지도 않는다.
+    if _local_node_is_busy():
+        return {
+            "status": "skipped",
+            "reason": "node_busy",
+            "model": model,
+            "latency_ms": None,
+            "detail": "우리 요청을 처리 중 — 생성 경로가 살아 있다는 증거이므로 프로브를 건너뜀",
+        }
 
     budget = float(HEALTH_GENERATION_TIMEOUT_SECONDS)
     started = time.monotonic()
