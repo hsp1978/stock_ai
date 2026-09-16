@@ -32,6 +32,8 @@ from config import (
     POSITION_TRANCHE_1_PCT, POSITION_TRANCHE_2_PCT, POSITION_TRANCHE_3_PCT,
 )
 
+from contextlib import contextmanager
+
 from logging_setup import get_logger
 
 logger = get_logger("stock_auto.analysis_tools")
@@ -2792,6 +2794,27 @@ def _format_tool_catalog() -> str:
 #  차트 분석 에이전트 (LLM 오케스트레이션)
 # ═══════════════════════════════════════════════════════════════
 
+@contextmanager
+def _local_node_slot():
+    """로컬(RTX) 노드 슬롯을 잡는다 — 잡지 못해도 **진행한다**.
+
+    목적은 이 경로의 부하를 `node_slot` 집계에 **보이게** 하는 것이다. 슬롯이
+    없다고 스캔을 건너뛰면 종전 동작이 바뀐다 (이 경로는 원래 제한이 없었다).
+    막는 게 아니라 드러내는 변경이다.
+
+    `dual_node_config` 를 못 불러오면 아무것도 하지 않는다 — 집계가 안 될 뿐,
+    분석은 종전대로 돈다.
+    """
+    try:
+        from dual_node_config import node_slot
+    except Exception:
+        yield False
+        return
+
+    with node_slot("rtx_5070", block=False) as acquired:
+        yield acquired
+
+
 class ChartAnalysisAgent:
     """LLM이 24개 호출 도구와 진입 계획 도구를 사용하여 분석을 수행하는 에이전트."""
 
@@ -3146,24 +3169,30 @@ class ChartAnalysisAgent:
 
         try:
             logger.info("    [Step 2] LLM 종합 판단 요청 중...")
-            resp = httpx.post(
-                f"{OLLAMA_BASE_URL}/api/generate",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": prompt,
-                    "stream": False,
-                    "keep_alive": OLLAMA_KEEP_ALIVE,
-                    "options": {
-                        "temperature": 0.2,
-                        "num_predict": 4096,
-                        # num_ctx 미지정 시 4,096으로 잘려 앞쪽 도구 결과가 버려진다.
-                        "num_ctx": OLLAMA_NUM_CTX,
+            # 이 호출은 `node_slot` 안에서 해야 한다 (2026-09-16). 종전에는 Ollama 를
+            # 직접 쳐서 **어느 집계에도 잡히지 않았다**. 두 가지가 깨졌다:
+            #   1. 노드 동시 요청 제한이 이 경로에만 적용되지 않았다
+            #   2. 헬스 프로브가 "노드가 바쁘다"를 알 수 없어, 스캔 중 1토큰 프로브가
+            #      큐 뒤에서 타임아웃하고 정상 노드를 `unusable` 로 보고했다 (§13.9q)
+            with _local_node_slot():
+                resp = httpx.post(
+                    f"{OLLAMA_BASE_URL}/api/generate",
+                    json={
+                        "model": OLLAMA_MODEL,
+                        "prompt": prompt,
+                        "stream": False,
+                        "keep_alive": OLLAMA_KEEP_ALIVE,
+                        "options": {
+                            "temperature": 0.2,
+                            "num_predict": 4096,
+                            # num_ctx 미지정 시 4,096으로 잘려 앞쪽 도구 결과가 버려진다.
+                            "num_ctx": OLLAMA_NUM_CTX,
+                        },
                     },
-                },
-                timeout=180,
-            )
-            resp.raise_for_status()
-            llm_conclusion = resp.json().get("response", "[응답 없음]")
+                    timeout=180,
+                )
+                resp.raise_for_status()
+                llm_conclusion = resp.json().get("response", "[응답 없음]")
         except Exception as e:
             logger.error(f"  [Ollama 종합 판단 오류] {e}")
             llm_conclusion = f"[LLM 오류] {e}\n\n시스템 자동 판단: {composite['final_signal']} (점수: {composite['composite_score']})"
