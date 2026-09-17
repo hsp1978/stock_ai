@@ -123,6 +123,18 @@ def build_router() -> Router:
                 }
             )
 
+    # `think: False` 는 **필수**다 (2026-09-16). 이 경로는 응답을
+    # `response_format={"type":"json_object"}` 로 받는데, Ollama 에서 그건
+    # `format: json` 문법 제약이 된다. qwen3 는 thinking 이 기본 ON 이라
+    # `<think>` 로 시작하려 하는데 문법이 JSON 만 허용하므로 **즉시 `{}` 를
+    # 내고 끝낸다** — 실측: 2토큰, 재현율 100%.
+    #
+    # 2026-09-16 배치에서 ML Specialist 가 7종목 × 2회 = 14회 전부 이걸로
+    # 실패하고 Mac 으로 폴백해, 2:2 분산의 이득을 절반 이상 까먹었다.
+    # multi_agent.py 의 직접 호출 경로에는 이미 `think=False` 가 있었다 —
+    # **한 경로에서 배운 것을 다른 경로에 옮기지 않은** 형태다 (§13.9h 와 같다).
+    #
+    # qwen2.5(Mac)는 thinking 이 없어 무해하다. 모델을 바꿀 때 지우지 말 것.
     model_list.extend(
         [
             {
@@ -131,6 +143,7 @@ def build_router() -> Router:
                     "model": f"ollama/{mac_model}",
                     "api_base": mac_url,
                     "timeout": max(60, ollama_timeout),
+                    "think": False,
                 },
             },
             {
@@ -139,6 +152,7 @@ def build_router() -> Router:
                     "model": f"ollama/{rtx_model}",
                     "api_base": rtx_url,
                     "timeout": max(90, ollama_timeout),
+                    "think": False,
                 },
             },
         ]

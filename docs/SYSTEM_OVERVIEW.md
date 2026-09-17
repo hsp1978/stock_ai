@@ -1616,6 +1616,71 @@ Ollama 호출부를 `_local_node_slot()` 안으로 옮겼다. **슬롯을 못 �
 테스트가 호출부의 들여쓰기까지 고정한다 — 슬롯 밖으로 되돌아가면 집계가 다시
 비고, 같은 증상이 재발한다.
 
+#### 13.9s qwen3 thinking + format:json = 빈 객체 (2026-09-16 배치 실측)
+
+2:2 분산(§13.9o 정정) 후 첫 배치. **성공 7 / 실패 0, 776초** — 종전 1,117초에서
+1.44배 개선이다. 그런데 A/B 예측은 2.33배였다. 차이가 로그에 있었다.
+
+```
+WARNING [llm.router] LLM response parse fail for ML Specialist
+        via agent-llm-tertiary (attempt 1/2): 3 validation errors
+  signal      Field required [type=missing, input_value={}, input_type=dict]
+  confidence  Field required [type=missing, input_value={}, input_type=dict]
+```
+
+배치 전체에서 17건. **ML Specialist 는 7종목 × 2회 = 14회 전부 실패**했고,
+Technical Analyst 도 3회 실패했다. 실패한 호출은 재시도를 소진한 뒤 Mac 으로
+폴백해, Quant·Risk 뒤에 줄을 섰다 — ML Specialist 평균 108.4초의 정체다.
+
+##### 원인 — 두 설정의 충돌
+
+| 설정 | 출처 | 효과 |
+|---|---|---|
+| `response_format={"type":"json_object"}` | `call_agent_llm` | Ollama 에서 `format: json` 문법 제약 |
+| thinking 기본 ON | qwen3 모델 자체 | `<think>` 로 응답을 시작하려 함 |
+
+문법이 JSON 만 허용하므로 모델은 `<think>` 를 낼 수 없고, **즉시 `{}` 를 내고
+끝낸다.** 실측 (3회 반복, 재현율 100%):
+
+```
+think 미지정   ->  '{}'                 eval 2 tok
+think: false   ->  '{"signal": ...}'    eval 135 tok
+```
+
+##### 이미 알고 있던 것을 옮기지 않았다
+
+`multi_agent.py` 의 **직접 호출 경로에는 `think=False` 가 이미 있었다** — 주석까지
+달려 있다 ("qwen3 thinking 모드 비활성화 — 미지원 모델은 무시"). 라우터 경로에만
+없었다. §13.9h 의 GPU 게이트와 같은 형태다: **한 경로에서 배운 것을 다른 경로에
+옮기지 않은 것**이 결함의 정체다.
+
+##### 왜 40일이 아니라 하루 만에 잡혔나
+
+이번엔 빨리 잡혔지만, 증상 자체는 조용한 쪽이다. `{}` 는 **HTTP 200** 이고,
+재시도 2회 뒤 다른 노드로 폴백해 **결과는 정상적으로 나온다.** 느려질 뿐이다.
+분산 효과를 숫자로 검증하려고 로그를 읽지 않았으면 그대로 지나갔다.
+CLAUDE.md §13-3 — "응답 코드 200을 성공으로 읽지 말 것."
+
+##### 배치 실측 (수정 전)
+
+| 에이전트 | 노드 | 평균 | 최소 | 최대 |
+|---|---|---|---|---|
+| ML Specialist | RTX→Mac 폴백 | 108.4s | 97.0s | 144.8s |
+| Quant Analyst | Mac | 74.2s | 39.7s | 89.9s |
+| Risk Manager | Mac | 55.7s | 38.7s | 87.9s |
+| Technical Analyst | RTX | **22.1s** | **3.5s** | 127.0s |
+| Geopolitical (Gemini) | — | 13.9s | 9.4s | 28.5s |
+| Event Analyst (Gemini) | — | 7.3s | 6.2s | 8.9s |
+| Value Investor (Gemini) | — | 6.4s | 5.5s | 8.1s |
+
+RTX 의 실제 LLM 호출은 배치 중 **1.1~3.9초**였다 (`/api/generate` 로그). 분산
+자체는 의도대로 동작했다 — 폴백이 그 이득을 먹었다.
+
+##### 남은 것
+
+수정 후 배치를 다시 재야 한다. 예측은 ML Specialist 가 Technical 수준(~20초)으로
+내려오는 것이지만, **그건 예측이지 측정이 아니다** (§13.9o 에서 같은 실수를 했다).
+
 ### 13.10 데이터 품질 위험
 
 - OHLCV 캐시는 TTL 메타(`fetched_at`, `latest_bar_date`, `source`)를 갖지만,
