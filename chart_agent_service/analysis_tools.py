@@ -1980,17 +1980,27 @@ class AnalysisTools:
             total_score = max(-10, min(10, total_score))
             signal = "buy" if total_score > 1 else "sell" if total_score < -1 else "neutral"
 
+            # 값을 못 가져온 것을 '중립 판단'처럼 읽히게 적지 말 것 (§13). 종전에는
+            # `외국인소진율=9048000.0% (stable)` 처럼 **틀린 값을 자신 있게** 적었다.
+            def _part(label: str, src: dict, key: str, unit: str = "%") -> str:
+                if src.get("available") is False:
+                    return f"{label}=판단불가({src.get('reason', 'unknown')})"
+                return f"{label}={src.get(key)}{unit} ({src.get('trend')})"
+
+            unavailable = [
+                name for name, src in (("외국인", foreign), ("공매도", short))
+                if src.get("available") is False
+            ]
             result.update({
                 "signal": signal,
                 "score": total_score,
                 "foreign": foreign,
                 "short_selling": short,
-                "detail": (
-                    f"외국인소진율={foreign.get('exhaustion_rate')}% "
-                    f"({foreign.get('trend')}), "
-                    f"공매도비율={short.get('short_ratio')}% "
-                    f"({short.get('trend')})"
-                ),
+                "data_unavailable": unavailable,
+                "detail": ", ".join([
+                    _part("외국인소진율", foreign, "exhaustion_rate"),
+                    _part("공매도비중", short, "short_ratio"),
+                ]),
             })
         except Exception as exc:
             result.update({
