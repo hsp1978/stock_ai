@@ -106,8 +106,24 @@ AGENT_LLM_MAPPING = {
     # 2개로 줄었을 때 Technical 45.5초·ML 63.2초로, 나머지 둘보다 무거웠다.
     #
     # **트레이드오프**: 이 둘은 qwen2.5:32b → qwen3:14b 로 모델이 바뀐다.
-    # 속도는 7배지만 파라미터는 절반 이하다. 품질 영향은 미측정 —
-    # `signal_outcomes` 를 소스별로 지켜볼 것. 나빠지면 매핑만 되돌리면 된다.
+    # 속도는 7배지만 파라미터는 절반 이하다.
+    #
+    # 2026-09-17 측정 — 품질 영향은 **중립이 아니다.** 같은 입력(동일 프롬프트,
+    # 지표 16개), 노드별 5회:
+    #
+    #   Quant Analyst   Mac qwen2.5:32b  neutral 4 / buy 1   평균 신뢰도 5.0
+    #                   RTX qwen3:14b    buy 5              평균 신뢰도 6.9
+    #   Risk Manager    Mac qwen2.5:32b  neutral 4 / buy 1   평균 신뢰도 5.1
+    #                   RTX qwen3:14b    buy 5              평균 신뢰도 6.5
+    #
+    # 분포가 겹치지 않는다. qwen3:14b 가 **체계적으로 더 낙관적이고 더
+    # 확신한다.** 신뢰도 차이는 판정에 직접 닿는다 —
+    # `enhanced_decision_maker.STRENGTH_CAP_CONFIDENCE = 5.0` 이라, Mac 은
+    # 경계선(5.0~5.1)이고 RTX 는 상한이 풀리는 쪽(6.5~6.9)이다.
+    #
+    # 어느 쪽이 **맞는지**는 모른다. `signal_outcomes` 를 소스별로 쌓아야 한다.
+    # 그때까지 속도를 이유로 더 옮기지 않는다 (§9.2 측정 가능성 > 최적화).
+    # 나빠지면 매핑만 되돌리면 된다.
     "Technical Analyst": {
         "provider": "ollama",
         "node": "rtx_5070",

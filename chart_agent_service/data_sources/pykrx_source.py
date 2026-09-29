@@ -14,6 +14,43 @@ from data_collector_models import PERIOD_DAYS
 from data_sources.base import Quote
 
 
+def _pick_column(df: pd.DataFrame, candidates: tuple[str, ...], label: str) -> Optional[str]:
+    """pykrx 컬럼을 이름으로 고른다. **못 찾으면 None** — 아무거나 고르지 않는다.
+
+    2026-09-22, 여기서 두 건이 동시에 터졌다. 둘 다 컬럼명이 한 글자 달랐다.
+
+        한도소진률  vs  코드가 찾던 "소진율"   (률 ≠ 율)
+        비중        vs  코드가 찾던 "비율"
+
+    매칭이 실패했을 때의 **폴백이 진짜 결함**이었다. 소진율 쪽은
+    `rate_col = df.columns.tolist()` 로 떨어져 **첫 컬럼(상장주식수)** 을 집었고,
+    그 값을 퍼센트로 보고했다 — 리포트에 `외국인소진율=9048000.0%`. 공매도 쪽은
+    빈 리스트가 되어 조용히 `0.0` 을 썼다.
+
+    두 경우 모두 하류 규칙이 `neutral, score 0` 으로 떨어져 **32일 내내 이 도구가
+    정확히 0점이었다** — 고장이 '중립 판단'으로 보였다 (CLAUDE.md §13).
+
+    그래서 여기서는 못 찾으면 None 을 주고, 호출부가 그걸 '판단 불가'로 다룬다.
+    실제 컬럼명은 로그에 남긴다 — pykrx 가 이름을 또 바꾸면 그게 단서가 된다.
+    """
+    cols = {str(c).strip(): c for c in df.columns}
+    for want in candidates:
+        if want in cols:
+            return cols[want]
+    # 부분 일치는 허용하되, **여러 개면 고르지 않는다** (어느 것인지 모르므로).
+    hits = [orig for name, orig in cols.items() if any(w in name for w in candidates)]
+    if len(hits) == 1:
+        return hits[0]
+
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "pykrx %s 컬럼을 찾지 못했다 (후보 %s / 실제 %s) — 판단 불가로 처리한다",
+        label, candidates, list(cols),
+    )
+    return None
+
+
 class PykrxSource:
     """pykrx 래퍼 — 한국 KRX 1차 소스."""
 
@@ -113,16 +150,35 @@ class PykrxSource:
             )
 
             if df is None or df.empty:
-                return {"exhaustion_rate": None, "trend": "unknown", "signal": "neutral", "score": 0}
+                return {"exhaustion_rate": None, "trend": "unknown", "signal": "neutral",
+                        "score": 0, "available": False, "reason": "no_data"}
 
-            # 한도 소진율 컬럼 (한글 → 영어 래핑)
-            rate_col = [c for c in df.columns if "소진율" in str(c) or "한도비율" in str(c)]
-            if not rate_col:
-                rate_col = df.columns.tolist()
+            # 실제 컬럼은 `한도소진률`(률)이다. 2026-09-22 이전 코드는 "소진율"(율)을
+            # 찾다 실패하고 **첫 컬럼(상장주식수)** 으로 폴백했다 — `_pick_column` 주석 참조.
+            rate_col = _pick_column(
+                df, ("한도소진률", "한도소진율", "소진률", "소진율", "한도비율"), "외국인 한도소진률"
+            )
+            if rate_col is None:
+                return {"exhaustion_rate": None, "trend": "unknown", "signal": "neutral",
+                        "score": 0, "available": False, "reason": "rate_column_not_found",
+                        "columns": [str(c) for c in df.columns]}
 
-            current_rate = float(df[rate_col[0]].iloc[-1])
-            prev_rate = float(df[rate_col[0]].iloc[0]) if len(df) > 1 else current_rate
+            current_rate = float(df[rate_col].iloc[-1])
+            prev_rate = float(df[rate_col].iloc[0]) if len(df) > 1 else current_rate
             delta = current_rate - prev_rate
+
+            # 퍼센트는 0~100 이다. 이 검사 하나만 있었어도 2026-09-22 의 버그를
+            # 즉시 잡았다 — `상장주식수`(9,048,000)를 소진율로 32일간 보고했다.
+            # 컬럼을 잘못 잡으면 '값이 이상하다'가 아니라 '판단 불가'로 끝낸다.
+            if not (0.0 <= current_rate <= 100.0):
+                import logging
+                logging.getLogger(__name__).warning(
+                    "get_foreign_holding_info(%s): 소진률 %s 가 0~100 밖이다 "
+                    "(컬럼 %r) — 잘못된 컬럼일 수 있다", ticker, current_rate, str(rate_col),
+                )
+                return {"exhaustion_rate": None, "trend": "unknown", "signal": "neutral",
+                        "score": 0, "available": False, "reason": "rate_out_of_range",
+                        "raw_value": current_rate, "column": str(rate_col)}
 
             # 외국인 소진율 높고 증가 → 강한 매수 신호
             if current_rate > 90 and delta > 1:
@@ -140,11 +196,13 @@ class PykrxSource:
                 "trend": "increasing" if delta > 0 else "decreasing" if delta < 0 else "stable",
                 "signal": signal,
                 "score": score,
+                "available": True,
             }
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("get_foreign_holding_info(%s): %s", ticker, exc)
-            return {"exhaustion_rate": None, "trend": "unknown", "signal": "neutral", "score": 0}
+            return {"exhaustion_rate": None, "trend": "unknown", "signal": "neutral", "score": 0,
+                    "available": False, "reason": f"{type(exc).__name__}: {exc}"[:120]}
 
     @staticmethod
     def get_short_selling_info(ticker: str, days: int = 5) -> Dict[str, Any]:
@@ -168,16 +226,34 @@ class PykrxSource:
             )
 
             if df is None or df.empty:
-                return {"short_balance": None, "short_ratio": None, "signal": "neutral", "score": 0}
+                return {"short_balance": None, "short_ratio": None, "signal": "neutral",
+                        "score": 0, "available": False, "reason": "no_data"}
 
-            # 공매도 잔고 비율 컬럼
-            ratio_col = [c for c in df.columns if "비율" in str(c) or "ratio" in str(c).lower()]
-            bal_col = [c for c in df.columns if "잔고" in str(c) or "balance" in str(c).lower()]
+            # 실제 컬럼은 `비중` 이다. 종전 코드는 "비율"을 찾다 실패하면 **조용히
+            # 0.0** 을 썼다 — 비율 0% 는 '공매도가 없다'는 강한 주장인데, 실제로는
+            # 컬럼을 못 찾았다는 뜻이었다 (`_pick_column` 주석 참조).
+            ratio_col = _pick_column(df, ("비중", "공매도비중", "비율", "ratio"), "공매도 비중")
+            bal_col = _pick_column(df, ("공매도잔고", "잔고", "balance"), "공매도 잔고")
+            if ratio_col is None:
+                return {"short_balance": None, "short_ratio": None, "signal": "neutral",
+                        "score": 0, "available": False, "reason": "ratio_column_not_found",
+                        "columns": [str(c) for c in df.columns]}
 
-            current_ratio = float(df[ratio_col[0]].iloc[-1]) if ratio_col else 0.0
-            prev_ratio = float(df[ratio_col[0]].iloc[0]) if (ratio_col and len(df) > 1) else current_ratio
+            current_ratio = float(df[ratio_col].iloc[-1])
+            prev_ratio = float(df[ratio_col].iloc[0]) if len(df) > 1 else current_ratio
             delta = current_ratio - prev_ratio
-            balance = int(df[bal_col[0]].iloc[-1]) if bal_col else 0
+            balance = int(df[bal_col].iloc[-1]) if bal_col is not None else None
+
+            # 위와 같은 이유 — 공매도 비중도 퍼센트다.
+            if not (0.0 <= current_ratio <= 100.0):
+                import logging
+                logging.getLogger(__name__).warning(
+                    "get_short_selling_info(%s): 비중 %s 가 0~100 밖이다 (컬럼 %r)",
+                    ticker, current_ratio, str(ratio_col),
+                )
+                return {"short_balance": balance, "short_ratio": None, "signal": "neutral",
+                        "score": 0, "available": False, "reason": "ratio_out_of_range",
+                        "raw_value": current_ratio, "column": str(ratio_col)}
 
             # 공매도 비율 높고 증가 → 약세 신호
             if current_ratio > 5.0 and delta > 0.5:
@@ -196,8 +272,10 @@ class PykrxSource:
                 "trend": "increasing" if delta > 0 else "decreasing" if delta < 0 else "stable",
                 "signal": signal,
                 "score": score,
+                "available": True,
             }
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("get_short_selling_info(%s): %s", ticker, exc)
-            return {"short_balance": None, "short_ratio": None, "signal": "neutral", "score": 0}
+            return {"short_balance": None, "short_ratio": None, "signal": "neutral", "score": 0,
+                    "available": False, "reason": f"{type(exc).__name__}: {exc}"[:120]}
