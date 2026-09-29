@@ -27,7 +27,7 @@ from config import (
     ATR_STOP_MULTIPLIER, ACCOUNT_SIZE, RISK_PER_TRADE_PCT,
     MAX_POSITION_PCT, TAKE_PROFIT_RR_RATIO, TRADING_STYLE, TIMEFRAME,
     COOLING_OFF_DAYS, DEFAULT_HISTORY_PERIOD,
-    SIGNAL_BUY_THRESHOLD, SIGNAL_SELL_THRESHOLD,
+    SIGNAL_BUY_THRESHOLD, SIGNAL_SELL_THRESHOLD, SIGNAL_MIN_EVALUATED_TOOLS,
     RSI_OVERSOLD, RSI_OVERBOUGHT,
     POSITION_TRANCHE_1_PCT, POSITION_TRANCHE_2_PCT, POSITION_TRANCHE_3_PCT,
 )
@@ -289,14 +289,14 @@ class AnalysisTools:
         result = {"tool": "rsi_divergence_analysis", "name": "RSI 다이버전스 분석"}
 
         if 'RSI' not in self.df.columns:
-            result.update({"signal": "neutral", "score": 0, "detail": "RSI 데이터 없음"})
+            _unevaluated(result, "RSI 데이터 없음")
             return result
 
         rsi = self.df['RSI'].dropna()
         close = self.close.loc[rsi.index]
 
         if len(rsi) < 20:
-            result.update({"signal": "neutral", "score": 0, "detail": "데이터 부족"})
+            _unevaluated(result, "데이터 부족")
             return result
 
         current_rsi = float(rsi.iloc[-1])
@@ -385,7 +385,7 @@ class AnalysisTools:
         bbm = f'BBM_{BOLLINGER_PERIOD}_{BOLLINGER_STD}'
 
         if bbu not in self.df.columns:
-            result.update({"signal": "neutral", "score": 0, "detail": "볼린저밴드 데이터 없음"})
+            _unevaluated(result, "볼린저밴드 데이터 없음")
             return result
 
         price = float(self.latest['Close'])
@@ -444,7 +444,7 @@ class AnalysisTools:
         hist_col = f'MACDh_{MACD_FAST}_{MACD_SLOW}_{MACD_SIGNAL}'
 
         if macd_col not in self.df.columns:
-            result.update({"signal": "neutral", "score": 0, "detail": "MACD 데이터 없음"})
+            _unevaluated(result, "MACD 데이터 없음")
             return result
 
         macd_val = float(self.latest[macd_col])
@@ -517,7 +517,7 @@ class AnalysisTools:
         dmn_col = f'DMN_{ADX_PERIOD}'
 
         if adx_col not in self.df.columns:
-            result.update({"signal": "neutral", "score": 0, "detail": "ADX 데이터 없음"})
+            _unevaluated(result, "ADX 데이터 없음")
             return result
 
         adx = float(self.latest[adx_col])
@@ -579,7 +579,7 @@ class AnalysisTools:
         result = {"tool": "volume_profile_analysis", "name": "거래량 프로파일 분석"}
 
         if 'OBV' not in self.df.columns:
-            result.update({"signal": "neutral", "score": 0, "detail": "OBV 데이터 없음"})
+            _unevaluated(result, "OBV 데이터 없음")
             return result
 
         vol = float(self.latest['Volume'])
@@ -809,12 +809,12 @@ class AnalysisTools:
         result = {"tool": "volatility_regime_analysis", "name": "변동성 체제 분석"}
 
         if 'ATR' not in self.df.columns:
-            result.update({"signal": "neutral", "score": 0, "detail": "ATR 데이터 없음"})
+            _unevaluated(result, "ATR 데이터 없음")
             return result
 
         atr = self.df['ATR'].dropna()
         if len(atr) < 50:
-            result.update({"signal": "neutral", "score": 0, "detail": "ATR 데이터 부족"})
+            _unevaluated(result, "ATR 데이터 부족")
             return result
 
         current_atr = float(atr.iloc[-1])
@@ -902,7 +902,7 @@ class AnalysisTools:
         result = {"tool": "mean_reversion_analysis", "name": "평균 회귀 분석"}
 
         if len(self.close) < 50:
-            result.update({"signal": "neutral", "score": 0, "detail": "데이터 부족"})
+            _unevaluated(result, "데이터 부족")
             return result
 
         price = float(self.latest['Close'])
@@ -1026,7 +1026,7 @@ class AnalysisTools:
         result = {"tool": "momentum_rank_analysis", "name": "모멘텀 순위 분석"}
 
         if len(self.close) < 60:
-            result.update({"signal": "neutral", "score": 0, "detail": "데이터 부족"})
+            _unevaluated(result, "데이터 부족")
             return result
 
         price = float(self.latest['Close'])
@@ -1085,7 +1085,7 @@ class AnalysisTools:
         result = {"tool": "support_resistance_analysis", "name": "지지/저항선 분석"}
 
         if len(self.df) < 20:
-            result.update({"signal": "neutral", "score": 0, "detail": "데이터 부족"})
+            _unevaluated(result, "데이터 부족")
             return result
 
         price = float(self.latest['Close'])
@@ -1161,7 +1161,7 @@ class AnalysisTools:
 
         returns = self.close.pct_change().dropna()
         if len(returns) < 60:
-            result.update({"signal": "neutral", "score": 0, "detail": "데이터 부족"})
+            _unevaluated(result, "데이터 부족")
             return result
 
         # 자기상관 (lag 1~5)
@@ -1236,13 +1236,13 @@ class AnalysisTools:
         result = {"tool": "risk_position_sizing", "name": "포지션 사이징 / 리스크 관리"}
 
         if 'ATR' not in self.df.columns:
-            result.update({"signal": "neutral", "score": 0, "detail": "ATR 데이터 없음"})
+            _unevaluated(result, "ATR 데이터 없음")
             return result
 
         price = float(self.latest['Close'])
         atr_series = self.df['ATR'].dropna()
         if atr_series.empty:
-            result.update({"signal": "neutral", "score": 0, "detail": "ATR 유효값 없음"})
+            _unevaluated(result, "ATR 유효값 없음")
             return result
         atr = float(atr_series.iloc[-1])
 
@@ -1485,14 +1485,14 @@ class AnalysisTools:
 
         returns = self.close.pct_change().dropna()
         if len(returns) < 60:
-            result.update({"signal": "neutral", "score": 0, "detail": "데이터 부족"})
+            _unevaluated(result, "데이터 부족")
             return result
 
         wins = returns[returns > 0]
         losses = returns[returns < 0]
 
         if len(wins) == 0 or len(losses) == 0:
-            result.update({"signal": "neutral", "score": 0, "detail": "승/패 데이터 부족"})
+            _unevaluated(result, "승/패 데이터 부족")
             return result
 
         win_rate = len(wins) / len(returns)
@@ -1607,15 +1607,15 @@ class AnalysisTools:
         try:
             spy = yf.Ticker(benchmark_symbol).history(period=DEFAULT_HISTORY_PERIOD)
             if spy.empty:
-                result.update({"signal": "neutral", "score": 0, "detail": f"{benchmark_symbol} 데이터 없음"})
+                _unevaluated(result, f"{benchmark_symbol} 데이터 없음")
                 return result
         except Exception as e:
-            result.update({"signal": "neutral", "score": 0, "detail": f"{benchmark_symbol} 수집 실패: {e}"})
+            _unevaluated(result, f"{benchmark_symbol} 수집 실패: {e}")
             return result
 
         common_idx = self.df.index.intersection(spy.index)
         if len(common_idx) < 60:
-            result.update({"signal": "neutral", "score": 0, "detail": "공통 기간 부족"})
+            _unevaluated(result, "공통 기간 부족")
             return result
 
         stock_ret = self.close.loc[common_idx].pct_change().dropna()
@@ -1625,7 +1625,7 @@ class AnalysisTools:
         spy_ret = spy_ret.loc[common_ret_idx]
 
         if len(stock_ret) < 30:
-            result.update({"signal": "neutral", "score": 0, "detail": "수익률 데이터 부족"})
+            _unevaluated(result, "수익률 데이터 부족")
             return result
 
         cov = float(stock_ret.cov(spy_ret))
@@ -1706,7 +1706,7 @@ class AnalysisTools:
             t = yf.Ticker(self.ticker)
             info = t.info or {}
         except Exception as e:
-            result.update({"signal": "neutral", "score": 0, "detail": f"데이터 수집 실패: {e}"})
+            _unevaluated(result, f"데이터 수집 실패: {e}")
             return result
 
         events = []
@@ -1968,7 +1968,7 @@ class AnalysisTools:
         result = {"tool": "institutional_flow_analysis", "name": "외국인/공매도 복합 분석"}
         is_korean = _market_from_ticker(self.ticker) == "KR"
         if not is_korean:
-            result.update({"signal": "neutral", "score": 0, "detail": "한국 주식 전용 도구"})
+            _unevaluated(result, "한국 주식 전용 도구")
             return result
         try:
             from data_sources.pykrx_source import PykrxSource
@@ -2003,10 +2003,7 @@ class AnalysisTools:
                 ]),
             })
         except Exception as exc:
-            result.update({
-                "signal": "neutral", "score": 0,
-                "detail": f"외국인/공매도 분석 실패: {str(exc)[:80]}",
-            })
+            _unevaluated(result, f"외국인/공매도 분석 실패: {str(exc)[:80]}")
         return result
 
     def dart_disclosure_analysis(self) -> dict:
@@ -2014,7 +2011,7 @@ class AnalysisTools:
         result = {"tool": "dart_disclosure_analysis", "name": "DART 공시 분석"}
         is_korean = _market_from_ticker(self.ticker) == "KR"
         if not is_korean:
-            result.update({"signal": "neutral", "score": 0, "detail": "한국 주식 전용 도구"})
+            _unevaluated(result, "한국 주식 전용 도구")
             return result
         try:
             from dart_client import (
@@ -2026,11 +2023,7 @@ class AnalysisTools:
                 disclosures = fetch_recent_disclosures(self.ticker, days_back=30, max_items=10)
             except DartUnavailable as exc:
                 # 조회 불가는 '공시 없음'과 다르다 — 사유를 detail에 남긴다.
-                result.update({
-                    "signal": "neutral", "score": 0,
-                    "unavailable": True,
-                    "detail": f"DART 조회 불가: {str(exc)[:80]}",
-                })
+                _unevaluated(result, f"DART 조회 불가: {str(exc)[:80]}")
                 return result
             if not disclosures:
                 result.update({
@@ -2055,10 +2048,7 @@ class AnalysisTools:
             # 희석(전환사채·유상증자)은 키워드가 아니라 **규모**로 판단한다.
             self._merge_dilution_into(result)
         except Exception as exc:
-            result.update({
-                "signal": "neutral", "score": 0,
-                "detail": f"DART 공시 분석 실패: {str(exc)[:80]}",
-            })
+            _unevaluated(result, f"DART 공시 분석 실패: {str(exc)[:80]}")
         return result
 
     def _merge_dilution_into(self, result: dict) -> None:
@@ -2184,10 +2174,10 @@ class AnalysisTools:
             cf = t.cashflow
 
             if bs is None or bs.empty or inc is None or inc.empty:
-                result.update({"signal": "neutral", "score": 0, "detail": "재무제표 없음"})
+                _unevaluated(result, "재무제표 없음")
                 return result
             if bs.shape[1] < 2:
-                result.update({"signal": "neutral", "score": 0, "detail": "데이터 1년치만 있음"})
+                _unevaluated(result, "데이터 1년치만 있음")
                 return result
 
             _g = self._safe_get
@@ -2278,10 +2268,7 @@ class AnalysisTools:
                 "detail": f"F-Score={fscore}/9 ({grade}), ROA={roa0:.3f}, OCF/TA={ocf0/avg_ta:.3f}",
             })
         except Exception as exc:
-            result.update({
-                "signal": "neutral", "score": 0,
-                "detail": f"F-Score 계산 실패: {str(exc)[:100]}",
-            })
+            _unevaluated(result, f"F-Score 계산 실패: {str(exc)[:100]}")
         return result
 
     def altman_zscore_analysis(self) -> dict:
@@ -2300,7 +2287,7 @@ class AnalysisTools:
             info = t.info or {}
 
             if bs is None or bs.empty or inc is None or inc.empty:
-                result.update({"signal": "neutral", "score": 0, "detail": "재무제표 없음"})
+                _unevaluated(result, "재무제표 없음")
                 return result
 
             _g = self._safe_get
@@ -2375,10 +2362,7 @@ class AnalysisTools:
                 ),
             })
         except Exception as exc:
-            result.update({
-                "signal": "neutral", "score": 0,
-                "detail": f"Z-Score 계산 실패: {str(exc)[:100]}",
-            })
+            _unevaluated(result, f"Z-Score 계산 실패: {str(exc)[:100]}")
         return result
 
     # ── Step 5: MFI 도구 (16→18개) ──────────────────────────────
@@ -2424,12 +2408,12 @@ class AnalysisTools:
         """[Step5-A] MFI 단독 도구 — 거래량 가중 과매수/과매도 (score ±3)."""
         result = {"tool": "money_flow_index_analysis", "name": "MFI(자금흐름지수) 분석"}
         if len(self.df) < 16:
-            result.update({"signal": "neutral", "score": 0, "detail": "데이터 부족"})
+            _unevaluated(result, "데이터 부족")
             return result
         mfi = self._compute_mfi(self.df)
         last = float(mfi.iloc[-1])
         if np.isnan(last):
-            result.update({"signal": "neutral", "score": 0, "detail": "MFI NaN"})
+            _unevaluated(result, "MFI NaN")
             return result
         score, flags = 0, []
         if last > 80:
@@ -2449,12 +2433,12 @@ class AnalysisTools:
         """[Step5-B] RSI+MFI 조합 — 합치 과매수/매도, 이중 다이버전스, 거짓 돌파 감지 (score ±6)."""
         result = {"tool": "rsi_mfi_combined_analysis", "name": "RSI+MFI 조합 분석"}
         if "RSI" not in self.df.columns or len(self.df) < 20:
-            result.update({"signal": "neutral", "score": 0, "detail": "데이터 부족"})
+            _unevaluated(result, "데이터 부족")
             return result
         rsi = self.df["RSI"].dropna()
         mfi = self._compute_mfi(self.df).dropna()
         if len(rsi) == 0 or len(mfi) == 0:
-            result.update({"signal": "neutral", "score": 0, "detail": "RSI/MFI 없음"})
+            _unevaluated(result, "RSI/MFI 없음")
             return result
         last_rsi, last_mfi = float(rsi.iloc[-1]), float(mfi.iloc[-1])
         score, flags = 0, []
@@ -2500,13 +2484,13 @@ class AnalysisTools:
         macd_col = f"MACD_{MACD_FAST}_{MACD_SLOW}_{MACD_SIGNAL}"
         sig_col = f"MACDs_{MACD_FAST}_{MACD_SLOW}_{MACD_SIGNAL}"
         if macd_col not in self.df.columns or "RSI" not in self.df.columns:
-            result.update({"signal": "neutral", "score": 0, "detail": "데이터 없음"})
+            _unevaluated(result, "데이터 없음")
             return result
         macd_s = self.df[macd_col].dropna()
         sig_s = self.df[sig_col].dropna()
         rsi = self.df["RSI"].dropna()
         if len(macd_s) < 2 or len(rsi) == 0:
-            result.update({"signal": "neutral", "score": 0, "detail": "데이터 부족"})
+            _unevaluated(result, "데이터 부족")
             return result
         bearish_cross = (
             float(macd_s.iloc[-2]) > float(sig_s.iloc[-2])
@@ -2720,12 +2704,56 @@ TOOL_DEFINITIONS = [
 
 # Ollama용 간소화 tool 이름 목록
 TOOL_NAMES = [t["function"]["name"] for t in TOOL_DEFINITIONS]
+def _unevaluated(result: dict, reason: str) -> dict:
+    """도구가 **판단을 내리지 못했다**고 표시한다 — '중립 판단'과 다르다.
+
+    2026-09-29. 도구 기여를 `ticker_day` 단위로 집계하다 발견했다. 최종 신호는
+    도구 점수의 **평균**과 임계(`+1.3 / -0.5`)를 비교하는데, 평가하지 못한 도구가
+    `score 0` 으로 그 평균에 들어가고 있었다. 미국 종목에서는 한국 전용 도구 2개가
+    **항상** 그랬다 (`외국인/공매도`, `DART` — 160/160 표본).
+
+    효과는 대칭이 아니다. 0쪽으로 희석하면 매수 임계(1.3)가 매도 임계(-0.5)보다
+    2.6배 멀기 때문에 **매수가 훨씬 더 억제된다.** 실측: 224 ticker_day 중
+    16건(7.1%)이 제외만으로 HOLD→BUY 로 바뀐다 (경계값 1.19~1.30 → 1.31~1.43,
+    전부 미국 종목).
+
+    **'평가 불가'와 '중립 관측'을 구분해야 한다.** 전자는 근거가 없는 것이고
+    후자는 근거가 중립이라는 판단이다. 그래서 다음은 이 헬퍼를 쓰지 **않는다**:
+
+        가격 변동 없음        실제로 안 움직였다
+        표준편차 0            실제로 변동이 없다
+        최근 30일 공시 없음   실제로 공시가 없었다 (이벤트 부재는 정보다)
+
+    `score 0` 은 그대로 남긴다 — 하류가 점수를 읽어도 안전하다. 평균에서 빼는 것은
+    `_is_directional_result()` 이 `evaluated` 를 보고 한다.
+    """
+    result.update({
+        "signal": "neutral",
+        "score": 0,
+        "evaluated": False,
+        "unavailable": True,      # 종전 DART 경로가 쓰던 이름 — 호환 유지
+        "detail": reason,
+    })
+    return result
+
+
 NON_DIRECTIONAL_TOOLS = {"risk_position_sizing", "entry_plan_analysis"}
 
 
 def _is_directional_result(result: dict) -> bool:
-    """최종 방향 점수에 포함할 도구인지 판단한다."""
-    return result.get("tool") not in NON_DIRECTIONAL_TOOLS
+    """최종 방향 점수에 포함할 도구인지 판단한다.
+
+    두 가지를 뺀다:
+      1. **도구 단위** — 애초에 방향을 내지 않는 도구 (`NON_DIRECTIONAL_TOOLS`)
+      2. **결과 단위** — 이번 종목에서 평가하지 못한 결과 (`evaluated is False`)
+
+    2번이 2026-09-29 추가다. 한국 전용 도구는 도구 자체는 방향을 내지만 미국
+    종목에서는 낼 수 없다 — 도구 단위로는 표현할 수 없는 구분이다. `_unevaluated()`
+    주석 참조.
+    """
+    if result.get("tool") in NON_DIRECTIONAL_TOOLS:
+        return False
+    return result.get("evaluated") is not False
 
 
 def _latest_close_of(df) -> Optional[float]:
@@ -2954,6 +2982,17 @@ class ChartAnalysisAgent:
         total = len(self.tool_results)
         directional_total = len(scores)
 
+        # 제외를 **숨기지 않는다**. 평균이 몇 개로 계산됐는지 보이지 않으면,
+        # 3개로 낸 신호와 20개로 낸 신호가 같아 보인다.
+        unevaluated = [
+            {"tool": r.get("tool"), "name": r.get("name"), "reason": r.get("detail")}
+            for r in self.tool_results if r.get("evaluated") is False
+        ]
+        # 남은 도구가 너무 적으면 평균이 몇 개의 값에 끌려다닌다. 임계는 24개 중
+        # 22개가 평가되는 상황에서 정합된 것이다 — 그 가정이 깨진 것을 알려야 한다.
+        min_required = max(1, int(SIGNAL_MIN_EVALUATED_TOOLS))
+        insufficient = directional_total < min_required
+
         # 임계값은 '도구 평균' 스케일 기준 (config 주석 참조). 개별 도구 점수의
         # ±2와 달라야 한다 — 평균은 분산 상쇄로 실측 [-1.0, +2.0]에 머문다.
         if avg_score > SIGNAL_BUY_THRESHOLD:
@@ -2981,6 +3020,10 @@ class ChartAnalysisAgent:
             "directional_signal_distribution": directional_signals,
             "tool_count": total,
             "directional_tool_count": directional_total,
+            "unevaluated_tool_count": len(unevaluated),
+            "unevaluated_tools": unevaluated,
+            "evaluated_sufficient": not insufficient,
+            "min_evaluated_tools": min_required,
             "tool_summaries": tool_summaries,
             "tool_details": self.tool_results,
         }
