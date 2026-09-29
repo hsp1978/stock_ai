@@ -234,6 +234,10 @@ class Settings(BaseSettings):
     # 실측 [-1.00, +2.04] (p10 -0.19 / p50 +0.41 / p90 +1.14, 26,041 스캔,
     # 2026-06-20~07-30)에 머문다. 과거 ±2.0은 도구 점수 '합계' 스케일 기준이라
     # BUY는 40일간 1건, SELL은 관측 최솟값(-1.0) 밖이라 도달 불가였다 (2026-07-30 진단).
+    # 평균이 몇 개 도구로 계산됐는지의 하한. 임계(±)는 24개 중 22개가 평가되는
+    # 상황에서 정합된 것이라, 남은 수가 적으면 평균이 소수의 값에 끌려다닌다.
+    # 미달이면 `evaluated_sufficient: False` 로 보고한다 (신호를 막지는 않는다).
+    SIGNAL_MIN_EVALUATED_TOOLS: int = Field(default=8, ge=1, le=64)
     SIGNAL_BUY_THRESHOLD: float = 1.3
     SIGNAL_SELL_THRESHOLD: float = -0.5
 
@@ -393,6 +397,7 @@ SIGNAL_EVAL_BATCH_LIMIT = settings.SIGNAL_EVAL_BATCH_LIMIT
 SIGNAL_EVAL_BACKLOG_ALERT = settings.SIGNAL_EVAL_BACKLOG_ALERT
 SIGNAL_BUY_THRESHOLD = settings.SIGNAL_BUY_THRESHOLD
 SIGNAL_SELL_THRESHOLD = settings.SIGNAL_SELL_THRESHOLD
+SIGNAL_MIN_EVALUATED_TOOLS = settings.SIGNAL_MIN_EVALUATED_TOOLS
 BUY_THRESHOLD = settings.BUY_THRESHOLD
 SELL_THRESHOLD = settings.SELL_THRESHOLD
 MIN_CONFIDENCE = settings.MIN_CONFIDENCE
