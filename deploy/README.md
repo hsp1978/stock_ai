@@ -18,6 +18,20 @@ sudo systemctl status stock-auto.service
 - `Type=oneshot` + `RemainAfterExit=yes` — `docker compose up -d` 가 detached 라 systemd 입장에선 한 번 실행 후 끝나는 task. compose 가 띄운 컨테이너는 docker daemon 이 관리.
 - `Requires=docker.service` — Docker 데몬이 살아있어야 하고, 데몬 종료 시 unit도 종료.
 - `User=ubuntu` — 사용자 docker group 권한 필요 (`groups ubuntu` 에 `docker` 포함 확인).
+- `ExecStop` 은 `compose stop` 이다 (`down` 아님). `down` 은 컨테이너를 지워 `docker logs` 가
+  재부팅마다 사라졌다 (2026-09-30, `docs/SYSTEM_OVERVIEW.md` §13.9w). 컨테이너까지 지우려면
+  `make down` 을 직접 쓴다. 유닛을 고쳤으면 설치본에도 반영한다:
+  `sudo cp deploy/stock-auto.service /etc/systemd/system/ && sudo systemctl daemon-reload`
+
+## 로그
+
+| 어디 | 보존 | 보는 법 |
+|---|---|---|
+| `logs/agent-api/agent-api.log*` (호스트) | 컨테이너 재생성과 무관. 10MB × 5 회전 | `tail -f logs/agent-api/agent-api.log` |
+| `docker logs stock-auto-agent-api` | 컨테이너 수명 동안 (50MB × 5) | `make logs` |
+
+파일 로그 상태는 `curl -s localhost:8100/health | jq .logging` — `file_status` 가 `enabled` 가
+아니면 호스트 디렉토리 권한부터 본다 (컨테이너 사용자 uid 1000).
 
 ## 운영 명령
 

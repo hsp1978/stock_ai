@@ -12,7 +12,10 @@ WorkingDirectory=/home/ubuntu/stock_auto
 User=ubuntu
 Group=ubuntu
 ExecStart=/usr/bin/docker compose --profile dev up -d
-ExecStop=/usr/bin/docker compose --profile dev down
+# down 이 아니라 stop — down 은 컨테이너를 지워 `docker logs` 가 재부팅마다
+# 사라진다 (2026-09-30, docs/SYSTEM_OVERVIEW.md §13.9w). 부팅 시 up -d 는 설정이
+# 그대로면 같은 컨테이너를 다시 시작하고, 바뀌었으면 재생성한다.
+ExecStop=/usr/bin/docker compose --profile dev stop
 TimeoutStartSec=300
 
 [Install]

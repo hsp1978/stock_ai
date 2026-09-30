@@ -26,8 +26,16 @@ services:
       # 속도가 10x+ 느려지고 멀티에이전트 호출이 줄줄이 timeout 됨.
       # LSTM 모델은 작아 CPU 추론으로 충분. GPU 는 Ollama 전용으로 양보.
       CUDA_VISIBLE_DEVICES: "-1"
+      # 파일 로그는 **호스트**에 남긴다. stdout(json-file)은 컨테이너와 같이 지워진다 —
+      # 재부팅 때 `compose down` → `up` 으로 재생성되면서 09-29 RTX 사고의 agent-api
+      # 로그가 전부 사라졌다 (SYSTEM_OVERVIEW §13.9w). 회전: LOG_MAX_BYTES × LOG_BACKUP_COUNT.
+      # .env 의 LOG_FILE 보다 우선한다. 상태는 /health 의 `logging` 에 나온다.
+      LOG_FILE: /app/logs/agent-api.log
     volumes:
       - ./chart_agent_service/output:/app/chart_agent_service/output
+      # 호스트 쪽 디렉토리는 저장소에 있다(.gitkeep) — 없으면 docker 가 root 로 만들어
+      # 컨테이너 사용자(app, uid 1000)가 못 쓴다. 그때는 /health 가 failed 로 보고한다.
+      - ./logs/agent-api:/app/logs
       - ./chart_agent_service/data:/app/chart_agent_service/data
       - ./chart_agent_service/charts:/app/chart_agent_service/charts
       # 백업은 컨테이너 밖(호스트)에 남아야 한다 — 컨테이너를 지워도 살아남는다.

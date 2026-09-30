@@ -96,8 +96,9 @@ python -c "import sys; sys.path.insert(0,'stock_analyzer'); \
 # 이미지 크기
 docker images stock-auto/{webui,agent-api}
 
-# 로그 (로테이션 없음, 주의)
-tail -f chart_agent_service/service.log
+# 로그 — 호스트 파일(재부팅·재생성에도 남음, 10MB×5 회전). service.log 는 04-29 이후 죽은 파일
+tail -f logs/agent-api/agent-api.log
+curl -s http://localhost:8100/health | jq .logging   # file_status: enabled 여야 함
 
 # 백업·복구 (docs/RUNBOOK_BACKUP.md)
 make backup          # 상태 백업 (매일 04:00 자동)
