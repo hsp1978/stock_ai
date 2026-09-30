@@ -1204,7 +1204,10 @@ def format_alert_message(ticker: str, result: dict) -> str:
 
     # LLM 판단 요약 (앞 300자)
     llm = result.get("llm_conclusion", "")
-    if llm and not llm.startswith("[오류]"):
+    # LLM 이 답하지 않았으면 싣지 않는다. 종전에는 `[오류]` 접두사만 걸러서
+    # 스캔 경로의 `[LLM 오류] ...`·`[응답 없음]` 이 'LLM 판단' 제목 아래 나갔다.
+    llm_unserved = (result.get("llm_route") or {}).get("unserved")
+    if llm and not llm_unserved and not llm.startswith(("[오류]", "[LLM 오류]", "[응답 없음]")):
         # 첫 줄만 추출 (종합 판단 부분)
         first_section = llm.split("\n\n")[0][:300]
         msg += f"\n<b>LLM 판단:</b>\n{first_section}"
@@ -1482,6 +1485,37 @@ def _save_watchlist_file(tickers: list[str]):
             f.write(f"{t.upper()}\n")
 
 
+def _summarize_scan_routes(routes: "dict[str, dict | None]") -> dict:
+    """Aggregate per-ticker scan LLM routes (`analysis_tools._scan_llm_route`).
+
+    경로 기록이 없는 종목(분석 예외, gpt4o/규칙 모드 등)은 `unrecorded` 로 센다 —
+    기록이 없는 것을 '답했다'로 읽지 않는다.
+    """
+    outcomes: dict = {}
+    unserved: list = []
+    unrecorded: list = []
+    slot_missed = 0
+    for ticker, route in routes.items():
+        if not route:
+            unrecorded.append(ticker)
+            continue
+        attempts = route.get("attempts") or [{}]
+        outcome = attempts[-1].get("outcome", "unknown")
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        if route.get("unserved"):
+            unserved.append(ticker)
+        if route.get("slot_acquired") is False:
+            slot_missed += 1
+    return {
+        "calls": len(routes) - len(unrecorded),
+        "unserved": len(unserved),
+        "unserved_tickers": unserved,
+        "unrecorded_tickers": unrecorded,
+        "outcomes": outcomes,
+        "slot_missed": slot_missed,
+    }
+
+
 def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
     """
     스케줄된 전체 종목 스캔.
@@ -1525,6 +1559,8 @@ def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
     }
     pending_alerts = []
     alerted_row_ids: "list[int]" = []
+    # 종목별 LLM 경로 — 스캔은 RTX 직접 호출이라 '답했나'가 핵심이다 (§13.9w 후속)
+    scan_routes: "dict[str, dict | None]" = {}
     results_lock = __import__('threading').Lock()
 
     # ── 단계 2: 병렬 LLM 분석 ────────────────────────────────
@@ -1544,6 +1580,9 @@ def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
                 logger.error(f"  [{ticker}] 오류: {e}")
                 result = None
 
+            with results_lock:
+                scan_routes[ticker] = (result or {}).get("llm_route")
+
             if result:
                 with results_lock:
                     latest_results[ticker] = {
@@ -1556,6 +1595,7 @@ def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
                         "signal": result.get("final_signal"),
                         "score": result.get("composite_score"),
                         "confidence": result.get("confidence"),
+                        "llm_served": not (result.get("llm_route") or {}).get("unserved", True),
                     }
 
                 alert = check_alert_condition(ticker, result)
@@ -1603,6 +1643,17 @@ def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
     _flush_latest_result_summaries()
     _persist_scan_history()
 
+    llm_routing = _summarize_scan_routes(scan_routes)
+    # 신호는 규칙 점수에서 나오므로 LLM 무응답이 스캔을 실패시키지는 않는다.
+    # 그래서 status 와 따로 싣는다 — 종전에는 무응답이 `completed` 에 묻혔다.
+    degraded = bool(llm_routing["unserved"] or llm_routing["unrecorded_tickers"])
+    if degraded:
+        logger.warning(
+            "  스캔 LLM 무응답 %d / 기록 없음 %d / 전체 %d — %s",
+            llm_routing["unserved"], len(llm_routing["unrecorded_tickers"]),
+            len(tickers), llm_routing["outcomes"],
+        )
+
     logger.info(f"\n  스캔 완료: {datetime.now().strftime('%H:%M')}")
     logger.info(f"{'='*60}\n")
     return {
@@ -1610,6 +1661,8 @@ def _run_scheduled_scan_impl(override_tickers: "list[str] | None" = None):
         "ticker_count": len(tickers),
         "alert_count": len(pending_alerts),
         "elapsed_sec": round(elapsed, 2),
+        "llm_routing": llm_routing,
+        "degraded": degraded,
     }
 
 

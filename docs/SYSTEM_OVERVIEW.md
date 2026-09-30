@@ -2014,8 +2014,12 @@ mechanism(2번)을 가를 agent-api 로그가 **없다.**
   결과에 `llm_routing`, 배치 요약에 `llm_routing` + `degraded` 가 실린다. 텔레그램에는
   `⚠️ LLM 경로 이탈 N/M호출 (rtx_5070→mac_studio k)` 줄이 붙는다. `status` 는 그대로
   `completed` 다 — 폴백은 실패가 아니고, 대신 따로 보인다. Gemini 3.6 → 3.5 는 쿼터 분산
-  설계라 `rotated` 로 따로 세고 `degraded` 에서 뺐다. 30분 스캔 경로는 대상이 아니다
-  (`tests/unit/test_llm_route_record.py`)
+  설계라 `rotated` 로 따로 세고 `degraded` 에서 뺐다 (`tests/unit/test_llm_route_record.py`).
+  **30분 스캔 경로**(같은 날)는 RTX 직접 호출이라 폴백이 없고, 대신 무응답이 가려져 있었다:
+  호출이 실패해도 `agent_mode=ollama`, 200 인데 빈 본문도 통과, 알림은 `[LLM 오류] ...` 를
+  'LLM 판단' 제목 아래 실었다. 결과마다 `llm_route`(같은 형태 + `slot_acquired`),
+  스캔 잡 요약에 `llm_routing` + `degraded`, Ollama 불통 시 `agent_mode=rule_only` 를
+  남긴다. 알림은 무응답 결론을 싣지 않는다 (`tests/unit/test_scan_llm_route.py`)
 
 ### 13.10 데이터 품질 위험
 

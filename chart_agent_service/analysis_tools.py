@@ -9,6 +9,7 @@
 import json
 import os
 import base64
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -2841,16 +2842,50 @@ def _local_node_slot():
     막는 게 아니라 드러내는 변경이다.
 
     `dual_node_config` 를 못 불러오면 아무것도 하지 않는다 — 집계가 안 될 뿐,
-    분석은 종전대로 돈다.
+    분석은 종전대로 돈다. 이때는 `None`(알 수 없음)을 내준다 — `False`(슬롯을 못
+    잡음)와 섞으면 `llm_route.slot_acquired` 가 과부하로 잘못 읽힌다.
     """
     try:
         from dual_node_config import node_slot
     except Exception:
-        yield False
+        yield None
         return
 
     with node_slot("rtx_5070", block=False) as acquired:
         yield acquired
+
+
+def _scan_llm_route(
+    outcome: str,
+    started: float,
+    slot_acquired: bool | None = None,
+    detail: str | None = None,
+) -> dict:
+    """Route record for the scan path, same shape as `llm.router.summarize_route`.
+
+    스캔은 RTX 를 한 번 직접 부르고 다른 노드로 넘어가지 않는다. 그래서 여기서
+    남길 것은 "LLM 이 실제로 답했나"다. 종전에는 호출이 실패해도 `agent_mode` 가
+    `ollama` 로 남았고, 실패는 `llm_conclusion` 본문 안의 `[LLM 오류]` 문구로만
+    드러났다 (§13.9w 후속).
+    """
+    attempt = {
+        "target": "rtx_5070",
+        "outcome": outcome,
+        "elapsed_ms": int((time.monotonic() - started) * 1000),
+    }
+    if detail:
+        attempt["detail"] = detail[:160]
+    served = outcome == "ok"
+    return {
+        "planned": "rtx_5070",
+        "served_by": "rtx_5070" if served else None,
+        "fallback": False,
+        "rotated": False,
+        "unserved": not served,
+        # 슬롯은 드러내기용이다 — 못 잡아도 호출은 진행한다 (_local_node_slot)
+        "slot_acquired": slot_acquired,
+        "attempts": [attempt],
+    }
 
 
 class ChartAnalysisAgent:
@@ -3169,13 +3204,19 @@ class ChartAnalysisAgent:
 
     def _run_ollama_agent(self) -> dict:
         """Ollama 기반 에이전트 (2단계: tool 선택 → 종합 판단)"""
+        started = time.monotonic()
         try:
             resp = httpx.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
             if resp.status_code != 200:
-                raise ConnectionError("Ollama 서버 응답 없음")
-        except Exception:
-            logger.error("  [경고] Ollama 서버 연결 실패. 전수 분석 모드로 전환.")
-            return self.compute_composite_score()
+                raise ConnectionError(f"Ollama 서버 응답 없음 (HTTP {resp.status_code})")
+        except Exception as exc:
+            logger.error(f"  [경고] Ollama 서버 연결 실패 ({exc}). 전수 분석 모드로 전환.")
+            composite = self.compute_composite_score()
+            composite["agent_mode"] = "rule_only"
+            composite["llm_route"] = _scan_llm_route(
+                "unavailable", started, detail=f"{type(exc).__name__}: {exc}"
+            )
+            return composite
 
         # Step 1: 전체 tool 실행 (Ollama는 function calling 미지원 모델이 많으므로)
         logger.info(f"    [Step 1] {len(TOOL_DEFINITIONS)}개 분석 도구 + 진입 계획 실행...")
@@ -3220,6 +3261,8 @@ class ChartAnalysisAgent:
 ## 매매 전략
 [포지션 사이징 결과 기반 진입/손절/익절 가격, 분할 매수 계획, 경고 사항]"""
 
+        slot_acquired: bool | None = None
+        started = time.monotonic()
         try:
             logger.info("    [Step 2] LLM 종합 판단 요청 중...")
             # 이 호출은 `node_slot` 안에서 해야 한다 (2026-09-16). 종전에는 Ollama 를
@@ -3227,7 +3270,7 @@ class ChartAnalysisAgent:
             #   1. 노드 동시 요청 제한이 이 경로에만 적용되지 않았다
             #   2. 헬스 프로브가 "노드가 바쁘다"를 알 수 없어, 스캔 중 1토큰 프로브가
             #      큐 뒤에서 타임아웃하고 정상 노드를 `unusable` 로 보고했다 (§13.9q)
-            with _local_node_slot():
+            with _local_node_slot() as slot_acquired:
                 resp = httpx.post(
                     f"{OLLAMA_BASE_URL}/api/generate",
                     json={
@@ -3245,13 +3288,23 @@ class ChartAnalysisAgent:
                     timeout=180,
                 )
                 resp.raise_for_status()
-                llm_conclusion = resp.json().get("response", "[응답 없음]")
+                llm_conclusion = resp.json().get("response") or ""
+            if llm_conclusion.strip():
+                route = _scan_llm_route("ok", started, slot_acquired)
+            else:
+                # 200 인데 본문이 비었다 — 성공으로 세지 않는다 (§13-3)
+                route = _scan_llm_route("empty", started, slot_acquired)
+                llm_conclusion = "[응답 없음]"
         except Exception as e:
             logger.error(f"  [Ollama 종합 판단 오류] {e}")
+            route = _scan_llm_route(
+                "call_error", started, slot_acquired, f"{type(e).__name__}: {e}"
+            )
             llm_conclusion = f"[LLM 오류] {e}\n\n시스템 자동 판단: {composite['final_signal']} (점수: {composite['composite_score']})"
 
         composite["llm_conclusion"] = llm_conclusion
         composite["agent_mode"] = "ollama"
+        composite["llm_route"] = route
         return composite
 
     def _format_tool_results_for_llm(self) -> str:
