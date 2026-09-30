@@ -108,9 +108,10 @@ from signal_tracker import insert_signal_outcome
 # Multi-Agent import
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "stock_analyzer"))
 try:
-    from multi_agent import MultiAgentOrchestrator
+    from multi_agent import MultiAgentOrchestrator, summarize_llm_routing
 except ImportError:
     MultiAgentOrchestrator = None
+    summarize_llm_routing = None
     logger.warning("Multi-Agent 모듈을 사용할 수 없다 — V2 배치가 비활성화된다")
 
 
@@ -1766,6 +1767,8 @@ def _run_multi_agent_batch_impl(tickers: "list[str] | None" = None) -> dict:
         "signals": {},
         "errors": {},
     }
+    # 종목 전체의 LLM 호출 경로 — 에이전트별로 모은다 (summarize_llm_routing 입력 형식)
+    batch_calls: dict = {}
     logger.info(f"\n{'='*60}")
     logger.info(f"  Multi-Agent 배치 시작: {datetime.now().strftime('%Y-%m-%d %H:%M')} — {len(targets)}종목")
     logger.info(f"{'='*60}\n")
@@ -1777,10 +1780,15 @@ def _run_multi_agent_batch_impl(tickers: "list[str] | None" = None) -> dict:
             result = orchestrator.analyze(ticker)
             _try_insert_group_outcomes(ticker, result)
             fd = result.get("final_decision") or {}
+            routing = result.get("llm_routing") or {}
             summary["signals"][ticker] = {
                 "signal": fd.get("final_signal"),
                 "confidence": fd.get("final_confidence"),
+                "llm_fallback": routing.get("fallback", 0),
+                "llm_unserved": routing.get("unserved", 0),
             }
+            for ar in result.get("agent_results") or []:
+                batch_calls.setdefault(ar.get("agent"), []).extend(ar.get("llm_calls") or [])
             summary["succeeded"] += 1
             logger.info(f"  [{ticker}] V2 배치 완료: {fd.get('final_signal')} ({fd.get('final_confidence')})")
         except Exception as exc:
@@ -1790,6 +1798,20 @@ def _run_multi_agent_batch_impl(tickers: "list[str] | None" = None) -> dict:
 
     if summary["failed"] and not summary["succeeded"]:
         summary["status"] = "error"
+    # 폴백은 배치를 실패시키지 않는다 — 그래서 status 와 따로 싣는다. 09-29 배치는
+    # RTX 몫이 전부 Mac 으로 넘어가 3배 느렸는데 `completed` 로만 보였다 (§13.9w).
+    if summarize_llm_routing is not None:
+        routing = summarize_llm_routing(batch_calls)
+        summary["llm_routing"] = routing
+        summary["degraded"] = bool(routing["fallback"] or routing["unserved"])
+        if summary["degraded"]:
+            logger.warning(
+                "  Multi-Agent 배치 LLM 경로 이탈: 폴백 %d / 무응답 %d / 전체 %d — %s",
+                routing["fallback"], routing["unserved"], routing["calls"],
+                routing["transitions"],
+            )
+        else:
+            logger.info("  Multi-Agent 배치 LLM 경로: 전체 %d 호출 배정대로", routing["calls"])
     logger.error(f"\n  Multi-Agent 배치 종료: 성공 {summary['succeeded']} / 실패 {summary['failed']}\n")
     return summary
 
@@ -1822,6 +1844,13 @@ def _format_batch_summary(summary: dict) -> str:
     errors = summary.get("errors") or {}
     if errors:
         lines.append(f"⚠️ 실패: {', '.join(errors.keys())}")
+    routing = summary.get("llm_routing") or {}
+    if routing.get("fallback") or routing.get("unserved"):
+        moves = ", ".join(f"{k} {v}" for k, v in (routing.get("transitions") or {}).items())
+        lines.append(
+            f"⚠️ LLM 경로 이탈 {routing.get('fallback', 0) + routing.get('unserved', 0)}"
+            f"/{routing.get('calls', 0)}호출 ({moves})"
+        )
     return "\n".join(lines)
 
 

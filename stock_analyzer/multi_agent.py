@@ -173,6 +173,47 @@ class AgentResult:
         return asdict(self)
 
 
+def summarize_llm_routing(calls_by_agent: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Aggregate per-call route summaries into counts (one analysis or a whole batch).
+
+    `fallback` 은 배정 대상이 아닌 곳이 답한 호출, `unserved` 는 아무도 답하지 못해
+    neutral 안전값으로 채워진 호출이다. `rotated` 는 Gemini 쿼터 분산(3.6 → 3.5)으로
+    설계상 예정된 이동이라 앞의 둘과 따로 센다. 셋은 겹치지 않는다.
+    """
+    calls = fallback = unserved = rotated = 0
+    served_by: Dict[str, int] = {}
+    transitions: Dict[str, int] = {}
+    affected: Dict[str, int] = {}
+    for agent, entries in calls_by_agent.items():
+        for entry in entries:
+            calls += 1
+            target = entry.get("served_by")
+            if target:
+                served_by[target] = served_by.get(target, 0) + 1
+            if entry.get("rotated"):
+                rotated += 1
+                continue
+            if entry.get("unserved"):
+                unserved += 1
+                key = f"{entry.get('planned')}→(none)"
+            elif entry.get("fallback"):
+                fallback += 1
+                key = f"{entry.get('planned')}→{target}"
+            else:
+                continue
+            transitions[key] = transitions.get(key, 0) + 1
+            affected[agent] = affected.get(agent, 0) + 1
+    return {
+        "calls": calls,
+        "fallback": fallback,
+        "unserved": unserved,
+        "rotated": rotated,
+        "served_by": served_by,
+        "transitions": transitions,
+        "affected_agents": affected,
+    }
+
+
 def _preferred_node_for(agent_name: str) -> Optional[str]:
     """에이전트에 배정된 Ollama 노드 (`AGENT_LLM_MAPPING` 의 `node`).
 
@@ -211,6 +252,9 @@ class BaseAgent:
         self.tools = tools
         self.llm_provider = llm_provider
         self.deadline_at: float | None = None
+        # 이 분석에서 한 LLM 호출마다 누가 실제로 답했는지 (`summarize_route`).
+        # 오케스트레이터가 실행 전에 비우고, 끝나면 결과에 싣는다.
+        self.llm_calls: List[Dict[str, Any]] = []
 
     def _get_stock_name_for_agent(self, ticker: str) -> Optional[str]:
         """에이전트용 종목명 가져오기 (한글명 우선)"""
@@ -465,15 +509,20 @@ class BaseAgent:
     def _call_llm(self, prompt: str) -> str:
         """LLM 호출 (LiteLLM Router 경유 — Step 9)."""
         try:
-            from llm.router import call_agent_llm, get_router
-            response = call_agent_llm(
-                get_router(),
-                self.name,
-                prompt,
-                preferred_provider=self.llm_provider,
-                timeout_seconds=self._remaining_timeout(),
-                preferred_node=self._preferred_node(),
-            )
+            from llm.router import call_agent_llm, get_router, summarize_route
+            route_log: List[Dict[str, Any]] = []
+            try:
+                response = call_agent_llm(
+                    get_router(),
+                    self.name,
+                    prompt,
+                    preferred_provider=self.llm_provider,
+                    timeout_seconds=self._remaining_timeout(),
+                    preferred_node=self._preferred_node(),
+                    route_log=route_log,
+                )
+            finally:
+                self.llm_calls.append(summarize_route(route_log))
             return json.dumps(
                 {
                     "signal": response.signal,
@@ -2353,6 +2402,7 @@ class MultiAgentOrchestrator:
                 deadline_at = time.monotonic() + _ma_timeout
                 for agent in self.agents:
                     agent.deadline_at = deadline_at
+                    agent.llm_calls = []
                 if hasattr(self.decision_maker, "deadline_at"):
                     self.decision_maker.deadline_at = deadline_at
 
@@ -2454,6 +2504,13 @@ class MultiAgentOrchestrator:
 
             total_time = (datetime.now() - start_time).total_seconds()
 
+            # 에이전트별 LLM 경로. 타임아웃된 에이전트의 스레드는 아직 돌 수 있어
+            # 리스트를 복사해 싣는다 (이후 추가분은 이 결과에 반영되지 않는다).
+            llm_calls_by_agent = {
+                agent.name: [dict(c) for c in getattr(agent, "llm_calls", [])]
+                for agent in self.agents
+            }
+
             # 결과 구성
             result = {
                 "ticker": ticker,
@@ -2470,10 +2527,12 @@ class MultiAgentOrchestrator:
                         "reasoning": r.reasoning[:300],  # 요약
                         "llm_provider": r.llm_provider,
                         "execution_time": r.execution_time,
-                        "error": r.error
+                        "error": r.error,
+                        "llm_calls": llm_calls_by_agent.get(r.agent_name, []),
                     }
                     for r in agent_results
                 ],
+                "llm_routing": summarize_llm_routing(llm_calls_by_agent),
                 "final_decision": final_decision,
                 "total_execution_time": total_time,
                 "analyzed_at": datetime.now().isoformat(),
