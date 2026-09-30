@@ -135,3 +135,31 @@ def test_health_response_includes_logging():
     import service
 
     assert '"logging": _logging_health()' in inspect.getsource(service.health)
+
+
+def test_second_configure_still_reports_the_applied_file(monkeypatch, tmp_path):
+    """배포 실측 회귀 (2026-09-30): config 임포트 중 get_logger 가 먼저 설정하자
+    service 의 configure_logging() 이 already_configured 만 받아 /health 가
+    file=None, unknown 을 보고했다. 파일 로그는 실제로 잘 쓰이고 있었다."""
+    import logging
+
+    import logging_setup
+
+    root = logging.getLogger()
+    saved_handlers, saved_level = list(root.handlers), root.level
+    monkeypatch.setenv("LOG_FILE", str(tmp_path / "agent-api.log"))
+    monkeypatch.setattr(logging_setup, "_configured", False)
+    try:
+        logging_setup.get_logger("early.import")  # 먼저 설정하는 쪽
+        again = logging_setup.configure_logging()  # service.py 최상위 호출
+
+        assert again["status"] == "already_configured"
+        assert again["file"] == str(tmp_path / "agent-api.log")
+        assert again["file_status"] == "enabled"
+    finally:
+        for h in list(root.handlers):
+            if h not in saved_handlers:
+                h.close()
+        root.handlers = saved_handlers
+        root.setLevel(saved_level)
+        logging_setup._configured = False
