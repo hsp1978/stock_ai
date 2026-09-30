@@ -269,3 +269,16 @@ def test_unknown_slot_state_is_not_counted_as_missed():
 
     out = service._summarize_scan_routes({"AAPL": _route("ok", slot_acquired=None)})
     assert out["slot_missed"] == 0
+
+
+def test_scan_routing_survives_into_the_job_status(monkeypatch):
+    """반환값만 보면 놓친다 — 잡 기록(/ops/jobs)에 실리는지 래퍼로 확인한다."""
+    service, _ = _run_scan(monkeypatch, {"AAPL": _route("ok"), "MSFT": _route("call_error")})
+    monkeypatch.setattr(service, "_persist_job_status", lambda: None)
+
+    service.run_scheduled_scan()
+    recorded = service._JOB_STATUS["watchlist_scan"]["last_result_summary"]
+
+    assert recorded["degraded"] is True
+    assert recorded["llm_routing"]["unserved_tickers"] == ["MSFT"]
+    assert "elapsed_sec" in recorded
