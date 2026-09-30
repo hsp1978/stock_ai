@@ -2005,8 +2005,10 @@ mechanism(2번)을 가를 agent-api 로그가 **없다.**
 
 - **mechanism 미확정.** 슬롯 누수 가설은 프로브 중단과 배치 우회를 함께 설명하지만,
   21:35 에 프로브가 다시 나간 이유와 프로브만 503 을 받은 이유는 설명하지 못한다
-- **로그 보존**: `LOG_FILE` 설정, 또는 `ExecStop` 을 `stop` 으로 바꾸기. 둘 다 운영 설정
-  변경이라 별도 PR 로 한다
+- ~~**로그 보존**~~ ✅ (2026-09-30) agent-api `LOG_FILE=/app/logs/agent-api.log` →
+  호스트 `logs/agent-api/`(10MB × 5 회전). 유닛 `ExecStop` 을 `down` → `stop` 으로 바꿨다.
+  파일 로그 상태는 `/health.logging` 에 나온다(`disabled`·`failed`·`missing` 구분).
+  `tests/unit/test_log_persistence.py` 가 고정한다
 - **폴백 가시화**: 배치 결과에 에이전트별 실제 노드·폴백 여부를 남긴다. 그러지 않으면
   "3배 느린 `completed`" 가 다시 조용히 지나간다
 

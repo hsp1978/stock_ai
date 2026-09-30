@@ -69,7 +69,9 @@ from logging_setup import configure_logging, get_logger
 
 # 로깅은 모듈 적재 시 한 번 설정한다. 종전에는 설정이 아예 없어
 # data_collector·llm/router 등이 남기던 logger.info 가 전부 버려졌다.
-configure_logging()
+# 결과는 버리지 않는다 — 파일 핸들러가 실패해도 기동은 계속되므로, `/health` 에
+# 싣지 않으면 "파일 로그가 있다"고 믿은 채 사고를 맞는다 (2026-09-30, §13.9w).
+_LOGGING_STATUS = configure_logging()
 logger = get_logger("stock_auto.service")
 from safety.kill_switch import KillSwitchASGIMiddleware
 from data_collector import (
@@ -2714,6 +2716,28 @@ def _classify_ollama_models(models: list) -> dict:
     return status
 
 
+def _logging_health() -> Dict[str, Any]:
+    """Report whether logs survive a container rebuild (file handler state)."""
+    file_path = _LOGGING_STATUS.get("file")
+    info: Dict[str, Any] = {
+        "file": file_path,
+        "file_status": _LOGGING_STATUS.get("file_status", "unknown"),
+    }
+    if _LOGGING_STATUS.get("file_error"):
+        info["file_error"] = _LOGGING_STATUS["file_error"]
+    if info["file_status"] == "disabled":
+        # 'disabled' 는 정상이 아니다 — stdout 만 남으면 컨테이너 재생성 때 사라진다.
+        info["warning"] = "LOG_FILE 미설정 — 로그가 컨테이너 수명에 묶인다"
+    elif file_path and info["file_status"] == "enabled":
+        try:
+            info["size_bytes"] = os.path.getsize(file_path)
+        except OSError as exc:
+            # 기동 때 열렸던 파일이 사라졌다 (호스트에서 지웠거나 마운트가 바뀜).
+            info["file_status"] = "missing"
+            info["file_error"] = f"{type(exc).__name__}: {exc}"
+    return info
+
+
 @app.get("/health")
 async def health():
     """헬스 체크 — **스레드 슬롯을 쓰지 않는다.**
@@ -2747,6 +2771,7 @@ async def health():
         "data_health": _LAST_DATA_HEALTH or {"status": "not_computed"},
         "market_session": probe["market_session"],
         "model_pin": probe.get("model_pin", {"status": "unknown"}),
+        "logging": _logging_health(),
         "probe": {
             "age_sec": probe["probe_age_sec"],
             "stale": probe["probe_stale"],

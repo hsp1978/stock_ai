@@ -252,7 +252,7 @@ def test_service_configures_logging_on_import():
     import service
 
     src = open(os.path.join(_AGENT_DIR, "service.py"), encoding="utf-8").read()
-    assert "\nconfigure_logging()\n" in src, "모듈 최상위 설정 호출이 없다"
+    assert "\n_LOGGING_STATUS = configure_logging()\n" in src, "모듈 최상위 설정 호출이 없다"
     assert service.logger.name == "stock_auto.service"
 
 
