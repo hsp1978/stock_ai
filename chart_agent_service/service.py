@@ -493,15 +493,23 @@ def _summarize_job_result(result: Any) -> Any:
     if result is None:
         return None
     if isinstance(result, dict):
+        # 화이트리스트다 — 여기 없는 키는 /ops/jobs 에서 사라진다. 2026-09-30:
+        # 배치·스캔이 `llm_routing`/`degraded` 를 돌려줘도 여기서 버려졌고, 배치의
+        # `succeeded`/`failed` 도 없어 부분 실패가 `processed: 7` 에 묻혔다.
         keys = (
             "status",
+            "degraded",
             "ticker_count",
             "processed",
+            "succeeded",
+            "failed",
+            "elapsed_sec",
             "updated",
             "adjustments",
             "stale_count",
             "degraded_count",
             "ok_count",
+            "llm_routing",
         )
         summary = {k: result.get(k) for k in keys if k in result}
         if "evaluation" in result and isinstance(result["evaluation"], dict):
