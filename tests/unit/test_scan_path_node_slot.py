@@ -94,7 +94,8 @@ def test_missing_dual_node_config_does_not_break_the_scan(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", fake_import)
 
     with at._local_node_slot() as acquired:
-        assert acquired is False
+        # None = 알 수 없음. 슬롯을 못 잡은 것(False)과 구분한다 (llm_route.slot_acquired)
+        assert acquired is None
 
 
 def test_the_ollama_call_site_is_inside_the_slot():
@@ -105,7 +106,7 @@ def test_the_ollama_call_site_is_inside_the_slot():
     src = inspect.getsource(at.ChartAnalysisAgent._run_ollama_agent)
     body = "\n".join(ln for ln in src.split("\n") if not ln.strip().startswith("#"))
 
-    slot = re.search(r"^(\s*)with _local_node_slot\(\):", body, re.M)
+    slot = re.search(r"^(\s*)with _local_node_slot\(\)(?: as \w+)?:", body, re.M)
     assert slot, "_run_ollama_agent 가 _local_node_slot 을 쓰지 않는다"
 
     call = re.search(r"^(\s*)resp = httpx\.post\(", body, re.M)
