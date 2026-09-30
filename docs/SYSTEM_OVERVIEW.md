@@ -1921,6 +1921,95 @@ PLTR 2026-09-12   1.26 → 1.39   HOLD→BUY
 요구하는데, 크로스 자체가 드물어 32일 표본으로는 도달 불가를 단정할 수 없다. 더 긴
 기간이 필요하다 — §13 의 "임계 ±2 도달 불가"와 같은 계열일 가능성이 있다.
 
+#### 13.9w '교착'이 아니었다 — 재시작이 GPU 를 망가뜨렸다 (2026-09-29~30)
+
+`/health` 가 RTX 를 `unusable`(generate 503 `maximum pending requests exceeded`)로
+보고했다. 09-16·09-22 와 같은 runner 교착으로 판단하고 `systemctl restart ollama` 를
+실행했더니 **GPU 가 재부팅 없이는 쓸 수 없는 상태가 됐다.** 사후에 로그를 다시 보니
+교착이라는 판단부터 틀렸다.
+
+##### 타임라인 (KST, ollama journal + Mac Studio `ollama.log`)
+
+| 시각 | 사건 |
+|---|---|
+| 09-29 15:43:37 | 헬스 프로브의 1토큰 generate **마지막 성공** (평소 약 100ms, 시간당 약 240건) |
+| 15:43 ~ 21:35 | 프로브 generate **5시간 52분간 0건**. 스캔 호출은 평소대로 |
+| 17:30 배치 | RTX 에 배치 호출 **0건**. Mac 호출 29 → **61건**. 소요 **2,039초**(직전 662초). 잡 상태는 `completed` |
+| 21:35 ~ 09-30 09:22 | 프로브 generate **503 × 2,505건**. 같은 시간 스캔 호출은 **200, 중앙값 45초** |
+| 09-30 09:22:50 | ollama 재시작 → 기존 runner 종료 순간 **Xid 62**(PMU halted) → **Xid 154**(GPU Reset Required) |
+| 09:22:51 | 새 ollama 가 GPU 를 찾지 못함 → `offloaded 0/41 layers`, **7 tok/s** |
+| 09:34 | 재부팅 → 41/41 GPU, **64.7 tok/s** 복귀 |
+
+##### 무엇이 틀렸나
+
+1. **RTX 는 멈추지 않았다.** 스캔 요청은 밤새 200 을 받았다. 45초는 이상치가 아니라
+   09-16 이후 매일의 스캔 호출 중앙값이다(응답이 길다. 17시 배치는 3.8초). 503 을 받은
+   것은 **프로브뿐**이었다. "503 이 쌓였다 = runner 교착"은 확인하지 않은 추론이었다.
+2. **실제 이상은 15:43 부터였다.** 프로브가 generate 를 보내지 않았고, 배치는 RTX 를
+   쓰지 않았다. 프로브는 `node_is_busy("rtx_5070")` 가 참이면 건너뛴다(§13.9q). 그러니
+   RTX 의 `node_slot` 집계가 0 으로 돌아오지 않았다는 가설과 맞는다. 슬롯을 쥔 요청이
+   끝나지 않았을 수 있다. **확인은 못 했다** — 아래 "증거가 사라졌다" 참고.
+3. **배치가 3배 느려졌는데 `completed` 였다.** RTX 몫이 Mac 으로 넘어가 끝나기는
+   했다. 폴백은 설계대로 동작했지만, 그 사실이 잡 결과 어디에도 남지 않았다
+   (CLAUDE.md §13 원칙 2).
+
+##### 커널에는 흔적이 없었다
+
+journald 는 영속(`journalctl -k -b -1`, 08-27 부터 보존)이다. 08-27 이후 NVRM/Xid
+메시지는 **09-30 09:22:50 한 번뿐**이다. 09-16·09-22·09-29 이상 구간에는 0건이다.
+Xid 62 의 `name=ollama, pid=891556` 은 재시작으로 종료되던 기존 runner 다.
+**하드웨어가 반복적으로 고장 난 것이 아니라, 재시작이 방아쇠였다.**
+
+`nvidia-smi --gpu-reset` 은 `is the primary GPU` 로 거부된다. 디스플레이를 잡은 카드라서
+재부팅 말고는 복구 수단이 없다.
+
+##### 증거가 사라졌다
+
+mechanism(2번)을 가를 agent-api 로그가 **없다.**
+
+- `LOG_FILE` 미설정이라 `logging_setup` 의 파일 핸들러가 꺼져 있다 (stdout 만)
+- `/etc/systemd/system/stock-auto.service` 의 `ExecStop=docker compose --profile dev down`
+  이 종료 시 **컨테이너를 삭제한다.** 부팅 시 `up -d` 가 새로 만든다. 그래서 `docker logs` 가
+  재부팅마다 초기화된다 (`restart: unless-stopped` 만으로 충분했다)
+- DB 에는 LLM 호출 단위 기록(노드·소요·폴백 여부)이 없다
+
+##### 대응 절차 — RTX 가 `unusable` 일 때
+
+재시작부터 하지 않는다. 순서대로:
+
+1. **스캔 호출이 200 을 받는가.** 받으면 runner 는 살아 있다. 문제는 프로브나 집계 쪽이다
+   ```
+   journalctl -u ollama --since '-1h' --no-pager | grep -E '"/api/(generate|chat)"' \
+     | awk -F'|' '{split($3,t," "); s=(t[1] ~ /[0-9]s$/ && t[1] !~ /ms$|µs$/)?"slow":"fast"; print $2, s}' \
+     | sort | uniq -c
+   ```
+   09-30 02시 실측: `14 200 slow` / `215 503 fast`. 생성 호출은 처리되고 있고, 503 은
+   짧은 호출(프로브)만 받았다는 뜻이다
+2. **`node_slot` 집계를 본다.** `inflight` 가 스캔 사이 유휴 구간에도 0 이 아니면 슬롯 누수다.
+   재시작 대상은 ollama 가 아니라 agent-api 다
+   ```
+   curl -s localhost:8100/system-monitor | jq '.llm.nodes | map_values(.inflight)'
+   ```
+3. **로그를 먼저 보존한다** — `docker logs stock-auto-agent-api > <scratch>/agent-api.log`
+4. 그래도 ollama 재시작이 필요하면 **재부팅이 필요해질 수 있다고 운영자에게 먼저 알린다.**
+   재시작 직후 반드시 확인한다:
+   ```
+   nvidia-smi --query-gpu=pstate --format=csv   # "[GPU requires reset]" 이면 재부팅
+   sudo dmesg -T | grep -i xid | tail -3
+   curl -s localhost:8100/health | jq '.ollama_runtime.status'   # cpu_fallback 이면 실패
+   ```
+   `generation: ok` 만 보고 복구로 읽지 말 것 — CPU 폴백에서도 `ok` 가 나온다
+   (§13.9p 가 `runtime` 을 따로 둔 이유).
+
+##### 남은 것
+
+- **mechanism 미확정.** 슬롯 누수 가설은 프로브 중단과 배치 우회를 함께 설명하지만,
+  21:35 에 프로브가 다시 나간 이유와 프로브만 503 을 받은 이유는 설명하지 못한다
+- **로그 보존**: `LOG_FILE` 설정, 또는 `ExecStop` 을 `stop` 으로 바꾸기. 둘 다 운영 설정
+  변경이라 별도 PR 로 한다
+- **폴백 가시화**: 배치 결과에 에이전트별 실제 노드·폴백 여부를 남긴다. 그러지 않으면
+  "3배 느린 `completed`" 가 다시 조용히 지나간다
+
 ### 13.10 데이터 품질 위험
 
 - OHLCV 캐시는 TTL 메타(`fetched_at`, `latest_bar_date`, `source`)를 갖지만,
