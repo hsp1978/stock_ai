@@ -223,6 +223,7 @@ def call_agent_llm(
     preferred_provider: str | None = None,
     timeout_seconds: float | None = None,
     preferred_node: str | None = None,
+    route_log: list[dict] | None = None,
 ) -> T:
     """
     LiteLLM Router + circuit breaker를 통해 LLM을 호출하고
@@ -240,8 +241,27 @@ def call_agent_llm(
     한 종목 분석에서 Mac 에 몰린 4개 에이전트가 90~147초를 쓰는 동안 RTX 는
     거의 유휴였다 (§13.9o). 폴백 순서는 유지되므로 지정한 노드가 죽으면 다른
     노드로 넘어간다.
+
+    route_log 를 넘기면 **후보별 시도 결과**를 채운다 (`summarize_route` 로 요약).
+    반환 타입은 호출자의 스키마라 "누가 실제로 답했나"를 실을 곳이 없다 —
+    2026-09-29 배치는 RTX 몫이 전부 Mac 으로 넘어가 3배 느렸는데 결과 어디에도
+    그 사실이 남지 않았다 (SYSTEM_OVERVIEW §13.9w).
     """
+    log: list[dict] = route_log if route_log is not None else []
+
+    def _note(model_name: str, outcome: str, started: float, detail: str | None = None) -> None:
+        entry = {
+            "model": model_name,
+            "target": _route_target(model_name),
+            "outcome": outcome,
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+        }
+        if detail:
+            entry["detail"] = detail[:160]
+        log.append(entry)
+
     if timeout_seconds is not None and timeout_seconds <= 0:
+        log.append({"model": None, "target": None, "outcome": "deadline", "elapsed_ms": 0})
         return _safe_response(
             response_model, "deadline_exceeded_before_call", ["LLM_DEADLINE_EXCEEDED"]
         )
@@ -274,12 +294,15 @@ def call_agent_llm(
     last_exc: Exception | None = None
 
     for model_name in model_candidates:
+        started = time.monotonic()
         if deadline is not None and deadline - time.monotonic() <= 0:
             last_exc = last_exc or TimeoutError("deadline_exceeded")
+            _note(model_name, "deadline", started)
             break
 
         if not _node_available_for_model(model_name):
             last_exc = RuntimeError(f"node_unavailable:{_node_for_model(model_name)}")
+            _note(model_name, "unavailable", started)
             logger.warning(
                 "LLM node unavailable for %s via %s", agent_role, model_name
             )
@@ -288,6 +311,7 @@ def call_agent_llm(
         with _node_slot_for_model(model_name) as acquired:
             if not acquired:
                 last_exc = RuntimeError(f"node_overloaded:{_node_for_model(model_name)}")
+                _note(model_name, "overloaded", started)
                 logger.warning(
                     "LLM node overloaded for %s via %s", agent_role, model_name
                 )
@@ -304,6 +328,7 @@ def call_agent_llm(
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             last_exc = TimeoutError("deadline_exceeded")
+                            _note(model_name, "deadline", started)
                             break
                         completion_kwargs["timeout"] = max(
                             1,
@@ -324,7 +349,9 @@ def call_agent_llm(
                     _record_node_success_for_model(model_name)
                     raw = (api_response.choices[0].message.content or "").strip()
                     json_str = _extract_json(raw)
-                    return response_model.model_validate_json(json_str)
+                    parsed = response_model.model_validate_json(json_str)
+                    _note(model_name, "ok", started)
+                    return parsed
 
                 except ValidationError as exc:
                     last_exc = exc
@@ -336,12 +363,15 @@ def call_agent_llm(
                         _PARSE_MAX_ATTEMPTS,
                         exc,
                     )
+                    if attempt == _PARSE_MAX_ATTEMPTS - 1:
+                        _note(model_name, "parse_error", started)
                     # 같은 모델 재시도 소진 시 루프 탈출 → 다음 후보 모델 폴백
                     continue
 
                 except Exception as exc:
                     last_exc = exc
                     _record_node_failure_for_model(model_name, exc)
+                    _note(model_name, "call_error", started, f"{type(exc).__name__}: {exc}")
                     logger.warning(
                         "LLM call fail for %s via %s: %s", agent_role, model_name, exc
                     )
@@ -359,6 +389,53 @@ def call_agent_llm(
     return _safe_response(
         response_model, f"call_error: {last_exc}", ["LLM_CALL_ERROR"]
     )
+
+
+def _route_target(model_name: str) -> str:
+    """Human-readable target of a router tier: Ollama node name or the Gemini model."""
+    node = _node_for_model(model_name)
+    if node:
+        return node
+    if model_name in GEMINI_TIERS:
+        for entry in get_router().model_list:
+            if entry.get("model_name") == model_name:
+                raw = (entry.get("litellm_params") or {}).get("model") or model_name
+                return str(raw).split("/")[-1]
+    return model_name
+
+
+def summarize_route(route_log: list[dict]) -> dict:
+    """Condense a route_log into planned target, actual target and fallback flag.
+
+    - planned: 첫 후보(배정된 대상)
+    - served_by: 실제로 유효한 응답을 준 대상
+    - fallback: 배정 대상이 아닌 곳이 답했다
+    - unserved: 아무도 답하지 못했다 — 응답은 neutral 안전값이다. 빈 이력도 여기다
+      (시도가 기록되지 않은 호출을 '정상'으로 읽지 않는다)
+    - rotated: Gemini 모델끼리 넘어갔다 (3.6 → 3.5). 무료 쿼터가 **모델당** 하루
+      20회라 배치가 두 모델을 나눠 쓰도록 설계했다 (CLAUDE.md §1). 이것까지 fallback 으로
+      세면 경보가 매일 울려 진짜 노드 이탈이 묻힌다. 그래서 따로 센다
+    """
+    planned = route_log[0]["target"] if route_log else None
+    served_entry = next((e for e in route_log if e["outcome"] == "ok"), None)
+    served = served_entry["target"] if served_entry else None
+    moved = served is not None and served != planned
+    rotated = (
+        moved
+        and route_log[0].get("model") in GEMINI_TIERS
+        and served_entry.get("model") in GEMINI_TIERS
+    )
+    return {
+        "planned": planned,
+        "served_by": served,
+        "fallback": moved and not rotated,
+        "rotated": bool(rotated),
+        "unserved": served is None,
+        "attempts": [
+            {k: e[k] for k in ("target", "outcome", "elapsed_ms", "detail") if k in e}
+            for e in route_log
+        ],
+    }
 
 
 def _node_for_model(model_name: str) -> str | None:

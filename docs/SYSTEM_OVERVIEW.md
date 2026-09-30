@@ -2009,8 +2009,13 @@ mechanism(2번)을 가를 agent-api 로그가 **없다.**
   호스트 `logs/agent-api/`(10MB × 5 회전). 유닛 `ExecStop` 을 `down` → `stop` 으로 바꿨다.
   파일 로그 상태는 `/health.logging` 에 나온다(`disabled`·`failed`·`missing` 구분).
   `tests/unit/test_log_persistence.py` 가 고정한다
-- **폴백 가시화**: 배치 결과에 에이전트별 실제 노드·폴백 여부를 남긴다. 그러지 않으면
-  "3배 느린 `completed`" 가 다시 조용히 지나간다
+- ~~**폴백 가시화**~~ ✅ (2026-09-30) 라우터가 후보별 시도 결과(`route_log`)를 남긴다.
+  에이전트 결과마다 `llm_calls`(planned / served_by / fallback / unserved / rotated), 분석
+  결과에 `llm_routing`, 배치 요약에 `llm_routing` + `degraded` 가 실린다. 텔레그램에는
+  `⚠️ LLM 경로 이탈 N/M호출 (rtx_5070→mac_studio k)` 줄이 붙는다. `status` 는 그대로
+  `completed` 다 — 폴백은 실패가 아니고, 대신 따로 보인다. Gemini 3.6 → 3.5 는 쿼터 분산
+  설계라 `rotated` 로 따로 세고 `degraded` 에서 뺐다. 30분 스캔 경로는 대상이 아니다
+  (`tests/unit/test_llm_route_record.py`)
 
 ### 13.10 데이터 품질 위험
 
