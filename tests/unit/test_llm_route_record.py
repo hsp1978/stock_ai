@@ -296,3 +296,21 @@ def test_rotation_does_not_degrade_the_batch(monkeypatch):
     assert result["degraded"] is False
     assert result["llm_routing"]["rotated"] == 2
     assert result["llm_routing"]["transitions"] == {}
+
+
+# ── 잡 기록까지 도달하는가 ────────────────────────────────────────────
+
+
+def test_batch_routing_survives_into_the_job_status(monkeypatch):
+    """반환값에 있어도 `_summarize_job_result` 화이트리스트에서 빠지면 /ops/jobs 에
+    안 보인다 — 2026-09-30 #89 배포 후 실제로 그랬다. 잡 래퍼를 끝까지 태운다."""
+    service, _ = _batch(monkeypatch, [_entry("rtx_5070", "mac_studio")])
+    monkeypatch.setattr(service, "send_telegram", lambda *a, **kw: None)
+    monkeypatch.setattr(service, "_persist_job_status", lambda: None)
+
+    service.run_multi_agent_batch()
+    recorded = service._JOB_STATUS["multi_agent_batch"]["last_result_summary"]
+
+    assert recorded["degraded"] is True
+    assert recorded["llm_routing"]["transitions"] == {"rtx_5070→mac_studio": 2}
+    assert recorded["succeeded"] == 2 and recorded["failed"] == 0
