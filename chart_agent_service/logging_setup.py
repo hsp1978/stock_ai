@@ -90,6 +90,10 @@ class SecretRedactingFilter(logging.Filter):
         return True
 
 _configured = False
+# 첫 설정 때 **실제로 적용된 값**. 두 번째 호출이 이걸 버리면, 먼저 설정한 쪽이
+# 누구냐(예: config 임포트 중 get_logger)에 따라 호출자가 파일 로그 상태를 잃는다
+# — 2026-09-30 /health.logging 이 file=None, unknown 으로 나왔다.
+_applied: dict | None = None
 
 
 class _RedactingMixin:
@@ -143,9 +147,9 @@ def configure_logging(force: bool = False) -> dict:
     설정 요청과 적용 결과를 같은 것으로 취급하지 않는다 — 파일 핸들러가 권한
     문제로 못 붙으면 그 사실이 반환값에 남아야 한다 (§13-2).
     """
-    global _configured
+    global _configured, _applied
     if _configured and not force:
-        return {"status": "already_configured"}
+        return {**(_applied or {}), "status": "already_configured"}
 
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
@@ -206,7 +210,7 @@ def configure_logging(force: bool = False) -> dict:
         logging.getLogger(name).setLevel(lib_level)
 
     _configured = True
-    return {
+    _applied = {
         "status": "configured",
         "level": logging.getLevelName(level),
         "format": "json" if isinstance(formatter, JsonFormatter) else "text",
@@ -215,6 +219,7 @@ def configure_logging(force: bool = False) -> dict:
         "file_error": file_error,
         "redaction": "enabled",
     }
+    return dict(_applied)
 
 
 def get_logger(name: str) -> logging.Logger:
