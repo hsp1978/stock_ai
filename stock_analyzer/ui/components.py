@@ -79,3 +79,15 @@ def render_bar_status_banner(bar_status: dict | None) -> None:
         st.warning(f"⏳ {bar_status.get('detail', '장중 분석 — 마지막 봉 미완성')}")
     elif state in ("not_opened", "no_session", "unknown"):
         st.info(f"마지막 봉 상태: {bar_status.get('detail') or state}")
+
+
+#: agent-api 가 매도를 advisory 로 표시할 때 붙는 설명 (sell_policy.ADVISORY_NOTE 와 같은 문구).
+SELL_ADVISORY_NOTE = "매도 신호는 검증된 우위가 없어 참고용 — 청산 신호 아님"
+
+
+def render_sell_advisory_note(result: dict | None) -> None:
+    """결과가 advisory 매도면 설명을 붙인다. 판정은 agent-api 가 내린 필드를 따른다."""
+    import streamlit as st
+
+    if result and result.get("sell_advisory"):
+        st.info(f"⚠️ 리스크 경고(매도·참고용) — {result.get('sell_advisory_note') or SELL_ADVISORY_NOTE}")

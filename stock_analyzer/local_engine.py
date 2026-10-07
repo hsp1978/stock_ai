@@ -753,6 +753,12 @@ def engine_scan_ticker(
 
         result["bar_status"] = latest_bar_status(ticker, df)
 
+        from sell_policy import sell_is_actionable
+
+        result["sell_advisory"] = (
+            str(result.get("final_signal") or "").upper() == "SELL" and not sell_is_actionable()
+        )
+
         chart_path = None
         try:
             chart_path = generate_agent_chart(ticker, df, result)
