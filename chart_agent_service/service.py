@@ -85,7 +85,6 @@ from data_collector import (
 from analysis_tools import ChartAnalysisAgent, generate_agent_chart
 from quant_indicators import analyze_quant_indicators
 from backtest_engine import run_all_backtests
-from ml_predictor import run_ml_prediction
 from portfolio_optimizer import (
     markowitz_optimize, risk_parity_optimize,
     compute_factor_ranking, compute_correlation_beta,
@@ -113,6 +112,10 @@ except ImportError:
     MultiAgentOrchestrator = None
     summarize_llm_routing = None
     logger.warning("Multi-Agent 모듈을 사용할 수 없다 — V2 배치가 비활성화된다")
+
+# /ml 은 판정(ML Specialist)과 같은 함수를 쓴다 — 2026-10-02 GLW 에서 화면은
+# ml_predictor 의 UP 75.1%, 판정은 ml_pipeline_fix 의 DOWN 41.4% 를 봤다.
+from ml_pipeline_fix import decision_ml_prediction  # noqa: E402
 
 
 def _resolve_signal_price(ticker: str, *results: dict) -> float:
@@ -3155,12 +3158,12 @@ def get_backtest(ticker: str):
 
 @app.get("/ml/{ticker}")
 def get_ml_prediction(ticker: str):
-    """ML 방향 예측"""
+    """ML 방향 예측 — 멀티에이전트 판정이 쓰는 것과 같은 결과."""
     ticker = ticker.upper()
     try:
         df = fetch_ohlcv(ticker)
         df = calculate_indicators(df)
-        return run_ml_prediction(ticker, df)
+        return _sanitize(decision_ml_prediction(ticker, df))
     except Exception as e:
         raise HTTPException(500, f"ML 예측 실패: {e}")
 

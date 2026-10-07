@@ -509,6 +509,35 @@ def enhanced_ml_ensemble(ticker: str, df: pd.DataFrame, debug: bool = False) -> 
     return result
 
 
+def decision_ml_prediction(ticker: str, df: pd.DataFrame) -> Dict:
+    """Return the ML result the decision path uses — the single source for ML.
+
+    ML Specialist (multi-agent decision) and the `/ml` endpoint (screen, export)
+    must both call this. They used to run different pipelines and disagreed in
+    direction: 2026-10-02 GLW decision used DOWN 41.4% while the screen showed
+    UP 75.1% from `ml_predictor`.
+
+    `pipeline` records which implementation produced the result.
+    """
+    result = enhanced_ml_ensemble(ticker, df, debug=False)
+    result["pipeline"] = "ml_pipeline_fix"
+    if result["ensemble"].get("model_count", 0) > 0:
+        return result
+
+    # 모델 0개면 레거시 파이프라인으로 폴백 — 폴백했다는 사실과 사유를 남긴다.
+    from ml_predictor import run_ml_prediction
+
+    fallback = run_ml_prediction(ticker, df, ensemble=True)
+    if fallback.get("ensemble", {}).get("model_count", 0) > 0:
+        fallback["pipeline"] = "ml_predictor_fallback"
+        fallback["fallback_reason"] = list(result.get("warnings", []))
+        fallback.setdefault("warnings", []).append(
+            "주 ML 파이프라인 모델 0개 → ml_predictor 폴백"
+        )
+        return fallback
+    return result
+
+
 # 테스트
 if __name__ == "__main__":
     # 테스트용 더미 데이터
