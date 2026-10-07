@@ -410,6 +410,56 @@ def _latest_close_and_date(df: "pd.DataFrame") -> tuple[Optional[float], Optiona
     return close, bar_date
 
 
+_MARKET_TZ = {"KRX": "Asia/Seoul", "NYSE": "America/New_York"}
+
+
+def latest_bar_status(
+    ticker: str, df: "pd.DataFrame", now: Optional[datetime] = None
+) -> dict[str, Any]:
+    """마지막 봉이 완결된 거래일 봉인지 — 장중이면 미완성이다.
+
+    일봉 분석은 EOD 전제다. 장중에 돌리면 마지막 봉은 일부 시간치만 담아
+    거래량비가 0.1x 처럼 나오고(2026-10-02 GLW, 개장 1시간 뒤 분석) 당일 고저가
+    덜 그려진다. 결과는 그대로 내되, 이 상태를 함께 실어 읽는 사람이 알게 한다.
+
+    state: complete | in_progress | not_opened | no_session | unknown
+    """
+    market = "KRX" if _is_korean_ticker(ticker) else "NYSE"
+    base: dict[str, Any] = {"market": market, "state": "unknown", "bar_date": None,
+                            "elapsed_pct": None, "detail": ""}
+    if df is None or df.empty:
+        base["detail"] = "데이터 없음 — 판정 불가"
+        return base
+    try:
+        from market_cal import session_progress
+
+        ts = pd.Timestamp(df.index[-1])
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert(_MARKET_TZ[market])
+        bar_date = ts.date()
+        base["bar_date"] = bar_date.isoformat()
+        prog = session_progress(market, bar_date, now)  # type: ignore[arg-type]
+    except Exception as exc:
+        base["detail"] = f"세션 판정 실패 — {type(exc).__name__}: {exc}"
+        return base
+
+    state = {"closed": "complete"}.get(prog["state"], prog["state"])
+    base["state"] = state
+    base["elapsed_pct"] = prog["elapsed_pct"]
+    if state == "in_progress":
+        base["detail"] = (
+            f"장중 분석 — 마지막 봉({bar_date}) 미완성, {market} 정규장 "
+            f"{prog['elapsed_pct']:.0f}% 경과. 거래량·당일 고저 기반 지표가 과소/왜곡될 수 있다"
+        )
+    elif state == "not_opened":
+        base["detail"] = f"마지막 봉({bar_date})의 {market} 정규장이 아직 열리지 않았다"
+    elif state == "no_session":
+        base["detail"] = f"마지막 봉({bar_date})은 {market} 휴장일 날짜다"
+    else:
+        base["detail"] = f"마지막 봉({bar_date}) 완결"
+    return base
+
+
 def verify_latest_close(
     ticker: str, period: str = DEFAULT_HISTORY_PERIOD, use_cache: bool = True
 ) -> PriceVerification:

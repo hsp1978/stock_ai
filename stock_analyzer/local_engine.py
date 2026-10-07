@@ -748,6 +748,11 @@ def engine_scan_ticker(
         result["options_pcr"] = options_pcr
         result["insider_trades"] = insider_trades
 
+        # HTTP 경로(service.analyze_ticker)와 같은 장중 미완성 봉 표시
+        from data_collector import latest_bar_status
+
+        result["bar_status"] = latest_bar_status(ticker, df)
+
         chart_path = None
         try:
             chart_path = generate_agent_chart(ticker, df, result)

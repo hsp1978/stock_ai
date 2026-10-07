@@ -134,3 +134,31 @@ def session_has_opened(
     if mkt_open.tzinfo is None:
         mkt_open = mkt_open.replace(tzinfo=timezone.utc)
     return now >= mkt_open
+
+
+def session_progress(
+    market: MarketCode, session_date: date, now: datetime | None = None
+) -> dict:
+    """State of the regular session for `session_date` as of `now` (UTC).
+
+    Returns {"state": "no_session" | "not_opened" | "in_progress" | "closed",
+    "elapsed_pct": float | None}. `elapsed_pct` is set only while in progress.
+    """
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    schedule = get_calendar(market).schedule(start_date=session_date, end_date=session_date)
+    if schedule.empty:
+        return {"state": "no_session", "elapsed_pct": None}
+    mkt_open = schedule.iloc[0]["market_open"].to_pydatetime()
+    mkt_close = schedule.iloc[0]["market_close"].to_pydatetime()
+    if mkt_open.tzinfo is None:
+        mkt_open = mkt_open.replace(tzinfo=timezone.utc)
+    if mkt_close.tzinfo is None:
+        mkt_close = mkt_close.replace(tzinfo=timezone.utc)
+    if now < mkt_open:
+        return {"state": "not_opened", "elapsed_pct": None}
+    if now >= mkt_close:
+        return {"state": "closed", "elapsed_pct": None}
+    elapsed = (now - mkt_open).total_seconds() / (mkt_close - mkt_open).total_seconds()
+    return {"state": "in_progress", "elapsed_pct": round(elapsed * 100, 1)}

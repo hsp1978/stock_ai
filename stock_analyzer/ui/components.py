@@ -66,3 +66,16 @@ def ticker_chip_html(ticker: str) -> str:
         f'<span class="wl-chip" title="{title}">'
         f'<span class="tc-badge {"kr" if is_kr else "us"}">{badge}</span>{ticker}</span>'
     )
+
+
+def render_bar_status_banner(bar_status: dict | None) -> None:
+    """장중 미완성 봉으로 낸 결과면 경고 배너를 띄운다. 완결 봉이면 아무것도 그리지 않는다."""
+    import streamlit as st
+
+    if not bar_status:
+        return
+    state = bar_status.get("state")
+    if state == "in_progress":
+        st.warning(f"⏳ {bar_status.get('detail', '장중 분석 — 마지막 봉 미완성')}")
+    elif state in ("not_opened", "no_session", "unknown"):
+        st.info(f"마지막 봉 상태: {bar_status.get('detail') or state}")
