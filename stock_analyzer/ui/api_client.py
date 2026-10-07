@@ -3,11 +3,18 @@
 `webui.py` 에서 분리한 두 번째 조각(CLAUDE.md §6-10 점진 분리). 모든 페이지가 쓰는
 공용 경로라 페이지를 떼기 전에 먼저 내보냈다.
 
-호출 규약(이중 경로)은 그대로다:
-  - `USE_LOCAL_ENGINE` 이면 in-process 엔진을 먼저 시도하고, None 이면 HTTP 폴백
-  - `/paper`·`/trading/`·`/gpu` 는 **항상 HTTP** — 상태 소유권이 agent-api 프로세스에
-    있어야 한다 (in-proc 으로 돌면 webui 가 GPU 언로드를 쏘게 된다)
-  - `/ml/*` 는 TF 풀스택이 webui 컨테이너에 없어 HTTP 강제
+호출 규약 — **기본은 HTTP 단일 경로**다 (`WEBUI_ENGINE_MODE=http`).
+  - 모든 호출이 agent-api 로 간다. 상태(결과 캐시·signal_outcomes DB·스캔 로그·잡)는
+    agent-api 프로세스와 그 마운트된 output 이 단일 소스다.
+  - `WEBUI_ENGINE_MODE=local` 은 agent-api 없이 webui 를 단독 실행할 때만 쓴다.
+    이때만 in-process 엔진을 먼저 시도하고 None 이면 HTTP 로 폴백한다.
+    `/paper`·`/trading/`·`/gpu`·`/ml/*` 는 local 모드에서도 HTTP 다.
+
+※ 2026-10-07 이전에는 `local_engine` import 가 성공하면 자동으로 in-process 였다.
+  webui 이미지에 chart_agent_service 가 들어간 2026-04-29 부터 webui 는 **마운트되지
+  않은 자기 컨테이너의 빈 상태**를 읽었다 — 결과 0건, signal_outcomes 0건(실제 8,860건),
+  스캔 로그 0건. 상세·Signal Accuracy·History·Scan Log 화면이 운영 데이터를 못 봤고,
+  webui 에서 누른 스캔·멀티에이전트는 webui 컨테이너 안에서 돌아 기록이 재생성 때 사라졌다.
 """
 
 from __future__ import annotations
@@ -25,6 +32,10 @@ for _p in (_ANALYZER_DIR, os.path.join(_PROJECT_ROOT, "chart_agent_service")):
     if _p not in sys.path:
         sys.path.append(_p)
 
+from app_logging import get_logger  # noqa: E402 — sys.path 설정 뒤
+
+logger = get_logger("stock_auto.webui.api_client")
+
 try:
     from chart_agent_service.config import AGENT_API_HOST, AGENT_API_PORT
 except ImportError:
@@ -33,16 +44,24 @@ except ImportError:
 
 AGENT_API_URL = os.getenv("AGENT_API_URL", f"http://{AGENT_API_HOST}:{AGENT_API_PORT}")
 
-try:
-    from local_engine import (
-        engine_dispatch_get,
-        engine_dispatch_post,
-        engine_get_chart_path,
-    )
+#: http(기본) | local. local 은 agent-api 없이 단독 실행할 때만 — 위 모듈 docstring 참조.
+WEBUI_ENGINE_MODE = os.getenv("WEBUI_ENGINE_MODE", "http").strip().lower()
 
-    USE_LOCAL_ENGINE = True
-except ImportError:  # webui 컨테이너에 서비스 모듈이 없으면 HTTP 전용
-    USE_LOCAL_ENGINE = False
+USE_LOCAL_ENGINE = False
+if WEBUI_ENGINE_MODE == "local":
+    try:
+        from local_engine import (
+            engine_dispatch_get,
+            engine_dispatch_post,
+            engine_get_chart_path,
+        )
+
+        USE_LOCAL_ENGINE = True
+    except ImportError as _exc:  # 요청한 모드를 못 쓰면 조용히 넘어가지 않는다
+        logger.warning("WEBUI_ENGINE_MODE=local 이지만 local_engine import 실패 — HTTP 사용: %s", _exc)
+elif WEBUI_ENGINE_MODE != "http":
+    logger.warning("알 수 없는 WEBUI_ENGINE_MODE=%r — HTTP 사용", WEBUI_ENGINE_MODE)
+
 
 def _agent_api_candidates() -> list[str]:
     """AGENT_API_URL이 오래된 원격 주소여도 로컬 agent-api로 폴백."""
@@ -74,9 +93,8 @@ def _force_http_api(path: str) -> bool:
 
 
 def api_get(path: str, timeout: int = 10):
-    # /ml/* 는 LSTM(TF) 풀스택이 webui 컨테이너에 없으므로 agent-api(GPU TF)로
-    # 강제 HTTP. 다른 path 는 in-process 우선(USE_LOCAL_ENGINE).
-    # 로컬 엔진이 None 반환 시 (핸들러 부재 — 예: /trading/*) HTTP fallback.
+    # 기본(http) 모드에서는 바로 HTTP. local 모드에서만 in-process 를 먼저 시도하고
+    # None(핸들러 부재)이면 HTTP 로 폴백한다. /ml/* 는 local 모드에서도 HTTP.
     if USE_LOCAL_ENGINE and not path.startswith("/ml/") and not _force_http_api(path):
         result = engine_dispatch_get(path)
         if result is not None:

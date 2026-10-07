@@ -53,12 +53,12 @@ def export_comprehensive_data(ticker: str, include_multi_agent: bool = True) -> 
             }
 
     # 3. 백테스트 결과
-    backtest_result = api_get(f"/backtest/{ticker}")
+    backtest_result = api_get(f"/backtest/{ticker}", timeout=60)
     if backtest_result:
         export_data["backtest"] = backtest_result
 
     # 4. ML 예측 결과
-    ml_result = api_get(f"/ml/{ticker}")
+    ml_result = api_get(f"/ml/{ticker}", timeout=120)
     if ml_result:
         export_data["ml_prediction"] = ml_result
 

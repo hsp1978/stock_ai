@@ -331,7 +331,7 @@ PR 머지 시:
 | # | 안티패턴 | 처리 단계 |
 |---|---|---|
 | 1 | ~~God file (`webui.py`)~~ ✅ 6,482 → **350 라인** (`ui/` 공용 8모듈 + `pages/` 17페이지, 2026-09-14) | 완료 |
-| 2 | Dual call path (in-proc + HTTP) | P2 (HTTP 단일화). `/paper`·`/trading`·`/gpu`는 강제 HTTP. 판정은 `ui/api_client.USE_LOCAL_ENGINE` 한 곳 (webui 중복 제거 2026-09-14) |
+| 2 | ~~Dual call path~~ webui 기본 HTTP 단일 경로 (`WEBUI_ENGINE_MODE=http`, 2026-10-07). 종전엔 import 성공만으로 in-process 였고 webui 컨테이너의 **빈 상태**를 읽었다(signal_outcomes 0건 vs 실제 8,860). `local` 은 agent-api 없는 단독 실행용 | 기본 경로 완료 · local_engine 제거는 P2 |
 | 3 | ~~`print()` 기반 로깅~~ ✅ 완료 (2026-09-14). agent-api 188건 + webui 라이브러리 179건. CLI 블록 206건은 의도적 유지 |
 | 4 | `paper_state.json` 무락 | 시스템 P0 |
 | 5 | 양방향 sys.path 주입 | 구조는 P2. **동명 모듈은 금지** — `tests/unit/test_module_shadowing.py` 가 차단 (2026-09-14) |
@@ -366,6 +366,7 @@ PR 머지 시:
 | RTX `unusable` → "교착" | 스캔은 200 을 받는 중. 재시작이 Xid 154 를 유발해 재부팅 필요. 배치는 Mac 폴백으로 3배 느린데 `completed` | 대응 절차 문서화, 재시작 금지 (SYSTEM_OVERVIEW §13.9w, 2026-09-30) |
 | 한국장 도구 섹션 없음 | 모듈 import 실패를 print 로 삼키고 섹션을 통째로 숨김 | `ui/korean_optional.py` 사유 보존 + 항상 렌더 (2026-09-14) |
 | 가격 검증 `ok` (미국 종목) | 토스 최신봉 = 야간거래로 만든 미개장 거래일 봉. "KST 라벨 차이"로 오진, 공통일 비교가 덮음 (08-03~) | 미개장 봉 제거 + `primary_ahead` 상태 (#94, 2026-10-07) |
+| webui 화면 '결과 없음'·승률 0건 | import 성공만으로 in-process 엔진 — webui 컨테이너의 빈 상태(DB·결과·스캔 로그)를 5개월간 읽음. 200 이라 아무도 몰랐다 | 기본 HTTP 단일 경로 (2026-10-07) |
 
 **작업 시 원칙**:
 1. `except`에서 사유를 버리지 말 것. 최소한 로그에 남긴다.
