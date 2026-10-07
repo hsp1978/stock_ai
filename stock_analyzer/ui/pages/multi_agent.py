@@ -12,6 +12,7 @@ import re
 import streamlit as st
 
 from datetime import datetime
+from ui.components import render_bar_status_banner
 from ui.api_client import api_get, api_post, log_action
 from ui.tickers import format_ticker_label, get_ticker_display_name, load_watchlist, validate_ticker_webui
 
@@ -382,6 +383,7 @@ def render_multi_agent():
 
         # === Decision Maker 종합 ===
         st.markdown("### 🎯 Decision Maker 최종 판단")
+        render_bar_status_banner(final_decision.get("bar_status"))
 
         # 최종 신호와 신뢰도
         col1, col2, col3 = st.columns(3)

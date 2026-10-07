@@ -2488,6 +2488,26 @@ class MultiAgentOrchestrator:
                     "detail": f"교차검증 실패 — {type(_pe).__name__}",
                 }
 
+            # 4.4.1. 장중 미완성 봉 — 판정은 그대로 두고 상태와 리스크 문구만 싣는다.
+            # 2026-10-02 GLW: 개장 1시간 뒤 수동 분석이 거래량 0.1x 를 '거래량 부족'
+            # 근거로 썼는데, 리포트 어디에도 장중 분석이라는 표시가 없었다.
+            try:
+                from data_collector import latest_bar_status
+
+                _bs = latest_bar_status(ticker, df)
+            except Exception as _be:
+                _bs = {"state": "unknown", "detail": f"봉 상태 판정 실패 — {type(_be).__name__}"}
+            final_decision["bar_status"] = _bs
+            if _bs.get("state") == "in_progress":
+                _risks = list(final_decision.get("key_risks") or [])
+                if _bs["detail"] not in _risks:
+                    _risks.insert(0, _bs["detail"])
+                final_decision["key_risks"] = _risks
+                _warns = list(final_decision.get("warnings") or [])
+                if "INTRADAY_PARTIAL_BAR" not in _warns:
+                    _warns.append("INTRADAY_PARTIAL_BAR")
+                final_decision["warnings"] = _warns
+
             # 4.5. 실행 가능성 판정 — 진입 계획이 붙은 뒤여야 한다.
             # aggregate() 안에서 판정하면 entry_plan이 아직 없어 항상 False가 된다.
             try:

@@ -1198,6 +1198,9 @@ def format_alert_message(ticker: str, result: dict) -> str:
         f"<b>신뢰도:</b> {confidence} / 10\n"
         f"<b>분포:</b> 매수 {dist.get('buy', 0)} | 매도 {dist.get('sell', 0)} | 중립 {dist.get('neutral', 0)}\n\n"
     )
+    bar = result.get("bar_status") or {}
+    if bar.get("state") == "in_progress":
+        msg += f"⚠️ {bar.get('detail', '장중 분석 — 마지막 봉 미완성')}\n\n"
 
     # 상위 3개 tool 결과
     summaries = result.get("tool_summaries", [])
@@ -1275,6 +1278,11 @@ def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
                 "status": "unavailable",
                 "detail": f"교차검증 실패 — {type(exc).__name__}: {exc}",
             }
+
+        # 마지막 봉이 장중 미완성인지 — 결과는 그대로 내고 상태만 싣는다.
+        from data_collector import latest_bar_status
+
+        result["bar_status"] = latest_bar_status(ticker, df)
 
         chart_path = None
         try:
