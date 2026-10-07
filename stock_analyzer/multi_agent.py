@@ -852,20 +852,13 @@ class MLSpecialist(BaseAgent):
         try:
             # 개선된 ML 파이프라인 사용
             try:
-                from ml_pipeline_fix import enhanced_ml_ensemble
+                # /ml 엔드포인트와 같은 함수 — 화면과 판정이 다른 ML 을 보면 안 된다.
+                from ml_pipeline_fix import decision_ml_prediction
                 from data_collector import fetch_ohlcv, calculate_indicators
 
                 df = fetch_ohlcv(ticker)
                 df = calculate_indicators(df)
-                ml_result = enhanced_ml_ensemble(ticker, df, debug=False)
-
-                # 모델이 0개인 경우 체크
-                if ml_result["ensemble"]["model_count"] == 0:
-                    # 기존 ml_predictor로 폴백 시도
-                    from ml_predictor import run_ml_prediction
-                    ml_result_fallback = run_ml_prediction(ticker, df, ensemble=True)
-                    if ml_result_fallback.get("ensemble", {}).get("model_count", 0) > 0:
-                        ml_result = ml_result_fallback
+                ml_result = decision_ml_prediction(ticker, df)
             except ImportError:
                 # ml_pipeline_fix가 없으면 기존 사용
                 from ml_predictor import run_ml_prediction

@@ -101,7 +101,7 @@ from quant_indicators import analyze_quant_indicators
 from backtest_engine import (
     run_all_backtests, optimize_strategy_params, backtest_walk_forward,
 )
-from ml_predictor import run_ml_prediction
+from ml_pipeline_fix import decision_ml_prediction
 from portfolio_optimizer import (
     markowitz_optimize, risk_parity_optimize,
     compute_factor_ranking, compute_correlation_beta,
@@ -924,12 +924,12 @@ def engine_backtest(ticker: str) -> dict:
 
 
 def engine_ml_predict(ticker: str, ensemble: bool = True) -> dict:
-    """ML 방향 예측 (앙상블 옵션)"""
+    """ML 방향 예측 — 판정 경로와 같은 함수. `ensemble` 은 호환용으로만 남는다."""
     ticker = ticker.upper()
     try:
         df = fetch_ohlcv(ticker)
         df = calculate_indicators(df)
-        return _sanitize(run_ml_prediction(ticker, df, ensemble=ensemble))
+        return _sanitize(decision_ml_prediction(ticker, df))
     except Exception as e:
         return {"error": str(e)}
 

@@ -231,6 +231,7 @@ def _install_fake_ml_pipeline(monkeypatch, up_probability, avg_accuracy=0.62):
         }
 
     fake_ml.enhanced_ml_ensemble = enhanced_ml_ensemble
+    fake_ml.decision_ml_prediction = lambda ticker, df: enhanced_ml_ensemble(ticker, df)
     monkeypatch.setitem(sys.modules, "ml_pipeline_fix", fake_ml)
 
     fake_dc = types.ModuleType("data_collector")

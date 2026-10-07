@@ -472,11 +472,15 @@ Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 ## 4. ML Prediction
 """
                 if "ml_prediction" in export_data and export_data["ml_prediction"]:
-                    ml = export_data["ml_prediction"]
+                    # 앙상블은 `ensemble` 아래에 있다 — 예전 키(ensemble_direction 등)는
+                    # 어느 파이프라인에도 없어 항상 N/A 였다.
+                    ens = export_data["ml_prediction"].get("ensemble", {}) or {}
+                    up = ens.get("up_probability")
                     report += f"""
-- **Direction**: {ml.get('ensemble_direction', 'N/A')}
-- **Probability**: {ml.get('ensemble_probability', 'N/A')}%
-- **Confidence**: {ml.get('ensemble_confidence', 'N/A')}/10
+- **Direction**: {ens.get('prediction', 'N/A')}
+- **Up Probability**: {f"{up:.1%}" if isinstance(up, (int, float)) else 'N/A'}
+- **Avg Accuracy**: {ens.get('avg_accuracy', 'N/A')}
+- **Confidence**: {ens.get('confidence', 'N/A')}/10
 """
                 else:
                     report += "\n*ML prediction not available*\n"
