@@ -2757,6 +2757,27 @@ def _is_directional_result(result: dict) -> bool:
     return result.get("evaluated") is not False
 
 
+# 손익비 하한. `EnhancedDecisionMaker.MIN_RISK_REWARD` 와 같은 값이어야 한다 —
+# 두 경로가 다른 하한을 쓰면 같은 종목이 한쪽에선 매수, 한쪽에선 관망이 된다.
+# (서로 import 할 수 없는 패키지라 테스트가 일치를 고정한다.)
+MIN_RISK_REWARD = 0.8
+
+
+def _support_resistance_rr(results: list) -> Optional[float]:
+    """지지/저항 도구의 R/R. 0 이하는 '계산 불가'라 None 으로 돌려준다.
+
+    멀티에이전트 `_min_risk_reward` 와 같은 규약 — 도구가 실패했을 때 R/R 없음을
+    '불리'로 읽으면 전 종목이 막힌다.
+    """
+    for r in results:
+        if r.get("tool") != "support_resistance_analysis" or r.get("error"):
+            continue
+        rr = r.get("risk_reward_ratio")
+        if isinstance(rr, (int, float)) and rr > 0:
+            return float(rr)
+    return None
+
+
 def _latest_close_of(df) -> Optional[float]:
     """DataFrame 의 최신 종가. ChartAnalysisAgent 는 self.latest 를 갖지 않는다."""
     try:
@@ -3037,6 +3058,24 @@ class ChartAnalysisAgent:
         else:
             final_signal = "HOLD"
 
+        # [R/R 하드 게이트] 멀티에이전트 판정에만 있던 게이트를 단일 경로에도 건다.
+        # 2026-10-02 GLW: R/R 0.20 인데 평균 1.61 로 BUY — LLM 결론은 '관망'이었고,
+        # 이 BUY 가 그대로 scan_agent 신호로 기록·알림 대상이 됐다.
+        # 점수(composite_score)는 바꾸지 않는다 — 강등은 신호에만, 사유는 rr_gate 에.
+        rr = _support_resistance_rr(self.tool_results)
+        rr_gate = {
+            "risk_reward": rr,
+            "min_risk_reward": MIN_RISK_REWARD,
+            "status": "unavailable" if rr is None else "checked",
+            "downgraded": False,
+        }
+        if final_signal == "BUY" and rr is not None and rr < MIN_RISK_REWARD:
+            final_signal = "HOLD"
+            rr_gate["downgraded"] = True
+            rr_gate["pre_gate_signal"] = "BUY"
+            rr_gate["reason"] = f"손익비 하한 미달(R/R {rr:.2f} < {MIN_RISK_REWARD}) → 관망 전환"
+            logger.info(f"  [{self.ticker}] {rr_gate['reason']}")
+
         # 신뢰도 (의견 일치도 기반)
         max_agreement = max(directional_signals.values())
         confidence = round(max_agreement / directional_total * 10, 1) if directional_total > 0 else 0
@@ -3059,6 +3098,7 @@ class ChartAnalysisAgent:
             "unevaluated_tools": unevaluated,
             "evaluated_sufficient": not insufficient,
             "min_evaluated_tools": min_required,
+            "rr_gate": rr_gate,
             "tool_summaries": tool_summaries,
             "tool_details": self.tool_results,
         }
