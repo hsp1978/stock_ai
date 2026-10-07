@@ -239,9 +239,14 @@ def test_call_agent_llm_budget_not_multiplied_across_fallbacks():
 
     mock_router.completion.side_effect = _completion
 
+    # 후보와 노드 가용성을 고정한다. 종전에는 실제 환경에 기댔다 — CI 에는 Gemini
+    # 키가 없고 Mac Studio 가용성 프로브가 네트워크로 실패해 후보가 RTX 하나만
+    # 남았고, 호출 1회로 아래 단언에 걸렸다 (로컬은 Mac 이 살아 있어 통과).
     started = time.monotonic()
     with patch(
         "llm.router.call_with_breaker", side_effect=lambda fn, *a, **kw: fn(*a, **kw)
+    ), patch("llm.router._has_primary", return_value=False), patch(
+        "llm.router._node_available_for_model", return_value=True
     ):
         call_agent_llm(
             mock_router,
@@ -251,7 +256,7 @@ def test_call_agent_llm_budget_not_multiplied_across_fallbacks():
         )
     elapsed = time.monotonic() - started
 
-    assert len(timeouts) >= 2, "폴백이 최소 1회는 일어나야 의미 있는 검증"
+    assert len(timeouts) == 2, "Ollama 2개 tier — 폴백 1회가 일어나야 의미 있는 검증"
     # 핵심: 폴백마다 예산이 차감된다. 예전처럼 매번 budget을 그대로 주면
     # timeouts가 [3.0, 3.0, 3.0]으로 평평해져 이 단조감소 검증에 걸린다.
     assert timeouts == sorted(timeouts, reverse=True), timeouts
