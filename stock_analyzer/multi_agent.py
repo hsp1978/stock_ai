@@ -2478,6 +2478,8 @@ class MultiAgentOrchestrator:
                     "status": _pv.status,
                     "primary_source": _pv.primary_source,
                     "secondary_source": _pv.secondary_source,
+                    "primary_bar_date": _pv.primary_bar_date,
+                    "secondary_bar_date": _pv.secondary_bar_date,
                     "diff_pct": _pv.diff_pct,
                     "detail": _pv.detail,
                 }

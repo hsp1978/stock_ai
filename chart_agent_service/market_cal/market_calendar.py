@@ -114,3 +114,23 @@ def get_market_session(market: MarketCode, dt: datetime | None = None) -> str:
     if dt <= mkt_close:
         return "regular"
     return "post_close"
+
+
+def session_has_opened(
+    market: MarketCode, session_date: date, now: datetime | None = None
+) -> bool:
+    """Whether the regular session for `session_date` has opened by `now` (UTC).
+
+    A date with no session (weekend, holiday) returns False — no regular-session
+    bar can exist for it.
+    """
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    schedule = get_calendar(market).schedule(start_date=session_date, end_date=session_date)
+    if schedule.empty:
+        return False
+    mkt_open = schedule.iloc[0]["market_open"].to_pydatetime()
+    if mkt_open.tzinfo is None:
+        mkt_open = mkt_open.replace(tzinfo=timezone.utc)
+    return now >= mkt_open

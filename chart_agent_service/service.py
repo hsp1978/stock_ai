@@ -896,6 +896,8 @@ def build_data_health(tickers: list[str] | None = None) -> dict:
                 reasons.append("price_source_mismatch")
             elif verification.get("status") == "bar_date_mismatch":
                 reasons.append("price_bar_date_mismatch")
+            elif verification.get("status") in ("primary_ahead", "primary_behind"):
+                reasons.append(f"price_latest_bar_{verification['status']}")
             elif verification.get("status") in ("single_source", "unavailable"):
                 reasons.append("price_unverified")
 
@@ -1253,6 +1255,8 @@ def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
                 "primary_close": pv.primary_close,
                 "secondary_source": pv.secondary_source,
                 "secondary_close": pv.secondary_close,
+                "primary_bar_date": pv.primary_bar_date,
+                "secondary_bar_date": pv.secondary_bar_date,
                 "diff_pct": pv.diff_pct,
                 "detail": pv.detail,
             }

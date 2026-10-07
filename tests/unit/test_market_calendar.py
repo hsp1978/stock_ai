@@ -23,6 +23,7 @@ from market_cal.market_calendar import (  # noqa: E402
     get_valid_trading_days,
     is_trading_day,
     reindex_to_trading_days,
+    session_has_opened,
 )
 
 
@@ -84,3 +85,26 @@ def test_reindex_empty_df():
     df = pd.DataFrame()
     result = reindex_to_trading_days(df, "NYSE", forward_fill=False)
     assert result.empty
+
+
+# ── 정규장 개장 여부 (2026-10-07 토스 야간거래 봉 추적) ─────────────
+
+
+def test_session_not_opened_before_nyse_open():
+    """10-07 ET 정규장은 13:30 UTC(EDT) 개장 — 그 전에는 '열리지 않음'."""
+    assert not session_has_opened(
+        "NYSE", date(2026, 10, 7), datetime(2026, 10, 7, 13, 29, tzinfo=timezone.utc)
+    )
+
+
+def test_session_opened_at_nyse_open():
+    assert session_has_opened(
+        "NYSE", date(2026, 10, 7), datetime(2026, 10, 7, 13, 30, tzinfo=timezone.utc)
+    )
+
+
+def test_session_on_non_trading_day_never_opens():
+    """토요일·휴장일에는 정규장 봉이 있을 수 없다."""
+    assert not session_has_opened(
+        "NYSE", date(2026, 10, 10), datetime(2026, 10, 12, 0, 0, tzinfo=timezone.utc)
+    )
