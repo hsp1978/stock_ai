@@ -28,7 +28,10 @@ def render_signal_accuracy():
     col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
     with col1:
         # 기본값은 매매 스타일의 의도 보유기간을 덮는 대표 horizon 이다.
-        _primary = (api_get("/signal-accuracy/horizon") or {}).get("primary_horizon_days", 7)
+        _horizon_info = api_get("/signal-accuracy/horizon") or {}
+        _primary = _horizon_info.get("primary_horizon_days", 7)
+        # 현재 신호 로직 시작일 — 이전 구간은 무효 창이다 (CLAUDE.md §7).
+        logic_start = _horizon_info.get("current_logic_start") or "2026-08-06"
         _options = [7, 14, 30]
         horizon = st.selectbox(
             "평가 기간", _options,
@@ -40,8 +43,14 @@ def render_signal_accuracy():
     with col3:
         signal_filter = st.selectbox("신호 필터", ["전체", "buy", "sell", "neutral"], index=0)
     with col4:
-        days_back = st.selectbox("조회 기간", [30, 90, 180, 365], index=2,
-                                  format_func=lambda x: f"최근 {x}일")
+        # 기본은 '현재 로직' 구간이다. 종전 기본 180일은 무효 창(~08-05)을 섞어
+        # 2026-10-07 기준 현재 로직 −0.58% 를 −2.21% 로 보이게 했다.
+        days_back = st.selectbox(
+            "조회 기간", ["current", 30, 90, 180, 365], index=0,
+            format_func=lambda x: (
+                f"현재 로직 ({logic_start[5:]}~)" if x == "current" else f"최근 {x}일"
+            ),
+        )
     with col5:
         dedupe = st.selectbox(
             "표본 단위", ["ticker_day", "ticker_horizon", "none"], index=0,
@@ -93,13 +102,11 @@ def render_signal_accuracy():
     st.divider()
 
     # ── 통계 조회 ──────────────────────────────────
-    url = (
-        f"/signal-accuracy?horizon={horizon}&min_confidence={min_conf}"
-        f"&days_back={days_back}&dedupe={dedupe}"
-    )
+    base_q = f"/signal-accuracy?horizon={horizon}&min_confidence={min_conf}&dedupe={dedupe}"
     if sig_param:
-        url += f"&signal={sig_param}"
-    data = api_get(url)
+        base_q += f"&signal={sig_param}"
+    window_q = f"&since={logic_start}" if days_back == "current" else f"&days_back={days_back}"
+    data = api_get(base_q + window_q)
 
     if not data or data.get("total_evaluated", 0) == 0:
         st.markdown("""
@@ -180,6 +187,14 @@ def render_signal_accuracy():
             delta=f"독립 블록 {blocks:,}건",
             delta_color="off",
         )
+
+    if data.get("window_includes_pre_logic"):
+        st.warning(
+            f"조회 기간에 현재 로직 시작일({logic_start}) 이전의 **무효 구간**이 섞여 있습니다. "
+            "현재 로직의 성과로 읽지 마세요 — 아래 '로직 구간별 비교'를 보세요."
+        )
+
+    _render_logic_epoch_comparison(base_q, logic_start)
 
     if not data.get("horizon_covers_holding", True):
         st.warning(
@@ -313,3 +328,31 @@ def render_signal_accuracy():
 # ═══════════════════════════════════════════════════════════════
 #  Screener 페이지 (V1 — 한국 주식 기술적 스크리너)
 # ═══════════════════════════════════════════════════════════════
+
+
+def _render_logic_epoch_comparison(base_q: str, logic_start: str) -> None:
+    """현재 로직과 구 로직(무효 창)을 같은 조건으로 나란히 보여준다."""
+    current = api_get(f"{base_q}&since={logic_start}") or {}
+    legacy = api_get(f"{base_q}&days_back=365&until={logic_start}") or {}
+    rows = []
+    for label, d in ((f"현재 로직 ({logic_start}~)", current),
+                     (f"구 로직 (~{logic_start}, 무효 창)", legacy)):
+        if not d or not d.get("total_evaluated"):
+            rows.append({"구간": label, "표본": 0, "독립 블록": 0, "방향 적중률": "—",
+                         "방향보정 기대값": "—", "시장 대비": "—"})
+            continue
+        rows.append({
+            "구간": label,
+            "표본": d.get("total_evaluated", 0),
+            "독립 블록": d.get("independent_blocks", 0),
+            "방향 적중률": f"{d.get('direction_hit_rate_pct', 0):.1f}%",
+            "방향보정 기대값": f"{d.get('avg_signed_return_pct', 0):+.2f}%",
+            "시장 대비": (f"{d.get('avg_excess_return_pct', 0):+.2f}%"
+                        if d.get("benchmark_sample") else "—"),
+        })
+    st.markdown("#### 로직 구간별 비교")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.caption(
+        "같은 평가 기간·신뢰도·신호·표본 단위로 집계. 구 로직 구간은 신호 로직이 달라 "
+        "현재 성능의 근거가 아니다. 미국 종목은 2026-10-07 검증 시계를 재시작했다 (§7)."
+    )

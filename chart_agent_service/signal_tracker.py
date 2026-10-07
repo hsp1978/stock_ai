@@ -804,6 +804,12 @@ def evaluate_past_signals(
 SAMPLE_MODES = ("ticker_day", "ticker_horizon", "none")
 DEFAULT_SAMPLE_MODE = "ticker_day"
 
+#: 현재 신호 로직의 시작일 (UTC 날짜). 이전 구간은 무효 창이다 — signal_outcomes
+#: 무기록(~07-05), 임계값 도달 불가(~07-30), 로직 연속 변경(~08-05). CLAUDE.md §7.
+#: 통계 화면의 기본 조회 범위가 이 날짜부터다. 180일 기본값은 무효 창을 섞어
+#: 2026-10-07 기준 현재 로직 −0.58% 를 −2.21% 로 보이게 했다 (14일, ticker_day).
+CURRENT_LOGIC_START = "2026-08-06"
+
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _JULIAN_EPOCH = 2440587.5  # 1970-01-01T00:00Z 의 julian day
 
@@ -842,15 +848,37 @@ def _wilson_ci(wins: int, n: int, z: float = 1.96) -> List[float]:
     return [round(max(0.0, center - margin) * 100, 1), round(min(1.0, center + margin) * 100, 1)]
 
 
+def _window_bounds_sql(
+    days_back: int, since: Optional[str], until: Optional[str]
+) -> Tuple[str, Tuple]:
+    """발행일 조건. `since` 가 있으면 `days_back` 대신 그 날짜부터, `until` 은 미포함 상한."""
+    if since:
+        lower = _as_utc(since)
+        if lower is None:
+            raise ValueError(f"since 형식 오류: {since!r}")
+        cutoff = lower.isoformat()
+    else:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
+    where, params = "issued_at >= ?", [cutoff]
+    if until:
+        upper = _as_utc(until)
+        if upper is None:
+            raise ValueError(f"until 형식 오류: {until!r}")
+        where += " AND issued_at < ?"
+        params.append(upper.isoformat())
+    return where, tuple(params)
+
+
 def load_sampled_outcomes(
-    conn, horizon: int, days_back: int, dedupe: str = DEFAULT_SAMPLE_MODE
+    conn, horizon: int, days_back: int, dedupe: str = DEFAULT_SAMPLE_MODE,
+    since: Optional[str] = None, until: Optional[str] = None,
 ) -> Tuple[List, int]:
     """평가 완료 행에서 표본 대표만 뽑는다. (표본 행, 표본화 전 행 수)"""
     ret_col = f"return_{horizon}d"
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
-    base_where = f"{ret_col} IS NOT NULL AND issued_at >= ?"
+    window_where, params = _window_bounds_sql(days_back, since, until)
+    base_where = f"{ret_col} IS NOT NULL AND {window_where}"
     raw_total = conn.execute(
-        f"SELECT COUNT(*) FROM signal_outcomes WHERE {base_where}", (cutoff,)
+        f"SELECT COUNT(*) FROM signal_outcomes WHERE {base_where}", params
     ).fetchone()[0]
 
     columns = (
@@ -861,7 +889,7 @@ def load_sampled_outcomes(
     bucket = _sample_bucket_sql(dedupe, horizon)
     if bucket is None:
         rows = conn.execute(
-            f"SELECT {columns} FROM signal_outcomes WHERE {base_where}", (cutoff,)
+            f"SELECT {columns} FROM signal_outcomes WHERE {base_where}", params
         ).fetchall()
         return rows, int(raw_total or 0)
 
@@ -878,7 +906,7 @@ def load_sampled_outcomes(
         )
         SELECT * FROM ranked WHERE rn = 1
         """,
-        (cutoff,),
+        params,
     ).fetchall()
     return rows, int(raw_total or 0)
 
@@ -1096,15 +1124,27 @@ def _tally(rows: List) -> Dict:
     }
 
 
+def _includes_pre_logic(days_back: int, since: Optional[str]) -> bool:
+    """조회 범위가 현재 로직 시작일 이전(무효 창)을 포함하는가."""
+    start = _as_utc(CURRENT_LOGIC_START)
+    lower = _as_utc(since) if since else datetime.now(timezone.utc) - timedelta(days=days_back)
+    return bool(start and lower and lower < start)
+
+
 def get_accuracy_stats(
     horizon: Optional[int] = None,
     min_confidence: float = 0.0,
     signal: Optional[str] = None,
     days_back: int = 180,
     dedupe: str = DEFAULT_SAMPLE_MODE,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
 ) -> Dict:
     """
     신뢰도·신호 조합별 정확도 집계.
+
+    `since`(포함)·`until`(미포함)은 발행일 범위다. `since` 가 있으면 `days_back` 을
+    대신한다 — 로직 구간처럼 날짜로 끊어야 하는 비교에 쓴다 (`CURRENT_LOGIC_START`).
 
     `dedupe` 기본값 때문에 반환되는 건수는 원시 행 수보다 작다 — 30분 스캔이
     같은 날 같은 종목을 반복 기록하기 때문이다. 원시 수는 `sampling.rows_raw`로
@@ -1134,7 +1174,9 @@ def get_accuracy_stats(
         dedupe = DEFAULT_SAMPLE_MODE
 
     conn = _get_conn()
-    sampled, raw_total = load_sampled_outcomes(conn, horizon, days_back, dedupe)
+    sampled, raw_total = load_sampled_outcomes(
+        conn, horizon, days_back, dedupe, since=since, until=until
+    )
     conn.close()
 
     sig_filter = (signal or "").lower() or None
@@ -1246,6 +1288,10 @@ def get_accuracy_stats(
         "primary_horizon_days": primary_horizon_days(holding),
         "min_confidence_filter": min_confidence,
         "days_back": days_back,
+        # 실제 적용된 발행일 범위. since 가 있으면 days_back 은 쓰이지 않았다.
+        "window": {"since": since, "until": until, "days_back": None if since else days_back},
+        "current_logic_start": CURRENT_LOGIC_START,
+        "window_includes_pre_logic": _includes_pre_logic(days_back, since),
         "total_evaluated": overall["total"],
         # ±2% 밴드 기반 승률은 대표 지표에서 내렸다 — 임의 임계이고 horizon 이
         # 길수록 넘기 쉬워져 기간 간 비교를 왜곡한다. 밴드 집계는 band_outcome 에.
