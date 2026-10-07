@@ -4122,7 +4122,8 @@ def api_screener_pipeline(
 @app.get("/signal-accuracy")
 def api_signal_accuracy(horizon: int | None = None, min_confidence: float = 0.0,
                          signal: str = None, days_back: int = 180,
-                         dedupe: str = "ticker_day"):
+                         dedupe: str = "ticker_day",
+                         since: str | None = None, until: str | None = None):
     """
     신호 정확도 통계 조회.
     - horizon: 7, 14, 30 (평가 기간 일수)
@@ -4132,18 +4133,29 @@ def api_signal_accuracy(horizon: int | None = None, min_confidence: float = 0.0,
     - dedupe: 표본 단위. ticker_day(기본) | ticker_horizon | none
       30분 스캔이 같은 종목·같은 날을 반복 기록하므로 none 은 독립 표본이 아니다.
       응답의 sampling·independent_blocks·win_rate_ci95 를 함께 볼 것.
+    - since / until: 발행일 범위 (YYYY-MM-DD, UTC). since 가 있으면 days_back 대신.
+      `current_logic_start` 이전은 무효 창 — 응답의 `window_includes_pre_logic` 참조.
     """
     from signal_tracker import get_accuracy_stats
-    return get_accuracy_stats(
-        horizon=horizon, min_confidence=min_confidence,
-        signal=signal, days_back=days_back, dedupe=dedupe
-    )
+    try:
+        return get_accuracy_stats(
+            horizon=horizon, min_confidence=min_confidence,
+            signal=signal, days_back=days_back, dedupe=dedupe,
+            since=since, until=until,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
 
 @app.get("/signal-accuracy/horizon")
 def api_signal_horizon():
     """평가 horizon 과 의도 보유기간의 정합 상태."""
-    from signal_tracker import HORIZONS, expected_holding_days, primary_horizon_days
+    from signal_tracker import (
+        CURRENT_LOGIC_START,
+        HORIZONS,
+        expected_holding_days,
+        primary_horizon_days,
+    )
 
     holding = expected_holding_days()
     primary = primary_horizon_days(holding)
@@ -4153,6 +4165,7 @@ def api_signal_horizon():
         "primary_horizon_days": primary,
         "available_horizons": HORIZONS,
         "covers_holding": primary >= holding,
+        "current_logic_start": CURRENT_LOGIC_START,
     }
 
 

@@ -1764,6 +1764,9 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
             return engine_portfolio_rebalance(method, interval, drift, dry_run)
         elif path.startswith("/signal-accuracy/calibrator"):
             return engine_signal_calibrator_status()
+        elif path.startswith("/signal-accuracy") and ("since=" in path or "until=" in path):
+            # 발행일 범위는 이 엔진이 해석하지 못한다 — 조용히 무시하지 말고 HTTP 로 넘긴다.
+            return None
         elif path.startswith("/signal-accuracy"):
             horizon = 7
             min_confidence = 0.0
