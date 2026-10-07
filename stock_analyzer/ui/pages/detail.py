@@ -15,7 +15,11 @@ import streamlit as st
 
 from datetime import datetime
 from ui.api_client import USE_LOCAL_ENGINE, api_get, get_chart_url, log_action
-from ui.components import _plotly_base_layout, render_bar_status_banner
+from ui.components import (
+    _plotly_base_layout,
+    render_bar_status_banner,
+    render_sell_advisory_note,
+)
 from ui.export import export_comprehensive_data
 from ui.format import _fmt_num, _fmt_price
 from ui.tickers import format_ticker_label
@@ -237,6 +241,7 @@ def render_detail():
     if analyzed_at:
         st.markdown(f'<div class="ts-meta">Analyzed: {analyzed_at}</div>', unsafe_allow_html=True)
     render_bar_status_banner(detail.get("bar_status"))
+    render_sell_advisory_note(detail)
 
     summaries = detail.get("tool_summaries", [])
     if summaries:

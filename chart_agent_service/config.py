@@ -241,6 +241,15 @@ class Settings(BaseSettings):
     SIGNAL_BUY_THRESHOLD: float = 1.3
     SIGNAL_SELL_THRESHOLD: float = -0.5
 
+    # 매도 신호를 '행동'으로 쓸지. advisory(기본) = 판정·기록은 그대로 하되 청산·매도 알림·
+    # 냉각기를 걸지 않고 '리스크 경고'로만 표시한다. actionable = 종전 동작.
+    # 근거(2026-10-07, 08-06~ 발행, ticker_day, 14일): 매도 평균 −5.70%·중앙값 −2.73%·
+    # 적중 43.3%(블록 63). 시장 +2% 상승 구간 적중 5.1%, 횡보 49.7% — 종목 선별력 없이
+    # 시장 방향에 건 내기였다. 328130.KQ 제외해도 적중 30.6%. 공매도가 없는 시스템이라
+    # 틀린 매도의 비용은 청산 후 놓친 상승이고, 냉각기가 이후 매수 알림까지 막았다.
+    # signal_outcomes 기록은 모드와 무관하게 계속한다 — 우위가 생기면 다시 켤 근거가 된다.
+    SELL_SIGNAL_MODE: Literal["advisory", "actionable"] = "advisory"
+
     # 알림 임계값 — 신호 판정보다 느슨하게 잡아 신호 판정이 binding이 되게 한다.
     # (알림이 더 엄격하면 BUY/SELL로 판정된 신호가 통보 없이 사라진다.)
     BUY_THRESHOLD: float = 1.2
@@ -397,6 +406,7 @@ SIGNAL_EVAL_BATCH_LIMIT = settings.SIGNAL_EVAL_BATCH_LIMIT
 SIGNAL_EVAL_BACKLOG_ALERT = settings.SIGNAL_EVAL_BACKLOG_ALERT
 SIGNAL_BUY_THRESHOLD = settings.SIGNAL_BUY_THRESHOLD
 SIGNAL_SELL_THRESHOLD = settings.SIGNAL_SELL_THRESHOLD
+SELL_SIGNAL_MODE = settings.SELL_SIGNAL_MODE
 SIGNAL_MIN_EVALUATED_TOOLS = settings.SIGNAL_MIN_EVALUATED_TOOLS
 BUY_THRESHOLD = settings.BUY_THRESHOLD
 SELL_THRESHOLD = settings.SELL_THRESHOLD

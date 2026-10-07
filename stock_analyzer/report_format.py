@@ -125,6 +125,8 @@ def format_execution_status_markdown(final_decision: Dict[str, Any]) -> str:
     gated = [w for w in warnings if str(w).startswith("RR_BELOW_MIN")]
     if gated:
         bits.append("R/R 하한 미달로 매수 차단됨")
+    if final_decision.get("sell_advisory"):
+        bits.append("매도는 참고용 리스크 경고 — 청산 신호 아님")
     if not bits:
         return ""
     return "- **실행 상태**: " + " · ".join(bits) + "\n"

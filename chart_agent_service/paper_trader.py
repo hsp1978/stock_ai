@@ -19,6 +19,9 @@ from currency_utils import (
     format_price,
     format_amount
 )
+from logging_setup import get_logger
+
+logger = get_logger("stock_auto.paper_trader")
 
 
 PAPER_STATE_FILE = os.path.join(OUTPUT_DIR, "paper_trading_state.json")
@@ -443,6 +446,12 @@ def process_agent_signal(ticker: str, result: dict, current_price: float) -> Opt
         )
 
     elif signal == "SELL":
+        from sell_policy import sell_is_actionable
+
+        if not sell_is_actionable():
+            # advisory: 매도는 청산 근거가 아니다 — 손절·익절·트레일링이 청산을 맡는다.
+            logger.info(f"  [{ticker}] SELL 신호 — advisory 모드라 청산하지 않음")
+            return None
         state = _load_state()
         pos = state.get("positions", {}).get(ticker)
         if pos:

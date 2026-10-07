@@ -157,8 +157,10 @@ def send_rich_signal_alert(
     entry_plan = final_decision.get("entry_plan") or {}
     calibrated = final_decision.get("calibration_applied", False)
 
-    icon = {"BUY": "🟢", "SELL": "🔴", "NEUTRAL": "⚪"}.get(signal, "⚪")
-    sig_label = {"BUY": "매수", "SELL": "매도", "NEUTRAL": "관망"}.get(signal, signal)
+    from sell_policy import sell_icon, sell_label
+
+    icon = {"BUY": "🟢", "SELL": sell_icon(), "NEUTRAL": "⚪"}.get(signal, "⚪")
+    sig_label = {"BUY": "매수", "SELL": sell_label(), "NEUTRAL": "관망"}.get(signal, signal)
 
     name_part = _escape_html(company_name) if company_name else ""
     header = f"{icon} <b>{_escape_html(ticker)}</b>"
@@ -305,7 +307,11 @@ def send_daily_digest(
 
     lines.append("")
     if sell_list:
-        lines.append(f"🔴 <b>매도 상위 {min(top_n, len(sell_list))}</b>")
+        from sell_policy import ADVISORY_NOTE, sell_icon, sell_is_actionable, sell_label
+
+        lines.append(f"{sell_icon()} <b>{sell_label()} 상위 {min(top_n, len(sell_list))}</b>")
+        if not sell_is_actionable():
+            lines.append(f"  <i>{ADVISORY_NOTE}</i>")
         for r in sell_list[:top_n]:
             ticker = _escape_html(r.get("ticker", "?"))
             conf = r.get("confidence", 0)
@@ -316,7 +322,9 @@ def send_daily_digest(
                 f"  • <b>{ticker}</b>{name_str} — 신뢰도 {conf:.1f} (점수 {score:+.1f})"
             )
     else:
-        lines.append("🔴 매도 신호 없음 (필터 기준)")
+        from sell_policy import sell_label as _sl
+
+        lines.append(f"{_sl()} 없음 (필터 기준)")
 
     return send_telegram_html("\n".join(lines))
 

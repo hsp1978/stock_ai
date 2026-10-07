@@ -2508,6 +2508,24 @@ class MultiAgentOrchestrator:
                     _warns.append("INTRADAY_PARTIAL_BAR")
                 final_decision["warnings"] = _warns
 
+            # 4.4.2. 매도 신호가 행동 근거인지 (SELL_SIGNAL_MODE). 판정은 그대로 두고 표시만.
+            try:
+                from sell_policy import ADVISORY_NOTE, sell_is_actionable
+
+                _advisory = (
+                    str(final_decision.get("final_signal") or "").lower() == "sell"
+                    and not sell_is_actionable()
+                )
+            except Exception:
+                _advisory, ADVISORY_NOTE = False, ""
+            final_decision["sell_advisory"] = _advisory
+            if _advisory:
+                _warns = list(final_decision.get("warnings") or [])
+                if "SELL_ADVISORY" not in _warns:
+                    _warns.append("SELL_ADVISORY")
+                final_decision["warnings"] = _warns
+                final_decision["sell_advisory_note"] = ADVISORY_NOTE
+
             # 4.5. 실행 가능성 판정 — 진입 계획이 붙은 뒤여야 한다.
             # aggregate() 안에서 판정하면 entry_plan이 아직 없어 항상 False가 된다.
             try:

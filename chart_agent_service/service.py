@@ -1189,15 +1189,20 @@ def format_alert_message(ticker: str, result: dict) -> str:
     confidence = result.get("confidence", 0)
     dist = result.get("signal_distribution", {})
 
-    emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(signal, "⚪")
+    from sell_policy import ADVISORY_NOTE, sell_icon, sell_is_actionable, sell_label
+
+    emoji = {"BUY": "🟢", "SELL": sell_icon(), "HOLD": "🟡"}.get(signal, "⚪")
+    sig_text = sell_label() if signal == "SELL" else signal
 
     msg = (
         f"{emoji} <b>{ticker} 에이전트 알림</b>\n\n"
-        f"<b>신호:</b> {signal}\n"
+        f"<b>신호:</b> {sig_text}\n"
         f"<b>점수:</b> {score:+.2f} / 10\n"
         f"<b>신뢰도:</b> {confidence} / 10\n"
         f"<b>분포:</b> 매수 {dist.get('buy', 0)} | 매도 {dist.get('sell', 0)} | 중립 {dist.get('neutral', 0)}\n\n"
     )
+    if signal == "SELL" and not sell_is_actionable():
+        msg += f"ℹ️ {ADVISORY_NOTE}\n\n"
     bar = result.get("bar_status") or {}
     if bar.get("state") == "in_progress":
         msg += f"⚠️ {bar.get('detail', '장중 분석 — 마지막 봉 미완성')}\n\n"
@@ -1284,6 +1289,13 @@ def analyze_ticker(ticker: str, ai_mode: str = "ollama") -> Optional[dict]:
 
         result["bar_status"] = latest_bar_status(ticker, df)
 
+        # 매도 신호가 행동 근거인지 — 화면·리포트는 이 필드를 읽는다 (자기 설정 말고).
+        from sell_policy import sell_is_actionable
+
+        result["sell_advisory"] = (
+            str(result.get("final_signal") or "").upper() == "SELL" and not sell_is_actionable()
+        )
+
         chart_path = None
         try:
             chart_path = generate_agent_chart(ticker, df, result)
@@ -1367,8 +1379,13 @@ def check_alert_condition(ticker: str, result: dict) -> Optional[dict]:
         logger.info(f"  [{ticker}] 알림 조건 미충족: {', '.join(reason)}")
         return None
 
-    # 1.5) 냉각기 체크 — 손절(SELL) 알림 이후 COOLING_OFF_DAYS 동안 BUY 알림 억제
-    if signal == "BUY" and ticker in cooling_off_state:
+    # 1.5) 냉각기 체크 — 손절(SELL) 알림 이후 COOLING_OFF_DAYS 동안 BUY 알림 억제.
+    # advisory 모드에서는 걸지도, 지키지도 않는다 — 검증되지 않은 매도가 이후 매수
+    # 알림까지 막으면 틀린 신호의 비용이 두 배가 된다.
+    from sell_policy import sell_is_actionable
+
+    sell_actionable = sell_is_actionable()
+    if signal == "BUY" and sell_actionable and ticker in cooling_off_state:
         cool = cooling_off_state[ticker]
         elapsed_days = (datetime.now() - datetime.fromisoformat(cool["triggered_at"])).total_seconds() / 86400
         if elapsed_days < COOLING_OFF_DAYS:
@@ -1379,7 +1396,7 @@ def check_alert_condition(ticker: str, result: dict) -> Optional[dict]:
             del cooling_off_state[ticker]
             _persist_cooling_off_state()
 
-    if signal == "SELL":
+    if signal == "SELL" and sell_actionable:
         cooling_off_state[ticker] = {
             "signal": signal,
             "triggered_at": datetime.now().isoformat(),
@@ -1405,6 +1422,7 @@ def check_alert_condition(ticker: str, result: dict) -> Optional[dict]:
         "score": score,
         "confidence": confidence,
         "result": result,
+        "advisory": signal == "SELL" and not sell_actionable,
     }
 
 
@@ -1449,7 +1467,9 @@ def send_summary_alert(alerts: list) -> bool:
                 msg += f"  <b>{a['ticker']}</b>: {a['score']:+.1f}점 (신뢰도 {a['confidence']})\n"
             msg += "\n"
         if sell_alerts:
-            msg += "🔴 <b>매도 신호</b>\n"
+            from sell_policy import sell_icon, sell_label
+
+            msg += f"{sell_icon()} <b>{sell_label()}</b>\n"
             for a in sorted(sell_alerts, key=lambda x: x["score"]):
                 msg += f"  <b>{a['ticker']}</b>: {a['score']:+.1f}점 (신뢰도 {a['confidence']})\n"
         delivered = bool(send_telegram(msg))
@@ -3013,11 +3033,14 @@ def system_monitor():
         llm_status["error"] = str(exc)[:200]
 
     try:
-        from signal_tracker import get_accuracy_stats, get_calibrator
+        from signal_tracker import CURRENT_LOGIC_START, get_accuracy_stats, get_calibrator
 
         signal_status = {
             # 대표 horizon 은 매매 스타일의 의도 보유기간에서 파생된다
-            "accuracy_primary": get_accuracy_stats(days_back=180),
+            # 대표 지표 — 현재 로직 구간, 판정 소스만 (무효 창·구성요소 중복 제외)
+            "accuracy_primary": get_accuracy_stats(
+                since=CURRENT_LOGIC_START, sources="decisions"
+            ),
             "calibrator": get_calibrator().status(),
             "last_validation": _LAST_SIGNAL_VALIDATION or {"status": "never_run"},
         }
@@ -3920,7 +3943,9 @@ def api_telegram_rich_signal(ticker: str, webui_base_url: Optional[str] = None):
     }
 
     try:
-        acc = get_accuracy_stats(days_back=180)
+        from signal_tracker import CURRENT_LOGIC_START
+
+        acc = get_accuracy_stats(since=CURRENT_LOGIC_START, sources="decisions")
     except Exception:
         acc = None
 
@@ -4123,7 +4148,8 @@ def api_screener_pipeline(
 def api_signal_accuracy(horizon: int | None = None, min_confidence: float = 0.0,
                          signal: str = None, days_back: int = 180,
                          dedupe: str = "ticker_day",
-                         since: str | None = None, until: str | None = None):
+                         since: str | None = None, until: str | None = None,
+                         sources: str = "decisions"):
     """
     신호 정확도 통계 조회.
     - horizon: 7, 14, 30 (평가 기간 일수)
@@ -4135,13 +4161,15 @@ def api_signal_accuracy(horizon: int | None = None, min_confidence: float = 0.0,
       응답의 sampling·independent_blocks·win_rate_ci95 를 함께 볼 것.
     - since / until: 발행일 범위 (YYYY-MM-DD, UTC). since 가 있으면 days_back 대신.
       `current_logic_start` 이전은 무효 창 — 응답의 `window_includes_pre_logic` 참조.
+    - sources: decisions(기본, 판정 소스) | components(group_*) | all.
+      group_* 은 멀티에이전트 구성요소라 같은 사건을 여러 번 센다.
     """
     from signal_tracker import get_accuracy_stats
     try:
         return get_accuracy_stats(
             horizon=horizon, min_confidence=min_confidence,
             signal=signal, days_back=days_back, dedupe=dedupe,
-            since=since, until=until,
+            since=since, until=until, sources=sources,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc))
