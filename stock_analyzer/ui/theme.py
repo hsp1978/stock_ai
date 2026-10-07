@@ -345,6 +345,8 @@ THEME_CSS = """
     .signal-badge-lg.buy { background: var(--buy); color: #003828; }
     .signal-badge-lg.sell { background: var(--sell); color: #40000f; }
     .signal-badge-lg.hold { background: var(--L2); color: var(--on-surface); }
+    /* 매도 advisory — 매도 판정이지만 행동 신호가 아니다 (SELL_SIGNAL_MODE). */
+    .signal-badge-lg.warn { background: var(--warn); color: #3d2a00; }
 
     /* ── Metric cards (Streamlit stMetric) — L1 on L0 ── */
     div[data-testid="stMetric"] {

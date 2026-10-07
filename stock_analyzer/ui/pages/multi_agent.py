@@ -12,7 +12,7 @@ import re
 import streamlit as st
 
 from datetime import datetime
-from ui.components import render_bar_status_banner, render_sell_advisory_note
+from ui.components import render_bar_status_banner, render_sell_advisory_note, signal_display
 from ui.api_client import api_get, api_post, log_action
 from ui.tickers import format_ticker_label, get_ticker_display_name, load_watchlist, validate_ticker_webui
 
@@ -390,8 +390,9 @@ def render_multi_agent():
         col1, col2, col3 = st.columns(3)
         with col1:
             signal = final_decision.get('final_signal', 'N/A').upper()
+            signal_text, _cls = signal_display(signal, final_decision)
             color = {"BUY": "🟢", "SELL": "🔴", "NEUTRAL": "⚪"}.get(signal, "⚪")
-            st.metric("최종 신호", f"{color} {signal}")
+            st.metric("최종 신호", signal_text if _cls == "warn" else f"{color} {signal}")
         with col2:
             confidence = final_decision.get('final_confidence', 0)
             # HOLD/NEUTRAL일 때 "관망 확신도"로 라벨 분리
