@@ -4,6 +4,7 @@ from market_cal.market_calendar import (
     get_valid_trading_days,
     is_trading_day,
     reindex_to_trading_days,
+    session_has_opened,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "reindex_to_trading_days",
     "is_trading_day",
     "get_market_session",
+    "session_has_opened",
 ]

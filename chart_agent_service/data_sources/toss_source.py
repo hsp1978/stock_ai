@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -20,6 +21,8 @@ import pandas as pd
 from data_sources.base import Quote
 from brokers.toss_auth import TossTokenManager
 from brokers.toss_broker import to_toss_symbol
+
+logger = logging.getLogger(__name__)
 
 
 # 1회 호출 최대 봉 수 (명세)
@@ -39,6 +42,60 @@ _INTERVAL_MAP = {
     "1m": "1m", "5m": "1m", "15m": "1m", "30m": "1m", "1h": "1m",
     "1d": "1d", "1wk": "1d", "1mo": "1d",
 }
+
+
+def _drop_unopened_us_bar(
+    df: pd.DataFrame, ticker: str, now: Optional[datetime] = None
+) -> pd.DataFrame:
+    """미국 종목의 '정규장이 아직 열리지 않은 거래일' 봉을 떼어낸다.
+
+    토스는 미국 종목의 야간거래(토스 '주간거래', ET 20:00~) 체결을 **다음 거래일
+    일봉**으로 미리 만든다. 실측(2026-10-07 11:13 KST): GLW 10-07 봉 거래량 14,102
+    (전일 8,876,879), 1분봉 누적이 정확히 09:02 KST 부터였다. yfinance 에는 이 봉이
+    없다. 평일 09:00~22:30 KST 동안 이 봉이 모든 도구·ML 의 마지막 행이 되어
+    거래량비 0.0x, 기준가=야간 체결가가 됐다 (일일 배치 17:30 KST 포함).
+
+    떼어낸 사실은 `df.attrs["unopened_session_bar"]` 에 남긴다. 판정 불가(캘린더
+    오류)는 봉을 남기고 `session_check="error"` 로 기록한다 — '확인함'으로 덮지 않는다.
+    """
+    if df.empty or ticker.upper().endswith((".KS", ".KQ")):
+        df.attrs["session_check"] = "not_applicable"
+        return df
+
+    last_idx = df.index[-1]
+    try:
+        from market_cal import session_has_opened
+
+        ts = pd.Timestamp(last_idx)
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert("America/New_York")
+        bar_date = ts.date()
+        opened = session_has_opened("NYSE", bar_date, now)
+    except Exception as exc:
+        logger.warning("[toss] %s 세션 개장 판정 실패 — 마지막 봉 유지: %s", ticker, exc)
+        df.attrs["session_check"] = f"error: {type(exc).__name__}"
+        return df
+
+    df.attrs["session_check"] = "checked"
+    if opened:
+        df.attrs["unopened_session_bar"] = None
+        return df
+
+    last = df.iloc[-1]
+    dropped = {
+        "bar_date": bar_date.isoformat(),
+        "close": float(last["Close"]),
+        "volume": float(last["Volume"]),
+        "reason": "NYSE 정규장 미개장 — 야간거래 체결로 만든 다음 거래일 봉",
+    }
+    logger.info(
+        "[toss] %s %s 봉 제외 (정규장 미개장, 거래량 %.0f)",
+        ticker, dropped["bar_date"], dropped["volume"],
+    )
+    trimmed = df.iloc[:-1].copy()
+    trimmed.attrs = dict(df.attrs)
+    trimmed.attrs["unopened_session_bar"] = dropped
+    return trimmed
 
 
 class TossDataSource:
@@ -129,8 +186,14 @@ class TossDataSource:
         df = self._candles_to_df(rows)
         if df.empty:
             return df
+        if toss_interval == "1d":
+            df = _drop_unopened_us_bar(df, ticker)
+            if df.empty:
+                return df
         # 목표 봉 수로 절단 (최근 N개)
+        attrs = dict(df.attrs)
         df = df.iloc[-target_bars:]
+        df.attrs = attrs
         # 캐시 메타 (CLAUDE.md 5.5)
         df.attrs["source"] = self.name
         df.attrs["fetched_at"] = datetime.now(timezone.utc).isoformat()

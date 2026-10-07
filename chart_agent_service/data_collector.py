@@ -349,7 +349,9 @@ class PriceVerification:
     """최신 종가 교차검증 결과."""
 
     ticker: str
-    status: str          # ok | mismatch | bar_date_mismatch | single_source | unavailable
+    # ok | mismatch | bar_date_mismatch | primary_ahead | primary_behind
+    # | single_source | unavailable
+    status: str
     primary_source: Optional[str] = None
     primary_close: Optional[float] = None
     primary_bar_date: Optional[str] = None
@@ -462,10 +464,14 @@ def verify_latest_close(
             failures.append(f"{name}(종가없음)")
             continue
 
-        # '최신 vs 최신'을 비교하면 안 된다. 실측(2026-09-11): 미국 종목에서 Toss 는
-        # KST 날짜(09-11), yfinance 는 미국장 날짜(09-10)로 최신 봉을 라벨링한다.
-        # 그대로 비교하면 **모든 미국 종목이 매일 불일치**로 잡혀 경고가 상시 켜진다.
-        # 두 소스에 공통으로 있는 가장 최근 거래일의 종가를 맞춰서 본다.
+        # 가격은 두 소스에 공통으로 있는 가장 최근 거래일끼리 비교한다.
+        #
+        # ※ 2026-09-11 이 자리의 주석은 "Toss 는 KST 날짜, yfinance 는 미국 날짜로
+        # 최신 봉을 라벨링한다"였다 — **오진이다**. 두 소스의 봉 시각은 같다
+        # (ET 00:00 = 13:00 KST). Toss 의 앞선 봉은 야간거래 체결로 만든 '아직
+        # 정규장이 열리지 않은 다음 거래일' 봉이었고, 이 비교가 그것을 `ok` 로
+        # 덮었다 (2026-10-07 추적). 그 봉은 이제 toss_source 가 떼어낸다.
+        # 최신 봉 날짜가 다르면 아래에서 `primary_ahead`/`primary_behind` 로 보고한다.
         primary_by_date = _close_by_date(primary.data)
         secondary_by_date = _close_by_date(df)
         common = sorted(set(primary_by_date) & set(secondary_by_date))
@@ -503,6 +509,15 @@ def verify_latest_close(
         )
         if status == "mismatch":
             detail += f" — 임계 {PRICE_MISMATCH_PCT}% 초과, 가격 기반 지표 신뢰 불가"
+        elif p_date and s_date and p_date != s_date:
+            # 공통일 종가가 맞아도 분석이 쓰는 건 최신 봉이다 — 그 봉은 검증되지 않았다.
+            # 'ok' 로 적으면 문구에만 남고 상태로는 사라진다 (§13 실패 은폐).
+            if p_date > s_date:
+                status = "primary_ahead"
+                detail += f" — 최신봉 {p_date} 는 {name} 에 없음, 미검증"
+            else:
+                status = "primary_behind"
+                detail += f" — {primary.source} 최신봉이 {name} 보다 늦음, 데이터 지연"
         result = PriceVerification(
             **base,
             status=status,

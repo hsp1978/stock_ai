@@ -72,6 +72,10 @@ def format_entry_plan_markdown(ticker: str, final_decision: Dict[str, Any]) -> s
             line += f" ⚠️ 소스 불일치 ({verification.get('detail', '')})"
         elif verification.get("status") in ("single_source", "unavailable"):
             line += " (교차검증 불가)"
+        elif verification.get("status") == "primary_ahead":
+            line += " (최신봉 미검증)"
+        elif verification.get("status") == "primary_behind":
+            line += " ⚠️ 시세 지연"
         lines.append(line)
     else:
         lines.append("- **현재가**: 미표기 — 진입가 검산 불가")

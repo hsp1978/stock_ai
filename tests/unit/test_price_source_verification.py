@@ -108,9 +108,11 @@ def test_small_gap_within_tolerance_stays_ok():
 
 
 def test_compares_on_the_latest_common_trading_day():
-    """실측 회귀 — 미국 종목에서 Toss 는 KST 날짜, yfinance 는 미국장 날짜로
-    최신봉을 라벨링한다(2026-09-11 vs 2026-09-10). '최신 vs 최신'을 비교하면
-    **모든 미국 종목이 매일 불일치**로 잡혀 경고가 상시 켜진다.
+    """가격은 공통 거래일끼리 비교한다 — 그러나 최신봉이 다르면 'ok' 가 아니다.
+
+    2026-09-11 이 테스트는 "Toss 는 KST 날짜로 라벨링한다"는 오진 위에서 `ok` 를
+    고정했다. 실제 Toss 의 앞선 봉은 정규장이 열리지 않은 다음 거래일 봉이었고,
+    `ok` 가 그것을 매일 덮었다 (2026-10-07 추적). 최신봉 불일치는 상태로 남긴다.
     """
     result = _verify(
         160.0, "toss", [_Source("yfinance", 150.0, bar_date="2026-09-10")],
@@ -118,11 +120,23 @@ def test_compares_on_the_latest_common_trading_day():
         primary_history=[("2026-09-10", 150.2)],   # 공통 거래일 09-10
     )
 
-    assert result.status == "ok"                  # 상시 경고가 아니다
+    assert result.status == "primary_ahead"
     assert result.compared_bar_date == "2026-09-10"
     assert result.diff_pct == pytest.approx(0.133, abs=0.01)
     assert "2026-09-10 종가 비교" in result.detail
-    assert "최신봉" in result.detail              # 지연 사실은 함께 남는다
+    assert "미검증" in result.detail
+    assert not result.is_mismatch                 # 가격 불일치와는 다른 사실이다
+
+
+def test_primary_behind_is_reported_as_lag():
+    """1차 소스가 하루 늦으면 데이터 지연이다 — 공통일 종가가 맞아도 'ok' 가 아니다."""
+    result = _verify(
+        150.0, "toss", [_Source("yfinance", 151.0, bar_date="2026-09-11",
+                                history=[("2026-09-10", 150.1)])],
+        primary_date="2026-09-10",
+    )
+    assert result.status == "primary_behind"
+    assert result.compared_bar_date == "2026-09-10"
 
 
 def test_mismatch_is_detected_on_the_common_day_even_with_lag():
