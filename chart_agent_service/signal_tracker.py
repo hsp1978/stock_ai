@@ -810,6 +810,32 @@ DEFAULT_SAMPLE_MODE = "ticker_day"
 #: 2026-10-07 기준 현재 로직 −0.58% 를 −2.21% 로 보이게 했다 (14일, ticker_day).
 CURRENT_LOGIC_START = "2026-08-06"
 
+#: 실제로 판정·알림·주문 후보가 되는 신호 소스. `group_*` 은 멀티에이전트의 구성요소
+#: (기술·리스크·매크로·펀더멘털 그룹)라 같은 사건이 최종 판정과 함께 여러 번 세어진다 —
+#: 2026-09 루닛 매도 1건이 소스 5곳에서 5번 집계됐다. 대표 지표는 판정 소스만 본다.
+DECISION_SOURCES = ("multi_agent_final", "scan_agent", "screener")
+SOURCE_SCOPES = ("decisions", "components", "all")
+
+
+def source_role(source: Optional[str]) -> str:
+    """decision | component | other."""
+    if source in DECISION_SOURCES:
+        return "decision"
+    if (source or "").startswith("group_"):
+        return "component"
+    return "other"
+
+
+def _source_scope_sql(scope: str) -> Tuple[str, Tuple]:
+    if scope == "decisions":
+        marks = ",".join("?" for _ in DECISION_SOURCES)
+        return f" AND signal_source IN ({marks})", tuple(DECISION_SOURCES)
+    if scope == "components":
+        return " AND signal_source LIKE 'group\\_%' ESCAPE '\\'", ()
+    if scope == "all":
+        return "", ()
+    raise ValueError(f"sources 는 {SOURCE_SCOPES} 중 하나: {scope!r}")
+
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _JULIAN_EPOCH = 2440587.5  # 1970-01-01T00:00Z 의 julian day
 
@@ -872,11 +898,14 @@ def _window_bounds_sql(
 def load_sampled_outcomes(
     conn, horizon: int, days_back: int, dedupe: str = DEFAULT_SAMPLE_MODE,
     since: Optional[str] = None, until: Optional[str] = None,
+    source_scope: str = "all",
 ) -> Tuple[List, int]:
     """평가 완료 행에서 표본 대표만 뽑는다. (표본 행, 표본화 전 행 수)"""
     ret_col = f"return_{horizon}d"
     window_where, params = _window_bounds_sql(days_back, since, until)
-    base_where = f"{ret_col} IS NOT NULL AND {window_where}"
+    scope_where, scope_params = _source_scope_sql(source_scope)
+    params = params + scope_params
+    base_where = f"{ret_col} IS NOT NULL AND {window_where}{scope_where}"
     raw_total = conn.execute(
         f"SELECT COUNT(*) FROM signal_outcomes WHERE {base_where}", params
     ).fetchone()[0]
@@ -1139,9 +1168,13 @@ def get_accuracy_stats(
     dedupe: str = DEFAULT_SAMPLE_MODE,
     since: Optional[str] = None,
     until: Optional[str] = None,
+    sources: str = "all",
 ) -> Dict:
     """
     신뢰도·신호 조합별 정확도 집계.
+
+    `sources`: decisions(판정 소스만) | components(group_*) | all. 기본 all 은 내부
+    호출자(칼리브레이터)의 종전 동작을 지키기 위해서다 — 대표 지표는 decisions 로 부른다.
 
     `since`(포함)·`until`(미포함)은 발행일 범위다. `since` 가 있으면 `days_back` 을
     대신한다 — 로직 구간처럼 날짜로 끊어야 하는 비교에 쓴다 (`CURRENT_LOGIC_START`).
@@ -1174,8 +1207,10 @@ def get_accuracy_stats(
         dedupe = DEFAULT_SAMPLE_MODE
 
     conn = _get_conn()
+    if sources not in SOURCE_SCOPES:
+        raise ValueError(f"sources 는 {SOURCE_SCOPES} 중 하나: {sources!r}")
     sampled, raw_total = load_sampled_outcomes(
-        conn, horizon, days_back, dedupe, since=since, until=until
+        conn, horizon, days_back, dedupe, since=since, until=until, source_scope=sources
     )
     conn.close()
 
@@ -1258,6 +1293,7 @@ def get_accuracy_stats(
         rows = [r for r in scoped if (r["signal_source"] or "unknown") == name]
         t = _tally(rows)
         by_source[name] = {
+            "role": source_role(name),
             "total": t["total"],
             "direction_hit_rate_pct": t["direction_hit_rate_pct"],
             "direction_sample": t["direction_sample"],
@@ -1292,6 +1328,8 @@ def get_accuracy_stats(
         "window": {"since": since, "until": until, "days_back": None if since else days_back},
         "current_logic_start": CURRENT_LOGIC_START,
         "window_includes_pre_logic": _includes_pre_logic(days_back, since),
+        "source_scope": sources,
+        "decision_sources": list(DECISION_SOURCES),
         "total_evaluated": overall["total"],
         # ±2% 밴드 기반 승률은 대표 지표에서 내렸다 — 임의 임계이고 horizon 이
         # 길수록 넘기 쉬워져 기간 간 비교를 왜곡한다. 밴드 집계는 band_outcome 에.

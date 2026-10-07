@@ -3033,11 +3033,14 @@ def system_monitor():
         llm_status["error"] = str(exc)[:200]
 
     try:
-        from signal_tracker import get_accuracy_stats, get_calibrator
+        from signal_tracker import CURRENT_LOGIC_START, get_accuracy_stats, get_calibrator
 
         signal_status = {
             # 대표 horizon 은 매매 스타일의 의도 보유기간에서 파생된다
-            "accuracy_primary": get_accuracy_stats(days_back=180),
+            # 대표 지표 — 현재 로직 구간, 판정 소스만 (무효 창·구성요소 중복 제외)
+            "accuracy_primary": get_accuracy_stats(
+                since=CURRENT_LOGIC_START, sources="decisions"
+            ),
             "calibrator": get_calibrator().status(),
             "last_validation": _LAST_SIGNAL_VALIDATION or {"status": "never_run"},
         }
@@ -3940,7 +3943,9 @@ def api_telegram_rich_signal(ticker: str, webui_base_url: Optional[str] = None):
     }
 
     try:
-        acc = get_accuracy_stats(days_back=180)
+        from signal_tracker import CURRENT_LOGIC_START
+
+        acc = get_accuracy_stats(since=CURRENT_LOGIC_START, sources="decisions")
     except Exception:
         acc = None
 
@@ -4143,7 +4148,8 @@ def api_screener_pipeline(
 def api_signal_accuracy(horizon: int | None = None, min_confidence: float = 0.0,
                          signal: str = None, days_back: int = 180,
                          dedupe: str = "ticker_day",
-                         since: str | None = None, until: str | None = None):
+                         since: str | None = None, until: str | None = None,
+                         sources: str = "decisions"):
     """
     신호 정확도 통계 조회.
     - horizon: 7, 14, 30 (평가 기간 일수)
@@ -4155,13 +4161,15 @@ def api_signal_accuracy(horizon: int | None = None, min_confidence: float = 0.0,
       응답의 sampling·independent_blocks·win_rate_ci95 를 함께 볼 것.
     - since / until: 발행일 범위 (YYYY-MM-DD, UTC). since 가 있으면 days_back 대신.
       `current_logic_start` 이전은 무효 창 — 응답의 `window_includes_pre_logic` 참조.
+    - sources: decisions(기본, 판정 소스) | components(group_*) | all.
+      group_* 은 멀티에이전트 구성요소라 같은 사건을 여러 번 센다.
     """
     from signal_tracker import get_accuracy_stats
     try:
         return get_accuracy_stats(
             horizon=horizon, min_confidence=min_confidence,
             signal=signal, days_back=days_back, dedupe=dedupe,
-            since=since, until=until,
+            since=since, until=until, sources=sources,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc))

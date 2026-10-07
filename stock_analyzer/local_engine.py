@@ -669,10 +669,12 @@ def engine_system_monitor() -> dict:
         llm_status["error"] = str(exc)[:200]
 
     try:
-        from signal_tracker import get_accuracy_stats, get_calibrator
+        from signal_tracker import CURRENT_LOGIC_START, get_accuracy_stats, get_calibrator
 
         signal_status = {
-            "accuracy_primary": get_accuracy_stats(days_back=180),
+            "accuracy_primary": get_accuracy_stats(
+                since=CURRENT_LOGIC_START, sources="decisions"
+            ),
             "calibrator": get_calibrator().status(),
             "last_validation": get_app_state("service.signal_validation.last_result", {"status": "never_run"}),
         }
@@ -1770,7 +1772,9 @@ def engine_dispatch_get(path: str) -> Optional[dict]:
             return engine_portfolio_rebalance(method, interval, drift, dry_run)
         elif path.startswith("/signal-accuracy/calibrator"):
             return engine_signal_calibrator_status()
-        elif path.startswith("/signal-accuracy") and ("since=" in path or "until=" in path):
+        elif path.startswith("/signal-accuracy") and any(
+            k in path for k in ("since=", "until=", "sources=")
+        ):
             # 발행일 범위는 이 엔진이 해석하지 못한다 — 조용히 무시하지 말고 HTTP 로 넘긴다.
             return None
         elif path.startswith("/signal-accuracy"):

@@ -25,7 +25,7 @@ def render_signal_accuracy():
     """, unsafe_allow_html=True)
 
     # ── 컨트롤 ─────────────────────────────────────
-    col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
+    col1, col2, col3, col4, col5, col6 = st.columns([1, 1, 1, 1, 1, 1])
     with col1:
         # 기본값은 매매 스타일의 의도 보유기간을 덮는 대표 horizon 이다.
         _horizon_info = api_get("/signal-accuracy/horizon") or {}
@@ -61,6 +61,20 @@ def render_signal_accuracy():
             }[x],
             help="30분 스캔은 같은 종목·같은 날을 최대 48회 기록한다. "
                  "'원시 행 전부'는 독립 표본이 아니라 진단용이다.",
+        )
+
+    with col6:
+        # 기본은 판정 소스다. group_* 은 멀티에이전트 구성요소라 같은 사건을 최종
+        # 판정과 함께 여러 번 센다 (2026-09 루닛 매도 1건이 소스 5곳에서 집계).
+        sources = st.selectbox(
+            "신호 소스", ["decisions", "components", "all"], index=0,
+            format_func=lambda x: {
+                "decisions": "판정 경로",
+                "components": "구성요소(group_*)",
+                "all": "전체",
+            }[x],
+            help="판정 경로 = multi_agent_final · scan_agent · screener. "
+                 "구성요소는 최종 판정의 재료라 대표 지표에서 뺀다.",
         )
 
     sig_param = None if signal_filter == "전체" else signal_filter
@@ -105,6 +119,8 @@ def render_signal_accuracy():
     base_q = f"/signal-accuracy?horizon={horizon}&min_confidence={min_conf}&dedupe={dedupe}"
     if sig_param:
         base_q += f"&signal={sig_param}"
+    all_sources_q = base_q + "&sources=all"
+    base_q += f"&sources={sources}"
     window_q = f"&since={logic_start}" if days_back == "current" else f"&days_back={days_back}"
     data = api_get(base_q + window_q)
 
@@ -195,6 +211,7 @@ def render_signal_accuracy():
         )
 
     _render_logic_epoch_comparison(base_q, logic_start)
+    _render_source_breakdown(all_sources_q + window_q)
 
     if not data.get("horizon_covers_holding", True):
         st.warning(
@@ -355,4 +372,33 @@ def _render_logic_epoch_comparison(base_q: str, logic_start: str) -> None:
     st.caption(
         "같은 평가 기간·신뢰도·신호·표본 단위로 집계. 구 로직 구간은 신호 로직이 달라 "
         "현재 성능의 근거가 아니다. 미국 종목은 2026-10-07 검증 시계를 재시작했다 (§7)."
+    )
+
+
+_ROLE_LABEL = {"decision": "판정", "component": "구성요소", "other": "기타"}
+
+
+def _render_source_breakdown(query: str) -> None:
+    """소스별 성과 — 전체 소스를 역할과 함께 보여준다 (대표 지표 선택과 무관)."""
+    data = api_get(query) or {}
+    by_source = data.get("by_source") or {}
+    if not by_source:
+        return
+    rows = []
+    for name, v in by_source.items():
+        rows.append({
+            "소스": name,
+            "역할": _ROLE_LABEL.get(v.get("role"), v.get("role") or "—"),
+            "표본": v.get("total", 0),
+            "방향 적중률": f"{v.get('direction_hit_rate_pct', 0):.1f}%",
+            "방향보정 기대값": f"{v.get('avg_signed_return_pct', 0):+.2f}%",
+            "시장 대비": (f"{v.get('avg_excess_return_pct', 0):+.2f}%"
+                        if v.get("benchmark_sample") else "—"),
+        })
+    rows.sort(key=lambda r: (r["역할"] != "판정", -r["표본"]))
+    st.markdown("#### 소스별 성과")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.caption(
+        "같은 조회 기간·평가 기간. '구성요소'(group_*)는 최종 판정의 재료라 같은 사건을 "
+        "중복 집계한다 — 대표 지표는 '판정' 소스로 본다."
     )
