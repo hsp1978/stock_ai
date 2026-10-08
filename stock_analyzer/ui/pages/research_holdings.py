@@ -16,6 +16,12 @@ def render_research_holdings():
     </div>
     """, unsafe_allow_html=True)
 
+    # 저장·삭제 결과는 rerun 뒤에 보여준다 — 바로 rerun 하면 메시지가 순식간에 사라져
+    # 저장됐는지 알 수 없었다 (2026-10-08: 입력했다는데 저장 요청이 0건이었다).
+    flash = st.session_state.pop("holdings_flash", None)
+    if flash:
+        st.success(flash)
+
     data = api_get("/research/holdings")
     if data is None:
         st.error("보유 목록을 읽지 못했습니다 — agent-api 응답 없음. 비어 있다는 뜻이 아닙니다.")
@@ -43,11 +49,11 @@ def render_research_holdings():
                 "stop_price": stop or None, "target_price": target or None}
         code, resp = api_request("PUT", "/research/holdings", json_body=body)
         if code == 200:
-            st.success(f"{ticker.upper()} 저장됨")
+            st.session_state["holdings_flash"] = f"{ticker.strip().upper()} 저장됨 — 아래 목록에서 확인하세요"
             st.rerun()
         else:
-            # 422 = 입력값 검증 실패 (수량·평단가 0 등) — 사유를 그대로 보여준다
-            st.error(f"저장 실패 ({code}): {resp}")
+            # 422 = 입력값 검증 실패 (수량·평단가 0 등) — 무엇이 틀렸는지 읽을 수 있게
+            st.error(f"저장 실패 ({code}): {_reason(resp)}")
 
     if holdings:
         st.markdown("#### 삭제")
@@ -57,7 +63,24 @@ def render_research_holdings():
         if c2.button("삭제"):
             code, resp = api_request("DELETE", f"/research/holdings/{target_ticker}")
             if code == 200:
-                st.success(f"{target_ticker} 삭제됨")
+                st.session_state["holdings_flash"] = f"{target_ticker} 삭제됨"
                 st.rerun()
             else:
                 st.error(f"삭제 실패 ({code}): {resp}")
+
+
+_FIELD = {"ticker": "티커", "qty": "수량", "avg_price": "평단가",
+          "stop_price": "손절가", "target_price": "목표가", "note": "메모"}
+
+
+def _reason(resp) -> str:
+    """FastAPI 422 본문 → '수량: 0보다 커야 합니다' 같은 한 줄."""
+    detail = resp.get("detail") if isinstance(resp, dict) else None
+    if isinstance(detail, list):
+        parts = []
+        for d in detail:
+            field = _FIELD.get((d.get("loc") or ["", ""])[-1], str(d.get("loc")))
+            msg = "0보다 커야 합니다" if d.get("type") == "greater_than" else d.get("msg", "")
+            parts.append(f"{field}: {msg}")
+        return " · ".join(parts)
+    return str(detail or resp)

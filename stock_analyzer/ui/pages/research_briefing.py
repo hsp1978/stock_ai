@@ -12,8 +12,13 @@ import streamlit as st
 from ui.api_client import api_get, api_post
 
 
-def _pct(v):
-    return None if v is None else round(float(v), 2)
+def _num(v, fmt: str = "{:,.2f}") -> str:
+    """표 셀 문자열. 빈 값은 빈칸.
+
+    숫자와 '' 를 한 열에 섞으면 Arrow 직렬화가 실패한다 (2026-10-08 webui 로그:
+    ArrowTypeError, column 실적 D) — 열 전체를 문자열로 만든다.
+    """
+    return "" if v is None else fmt.format(float(v))
 
 
 def render_research_briefing():
@@ -43,20 +48,18 @@ def render_research_briefing():
         rows.append({
             "종목": i["ticker"],
             "보유": "●" if i.get("is_holding") else "",
-            "종가": i.get("close"),
-            "등락%": _pct(i.get("change_pct")),
-            "손익%": _pct(i.get("pnl_pct")),
-            "손절까지%": _pct(i.get("to_stop_pct")),
-            "목표까지%": _pct(i.get("to_target_pct")),
-            "실적 D": i.get("days_to_earnings") if i.get("earnings_status") == "ok" else None,
-            "공시": len(i.get("disclosures") or []),
+            "종가": _num(i.get("close"), "{:,.0f}" if i.get("market") == "KRX" else "{:,.2f}"),
+            "등락%": _num(i.get("change_pct"), "{:+.2f}"),
+            "손익%": _num(i.get("pnl_pct"), "{:+.2f}"),
+            "손절까지%": _num(i.get("to_stop_pct"), "{:+.2f}"),
+            "목표까지%": _num(i.get("to_target_pct"), "{:+.2f}"),
+            "실적 D": _num(i.get("days_to_earnings") if i.get("earnings_status") == "ok" else None,
+                         "{:.1f}"),
+            "공시": str(len(i.get("disclosures") or [])),
             "볼 것": " · ".join(i.get("flags") or []),
             "가격 검증": i.get("price_check"),
         })
-    # 빈 값은 빈칸으로 — "None" 이 찍히면 값이 'None' 인 것처럼 읽힌다
-    table = pd.DataFrame(rows)
-    st.dataframe(table.astype(object).where(table.notna(), ""), hide_index=True,
-                 use_container_width=True)
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
     for i in items:
         notes = [n for n in (i.get("bar_note"), i.get("earnings_note")) if n]
