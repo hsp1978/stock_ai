@@ -116,3 +116,26 @@ def test_ui_note_matches_policy_note():
     from ui.components import SELL_ADVISORY_NOTE
 
     assert SELL_ADVISORY_NOTE == sell_policy.ADVISORY_NOTE
+
+
+# ── 화면 배지 ────────────────────────────────────────────────────────
+
+
+def _ui():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../stock_analyzer"))
+    from ui.components import signal_display
+
+    return signal_display
+
+
+def test_badge_shows_risk_warning_for_advisory_sell():
+    """배너만 바꾸고 배지를 빨간 SELL 로 두면 배지만 보는 사람은 매도로 읽는다."""
+    assert _ui()("SELL", {"sell_advisory": True}) == ("⚠️ 리스크 경고", "warn")
+
+
+def test_badge_keeps_sell_when_actionable_or_unflagged():
+    """판정은 agent-api 필드를 따른다 — 필드가 없는 옛 결과는 SELL 그대로."""
+    assert _ui()("SELL", {"sell_advisory": False}) == ("SELL", "sell")
+    assert _ui()("SELL", {}) == ("SELL", "sell")
+    assert _ui()("BUY", {"sell_advisory": True}) == ("BUY", "buy")
+    assert _ui()("HOLD", None) == ("HOLD", "hold")

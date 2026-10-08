@@ -19,6 +19,7 @@ from ui.components import (
     _plotly_base_layout,
     render_bar_status_banner,
     render_sell_advisory_note,
+    signal_display,
 )
 from ui.export import export_comprehensive_data
 from ui.format import _fmt_num, _fmt_price
@@ -220,13 +221,13 @@ def render_detail():
     dist = detail.get("signal_distribution", {})
     analyzed_at = str(detail.get("analyzed_at", ""))[:19].replace("T", " ")
 
-    badge_class = "buy" if signal == "BUY" else ("sell" if signal == "SELL" else "hold")
+    signal_text, badge_class = signal_display(signal, detail)
     score_color = "var(--buy)" if score > 0 else "var(--sell)" if score < 0 else "var(--outline)"
 
     st.markdown(f"""
     <div style="margin-bottom:24px;">
         <div style="font-size:10px; color:var(--on-surface-variant); text-transform:uppercase; letter-spacing:1px; margin-bottom:8px;">Signal</div>
-        <span class="signal-badge-lg {badge_class}">{signal}</span>
+        <span class="signal-badge-lg {badge_class}">{signal_text}</span>
     </div>
     """, unsafe_allow_html=True)
 

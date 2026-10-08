@@ -91,3 +91,16 @@ def render_sell_advisory_note(result: dict | None) -> None:
 
     if result and result.get("sell_advisory"):
         st.info(f"⚠️ 리스크 경고(매도·참고용) — {result.get('sell_advisory_note') or SELL_ADVISORY_NOTE}")
+
+
+def signal_display(signal: str | None, result: dict | None) -> tuple[str, str]:
+    """(표시 문구, 배지 클래스). advisory 매도는 'SELL' 대신 리스크 경고로 보인다.
+
+    판정은 agent-api 의 `sell_advisory` 필드를 따른다 — 경고 배너만 바꾸고 배지를
+    빨간 SELL 로 두면 배지만 보는 사람은 매도 신호로 읽는다 (2026-10-07).
+    """
+    sig = (signal or "").upper()
+    if sig == "SELL" and result and result.get("sell_advisory"):
+        return "⚠️ 리스크 경고", "warn"
+    cls = {"BUY": "buy", "SELL": "sell"}.get(sig, "hold")
+    return (sig or "?"), cls
