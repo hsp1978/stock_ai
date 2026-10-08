@@ -502,21 +502,28 @@ def _summarize_job_result(result: Any) -> Any:
     if result is None:
         return None
     if isinstance(result, dict):
+        # 화이트리스트다 — 여기 없는 키는 /ops/jobs 에서 사라진다. 2026-09-30:
+        # 배치·스캔이 `llm_routing`/`degraded` 를 돌려줘도 여기서 버려졌고, 배치의
+        # `succeeded`/`failed` 도 없어 부분 실패가 `processed: 7` 에 묻혔다.
         keys = (
             "status",
+            "degraded",
             "ticker_count",
             "processed",
+            "succeeded",
+            "failed",
+            "elapsed_sec",
             "updated",
             "adjustments",
             "stale_count",
             "degraded_count",
             "ok_count",
-            # 리서치 잡 — 전송 '결과'와 볼 거리 수 (§13-2)
+            "llm_routing",
+            # 리서치 잡 — 전송 '결과'와 볼 거리 수 (§13-2). failed 는 위에 있다
             "market",
             "delivered",
             "items",
             "flagged",
-            "failed",
             "new_disclosures",
             "summarized",
             "error_count",
