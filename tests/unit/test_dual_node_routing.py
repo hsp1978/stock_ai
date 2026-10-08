@@ -59,7 +59,7 @@ def test_mac_studio_health_uses_longer_timeout_and_ttl_cache(monkeypatch):
     session.get_responses.extend([
         _Response(200),                                     # /api/tags
         _Response(200, {"models": [                          # /api/ps
-            {"name": "qwen2.5:32b", "size": 1000, "size_vram": 990}]}),
+            {"name": "qwen2.5:32b", "size": 1000, "size_vram": 990, "expires_at": "2099-01-01T00:00:00+00:00"}]}),
     ])
     # 2026-09-16: 적재 위치만으로는 '생성이 죽은 노드'를 못 잡아, 1토큰 생성 검사를
     # 더했다 (test_generation_probe.py). 그래서 health 검사가 GET 2회 + POST 1회다.
@@ -84,7 +84,7 @@ def test_mac_studio_health_requires_consecutive_failures(monkeypatch):
     session.get_responses.extend([
         _Response(200),                                      # /api/tags
         _Response(200, {"models": [                           # /api/ps
-            {"name": "qwen2.5:32b", "size": 1000, "size_vram": 990}]}),
+            {"name": "qwen2.5:32b", "size": 1000, "size_vram": 990, "expires_at": "2099-01-01T00:00:00+00:00"}]}),
         TimeoutError("busy"),
         TimeoutError("still busy"),
     ])

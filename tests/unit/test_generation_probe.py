@@ -39,7 +39,7 @@ import dual_node_config as dn  # noqa: E402
 import service  # noqa: E402
 
 _LOADED = {"models": [{"name": "qwen3:14b-q4_K_M", "on_gpu": True,
-                       "size_bytes": 1000, "size_vram_bytes": 1000,
+                       "size_bytes": 1000, "size_vram_bytes": 1000, "expires_at": "2099-01-01T00:00:00+00:00",
                        "gpu_fraction": 1.0}]}
 
 
@@ -180,7 +180,7 @@ def _refresh(monkeypatch, *, tags=200, ps_models=None):
         async def get(self, url):
             if url.endswith("/api/ps"):
                 return _Resp(200, {"models": ps_models if ps_models is not None else [
-                    {"name": "qwen3:14b-q4_K_M", "size": 1000, "size_vram": 1000}]})
+                    {"name": "qwen3:14b-q4_K_M", "size": 1000, "size_vram": 1000, "expires_at": "2099-01-01T00:00:00+00:00"}]})
             return _Resp(tags)
 
     monkeypatch.setattr(service.httpx, "AsyncClient", lambda **kw: C())
@@ -223,7 +223,7 @@ def test_cpu_fallback_still_wins_over_generation(monkeypatch):
 
     snap = _refresh(
         monkeypatch,
-        ps_models=[{"name": "m", "size": 1000, "size_vram": 0}],
+        ps_models=[{"name": "m", "size": 1000, "size_vram": 0, "expires_at": "2099-01-01T00:00:00+00:00"}],
     )
 
     assert snap["ollama_runtime"]["status"] == "cpu_fallback"
@@ -254,7 +254,7 @@ def _mac_session(monkeypatch, *, ps_models, generation):
 
     monkeypatch.setattr(dn, "get_http_session", lambda: S())
     monkeypatch.setattr(dn, "probe_node_generation",
-                        lambda base_url, model, timeout=None, node=None: generation)
+                        lambda base_url, model, timeout=None, node=None, expires_at=None: generation)
     monkeypatch.setenv("MAC_STUDIO_HEALTH_TTL_SECONDS", "0")
 
 
@@ -268,7 +268,7 @@ def reset_mac_cache():
 def test_mac_runtime_becomes_unusable_when_generation_stalls(monkeypatch):
     _mac_session(
         monkeypatch,
-        ps_models=[{"name": "qwen2.5:32b", "size": 1000, "size_vram": 990}],
+        ps_models=[{"name": "qwen2.5:32b", "size": 1000, "size_vram": 990, "expires_at": "2099-01-01T00:00:00+00:00"}],
         generation={"status": "stalled", "detail": "20초 안에 1토큰도"},
     )
 
@@ -282,7 +282,7 @@ def test_mac_unusable_node_is_not_available(monkeypatch):
     """라우팅에서 빠져야 한다 — 아니면 게이트가 판정만 바꾸고 끝난다."""
     _mac_session(
         monkeypatch,
-        ps_models=[{"name": "qwen2.5:32b", "size": 1000, "size_vram": 990}],
+        ps_models=[{"name": "qwen2.5:32b", "size": 1000, "size_vram": 990, "expires_at": "2099-01-01T00:00:00+00:00"}],
         generation={"status": "stalled", "detail": "20초 안에 1토큰도"},
     )
 
@@ -298,7 +298,7 @@ def test_mac_unusable_node_is_not_available(monkeypatch):
 def test_mac_usable_node_stays_available(monkeypatch):
     _mac_session(
         monkeypatch,
-        ps_models=[{"name": "qwen2.5:32b", "size": 1000, "size_vram": 990}],
+        ps_models=[{"name": "qwen2.5:32b", "size": 1000, "size_vram": 990, "expires_at": "2099-01-01T00:00:00+00:00"}],
         generation={"status": "ok", "latency_ms": 300},
     )
 
@@ -338,7 +338,8 @@ def test_node_generation_probe_sends_one_token(monkeypatch):
 
     monkeypatch.setattr(dn, "get_http_session", lambda: S())
 
-    result = dn.probe_node_generation("http://mac:8080/", "qwen2.5:32b", timeout=5.0)
+    result = dn.probe_node_generation("http://mac:8080/", "qwen2.5:32b", timeout=5.0,
+                                       expires_at="2099-01-01T00:00:00+00:00")
 
     assert result["status"] == "ok"
     assert seen["url"] == "http://mac:8080/api/generate"
@@ -355,7 +356,8 @@ def test_node_generation_probe_timeout_is_stalled(monkeypatch):
 
     monkeypatch.setattr(dn, "get_http_session", lambda: S())
 
-    result = dn.probe_node_generation("http://mac:8080", "qwen2.5:32b", timeout=1.0)
+    result = dn.probe_node_generation("http://mac:8080", "qwen2.5:32b", timeout=1.0,
+                                       expires_at="2099-01-01T00:00:00+00:00")
 
     assert result["status"] == "stalled"
     assert result["latency_ms"] is not None
@@ -462,7 +464,8 @@ def test_mac_probe_skips_while_that_node_is_busy(_no_load, monkeypatch):
     with dn.node_slot("mac_studio", block=False) as acquired:
         assert acquired is True
         result = dn.probe_node_generation(
-            "http://mac:8080", "qwen2.5:32b", timeout=1.0, node="mac_studio"
+            "http://mac:8080", "qwen2.5:32b", timeout=1.0, node="mac_studio",
+            expires_at="2099-01-01T00:00:00+00:00",
         )
 
     assert result["status"] == "skipped"
@@ -480,7 +483,8 @@ def test_busy_on_one_node_does_not_skip_the_other(_no_load, monkeypatch):
 
     with dn.node_slot("rtx_5070", block=False):
         result = dn.probe_node_generation(
-            "http://mac:8080", "qwen2.5:32b", timeout=1.0, node="mac_studio"
+            "http://mac:8080", "qwen2.5:32b", timeout=1.0, node="mac_studio",
+            expires_at="2099-01-01T00:00:00+00:00",
         )
 
     assert result["status"] == "ok"
@@ -492,7 +496,7 @@ def test_mac_gate_keeps_a_busy_node_available(_no_load, monkeypatch):
         def get(self, url, timeout=None):
             if url.endswith("/api/ps"):
                 return _Resp(200, {"models": [
-                    {"name": "qwen2.5:32b", "size": 1000, "size_vram": 990}]})
+                    {"name": "qwen2.5:32b", "size": 1000, "size_vram": 990, "expires_at": "2099-01-01T00:00:00+00:00"}]})
             return _Resp(200)
 
         def post(self, url, json=None, timeout=None):
@@ -512,3 +516,63 @@ def test_mac_gate_keeps_a_busy_node_available(_no_load, monkeypatch):
     snap = dn.mac_studio_health_snapshot()
     assert snap["runtime"] == "gpu"
     assert snap["failures"] == 0
+
+
+
+# ── 프로브가 모델 언로드를 미루지 않는다 (2026-10-08) ──────────────────
+#
+# Ollama 는 요청마다 언로드 시각을 '지금 + keep_alive'로 다시 잡는다. keep_alive 없는
+# 프로브가 15초마다 돌면서 RTX 모델 언로드 시각을 매번 5분 뒤로 밀었다 — 아무도 쓰지 않아도
+# VRAM 10 GB 를 영구 점유했다.
+
+
+def test_remaining_keep_alive_preserves_expiry():
+    from datetime import datetime, timezone
+
+    from ollama_keepalive import remaining_keep_alive
+
+    now = datetime(2026, 10, 8, 5, 2, 38, tzinfo=timezone.utc)
+    # Ollama 실제 표기: 서버 시간대 + 나노초
+    assert remaining_keep_alive("2026-10-08T14:07:29.439162455+09:00", now) == "291s"
+    assert remaining_keep_alive("2026-10-08T05:00:00+00:00", now) == "1s"   # 이미 지남
+    assert remaining_keep_alive(None, now) is None
+    assert remaining_keep_alive("garbage", now) is None
+
+
+def test_service_probe_sends_remaining_keep_alive(monkeypatch):
+    sent = []
+
+    class C:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None):
+            sent.append(json)
+            return _Resp(200)
+
+    monkeypatch.setattr(service.httpx, "AsyncClient", C)
+    monkeypatch.setattr(service, "_local_node_is_busy", lambda: False)
+    asyncio.run(service._probe_generation("http://rtx:11434", dict(_LOADED)))
+    assert sent and sent[0]["keep_alive"].endswith("s") and int(sent[0]["keep_alive"][:-1]) > 60
+
+
+def test_probe_without_expiry_is_skipped_not_extending():
+    """언로드 시각을 모르면 보내지 않는다 — 보내면 기본 5분이 붙어 모델을 붙잡는다."""
+    runtime = {"models": [{"name": "m", "on_gpu": True, "size_bytes": 1, "size_vram_bytes": 1}]}
+    r = asyncio.run(service._probe_generation("http://rtx:11434", runtime))
+    assert r["status"] == "skipped" and r["reason"] == "expiry_unknown"
+    r2 = dn.probe_node_generation("http://mac:8080", "m", timeout=1.0)
+    assert r2["status"] == "skipped" and r2["reason"] == "expiry_unknown"
+
+
+def test_scan_keep_alive_is_short_by_default():
+    """스캔이 끝나면 GPU 를 비운다 — 1h 였을 때 30분 주기 스캔이 VRAM 을 계속 점유했다."""
+    import config
+
+    assert config.Settings.model_fields["OLLAMA_KEEP_ALIVE"].default == "5m"
