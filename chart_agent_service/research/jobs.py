@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Callable, Iterable, Literal, Optional
 
 from research.briefing import Fetchers, build_briefing, dart_url
@@ -60,15 +61,24 @@ def run_market_briefing(
     }
 
 
-def _format_disclosure_alert(new: list[tuple[str, dict]]) -> str:
+#: 알림 한 번에 요약할 최대 공시 수 — LLM 쿼터(모델당 하루 20회)를 감시 잡이 다 쓰지 않게
+_MAX_SUMMARIES = 5
+
+
+def _format_disclosure_alert(new: list[tuple[str, dict]], summaries: Optional[dict] = None) -> str:
     from html import escape
 
+    summaries = summaries or {}
     lines = [f"📄 <b>새 공시 {len(new)}건</b>"]
     for ticker, row in new[:20]:
         title = escape(str(row.get("report_nm", "")).strip())
-        lines.append(
-            f'• <b>{escape(ticker)}</b> <a href="{escape(dart_url(row.get("rcept_no", "")))}">{title}</a>'
-        )
+        no = str(row.get("rcept_no", ""))
+        lines.append(f'• <b>{escape(ticker)}</b> <a href="{escape(dart_url(no))}">{title}</a>')
+        summ = summaries.get(no)
+        if summ is not None and summ.bullets:
+            lines += [f"   – {escape(b)}" for b in summ.bullets]
+        elif summ is not None:
+            lines.append(f"   <i>요약 없음 — {escape(summ.reason or '실패')}</i>")
     if len(new) > 20:
         lines.append(f"…외 {len(new) - 20}건 (화면에서 확인)")
     lines.append("<i>원문 링크입니다. 매수·매도 판단이 아닙니다.</i>")
@@ -81,6 +91,7 @@ def run_disclosure_watch(
     send: Callable[[str], bool],
     load_seen: Callable[[], Optional[list[str]]],
     save_seen: Callable[[list[str]], None],
+    summarize: Optional[Callable[[str, str, str], object]] = None,
 ) -> dict:
     """한국 종목의 새 공시를 알린다.
 
@@ -116,7 +127,20 @@ def run_disclosure_watch(
         status = "partial_failure" if errors else "completed"
         return {**result, "status": status, "delivered": False}
 
-    delivered = bool(send(_format_disclosure_alert(new)))
+    summaries: dict = {}
+    summarized_ok = 0
+    if summarize is not None:
+        for ticker, row in new[:_MAX_SUMMARIES]:
+            no = str(row.get("rcept_no", ""))
+            try:
+                summ = summarize(no, ticker, str(row.get("report_nm", "")).strip())
+            except Exception as exc:  # 요약 실패는 알림을 막지 않는다 — 링크는 나간다
+                summ = SimpleNamespace(bullets=(), reason=f"{type(exc).__name__}: {exc}")
+            summaries[no] = summ
+            summarized_ok += 1 if getattr(summ, "bullets", ()) else 0
+    result["summarized"] = summarized_ok
+
+    delivered = bool(send(_format_disclosure_alert(new, summaries)))
     if delivered:
         save_seen(sorted(seen | set(found))[-_SEEN_LIMIT:])
     status = "delivery_failed" if not delivered else ("partial_failure" if errors else "completed")

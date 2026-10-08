@@ -53,14 +53,23 @@ def render_research_briefing():
             "볼 것": " · ".join(i.get("flags") or []),
             "가격 검증": i.get("price_check"),
         })
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    # 빈 값은 빈칸으로 — "None" 이 찍히면 값이 'None' 인 것처럼 읽힌다
+    table = pd.DataFrame(rows)
+    st.dataframe(table.astype(object).where(table.notna(), ""), hide_index=True,
+                 use_container_width=True)
 
     for i in items:
         notes = [n for n in (i.get("bar_note"), i.get("earnings_note")) if n]
         if not (i.get("disclosures") or i.get("errors") or notes):
             continue
-        with st.expander(f"{i['ticker']} — 공시 {len(i.get('disclosures') or [])}건"
-                         + (f" · 수집 실패 {len(i['errors'])}건" if i.get("errors") else "")):
+        parts = []
+        if i.get("disclosures"):
+            parts.append(f"공시 {len(i['disclosures'])}건")
+        if i.get("errors"):
+            parts.append(f"수집 실패 {len(i['errors'])}건")
+        if notes:
+            parts.append("참고 " + str(len(notes)))
+        with st.expander(f"{i['ticker']} — " + " · ".join(parts)):
             for d in i.get("disclosures") or []:
                 st.markdown(f"- {d['date']} [{d['title']}]({d['url']})")
             for n in notes:

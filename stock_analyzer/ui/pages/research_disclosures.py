@@ -39,3 +39,31 @@ def render_research_disclosures():
             "url": st.column_config.LinkColumn("원문", display_text="DART 열기"),
         },
     )
+
+    st.markdown("#### 요약")
+    st.caption("원문에 근거가 확인된 문장만 보여줍니다. 평가·전망은 쓰지 않습니다. 같은 공시는 한 번만 요약합니다.")
+    labels = {r["rcept_no"]: f"{r['date']} {r['ticker']} — {r['title']}" for r in rows}
+    pick = st.selectbox("공시 선택", list(labels), format_func=lambda k: labels[k],
+                        label_visibility="collapsed")
+    if st.button("요약 보기"):
+        row = next(r for r in rows if r["rcept_no"] == pick)
+        from urllib.parse import quote
+
+        with st.spinner("요약 중 (처음 한 번은 최대 1분)..."):
+            summ = api_get(
+                f"/research/disclosures/{pick}/summary?ticker={quote(row['ticker'])}"
+                f"&title={quote(row['title'])}",
+                timeout=120,
+            )
+        if summ is None:
+            st.error("요약을 받지 못했습니다 — agent-api 응답 없음.")
+        elif summ.get("status") == "unavailable":
+            st.warning(f"요약 없음 — {summ.get('reason')}")
+        else:
+            for b in summ.get("bullets") or []:
+                st.markdown(f"- {b}")
+            if summ.get("numbers"):
+                st.caption("핵심 수치: " + " · ".join(summ["numbers"]))
+            if summ.get("dropped"):
+                st.caption(f"근거를 확인할 수 없거나 평가가 섞인 문장 {summ['dropped']}개는 뺐습니다.")
+            st.markdown(f"[DART 원문]({summ.get('url')}) · 요약: {summ.get('served_by') or '?'}")
