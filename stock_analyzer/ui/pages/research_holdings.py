@@ -5,7 +5,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from ui.api_client import api_get, api_request
+from ui.api_client import api_get, api_request, log_action
 
 
 def render_research_holdings():
@@ -15,6 +15,12 @@ def render_research_holdings():
         <div class="page-subtitle">보유 종목을 직접 입력합니다. 손절·목표가는 브리핑의 거리 계산에만 씁니다.</div>
     </div>
     """, unsafe_allow_html=True)
+
+    log_action("page_view", page="research_holdings")
+    st.caption(
+        "보유 종목은 **여기서만** 입력합니다. 상단 검색창(종목 분석·스캔)이나 "
+        "Paper Trade 의 모의 포지션과는 별개입니다."
+    )
 
     # 저장·삭제 결과는 rerun 뒤에 보여준다 — 바로 rerun 하면 메시지가 순식간에 사라져
     # 저장됐는지 알 수 없었다 (2026-10-08: 입력했다는데 저장 요청이 0건이었다).

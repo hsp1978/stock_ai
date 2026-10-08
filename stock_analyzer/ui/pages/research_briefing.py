@@ -9,7 +9,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from ui.api_client import api_get, api_post
+from ui.api_client import api_get, api_post, log_action
 
 
 def _num(v, fmt: str = "{:,.2f}") -> str:
@@ -28,6 +28,9 @@ def render_research_briefing():
         <div class="page-subtitle">보유·관심 종목 점검 — 사실과 거리만 표시합니다. 매수·매도 판단이 아닙니다.</div>
     </div>
     """, unsafe_allow_html=True)
+
+    log_action("page_view", page="research_briefing")
+    _render_holdings_notice()
 
     if st.button("🔄 지금 점검", type="primary"):
         result = api_get("/research/briefing", timeout=180)
@@ -93,3 +96,21 @@ def render_research_briefing():
                 st.info("오늘은 휴장일이라 보내지 않았습니다.")
             else:
                 st.error(f"전송되지 않음: {res.get('status') or '응답 없음'}")
+
+
+def _render_holdings_notice() -> None:
+    """보유 목록이 비어 있으면 입력 위치로 안내한다. 조회 실패는 '비어 있음'과 구분한다."""
+    data = api_get("/research/holdings")
+    if data is None:
+        st.warning("보유 목록을 읽지 못했습니다 — 보유 손익이 빠질 수 있습니다.")
+        return
+    if data.get("holdings"):
+        return
+    c1, c2 = st.columns([3, 1])
+    c1.warning(
+        "보유 종목이 비어 있어 손익·손절/목표가 거리가 나오지 않습니다. "
+        "상단 검색창은 종목 분석(스캔)용이라 보유 목록에 들어가지 않습니다."
+    )
+    if c2.button("보유 종목 입력하러 가기", use_container_width=True):
+        st.session_state.nav_page = "Holdings"
+        st.rerun()

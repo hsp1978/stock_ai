@@ -5,7 +5,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from ui.api_client import api_get
+from ui.api_client import api_get, log_action
 
 
 def render_research_disclosures():
@@ -16,6 +16,7 @@ def render_research_disclosures():
     </div>
     """, unsafe_allow_html=True)
 
+    log_action("page_view", page="research_disclosures")
     days = st.selectbox("기간", [3, 7, 30], index=1, format_func=lambda d: f"최근 {d}일")
     data = api_get(f"/research/disclosures?days={days}", timeout=120)
     if data is None:
