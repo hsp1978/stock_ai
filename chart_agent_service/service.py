@@ -2859,6 +2859,15 @@ async def _probe_generation(base_url: str, runtime: dict) -> dict:
             "detail": "우리 요청을 처리 중 — 생성 경로가 살아 있다는 증거이므로 프로브를 건너뜀",
         }
 
+    # 남은 유지 시간 그대로 — 프로브가 모델 언로드를 미루지 않게 (ollama_keepalive)
+    from ollama_keepalive import remaining_keep_alive
+
+    keep_alive = remaining_keep_alive(models[0].get("expires_at"))
+    if keep_alive is None:
+        return {"status": "skipped", "reason": "expiry_unknown", "model": model,
+                "latency_ms": None,
+                "detail": "언로드 시각을 몰라 프로브가 유지 시간을 연장할 수 있어 건너뜀"}
+
     budget = float(HEALTH_GENERATION_TIMEOUT_SECONDS)
     started = time.monotonic()
     try:
@@ -2869,6 +2878,7 @@ async def _probe_generation(base_url: str, runtime: dict) -> dict:
                     "model": model,
                     "prompt": "ok",
                     "stream": False,
+                    "keep_alive": keep_alive,
                     # 1토큰이면 충분하다 — 생성 경로가 살아 있는지만 본다.
                     "options": {"num_predict": 1},
                 },
@@ -2958,6 +2968,8 @@ def _classify_ollama_models(models: list) -> dict:
                 "size_bytes": size,
                 "size_vram_bytes": vram,
                 "gpu_fraction": round(vram / size, 3) if size else None,
+                # 언로드 예정 시각 — 프로브가 이 시각을 바꾸지 않도록 쓴다 (ollama_keepalive)
+                "expires_at": m.get("expires_at"),
             }
         )
 

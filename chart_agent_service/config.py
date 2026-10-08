@@ -82,7 +82,10 @@ class Settings(BaseSettings):
     OLLAMA_NUM_CTX: int = Field(default=8192, ge=2048, le=131072)
     # 기본 keep_alive 5분이면 30분 주기 스캔마다 모델을 내렸다 다시 올린다.
     # 재로드마다 GPU 적재 판정을 새로 하므로 드라이버 상태에 취약해진다.
-    OLLAMA_KEEP_ALIVE: str = "1h"
+    # 스캔 요청이 모델을 붙잡아 두는 시간. 끝나면 GPU 를 비워 다른 서비스가 쓰게 한다
+    # (2026-10-08 운영자 요청). 1h 였을 때는 30분 주기 스캔이 VRAM 10 GB 를 계속 점유했다.
+    # 다음 요청 때 모델을 다시 올리는 비용(수 초~수십 초)을 감수한다.
+    OLLAMA_KEEP_ALIVE: str = "5m"
     OPENAI_API_KEY: str = ""
     GEMINI_API_KEY: str = ""
     # gemini-2.0-flash 는 2026-09-15 확인 시 **404 로 폐기**됐다

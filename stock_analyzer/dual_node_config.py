@@ -352,7 +352,8 @@ def mac_studio_runtime_status(timeout: float | None = None) -> Dict[str, Any]:
     # 검사로는 잡히지 않는다. 그래서 1토큰 생성까지 확인한다.
     status["status"] = "gpu"
     generation = probe_node_generation(
-        mac_url, models[0].get("name"), timeout=timeout, node="mac_studio"
+        mac_url, models[0].get("name"), timeout=timeout, node="mac_studio",
+        expires_at=models[0].get("expires_at"),
     )
     status["generation"] = generation
     if generation["status"] in ("stalled", "error"):
@@ -371,6 +372,7 @@ def probe_node_generation(
     model: str | None,
     timeout: float | None = None,
     node: str | None = None,
+    expires_at: str | None = None,
 ) -> Dict[str, Any]:
     """적재된 모델로 **1토큰만** 생성해 본다 — 노드를 실제로 쓸 수 있는지.
 
@@ -401,6 +403,15 @@ def probe_node_generation(
             "detail": "우리 요청을 처리 중 — 생성 경로가 살아 있다는 증거이므로 프로브를 건너뜀",
         }
 
+    # 남은 유지 시간 그대로 — 프로브가 모델 언로드를 미루지 않게 (ollama_keepalive)
+    from ollama_keepalive import remaining_keep_alive
+
+    keep_alive = remaining_keep_alive(expires_at)
+    if keep_alive is None:
+        return {"status": "skipped", "reason": "expiry_unknown", "model": model,
+                "latency_ms": None,
+                "detail": "언로드 시각을 몰라 프로브가 유지 시간을 연장할 수 있어 건너뜀"}
+
     budget = timeout if timeout is not None else _float_setting(
         "HEALTH_GENERATION_TIMEOUT_SECONDS", 20.0
     )
@@ -412,6 +423,7 @@ def probe_node_generation(
                 "model": model,
                 "prompt": "ok",
                 "stream": False,
+                "keep_alive": keep_alive,
                 "options": {"num_predict": 1},
             },
             timeout=budget,
