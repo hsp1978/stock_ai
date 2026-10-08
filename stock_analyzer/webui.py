@@ -84,6 +84,9 @@ from ui.pages.portfolio import render_portfolio  # noqa: E402
 from ui.pages.ranking import render_ranking  # noqa: E402
 from ui.pages.screener import render_screener  # noqa: E402
 from ui.pages.signal_accuracy import render_signal_accuracy  # noqa: E402
+from ui.pages.research_briefing import render_research_briefing  # noqa: E402
+from ui.pages.research_disclosures import render_research_disclosures  # noqa: E402
+from ui.pages.research_holdings import render_research_holdings  # noqa: E402
 from ui.market import (  # noqa: E402
     _INDEX_PERIODS, KRW_CROSS, MARKET_INDICES, _krw_cross_series,
     fetch_index_history, fetch_market_indices,
@@ -112,6 +115,8 @@ inject_theme()
 # ── 내비게이션 정의 (DS §05 SidebarNav) ──
 # 사이드바는 이동 전용. 스캔·GPU·모델 설정 등 조작 패널은 상단 커맨드바로 분리한다.
 NAV_GROUPS = {
+    # 리서치 도구 (2026-10-08 전환) — 사실·거리만, 판단 없음
+    "RESEARCH": ["Briefing", "Holdings", "Disclosures"],
     "ANALYSIS": [
         "Home", "Dashboard", "Detail", "Multi-Agent",
         "Quant Indicators", "Screener", "Signal Accuracy", "ML Predict", "Backtest",
@@ -347,6 +352,12 @@ elif page == "Backtest":
     render_backtest()
 elif page == "ML Predict":
     render_ml_predict()
+elif page == "Briefing":
+    render_research_briefing()
+elif page == "Holdings":
+    render_research_holdings()
+elif page == "Disclosures":
+    render_research_disclosures()
 elif page == "Portfolio":
     render_portfolio()
 elif page == "Ranking":

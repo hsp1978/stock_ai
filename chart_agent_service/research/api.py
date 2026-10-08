@@ -68,3 +68,90 @@ def get_briefing(tickers: Optional[str] = None) -> Briefing:
         wanted = {t.strip().upper() for t in universe}
         holdings = [h for h in holdings if h.ticker in wanted]
     return build_briefing(universe, holdings)
+
+
+def _is_trading_day(market: str) -> bool:
+    from market_cal import is_trading_day
+
+    return is_trading_day(market)
+
+
+def _send(text: str) -> bool:
+    from telegram_bot import send_telegram_html
+
+    return send_telegram_html(text)
+
+
+def run_briefing_job(market: str) -> dict:
+    """스케줄 잡·수동 실행 공용."""
+    from research.jobs import run_market_briefing
+
+    return run_market_briefing(market, _watchlist(), list_holdings(), _send, _is_trading_day)
+
+
+def run_disclosure_job() -> dict:
+    from dart_client import fetch_recent_disclosures
+    from research.jobs import load_seen_disclosures, run_disclosure_watch, save_seen_disclosures
+
+    tickers = _watchlist() + [h.ticker for h in list_holdings()]
+    return run_disclosure_watch(
+        tickers,
+        lambda t: fetch_recent_disclosures(t, days_back=1),
+        _send,
+        load_seen_disclosures,
+        save_seen_disclosures,
+    )
+
+
+class JobResult(BaseModel):
+    result: dict
+
+
+@router.post("/briefing/send", response_model=JobResult)
+def send_briefing(market: str = "KRX") -> JobResult:
+    """수동 발송 — 스케줄과 같은 경로. 휴장일이면 보내지 않는다."""
+    market = market.upper()
+    if market not in ("KRX", "NYSE"):
+        raise HTTPException(400, "market 은 KRX 또는 NYSE")
+    return JobResult(result=run_briefing_job(market))
+
+
+class DisclosureRow(BaseModel):
+    ticker: str
+    date: str
+    title: str
+    kind: str
+    url: str
+
+
+class DisclosuresResponse(BaseModel):
+    days: int
+    rows: list[DisclosureRow]
+    errors: list[str]
+
+
+@router.get("/disclosures", response_model=DisclosuresResponse)
+def get_disclosures(days: int = 7) -> DisclosuresResponse:
+    """보유 + 관심 한국 종목의 최근 공시. 조회 실패는 errors 로 — '공시 없음'과 구분."""
+    from dart_client import fetch_recent_disclosures
+    from research.briefing import dart_url
+
+    days = max(1, min(days, 90))
+    tickers = sorted({t for t in _watchlist() + [h.ticker for h in list_holdings()]
+                      if t.endswith((".KS", ".KQ"))})
+    rows: list[DisclosureRow] = []
+    errors: list[str] = []
+    for t in tickers:
+        try:
+            items = fetch_recent_disclosures(t, days_back=days, max_items=30)
+        except Exception as exc:
+            errors.append(f"{t}: {exc}")
+            continue
+        for r in items:
+            rows.append(DisclosureRow(
+                ticker=t, date=str(r.get("rcept_dt", "")),
+                title=str(r.get("report_nm", "")).strip(), kind=str(r.get("classified", "")),
+                url=dart_url(str(r.get("rcept_no", ""))),
+            ))
+    rows.sort(key=lambda r: r.date, reverse=True)
+    return DisclosuresResponse(days=days, rows=rows, errors=errors)
