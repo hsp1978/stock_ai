@@ -518,6 +518,7 @@ def _summarize_job_result(result: Any) -> Any:
             "flagged",
             "failed",
             "new_disclosures",
+            "summarized",
             "error_count",
         )
         summary = {k: result.get(k) for k in keys if k in result}

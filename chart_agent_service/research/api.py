@@ -93,6 +93,8 @@ def run_disclosure_job() -> dict:
     from dart_client import fetch_recent_disclosures
     from research.jobs import load_seen_disclosures, run_disclosure_watch, save_seen_disclosures
 
+    from research.disclosure_summary import get_summary
+
     tickers = _watchlist() + [h.ticker for h in list_holdings()]
     return run_disclosure_watch(
         tickers,
@@ -100,6 +102,7 @@ def run_disclosure_job() -> dict:
         _send,
         load_seen_disclosures,
         save_seen_disclosures,
+        summarize=get_summary,
     )
 
 
@@ -117,6 +120,7 @@ def send_briefing(market: str = "KRX") -> JobResult:
 
 
 class DisclosureRow(BaseModel):
+    rcept_no: str
     ticker: str
     date: str
     title: str
@@ -149,9 +153,20 @@ def get_disclosures(days: int = 7) -> DisclosuresResponse:
             continue
         for r in items:
             rows.append(DisclosureRow(
-                ticker=t, date=str(r.get("rcept_dt", "")),
+                rcept_no=str(r.get("rcept_no", "")), ticker=t, date=str(r.get("rcept_dt", "")),
                 title=str(r.get("report_nm", "")).strip(), kind=str(r.get("classified", "")),
                 url=dart_url(str(r.get("rcept_no", ""))),
             ))
     rows.sort(key=lambda r: r.date, reverse=True)
     return DisclosuresResponse(days=days, rows=rows, errors=errors)
+
+
+@router.get("/disclosures/{rcept_no}/summary")
+def get_disclosure_summary(rcept_no: str, ticker: str = "", title: str = "",
+                           refresh: bool = False) -> dict:
+    """공시 요약 (캐시 우선). 원문에 근거가 확인된 문장만, 출처 링크와 함께."""
+    from research.disclosure_summary import get_summary
+
+    if not rcept_no.isdigit() or len(rcept_no) != 14:
+        raise HTTPException(400, "rcept_no 는 14자리 DART 접수번호")
+    return get_summary(rcept_no, ticker.upper(), title, refresh=refresh).model_dump()
