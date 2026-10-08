@@ -124,7 +124,6 @@ class DisclosureRow(BaseModel):
     ticker: str
     date: str
     title: str
-    kind: str
     url: str
 
 
@@ -154,7 +153,7 @@ def get_disclosures(days: int = 7) -> DisclosuresResponse:
         for r in items:
             rows.append(DisclosureRow(
                 rcept_no=str(r.get("rcept_no", "")), ticker=t, date=str(r.get("rcept_dt", "")),
-                title=str(r.get("report_nm", "")).strip(), kind=str(r.get("classified", "")),
+                title=str(r.get("report_nm", "")).strip(),
                 url=dart_url(str(r.get("rcept_no", ""))),
             ))
     rows.sort(key=lambda r: r.date, reverse=True)

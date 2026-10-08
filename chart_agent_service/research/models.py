@@ -34,8 +34,9 @@ class Disclosure(BaseModel):
 
     date: str
     title: str
-    kind: str = ""
     url: str
+    # 'kind'(호재/악재/중립)는 두지 않는다 — dart_client.classify_disclosure 는 제목 키워드로
+    # 호재·악재를 판정하는 값이라 리서치 도구의 '판단 없음' 범위 밖이다 (2026-10-08).
 
 
 class BriefingItem(BaseModel):

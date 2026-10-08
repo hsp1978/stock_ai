@@ -31,11 +31,11 @@ def render_research_disclosures():
             st.info(f"최근 {days}일 공시가 없습니다.")
         return
     st.dataframe(
-        pd.DataFrame(rows)[["date", "ticker", "title", "kind", "url"]],
+        pd.DataFrame(rows)[["date", "ticker", "title", "url"]],
         hide_index=True,
         use_container_width=True,
         column_config={
-            "date": "접수일", "ticker": "종목", "title": "제목", "kind": "분류",
+            "date": "접수일", "ticker": "종목", "title": "제목",
             "url": st.column_config.LinkColumn("원문", display_text="DART 열기"),
         },
     )
