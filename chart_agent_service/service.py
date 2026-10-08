@@ -20,7 +20,7 @@ import threading
 
 import anyio
 import anyio.to_thread
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -64,6 +64,7 @@ from config import (
     RESEARCH_BRIEFING_ENABLED, RESEARCH_BRIEFING_KR_HOUR, RESEARCH_BRIEFING_KR_MINUTE,
     RESEARCH_BRIEFING_US_HOUR, RESEARCH_BRIEFING_US_MINUTE,
     RESEARCH_DISCLOSURE_WATCH_ENABLED, RESEARCH_DISCLOSURE_WATCH_MINUTES,
+    RESEARCH_GATE2_START, RESEARCH_GATE2_END, RESEARCH_GATE2_REPORT_AT,
     SIGNAL_EVAL_DAYS_BACK, SIGNAL_EVAL_BACKLOG_ALERT,
     MULTI_AGENT_BATCH_ENABLED, MULTI_AGENT_BATCH_HOUR, MULTI_AGENT_BATCH_MINUTE,
 )
@@ -387,6 +388,7 @@ _KNOWN_OPS_JOBS = {
     "research_briefing_kr": "Research Briefing (KRX)",
     "research_briefing_us": "Research Briefing (NYSE)",
     "research_disclosure_watch": "Research Disclosure Watch",
+    "research_gate2_report": "Research Gate 2 Report",
 }
 
 
@@ -527,6 +529,7 @@ def _summarize_job_result(result: Any) -> Any:
             "new_disclosures",
             "summarized",
             "error_count",
+            "verdict",
         )
         summary = {k: result.get(k) for k in keys if k in result}
         if "evaluation" in result and isinstance(result["evaluation"], dict):
@@ -2150,6 +2153,17 @@ def run_output_retention(dry_run: bool = False) -> dict:
         return {"status": "error", "error": str(exc)}
 
 
+def _parse_gate2_report_at(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        logger.error(f"[스케줄러] RESEARCH_GATE2_REPORT_AT 형식 오류: {value!r} — 등록 안 함")
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 def run_research_briefing(market: str) -> dict:
     """스케줄 잡 — 시장별 일일 브리핑. 전송 실패는 오류로 기록한다 (completed 로 덮지 않음)."""
     job_id = "research_briefing_kr" if market == "KRX" else "research_briefing_us"
@@ -2158,12 +2172,14 @@ def run_research_briefing(market: str) -> dict:
         from research.api import run_briefing_job
 
         result = run_briefing_job(market)
+        _record_research_run(job_id, started_at, result)
         if result.get("status") == "delivery_failed":
             _record_job_error(job_id, started_at, f"브리핑 텔레그램 전송 실패 ({market})")
         else:
             _record_job_success(job_id, started_at, result)
         return result
     except Exception as exc:
+        _record_research_run(job_id, started_at, None, str(exc))
         _record_job_error(job_id, started_at, exc)
         return {"status": "error", "error": str(exc)}
 
@@ -2176,10 +2192,47 @@ def run_research_disclosure_watch() -> dict:
         from research.api import run_disclosure_job
 
         result = run_disclosure_job()
+        _record_research_run(job_id, started_at, result)
         if result.get("status") == "delivery_failed":
             _record_job_error(job_id, started_at, "새 공시 알림 전송 실패 — 다음 실행에서 재시도")
         else:
             _record_job_success(job_id, started_at, result)
+        return result
+    except Exception as exc:
+        _record_research_run(job_id, started_at, None, str(exc))
+        _record_job_error(job_id, started_at, exc)
+        return {"status": "error", "error": str(exc)}
+
+
+def _record_research_run(job_id: str, started_at: datetime, result: dict | None,
+                         error: str = "") -> None:
+    """게이트 2 판정 근거. 기록 실패는 잡을 실패시키지 않되 사유를 남긴다 (§13-1)."""
+    try:
+        from research.history import record_run
+
+        record_run(job_id, started_at, result, error)
+    except Exception as exc:
+        logger.error(f"[리서치 이력] {job_id} 기록 실패: {type(exc).__name__}: {exc}")
+
+
+def run_research_gate2_report() -> dict:
+    """1회성 잡 — 게이트 2 판정 리포트를 만들어 저장하고 텔레그램으로 보낸다."""
+    job_id = "research_gate2_report"
+    started_at = _record_job_start(job_id, _KNOWN_OPS_JOBS[job_id])
+    try:
+        from research.api import build_gate2_report_payload
+        from telegram_bot import send_telegram_html
+        from html import escape
+
+        report = build_gate2_report_payload()
+        set_app_state("research.gate2_report", report)
+        delivered = send_telegram_html(f"<pre>{escape(report['markdown'][:3800])}</pre>")
+        result = {"status": "completed" if delivered else "delivery_failed",
+                  "delivered": delivered, "items": report["history_runs"]}
+        if delivered:
+            _record_job_success(job_id, started_at, {**result, "verdict": report["verdict"]})
+        else:
+            _record_job_error(job_id, started_at, f"게이트 2 리포트 전송 실패 (판정 {report['verdict']}, 저장됨)")
         return result
     except Exception as exc:
         _record_job_error(job_id, started_at, exc)
@@ -2372,6 +2425,11 @@ def _start_background_scheduler(run_initial_scan: bool = False) -> None:
             hour=RESEARCH_BRIEFING_US_HOUR, minute=RESEARCH_BRIEFING_US_MINUTE,
             id='research_briefing_us', replace_existing=True,
         )
+    _gate2_at = _parse_gate2_report_at(RESEARCH_GATE2_REPORT_AT)
+    if _gate2_at is not None and _gate2_at > datetime.now(timezone.utc):
+        # 지난 시각으로 등록하면 기동 때마다 즉시 실행된다 — 미래일 때만
+        scheduler.add_job(run_research_gate2_report, 'date', run_date=_gate2_at,
+                          id='research_gate2_report', replace_existing=True)
     if RESEARCH_DISCLOSURE_WATCH_ENABLED:
         scheduler.add_job(
             run_research_disclosure_watch, 'interval',

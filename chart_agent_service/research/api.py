@@ -169,3 +169,65 @@ def get_disclosure_summary(rcept_no: str, ticker: str = "", title: str = "",
     if not rcept_no.isdigit() or len(rcept_no) != 14:
         raise HTTPException(400, "rcept_no 는 14자리 DART 접수번호")
     return get_summary(rcept_no, ticker.upper(), title, refresh=refresh).model_dump()
+
+
+def build_gate2_report_payload(start: str | None = None, end: str | None = None) -> dict:
+    """게이트 2 판정. 기간 기본값은 config (RESEARCH_GATE2_START/END)."""
+    from datetime import date, datetime, timezone
+
+    from config import (
+        RESEARCH_BRIEFING_KR_HOUR,
+        RESEARCH_BRIEFING_KR_MINUTE,
+        RESEARCH_BRIEFING_US_HOUR,
+        RESEARCH_BRIEFING_US_MINUTE,
+        RESEARCH_GATE2_END,
+        RESEARCH_GATE2_START,
+    )
+    from dart_client import fetch_recent_disclosures
+    from market_cal import get_valid_trading_days
+    from research.gate_report import build_report, collect_filings, due_days, to_markdown
+    from research.history import load_history
+
+    s = date.fromisoformat(start or RESEARCH_GATE2_START)
+    e = date.fromisoformat(end or RESEARCH_GATE2_END)
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    upto = min(e, today)
+    times = {"KRX": (RESEARCH_BRIEFING_KR_HOUR, RESEARCH_BRIEFING_KR_MINUTE),
+             "NYSE": (RESEARCH_BRIEFING_US_HOUR, RESEARCH_BRIEFING_US_MINUTE)}
+    trading = {
+        m: due_days([d.date() for d in get_valid_trading_days(m, s, upto)], *times[m], now)
+        for m in ("KRX", "NYSE")
+    }
+    tickers = _watchlist() + [h.ticker for h in list_holdings()]
+    filings, ferr = collect_filings(
+        tickers, (today - s).days + 1,
+        lambda t, days: fetch_recent_disclosures(t, days_back=days, max_items=100),
+    )
+    from research.jobs import load_seen_disclosures
+
+    report = build_report(s, upto, load_history(), trading, filings, ferr,
+                          seen=load_seen_disclosures() or [])
+    if upto < e:
+        report["gaps"].append(f"기간 진행 중 — {upto} 까지 중간 점검")
+        if report["verdict"] == "PASS":
+            report["verdict"] = "INCOMPLETE"
+    report["markdown"] = to_markdown(report)
+    return report
+
+
+@router.get("/gate2-report")
+def get_gate2_report(start: Optional[str] = None, end: Optional[str] = None,
+                     saved: bool = False) -> dict:
+    """게이트 2 판정. saved=true 면 자동 실행이 저장한 최종 리포트를 돌려준다."""
+    if saved:
+        from db import get_app_state
+
+        stored = get_app_state("research.gate2_report", default=None)
+        if not stored:
+            raise HTTPException(404, "저장된 게이트 2 리포트 없음 (자동 실행 전)")
+        return stored
+    try:
+        return build_gate2_report_payload(start, end)
+    except ValueError as exc:
+        raise HTTPException(400, f"날짜 형식 오류: {exc}")

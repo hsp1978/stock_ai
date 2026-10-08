@@ -122,7 +122,8 @@ def run_disclosure_watch(
 
     if first_run:
         save_seen(sorted(seen | set(found))[-_SEEN_LIMIT:])
-        return {**result, "status": "initialized", "delivered": False}
+        # 보내지 않고 기준으로 삼은 공시 — 게이트 판정에서 '누락'으로 세지 않도록 남긴다
+        return {**result, "status": "initialized", "delivered": False, "initialized": found}
     if not new:
         status = "partial_failure" if errors else "completed"
         return {**result, "status": status, "delivered": False}
@@ -144,7 +145,9 @@ def run_disclosure_watch(
     if delivered:
         save_seen(sorted(seen | set(found))[-_SEEN_LIMIT:])
     status = "delivery_failed" if not delivered else ("partial_failure" if errors else "completed")
-    return {**result, "status": status, "delivered": delivered}
+    # 실제로 알림이 나간 공시 — 게이트 2 '누락 0' 판정의 근거
+    return {**result, "status": status, "delivered": delivered,
+            "alerted": found if delivered else []}
 
 
 def load_seen_disclosures() -> Optional[list[str]]:
