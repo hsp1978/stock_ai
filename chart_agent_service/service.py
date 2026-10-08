@@ -2370,6 +2370,11 @@ app = FastAPI(
     default_response_class=_DefaultJSONResponse,
 )
 
+# 리서치·모니터링 도구 (2026-10-08 전환 1단계) — 신호 없이 사실·거리만
+from research.api import router as research_router  # noqa: E402
+
+app.include_router(research_router)
+
 
 # ── GlobalKillSwitch 미들웨어 ─────────────────────────────────────────
 
