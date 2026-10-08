@@ -152,6 +152,28 @@ def api_post(path: str, timeout: int = 300, json_body: dict = None):
     return None
 
 
+def api_request(method: str, path: str, json_body: dict | None = None, timeout: int = 30):
+    """HTTP 전용 호출 (PUT·DELETE 등). (상태 코드, 본문) — 연결 실패면 (None, 사유).
+
+    화면이 404·422 같은 응답을 사유와 함께 보여줄 수 있도록 예외 대신 코드를 돌려준다.
+    """
+    last_error = "agent-api 연결 실패"
+    for base_url in _agent_api_candidates():
+        try:
+            resp = httpx.request(method, f"{base_url}{path}", json=json_body, timeout=timeout)
+        except httpx.ConnectError as e:
+            last_error = f"연결 실패: {e}"
+            continue
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"
+        try:
+            body = resp.json()
+        except ValueError:
+            body = resp.text
+        return resp.status_code, body
+    return None, last_error
+
+
 def _get_session_id() -> str:
     """Streamlit session 당 1회 생성되는 UUID — user_action_log 트래킹용."""
     if "_action_log_sid" not in st.session_state:

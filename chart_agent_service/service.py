@@ -61,6 +61,9 @@ from config import (
     OFFSITE_BACKUP_DEST, OFFSITE_BACKUP_TIMEOUT_SEC,
     OPS_ALERT_DEDUPE_MINUTES, DEFAULT_HISTORY_PERIOD,
     SCREENER_BATCH_ENABLED, SCREENER_BATCH_HOUR, SCREENER_BATCH_MINUTE,
+    RESEARCH_BRIEFING_ENABLED, RESEARCH_BRIEFING_KR_HOUR, RESEARCH_BRIEFING_KR_MINUTE,
+    RESEARCH_BRIEFING_US_HOUR, RESEARCH_BRIEFING_US_MINUTE,
+    RESEARCH_DISCLOSURE_WATCH_ENABLED, RESEARCH_DISCLOSURE_WATCH_MINUTES,
     SIGNAL_EVAL_DAYS_BACK, SIGNAL_EVAL_BACKLOG_ALERT,
     MULTI_AGENT_BATCH_ENABLED, MULTI_AGENT_BATCH_HOUR, MULTI_AGENT_BATCH_MINUTE,
 )
@@ -381,6 +384,9 @@ _KNOWN_OPS_JOBS = {
     "output_retention": "Output Retention",
     "state_backup": "State Backup",
     "multi_agent_batch": "Multi-Agent Batch",
+    "research_briefing_kr": "Research Briefing (KRX)",
+    "research_briefing_us": "Research Briefing (NYSE)",
+    "research_disclosure_watch": "Research Disclosure Watch",
 }
 
 
@@ -505,6 +511,14 @@ def _summarize_job_result(result: Any) -> Any:
             "stale_count",
             "degraded_count",
             "ok_count",
+            # 리서치 잡 — 전송 '결과'와 볼 거리 수 (§13-2)
+            "market",
+            "delivered",
+            "items",
+            "flagged",
+            "failed",
+            "new_disclosures",
+            "error_count",
         )
         summary = {k: result.get(k) for k in keys if k in result}
         if "evaluation" in result and isinstance(result["evaluation"], dict):
@@ -2128,6 +2142,42 @@ def run_output_retention(dry_run: bool = False) -> dict:
         return {"status": "error", "error": str(exc)}
 
 
+def run_research_briefing(market: str) -> dict:
+    """스케줄 잡 — 시장별 일일 브리핑. 전송 실패는 오류로 기록한다 (completed 로 덮지 않음)."""
+    job_id = "research_briefing_kr" if market == "KRX" else "research_briefing_us"
+    started_at = _record_job_start(job_id, _KNOWN_OPS_JOBS[job_id])
+    try:
+        from research.api import run_briefing_job
+
+        result = run_briefing_job(market)
+        if result.get("status") == "delivery_failed":
+            _record_job_error(job_id, started_at, f"브리핑 텔레그램 전송 실패 ({market})")
+        else:
+            _record_job_success(job_id, started_at, result)
+        return result
+    except Exception as exc:
+        _record_job_error(job_id, started_at, exc)
+        return {"status": "error", "error": str(exc)}
+
+
+def run_research_disclosure_watch() -> dict:
+    """스케줄 잡 — 한국 종목 새 공시 알림."""
+    job_id = "research_disclosure_watch"
+    started_at = _record_job_start(job_id, _KNOWN_OPS_JOBS[job_id])
+    try:
+        from research.api import run_disclosure_job
+
+        result = run_disclosure_job()
+        if result.get("status") == "delivery_failed":
+            _record_job_error(job_id, started_at, "새 공시 알림 전송 실패 — 다음 실행에서 재시도")
+        else:
+            _record_job_success(job_id, started_at, result)
+        return result
+    except Exception as exc:
+        _record_job_error(job_id, started_at, exc)
+        return {"status": "error", "error": str(exc)}
+
+
 def run_state_backup() -> dict:
     """스케줄 잡 — 운영 상태 백업.
 
@@ -2302,6 +2352,23 @@ def _start_background_scheduler(run_initial_scan: bool = False) -> None:
             minute=SCREENER_BATCH_MINUTE,
             id='screener_batch',
             replace_existing=True,
+        )
+    if RESEARCH_BRIEFING_ENABLED:
+        scheduler.add_job(
+            run_research_briefing, 'cron', args=["KRX"], day_of_week='mon-fri',
+            hour=RESEARCH_BRIEFING_KR_HOUR, minute=RESEARCH_BRIEFING_KR_MINUTE,
+            id='research_briefing_kr', replace_existing=True,
+        )
+        scheduler.add_job(
+            run_research_briefing, 'cron', args=["NYSE"], day_of_week='mon-fri',
+            hour=RESEARCH_BRIEFING_US_HOUR, minute=RESEARCH_BRIEFING_US_MINUTE,
+            id='research_briefing_us', replace_existing=True,
+        )
+    if RESEARCH_DISCLOSURE_WATCH_ENABLED:
+        scheduler.add_job(
+            run_research_disclosure_watch, 'interval',
+            minutes=RESEARCH_DISCLOSURE_WATCH_MINUTES,
+            id='research_disclosure_watch', replace_existing=True,
         )
     if MULTI_AGENT_BATCH_ENABLED:
         scheduler.add_job(
