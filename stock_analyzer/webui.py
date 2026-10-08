@@ -263,9 +263,12 @@ def render_command_bar(health: dict | None, info: dict | None):
     c_search, c_scan, c_all, c_gpu, c_sys = st.columns([4, 1.1, 1.1, 1.2, 1.2])
 
     with c_search:
+        # 보유 종목 입력란이 아니다 — 2026-10-08 운영자가 여기에 보유 종목을 넣었고
+        # 스캔만 돌았다 (보유 목록 0건). 무엇을 하는 칸인지 문구로 밝힌다.
         scan_ticker = st.text_input(
-            "검색", placeholder="AAPL · 005930.KS · 삼성전자 검색",
+            "종목 분석", placeholder="종목 분석(스캔) — AAPL · 005930.KS · 삼성전자",
             label_visibility="collapsed", key="cmd_search",
+            help="입력한 종목을 지금 분석합니다. 보유 종목 등록은 RESEARCH → Holdings 에서 합니다.",
         )
     with c_scan:
         do_scan = st.button("Scan", use_container_width=True, key="cmd_scan")
