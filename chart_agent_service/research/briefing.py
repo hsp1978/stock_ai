@@ -175,7 +175,7 @@ def _disclosure_part(ticker: str, f: Fetchers, acc: _Acc) -> None:
     acc.values["disclosure_status"] = "ok"
     items = tuple(
         Disclosure(date=r.get("rcept_dt", ""), title=str(r.get("report_nm", "")).strip(),
-                   kind=r.get("classified", ""), url=dart_url(r.get("rcept_no", "")))
+                   url=dart_url(r.get("rcept_no", "")))
         for r in rows
     )
     acc.values["disclosures"] = items

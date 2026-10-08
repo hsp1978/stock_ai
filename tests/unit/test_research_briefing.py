@@ -249,3 +249,16 @@ def test_disclosure_title_is_stripped():
     rows = [{"rcept_dt": "20261007", "report_nm": "주식소각결정              ", "rcept_no": "1"}]
     item = B.build_item("005930.KS", None, _fetchers(_df([1.0, 2.0]), disclosures=rows))
     assert item.disclosures[0].title == "주식소각결정"
+
+
+def test_disclosures_carry_no_sentiment_label():
+    """classify_disclosure(호재/악재/중립)는 판단이다 — 리서치 출력에 싣지 않는다."""
+    from research.api import DisclosureRow
+    from research.models import Disclosure
+
+    assert "kind" not in Disclosure.model_fields
+    assert "kind" not in DisclosureRow.model_fields
+    rows = [{"rcept_dt": "20261007", "report_nm": "유상증자결정", "classified": "negative",
+             "rcept_no": "1"}]
+    item = B.build_item("005930.KS", None, _fetchers(_df([1.0, 2.0]), disclosures=rows))
+    assert "negative" not in item.model_dump_json()
