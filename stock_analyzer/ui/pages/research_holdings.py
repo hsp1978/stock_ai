@@ -39,18 +39,33 @@ def render_research_holdings():
         st.info("입력된 보유 종목이 없습니다.")
 
     st.markdown("#### 추가 · 수정")
-    st.caption("같은 티커를 다시 저장하면 바뀝니다.")
-    with st.form("holding_form", clear_on_submit=True):
+    # 기존 종목을 고르면 현재 값이 채워진다. 종전에는 빈 폼이라 손절가만 바꾸려 해도
+    # 수량·평단가를 다시 넣어야 했고, 빠뜨리면 422 로 저장되지 않았다 (2026-10-08 추정 원인:
+    # 손절·목표가를 입력했다는데 보유 목록은 그대로였다).
+    by_ticker = {h["ticker"]: h for h in holdings}
+    choice = st.selectbox(
+        "수정할 종목", ["(새 종목 추가)"] + list(by_ticker),
+        help="기존 종목을 고르면 현재 값이 채워집니다. 바꿀 칸만 고치고 저장하세요.",
+    )
+    cur = by_ticker.get(choice, {})
+    k = choice  # 선택이 바뀌면 폼 위젯을 새로 만들어 기본값이 다시 채워지게
+    with st.form(f"holding_form_{k}", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
-        ticker = c1.text_input("티커", placeholder="005930.KS / PLTR")
-        qty = c2.number_input("수량", min_value=0.0, step=1.0)
-        avg = c3.number_input("평단가", min_value=0.0, step=1.0)
+        ticker = c1.text_input("티커", value=cur.get("ticker", ""), placeholder="005930.KS / PLTR",
+                               disabled=bool(cur), key=f"h_ticker_{k}")
+        qty = c2.number_input("수량", min_value=0.0, step=1.0,
+                              value=float(cur.get("qty") or 0.0), key=f"h_qty_{k}")
+        avg = c3.number_input("평단가", min_value=0.0, step=1.0,
+                              value=float(cur.get("avg_price") or 0.0), key=f"h_avg_{k}")
         c4, c5, c6 = st.columns(3)
-        stop = c4.number_input("손절가 (선택, 0 = 없음)", min_value=0.0, step=1.0)
-        target = c5.number_input("목표가 (선택, 0 = 없음)", min_value=0.0, step=1.0)
-        note = c6.text_input("메모", max_chars=200)
+        stop = c4.number_input("손절가 (선택, 0 = 없음)", min_value=0.0, step=1.0,
+                               value=float(cur.get("stop_price") or 0.0), key=f"h_stop_{k}")
+        target = c5.number_input("목표가 (선택, 0 = 없음)", min_value=0.0, step=1.0,
+                                 value=float(cur.get("target_price") or 0.0), key=f"h_target_{k}")
+        note = c6.text_input("메모", value=cur.get("note", ""), max_chars=200, key=f"h_note_{k}")
         submitted = st.form_submit_button("저장", type="primary")
     if submitted:
+        ticker = cur.get("ticker") or ticker
         body = {"ticker": ticker, "qty": qty, "avg_price": avg, "note": note,
                 "stop_price": stop or None, "target_price": target or None}
         code, resp = api_request("PUT", "/research/holdings", json_body=body)
