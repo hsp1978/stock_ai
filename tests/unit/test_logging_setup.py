@@ -435,3 +435,26 @@ def test_webui_configures_logging_before_rendering():
     assert "\nconfigure_logging()\n" in src
     # UI 를 그리기 전이어야 한다 — 그 전에 난 로그는 사라진다
     assert src.index("configure_logging()") < src.index("st.set_page_config")
+
+
+def test_malformed_third_party_log_call_is_kept_not_traced(monkeypatch, capsys):
+    """pykrx: `logging.info(args, kwargs)` — 트레이스백 대신 원문을 한 줄로 남긴다."""
+    _env(monkeypatch)
+    logging_setup.configure_logging(force=True)
+
+    logging.info(("481050",), {})
+
+    captured = capsys.readouterr()
+    assert "Logging error" not in captured.err
+    assert "unformattable log call" in captured.out
+    assert "481050" in captured.out          # 원래 내용은 보존된다
+
+
+def test_malformed_log_call_is_still_masked(monkeypatch, capsys):
+    _env(monkeypatch)
+    logging_setup.configure_logging(force=True)
+
+    logging.warning(("https://x.example/?apikey=svo6QLxZtke0YUW8Ek04vBxGTGfGu7fS",), {})
+
+    out = capsys.readouterr().out
+    assert "svo6QLxZtke0YUW8Ek04vBxGTGfGu7fS" not in out

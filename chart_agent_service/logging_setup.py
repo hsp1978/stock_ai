@@ -79,8 +79,14 @@ class SecretRedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             message = record.getMessage()
-        except Exception:
-            return True
+        except Exception as exc:
+            # 서드파티의 잘못된 로그 호출 — 예: pykrx 가 종목을 못 찾으면
+            # `logging.info(args, kwargs)` 를 부른다 (튜플이 msg, dict 가 인자).
+            # 그대로 두면 핸들러가 '--- Logging error ---' 트레이스백을 찍고 원래
+            # 내용은 사라진다. 원문을 repr 로 보존해 한 줄로 남긴다 (2026-10-16).
+            message = (f"[unformattable log call: {type(exc).__name__}] "
+                       f"msg={record.msg!r} args={record.args!r}")
+            record.msg, record.args = message, ()
         scrubbed = self.scrub(message)
         if scrubbed != message:
             record.msg = scrubbed
