@@ -34,10 +34,34 @@ TRADING = {"KRX": [D1, D2], "NYSE": [D1, D2]}
 
 
 def test_all_delivered_is_pass():
+    hist = _ok_briefings() + [_run("research_disclosure_watch", D1, 3, status="completed",
+                                   alerted=["A"], delivered=True)]
+    r = G.build_report(D1, D2, hist, TRADING, [{"rcept_no": "A", "rcept_dt": "20261008", "ticker": "X"}])
+    assert r["verdict"] == "PASS" and r["briefings"]["ok"] == 4
+    assert r["disclosure_coverage"]["verified"] is True
+
+
+def test_no_filings_in_window_is_unverified_not_pass():
+    """대상 0건의 '누락 0' 은 검사하지 않은 것이다 (2026-10-16 중간 점검)."""
+    r = G.build_report(D1, D2, _ok_briefings(), TRADING, [])
+    assert r["verdict"] == "INCOMPLETE"
+    assert r["disclosure_coverage"]["verified"] is False
+    assert any("검증 불가" in g for g in r["gaps"])
+    assert "검증 불가 (실제 알림 0건)" in G.to_markdown(r)
+
+
+def test_baseline_only_filing_does_not_verify_alert_path():
+    """첫 실행에서 '본 것'으로만 처리된 공시는 알림 경로를 타지 않았다."""
     hist = _ok_briefings() + [_run("research_disclosure_watch", D1, 2, status="initialized",
                                    initialized=["A"], delivered=False)]
     r = G.build_report(D1, D2, hist, TRADING, [{"rcept_no": "A", "rcept_dt": "20261008", "ticker": "X"}])
-    assert r["verdict"] == "PASS" and r["briefings"]["ok"] == 4
+    assert r["disclosure_coverage"]["missed"] == []
+    assert r["verdict"] == "INCOMPLETE" and r["disclosure_coverage"]["verified"] is False
+
+
+def test_failure_still_wins_over_unverified():
+    r = G.build_report(D1, D2, _ok_briefings()[1:], TRADING, [])
+    assert r["verdict"] == "FAIL"
 
 
 def test_missing_briefing_day_fails():
@@ -79,7 +103,9 @@ def test_seen_list_covers_init_before_history():
     """이력 기록 전에 일어난 첫 실행분은 '본 것' 목록이 증명한다."""
     r = G.build_report(D1, D2, _ok_briefings(), TRADING,
                        [{"rcept_no": "S", "rcept_dt": "20261008", "ticker": "X"}], seen=["S"])
-    assert r["verdict"] == "PASS"
+    # 놓침(FAIL)으로 세지 않는다. 다만 알림 경로를 탄 것은 아니라 검증 근거도 아니다
+    assert r["disclosure_coverage"]["missed"] == []
+    assert r["verdict"] == "INCOMPLETE" and r["disclosure_coverage"]["verified"] is False
 
 
 def test_filing_before_window_is_ignored():

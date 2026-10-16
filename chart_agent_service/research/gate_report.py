@@ -83,7 +83,12 @@ def check_disclosure_coverage(
     missed = [f"{f.get('ticker')} {f.get('rcept_dt')} {str(f.get('report_nm', '')).strip()}"
               for f in rows
               if str(f.get("rcept_no")) not in alerted and str(f.get("rcept_no")) not in baseline]
-    return {"filings": len(rows), "alerted": len(rows) - len(missed), "missed": missed}
+    # 기간 중 공시가 **실제 알림으로** 나간 건수. 0 이면 '누락 0' 은 검사한 적 없는 것과
+    # 같다 — 대상 0건이거나, 기준(baseline)으로만 처리돼 알림 경로를 안 탔다 (§13-4).
+    # 2026-10-16 중간 점검: 10-08~10-16 대상 공시 0건인데 '누락 0' 으로 보였다.
+    delivered = sum(1 for f in rows if str(f.get("rcept_no")) in alerted)
+    return {"filings": len(rows), "alerted": len(rows) - len(missed), "missed": missed,
+            "delivered_in_window": delivered, "verified": delivered > 0}
 
 
 def build_report(
@@ -111,6 +116,9 @@ def build_report(
         gaps.append(f"이력 시작 {first[:16]} — 그 전 구간은 판정 근거 없음")
     if filings_error:
         gaps.append(f"DART 대조 불가: {filings_error}")
+    elif not c["verified"]:
+        gaps.append(f"공시 커버리지 검증 불가 — 기간 중 알림으로 나간 공시 0건 "
+                    f"(대상 {c['filings']}건). 알림 경로가 실제 공시로 실행된 적 없음")
 
     failed = bool(b["missing"] or b["failed"] or d["unrecovered"] or c["missed"])
     verdict: Verdict = "FAIL" if failed else ("INCOMPLETE" if gaps else "PASS")
@@ -134,7 +142,8 @@ def to_markdown(r: dict) -> str:
         f"재전송 안 됨 {len(d['unrecovered'])}회, 오류 실행 {d['errored_runs']}회"
     )
     lines.append(f"3. 공시 커버리지: DART {c['filings']}건 중 알림 {c['alerted']}건"
-                 + (f" — 놓친 공시 {len(c['missed'])}건" if c["missed"] else " — 누락 0"))
+                 + (f" — 놓친 공시 {len(c['missed'])}건" if c["missed"]
+                    else " — 누락 0" if c.get("verified") else " — 검증 불가 (실제 알림 0건)"))
     lines += [f"   - 놓침: {x}" for x in c["missed"]]
     if r["gaps"]:
         lines += ["", "판정 근거 부족:"] + [f"- {g}" for g in r["gaps"]]
