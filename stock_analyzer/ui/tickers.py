@@ -218,10 +218,13 @@ def get_ticker_display_name(ticker: str) -> str:
         try:
             from pykrx import stock as _krx
             name = _krx.get_market_ticker_name(code)
-            if name and name.strip() and name != code:
+            # 못 찾으면 str 이 아니라 빈 DataFrame 을 돌려준다. 종전 `if name` 은
+            # 여기서 ValueError 를 내고 except 가 사유 없이 삼켰다.
+            if isinstance(name, str) and name.strip() and name != code:
                 return name.strip()
-        except Exception:
-            pass
+            logger.debug("pykrx 종목명 없음 %s → 다음 소스", code)
+        except Exception as e:
+            logger.debug("pykrx 종목명 조회 실패 %s: %s", code, e)
 
         # ─── 한국 주식: FinanceDataReader ───
         try:
