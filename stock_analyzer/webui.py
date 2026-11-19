@@ -107,6 +107,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# 인증 게이트 — 비밀번호 확인 전에는 아무것도 렌더하지 않는다 (WEBUI_PASSWORD, .env).
+from ui.auth_gate import require_password  # noqa: E402
+
+require_password()
+
 # ── Kinetic Terminal Design System CSS ──────────────────────────
 # ── Kinetic Terminal Design System CSS (stock_analyzer/ui/theme.py) ──
 inject_theme()
