@@ -1,7 +1,7 @@
 # CLAUDE.md — Stock AI Analysis System V2
 
 > 이 파일은 Claude Code가 본 프로젝트에서 작업할 때 매 세션 자동 로드되는 영구 컨텍스트다.
-> 변경 시 commit 메시지에 `[claude-md]` prefix 사용. 컨텍스트 토큰 비용을 고려해 간결하게 유지한다.
+> 변경 시 commit 메시지(§5.7 형식)에 `[claude-md]` 태그를 붙인다. 컨텍스트 토큰 비용을 고려해 간결하게 유지한다.
 
 ---
 
@@ -15,7 +15,7 @@
 **핵심 구조**:
 - 8 LLM 에이전트 (Gemini 4 = `gemini-3.6-flash`, 쿼터 소진 시 `3.5-flash` + Ollama 4)
   ※ 무료 등급 쿼터는 **모델당 하루 20회**다. 4 에이전트 × 7종목 = 배치 1회 28회라
-    한 모델로는 매일 끊긴다 (§13.9j). 모델을 바꿀 때 가용성 먼저 확인할 것 —
+    한 모델로는 매일 끊긴다 (`docs/SYSTEM_OVERVIEW.md` §13.9j). 모델을 바꿀 때 가용성 먼저 확인할 것 —
     `gemini-2.0-flash` 는 2026-09-15 기준 404 로 폐기됐다.
 - 16 분석 도구 (`chart_agent_service/analysis_tools.py`)
 - 5 ML 앙상블 (RandomForest / GradientBoosting / LightGBM / XGBoost / LSTM)
@@ -55,7 +55,7 @@ stock_auto/
 │  ├ BACKTEST_ASSUMPTIONS.md            # Slippage/수수료/rf 가정
 │  └ USER_MANUAL.md                     # WebUI 사용법
 ├ chart_agent_service/                  # FastAPI agent-api
-│  ├ service.py (67 endpoints)
+│  ├ service.py (HTTP 엔드포인트)
 │  ├ config.py  (Pydantic Settings 60+ field)
 │  ├ analysis_tools.py (16 tools)
 │  ├ ml_predictor.py / backtest_engine.py
@@ -65,14 +65,14 @@ stock_auto/
 │  ├ db.py (SQLite WAL)
 │  └ data_sources/  brokers/  execution/
 ├ stock_analyzer/                       # Streamlit webui + scanner
-│  ├ webui.py (350 lines — 부팅·내비·커맨드바·라우팅)
-│  ├ ui/ (공용 8모듈 + pages/ 17페이지 — 분해 완료 2026-09-14)
+│  ├ webui.py (부팅·내비·커맨드바·라우팅만)
+│  ├ ui/ (공용 모듈 + pages/ 페이지별 파일)
 │  ├ multi_agent.py (8 agents Orchestrator)
 │  ├ enhanced_decision_maker.py
 │  ├ dual_node_config.py (라우팅/폴백)
 │  ├ local_engine.py (in-proc / HTTP 분기)
 │  └ watchlist.txt
-└ tests/                                # unit/ 15 test files (P2 정비 완료, CI 미구축)
+└ tests/                                # unit/ (CI: .github/workflows/ci.yml)
 ```
 
 ---
@@ -117,7 +117,7 @@ make help
 - **버전**: Python 3.12 고정. 3.13 호환성 미확인.
 - **타입 힌트**: 신규 코드는 반드시 타입 힌트.
 - **포매팅**: `ruff format`. 라인 길이 100자.
-- **린트**: `ruff check`. 무시 규칙은 `pyproject.toml`에 명시.
+- **린트**: `ruff check`. 무시 규칙은 `ruff.toml`에 명시.
 - **import 순서**: stdlib → 외부 → 내부. `isort` 호환.
 - **주석 언어**: 한국어 OK. 단 함수 docstring은 영어 권장 (LLM 호출 시 토큰 비용).
 
@@ -198,7 +198,7 @@ make help
 ## 7. 통합 로드맵
 
 ### P0+P1+P2 — 완료 (2026-05-14)
-12 단계 EXECUTION_PLAN + P2 (F-Score/Z-Score, VaR/CVaR, DSR+PBO, LLM calibration, IC ensemble, pykrx 외국인/공매도, DART) 모두 머지. tests/ 18 files.
+12 단계 EXECUTION_PLAN + P2 (F-Score/Z-Score, VaR/CVaR, DSR+PBO, LLM calibration, IC ensemble, pykrx 외국인/공매도, DART) 모두 머지.
 
 ### P3 — 데이터 누적 후 재검토 (선택)
 - HMM regime detector
@@ -317,9 +317,9 @@ Signal Accuracy 화면 기본 조회는 현재 로직 구간이다 (`signal_trac
   `data_sources/toss_source.py`.
 
 신규 의존성 추가 시:
-1. `pyproject.toml` 명시
+1. 해당 서비스의 `requirements.txt`(`chart_agent_service/` 또는 `stock_analyzer/`)에 명시
 2. 핀 버전 또는 범위 사용
-3. `requirements*.txt` 동기화
+3. 두 서비스가 모두 쓰면 양쪽 `requirements.txt` 동기화
 4. Docker 이미지 재빌드 영향 평가
 
 ---
@@ -347,7 +347,7 @@ Signal Accuracy 화면 기본 조회는 현재 로직 구간이다 (`signal_trac
 세션이 길어지면 `/compact`로 컨텍스트 축소. 작업 단위 완료 후 `/clear` 권장.
 
 PR 머지 시:
-1. `pytest` 통과 확인 (CI 부재 — 수동)
+1. CI(`.github/workflows/ci.yml`: lint + pytest) 통과 확인
 2. `docker compose --profile dev up -d` 재기동 후 `/health` 정상 확인
 
 ---
@@ -421,5 +421,5 @@ PR 머지 시:
 
 ---
 
-**문서 끝.** 변경 사항은 `git commit -m "[claude-md] ..."`로 기록.
+**문서 끝.** 변경 커밋은 §5.7 형식에 `[claude-md]` 태그를 붙인다.
 
